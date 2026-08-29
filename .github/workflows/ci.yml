@@ -26,7 +26,7 @@ jobs:
             backend/requirements.txt
             backend/requirements-dev.txt
             worker/requirements.txt
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: "22"
           cache: npm
