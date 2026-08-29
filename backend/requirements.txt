@@ -1,5 +1,5 @@
 fastapi==0.141.1
-uvicorn[standard]==0.52.3
+uvicorn[standard]==0.52.4
 requests==2.32.5
 qrcode==8.2
 cryptography==46.0.1
