@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 安全漏洞与敏感信息
+    url: https://github.com/tswawa/xianyu-saas/security/advisories/new
+    about: 请私下报告漏洞；不要公开 Cookie、Token、API Key、订单号或聊天内容。
+  - name: 使用与方案讨论
+    url: https://github.com/tswawa/xianyu-saas/discussions
+    about: 一般使用问题和方案讨论请放在 Discussions。

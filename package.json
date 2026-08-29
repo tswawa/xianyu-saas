@@ -1,0 +1,45 @@
+{
+  "name": "deepwhale-xianyu-service",
+  "version": "0.1.0",
+  "private": true,
+  "description": "按店铺账号隔离的闲鱼客服工作台、服务端与自动客服 worker",
+  "license": "GPL-3.0-only",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/tswawa/xianyu-saas.git"
+  },
+  "bugs": {
+    "url": "https://github.com/tswawa/xianyu-saas/issues"
+  },
+  "homepage": "https://github.com/tswawa/xianyu-saas#readme",
+  "scripts": {
+    "dev": "bash scripts/dev-all.sh",
+    "dev:web": "node scripts/dev-server.mjs",
+    "test": "bash scripts/test-all.sh",
+    "test:api": "backend/.venv/bin/python tests/api-contract.py && backend/.venv/bin/python tests/shop-sync-contract.py && backend/.venv/bin/python tests/xianyu-login-contract.py",
+    "test:p0": "backend/.venv/bin/python tests/control-plane-contract.py",
+    "test:ai": "backend/.venv/bin/python tests/ai-provider-adapters-contract.py && backend/.venv/bin/python tests/ai-customer-service-contract.py",
+    "test:consumer": "backend/.venv/bin/python tests/job-consumer-contract.py",
+    "test:async": "backend/.venv/bin/python tests/async-shop-sync-contract.py",
+    "test:recovery": "backend/.venv/bin/python tests/worker-recovery-contract.py",
+    "test:auto-worker": "backend/.venv/bin/python tests/auto-worker-contract.py",
+    "test:api-lock": "backend/.venv/bin/python tests/api-process-lock-contract.py",
+    "test:runtime-cas": "backend/.venv/bin/python tests/db-runtime-cas-contract.py",
+    "test:storage": "backend/.venv/bin/python tests/account-storage-contract.py",
+    "test:isolation": "backend/.venv/bin/python tests/account-isolation-contract.py",
+    "test:inbox": "backend/.venv/bin/python tests/inbox-contract.py",
+    "test:manual-reply": "backend/.venv/bin/python tests/manual-reply-contract.py",
+    "test:analytics": "backend/.venv/bin/python tests/analytics-contract.py",
+    "test:product-batch": "backend/.venv/bin/python tests/product-batch-contract.py",
+    "test:templates-cards": "backend/.venv/bin/python tests/templates-cards-contract.py",
+    "test:deploy": "backend/.venv/bin/python tests/deploy-contract.py",
+    "test:repository": "python3 tests/repository-contract.py",
+    "test:connector": "node tests/connector-extension-contract.mjs",
+    "test:ui": "node tests/ui-check.mjs",
+    "test:worker": "cd worker && timeout 20m prlimit --as=3221225472 -- .venv/bin/python -m unittest discover -s tests -v",
+    "test:syntax": "python3 -m py_compile backend/*.py tests/*.py worker/*.py worker/utils/*.py worker/scripts/*.py worker/tests/*.py && node --check frontend/assets/app.js && node --check scripts/dev-server.mjs && node --check tests/ui-check.mjs && node --check tests/connector-extension-contract.mjs"
+  },
+  "devDependencies": {
+    "playwright": "1.55.1"
+  }
+}

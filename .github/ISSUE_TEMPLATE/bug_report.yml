@@ -1,0 +1,41 @@
+name: Bug report
+description: 报告可复现的工程问题
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **安全提醒：不要粘贴 Cookie、Token、API Key、密码、真实订单号、买家昵称、聊天正文、库存或未经脱敏的日志。**
+        请使用最小化的假数据，并在提交前运行仓库脱敏合同。
+  - type: input
+    id: version
+    attributes:
+      label: 版本或提交
+      description: 提供版本号或短提交 SHA，不要提供生产主机路径。
+      placeholder: v0.1.0 / abc1234
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: 复现步骤
+      description: 请使用假账号、假订单和本地模拟数据描述最小复现。
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望行为
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: 实际行为
+    validations:
+      required: true
+  - type: textarea
+    id: checks
+    attributes:
+      label: 已运行的检查
+      description: 例如 npm test、专项合同或 git diff --check。

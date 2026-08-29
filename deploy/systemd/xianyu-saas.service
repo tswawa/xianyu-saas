@@ -1,0 +1,40 @@
+[Unit]
+Description=Xianyu SaaS API and managed bot supervisor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=xianyu-saas
+Group=xianyu-saas
+WorkingDirectory=/opt/xianyu-saas/backend
+EnvironmentFile=/etc/xianyu-saas.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/xianyu-saas/backend/.venv/bin/uvicorn app:app --host 127.0.0.1 --port 8096 --proxy-headers --forwarded-allow-ips=127.0.0.1
+
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=35
+KillMode=control-group
+UMask=0077
+StateDirectory=xianyu-saas
+StateDirectoryMode=0700
+ReadWritePaths=/var/lib/xianyu-saas
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

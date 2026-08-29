@@ -1,0 +1,5 @@
+# Runtime dependencies
+-r requirements.txt
+
+# FastAPI/Starlette TestClient dependency; not installed on production-only hosts.
+httpx2==2.10.0

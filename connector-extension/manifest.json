@@ -1,0 +1,32 @@
+{
+  "manifest_version": 3,
+  "name": "DeepWhale 闲鱼连接助手",
+  "version": "1.0.0",
+  "description": "在闲鱼官网完成登录后，将当前店铺连接信息安全交给 DeepWhale 闲鱼客服工作台。",
+  "minimum_chrome_version": "102",
+  "permissions": [
+    "cookies"
+  ],
+  "host_permissions": [
+    "https://deepwhale.chat/xianyu-saas/*",
+    "https://*.goofish.com/*"
+  ],
+  "background": {
+    "service_worker": "service-worker.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://deepwhale.chat/xianyu-saas/*"
+      ],
+      "js": [
+        "content-script.js"
+      ],
+      "run_at": "document_start",
+      "all_frames": false
+    }
+  ],
+  "action": {
+    "default_title": "闲鱼连接助手"
+  }
+}

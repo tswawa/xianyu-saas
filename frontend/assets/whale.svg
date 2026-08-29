@@ -1,0 +1,47 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 300 210" role="img" aria-labelledby="title desc" shape-rendering="crispEdges">
+  <title id="title">DeepWhale 像素鲸鱼</title>
+  <desc id="desc">一只带喷水、白色腹部和粉色脸颊的蓝色像素鲸鱼</desc>
+  <defs>
+    <linearGradient id="body-blue" x1="44" y1="76" x2="236" y2="178" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#4ea8f5"/>
+      <stop offset="0.36" stop-color="#3576df"/>
+      <stop offset="0.72" stop-color="#285bc8"/>
+      <stop offset="1" stop-color="#1e43a7"/>
+    </linearGradient>
+    <linearGradient id="tail-blue" x1="180" y1="48" x2="242" y2="126" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#3b85e9"/>
+      <stop offset="1" stop-color="#2455c2"/>
+    </linearGradient>
+    <linearGradient id="spout-blue" x1="94" y1="22" x2="136" y2="68" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#2688e8"/>
+      <stop offset="1" stop-color="#62cdf8"/>
+    </linearGradient>
+  </defs>
+
+  <g aria-hidden="true">
+    <path fill="url(#spout-blue)" d="M102 62h10V48h-8V40H94V30H82v14h10v10h10Zm10-18h10V24h-12v20Zm8 18h10V50h10V40h10V28h-12v10h-10v12h-8Z"/>
+    <path fill="#8fe2ff" d="M92 42h7v9h8v9h-5V52H92Zm28 16h7v-9h8v-9h5v10h-10v12h-10Z" opacity=".72"/>
+
+    <path fill="#101760" d="M202 134h16v-20h8V98h-8V90h-12v-8h-12v-8h-12v-8h-10V58h-8V44h-8V32h16v8h12v8h16v8h12v10h12v8h10v-8h10V58h12v-8h14V40h16v34h-8v14h-10v10h-14v10h-14v12h-8v24h-14v16h-16Z"/>
+    <path fill="url(#tail-blue)" d="M208 126h8v-18h8V96h-8v-8h-12v-8h-12v-8h-12v-8h-10V52h8v6h14v8h14v8h12v10h14v8h10v-8h10v-8h12v-8h14V56h8v14h-8v12h-10v10h-14v10h-14v10h-8v22h-14Z"/>
+    <path fill="#54b5f5" d="M176 52h8v8h14v8h-10v-6h-12Zm70 34h10v-8h12v-10h8v10h-8v10h-14v10h-8Z" opacity=".72"/>
+
+    <path fill="#101760" d="M46 82h12v-8h14v-8h20v-6h58v6h18v8h14v10h12v14h10v14h12v14h12v6h14v8h12v16h-8v12h-12v10h-16v10h-20v10h-22v8h-18v10h-26v-6h-36v-4H82v-8H66v-8H54v-10H44v-12h-8v-14h-6v-34h6V94h10Z"/>
+    <path fill="url(#body-blue)" d="M50 90h12v-8h16v-8h72v8h16v8h14v12h10v14h12v14h12v10h16v8h14v8h-8v8h-14v10h-18v8h-20v8h-22v8h-18v-6h-34v-4H86v-8H70v-8H58v-10H50v-12h-6v-34h6Z"/>
+    <path fill="#55aaf1" d="M52 92h10v-8h16v-8h72v8H78v8H66v10H58v8H50v-8h2Z" opacity=".72"/>
+    <path fill="#2b63cf" d="M50 124h40v8h70v8h54v8h28v8h-8v8h-14v10h-18v8h-20v8h-22v8h-16v-6h-34v-4H86v-8H70v-8H58v-10H50Z" opacity=".48"/>
+
+    <path fill="#c9d9ef" d="M48 132h22v6h18v8h18v10h18v10h26v20h-16v4h-28v-6H84v-8H68v-8H56v-10h-8Z"/>
+    <path fill="#ffffff" d="M54 134h10v8h12v8h16v10h18v10h30v10h-30v-4H88v-8H72v-8H60v-10h-6Z"/>
+    <path fill="#e8f1fb" d="M68 138h8v12h12v10h14v10h22v10h-14v-4H90v-8H76v-10h-8Z"/>
+
+    <path fill="#101760" d="M142 154h18v8h10v10h10v10h8v14h-8v8h-24v-6h-12v-10h-8v-12h-8v-14h14Z"/>
+    <path fill="url(#tail-blue)" d="M146 162h10v8h10v10h8v10h6v6h-20v-6h-10v-10h-8v-10h-6v-8Z"/>
+    <path fill="#55b6f3" d="M150 166h6v8h8v8h8v8h-8v-6h-8v-8h-6Z" opacity=".7"/>
+
+    <path fill="#0c145b" d="M104 108h10v-6h18v6h8v8h6v18h-8v8h-24v-6h-10v-8h-6v-14h6Z"/>
+    <rect x="116" y="112" width="10" height="12" fill="#ffffff"/>
+    <rect x="126" y="128" width="18" height="10" rx="1" fill="#ff7887"/>
+    <rect x="128" y="128" width="14" height="4" fill="#ff9aa5"/>
+  </g>
+</svg>

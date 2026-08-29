@@ -1,0 +1,29 @@
+services:
+  xianyu-autoagent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: xianyu-autoagent:local
+    container_name: xianyu-autoagent
+    restart: "on-failure:5"
+    init: true
+    user: "10001:10001"
+    env_file:
+      - .env
+    environment:
+      TZ: Asia/Shanghai
+      XIAN_YU_DATA_DIR: /app/data
+      PRODUCTS_CONFIG_FILE: /app/data/products_config.json
+      REPLY_RULES_FILE: /app/data/reply_rules.json
+    volumes:
+      - ./runtime-data:/app/data
+      - ./prompts:/app/prompts:ro
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 256
+    stop_grace_period: 30s

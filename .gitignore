@@ -1,0 +1,65 @@
+# Python environment and caches
+backend/.venv/
+backend/__pycache__/
+__pycache__/
+*.py[cod]
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+config/saas.env
+config/*.local
+*.secret
+*.secrets
+**/cookies.txt
+**/cookies.*
+**/cookie.*
+**/*_cookie.*
+**/token.*
+**/*_token.*
+**/credential.*
+**/*_credential.*
+**/credentials.*
+**/*_credentials.*
+test-codes.txt
+
+# Runtime state and databases
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.lock
+*.api.lock
+data/
+runtime-data/
+.narrafork/
+.local/
+logs/
+*.log
+redeem_codes.json*
+redeem_sent.json*
+trial_codes.json*
+trial_sent.json*
+pan_links.json*
+pan_sent.json*
+reply_rules.json*
+legacy_delivery_ledger.json*
+
+# Temporary distilled exports and demo HTML
+蒸馏/
+xianyusaas迭代演示UI-1.html
+智能客服交互原型UI.html
+
+# Generated test output
+test-results/
+coverage/
+.pytest_cache/
+node_modules/
+
+# Editors and OS files
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo

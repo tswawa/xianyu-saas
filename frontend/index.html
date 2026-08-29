@@ -1,0 +1,831 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#FFDA00">
+  <title>闲鱼客服工作台</title>
+  <link rel="icon" type="image/svg+xml" href="/xianyu-saas/assets/whale.svg">
+  <link rel="preload" href="/xianyu-saas/assets/ui-sans-generated.woff2?v=20260828-01" as="font" type="font/woff2" crossorigin>
+  <link rel="stylesheet" href="/xianyu-saas/assets/app.css?v=20260828-01">
+  <script defer src="/xianyu-saas/assets/app.js?v=20260828-01"></script>
+</head>
+<body>
+  <div id="toastRegion" class="toast-region" aria-live="polite" aria-atomic="true"></div>
+
+  <section id="introCurtain" class="intro-curtain" aria-label="xianyu-saas 开场">
+    <div class="intro-aurora" aria-hidden="true"></div>
+    <div class="spotlight-stage">
+      <a class="spotlight-github" href="https://github.com/tswawa" target="_blank" rel="noopener noreferrer" aria-label="访问 GitHub 项目">
+        <span class="spotlight-light" aria-hidden="true"></span>
+        <span class="spotlight-bulb" aria-hidden="true"></span>
+        <span class="spotlight-card">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 .7a11.5 11.5 0 0 0-3.64 22.41c.58.1.79-.25.79-.56v-2.23c-3.22.7-3.9-1.37-3.9-1.37-.53-1.34-1.29-1.7-1.29-1.7-1.05-.72.08-.71.08-.71 1.16.08 1.78 1.2 1.78 1.2 1.03 1.77 2.71 1.26 3.37.96.1-.75.4-1.26.73-1.55-2.57-.29-5.27-1.29-5.27-5.72 0-1.26.45-2.3 1.19-3.11-.12-.29-.52-1.47.11-3.07 0 0 .97-.31 3.16 1.19A10.9 10.9 0 0 1 12 6.05c.98 0 1.96.13 2.88.39 2.2-1.5 3.16-1.19 3.16-1.19.63 1.6.23 2.78.11 3.07.74.81 1.19 1.85 1.19 3.11 0 4.44-2.71 5.42-5.29 5.71.42.36.79 1.07.79 2.16v3.25c0 .31.21.67.8.56A11.5 11.5 0 0 0 12 .7Z"/></svg>
+          <strong>GitHub</strong>
+        </span>
+      </a>
+      <span class="spotlight-floor" aria-hidden="true"></span>
+      <button id="enterWorkspaceButton" class="intro-enter" type="button">进入xianyu-saas</button>
+    </div>
+  </section>
+
+  <section id="authScreen" class="auth-screen" hidden>
+    <div class="auth-card">
+      <div class="auth-brand">
+        <span class="auth-logo" aria-hidden="true">闲</span>
+        <h1 id="authTitle" class="auth-title">闲鱼客服工作台</h1>
+        <p id="authDescription" class="auth-subtitle">关键词自动回复 · 付款后自动发资料</p>
+      </div>
+      <div class="auth-tabs" role="tablist" aria-label="账户操作">
+        <button id="loginTab" type="button" role="tab" aria-selected="true" aria-controls="authForm">登录</button>
+        <button id="registerTab" type="button" role="tab" aria-selected="false" aria-controls="authForm">注册</button>
+      </div>
+      <form id="authForm" novalidate>
+        <label class="field-group">
+          <span>账号</span>
+          <input id="authUsername" name="username" autocomplete="username" required minlength="3" maxlength="32" placeholder="输入账号">
+        </label>
+        <label class="field-group">
+          <span>密码</span>
+          <input id="authPassword" name="password" type="password" autocomplete="current-password" required minlength="8" placeholder="输入密码">
+        </label>
+        <p id="authError" class="form-message" role="alert"></p>
+        <button id="authSubmit" class="button button-primary button-block" type="submit">
+          <span>登录</span>
+          <svg class="icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#log-in"></use></svg>
+        </button>
+      </form>
+    </div>
+  </section>
+
+  <section id="workspace" class="workspace" hidden>
+    <aside id="sidebar" class="sidebar" aria-label="主导航">
+      <div class="sidebar-top">
+        <button class="sidebar-logo" type="button" data-view="home" aria-label="回到运营概览" title="运营概览">XS</button>
+        <button id="closeSidebar" class="icon-button mobile-only" type="button" aria-label="关闭导航" aria-controls="sidebar">
+          <svg class="icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#x"></use></svg>
+        </button>
+      </div>
+      <nav id="sideNav" class="side-nav" aria-label="工作台导航"></nav>
+      <div class="sidebar-bottom">
+        <button class="side-nav-item" type="button" data-view="shops" aria-label="店铺管理" title="店铺管理">
+          <svg class="icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#store"></use></svg>
+          <span class="side-nav-tooltip">店铺管理</span>
+        </button>
+        <button class="side-nav-item" type="button" data-view="docs" aria-label="项目说明" title="项目说明">
+          <svg class="icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#file-text"></use></svg>
+          <span class="side-nav-tooltip">项目说明</span>
+        </button>
+        <button id="logoutButton" class="side-nav-item sidebar-logout" type="button" aria-label="退出登录" title="退出登录">
+          <svg class="icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#log-out"></use></svg>
+        </button>
+        <span id="userAvatarBadge" class="user-avatar-badge" aria-label="当前用户">店</span>
+      </div>
+    </aside>
+    <div class="sidebar-scrim" aria-hidden="true"></div>
+
+    <div class="workspace-main">
+      <header class="topbar">
+        <div class="topbar-left">
+          <button id="mobileMenu" class="icon-button mobile-only" type="button" aria-label="打开导航" aria-controls="sidebar" aria-expanded="false">
+            <svg class="icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#menu"></use></svg>
+          </button>
+          <span class="brand-saas-title">xianyu-saas</span>
+          <div id="accountTabs" class="account-tabs" role="tablist" aria-label="闲鱼店铺矩阵"></div>
+        </div>
+        <div class="topbar-actions">
+          <button id="refreshButton" class="icon-button" type="button" aria-label="刷新数据" title="刷新数据">
+            <svg class="icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#refresh-cw"></use></svg>
+          </button>
+          <button id="headerLogoutButton" class="header-logout-button" type="button">退出</button>
+        </div>
+      </header>
+
+      <main id="mainContent" class="main-content">
+        <!-- 运营概览 -->
+        <section data-panel="home" class="view-panel is-visible">
+          <div class="page-head">
+            <div class="page-head-copy">
+              <h1><svg class="icon page-head-icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#layout-dashboard"></use></svg>运营概览驾驶舱</h1>
+            </div>
+            <div id="analyticsPeriod" class="sub-tabs-bar period-switch" role="group" aria-label="统计周期">
+              <button type="button" data-period="1" aria-pressed="true">今日实时</button>
+              <button type="button" data-period="7" aria-pressed="false">近 7 天</button>
+              <button type="button" data-period="30" aria-pressed="false">近 30 天</button>
+            </div>
+          </div>
+
+          <div id="homeStatCards" class="stat-card-grid" aria-label="经营概览"></div>
+
+          <div class="overview-grid-2col">
+            <section class="card-section overview-trend-card">
+              <div class="section-title"><div><h2><svg class="icon section-icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#bar-chart-2"></use></svg>消息与自动回复趋势</h2></div></div>
+              <div id="analyticsChart" class="chart-canvas"></div>
+              <p class="chart-empty" hidden>暂无趋势数据</p>
+            </section>
+
+            <section id="attentionPanel" class="card-section attention-panel" aria-labelledby="attentionTitle">
+              <div class="section-title">
+                <div><h2 id="attentionTitle"><svg class="icon section-icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#circle-alert"></use></svg>风险与待办预警看板</h2></div>
+                <span id="attentionCount" class="badge badge-red">0</span>
+              </div>
+              <div id="attentionList" class="attention-list"><div class="attention-empty">当前没有需要处理的事项</div></div>
+            </section>
+          </div>
+
+          <section class="card-section">
+            <div class="section-title">
+              <div><h2><svg class="icon section-icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#box"></use></svg>在售商品实时快照</h2></div>
+              <a class="text-link" href="#" data-view="goods">进入履约中心批量设置资料<svg class="icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#chevron-right"></use></svg></a>
+            </div>
+            <div id="homeProductGrid" class="home-product-grid"></div>
+          </section>
+        </section>
+
+        <!-- 店铺管理 -->
+        <section data-panel="shops" class="view-panel" hidden>
+          <div class="page-head">
+            <div class="page-head-copy">
+              <h1><svg class="icon page-head-icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#store"></use></svg>店铺管理</h1>
+            </div>
+            <div class="page-head-actions">
+              <button id="refreshShopAccounts" class="button button-secondary" type="button">
+                <svg class="icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#refresh-cw"></use></svg><span>刷新列表</span>
+              </button>
+              <button id="openAddShopAccount" class="button button-primary" type="button" data-open-shop-add>
+                <svg class="icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#plus"></use></svg><span>添加店铺</span>
+              </button>
+            </div>
+          </div>
+
+          <div class="shops-layout">
+            <div class="shops-main">
+              <section class="card-section">
+                <div class="section-title">
+                  <div><h2><svg class="icon section-icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#store"></use></svg>我的店铺</h2></div>
+                  <span id="shopAccountsCount" class="badge badge-muted">0 个</span>
+                </div>
+                <div id="shopAccountsPanelList" class="shop-card-list" aria-label="店铺列表"></div>
+                <div id="shopAccountsPagination" class="shop-pagination" hidden>
+                  <button type="button" class="icon-button is-previous" data-shop-page="prev" aria-label="上一页" title="上一页">
+                    <svg class="icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#chevron-right"></use></svg>
+                  </button>
+                  <span id="shopAccountsPageLabel">第 1 页</span>
+                  <button type="button" class="icon-button" data-shop-page="next" aria-label="下一页" title="下一页">
+                    <svg class="icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#chevron-right"></use></svg>
+                  </button>
+                  <label class="shop-page-size"><span>每页</span>
+                    <select id="shopAccountsPageSize" aria-label="每页店铺数">
+                      <option value="5">5</option>
+                      <option value="10">10</option>
+                      <option value="20">20</option>
+                    </select>
+                  </label>
+                </div>
+                <div class="shop-add-block">
+                  <div class="shop-add-heading">
+                    <span class="shop-add-icon"><svg class="icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#plus"></use></svg></span>
+                    <div><strong>添加店铺</strong></div>
+                  </div>
+                  <form id="addShopAccountPanelForm" class="stack-form" novalidate>
+                    <label class="field-group"><span>店铺名称（可选）</span><input id="shopAccountPanelNameInput" name="name" maxlength="160" placeholder="默认使用闲鱼店铺名"></label>
+                    <div class="form-actions"><span id="shopAccountPanelMessage" class="form-message shop-account-message"></span><button class="button button-primary" type="submit"><svg class="icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#plus"></use></svg><span>添加并连接</span></button></div>
+                  </form>
+                </div>
+              </section>
+            </div>
+
+            <aside class="shops-side" id="shopConnectionCard">
+              <section class="card-section">
+                <div class="section-title">
+                  <div><h2 id="shopConnectionTitle"><svg class="icon section-icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#wifi"></use></svg>连接闲鱼店铺</h2><p id="shopConnectionDescription">使用闲鱼 App 扫码，登录信息只在闲鱼官方页面完成。</p></div>
+                </div>
+                <div class="connector-flow">
+                  <div class="connector-trust">
+                    <span class="connector-trust-icon"><svg class="icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#shield-check"></use></svg></span>
+                    <div><strong>官方扫码登录</strong></div>
+                  </div>
+                  <div class="connector-actions">
+                    <button id="xianyuConnectButton" class="button button-primary" type="button">
+                      <svg class="icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#wifi"></use></svg><span>连接闲鱼店铺</span>
+                    </button>
+
+                  </div>
+                </div>
+              </section>
+
+              <section class="card-section">
+                <div class="section-title">
+                  <div><h2><svg class="icon section-icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#circle-check"></use></svg>当前状态</h2></div>
+                  <div class="status-section-actions">
+                    <span id="shopConnectionBadge" class="badge badge-muted">未连接</span>
+                    <button id="checkCookieButton" class="icon-button" type="button" aria-label="重新检测登录状态" title="重新检测登录状态">
+                      <svg class="icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#refresh-cw"></use></svg>
+                    </button>
+                  </div>
+                </div>
+                <div id="cookieStatusNotice" class="cookie-status-notice" hidden role="status" aria-live="polite">
+                  <div class="cookie-status-copy">
+                    <svg class="icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#circle-alert"></use></svg>
+                    <div><strong id="cookieStatusTitle">需要处理</strong><p id="cookieStatusMessage"></p><small id="cookieStatusAction"></small></div>
+                  </div>
+                </div>
+                <dl class="simple-details">
+                  <div><dt>店铺名称</dt><dd id="shopAccountValue">未连接店铺</dd></div>
+                  <div><dt>登录状态</dt><dd id="shopCookieState">未连接</dd></div>
+                  <div><dt>商品</dt><dd id="shopProductState">等待识别</dd></div>
+                  <div><dt>最近识别</dt><dd id="shopLastSync">--</dd></div>
+                </dl>
+                <form id="renameShopAccountForm" class="rename-shop-form" hidden novalidate>
+                  <label class="field-group"><span>店铺显示名称</span><input id="shopDisplayNameInput" name="name" maxlength="160" placeholder="默认使用闲鱼店铺名"></label>
+                  <div class="form-actions"><span id="renameShopAccountMessage" class="form-message"></span><button class="button button-secondary" type="submit"><svg class="icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#save"></use></svg><span>保存名称</span></button></div>
+                </form>
+              </section>
+            </aside>
+          </div>
+        </section>
+
+        <!-- 商品管理 -->
+        <section data-panel="goods" class="view-panel" hidden>
+          <div class="page-head">
+            <div class="page-head-copy"><h1><svg class="icon page-head-icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#box"></use></svg>自动化履约中心</h1></div>
+            <div class="sub-tabs-bar" role="tablist" aria-label="履约中心功能">
+              <button type="button" class="sub-tab-btn is-active" data-view="goods" role="tab" aria-selected="true">在售商品与发货资料</button>
+              <button type="button" class="sub-tab-btn" data-view="templates" role="tab" aria-selected="false">发货模板库</button>
+              <button type="button" class="sub-tab-btn" data-view="cards" role="tab" aria-selected="false">卡密库存池</button>
+            </div>
+          </div>
+          <div class="panel-toolbar">
+            <button class="button button-secondary button-compact" type="button" data-open-batch-delivery><svg class="icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#copy"></use></svg><span>批量设置资料</span></button>
+            <button id="refreshProducts" class="button button-secondary button-compact" type="button"><svg class="icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#refresh-cw"></use></svg><span>同步闲鱼商品</span></button>
+          </div>
+          <div id="productsNotice" class="inline-status" hidden>
+            <svg class="icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#circle-check"></use></svg>
+            <span></span>
+          </div>
+
+          <section class="card-section table-card">
+            <div class="table-head" role="row" aria-hidden="true">
+              <span>商品</span><span>价格</span><span>发货方案</span><span>操作</span>
+            </div>
+            <div id="productGrid" class="product-row-list"></div>
+          </section>
+
+          <div id="productsEmpty" class="empty-panel" hidden>
+            <span class="empty-icon"><svg class="icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#box"></use></svg></span>
+            <h2 id="productsEmptyTitle">还没有商品</h2>
+            <p id="productsEmptyMessage">先连接店铺，系统会自动读取商品名称、简介和价格。</p>
+            <button id="productsEmptyAction" class="button button-primary" type="button" data-view="shops">
+              <svg class="icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#wifi"></use></svg><span>去连接店铺</span>
+            </button>
+          </div>
+        </section>
+
+        <!-- 智能客服中心：会话工作台 -->
+        <section data-panel="chat" class="view-panel" hidden>
+          <div class="page-head">
+            <div class="page-head-copy"><h1><svg class="icon page-head-icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#message-square-text"></use></svg>智能客服中心</h1></div>
+            <div class="sub-tabs-bar" role="tablist" aria-label="智能客服功能">
+              <button type="button" class="sub-tab-btn is-active" data-view="chat" role="tab" aria-selected="true">会话工作台</button>
+              <button type="button" class="sub-tab-btn" data-view="ai-config" role="tab" aria-selected="false">AI 客服设置</button>
+              <button type="button" class="sub-tab-btn" data-view="auto-reply" role="tab" aria-selected="false">规则客服</button>
+            </div>
+          </div>
+          <div class="chat-layout">
+            <aside class="conversation-list">
+              <div class="conversation-list-head">
+                <div><strong>买家会话</strong><small id="conversationCountLabel"><span id="conversationCount">0</span> 个会话</small></div>
+                <span id="conversationUnreadCount" class="inbox-unread-count" hidden>0</span>
+              </div>
+              <div class="conversation-tools">
+                <select id="conversationCategory" class="chat-dropdown-select" aria-label="会话分类">
+                  <option value="all">全部会话分类</option>
+                  <option value="unread">未读消息优先</option>
+                  <option value="takeover">人工接管会话</option>
+                </select>
+                <label class="conversation-search">
+                  <svg class="icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#search"></use></svg>
+                  <input id="conversationSearch" type="search" maxlength="120" autocomplete="off" placeholder="搜索买家或消息" aria-label="搜索买家或消息">
+                  <button id="clearConversationSearch" class="icon-button" type="button" aria-label="清空搜索" title="清空搜索" hidden><svg class="icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#x"></use></svg></button>
+                </label>
+                <div class="conversation-filters" role="group" aria-label="会话筛选">
+                  <button type="button" class="conversation-filter is-active" data-inbox-filter="all" aria-pressed="true">全部</button>
+                  <button type="button" class="conversation-filter" data-inbox-filter="unread" aria-pressed="false">未读 <span id="conversationUnreadFilterCount">0</span></button>
+                  <button type="button" class="conversation-filter" data-inbox-filter="takeover" aria-pressed="false">接管</button>
+                </div>
+              </div>
+              <div id="conversationItems" class="conversation-items"></div>
+            </aside>
+            <section class="chat-window">
+              <header class="chat-head">
+                <div class="chat-head-copy">
+                  <strong id="chatBuyerName">买家咨询</strong>
+                  <small id="chatItemName">店铺对话</small>
+                </div>
+                <div class="chat-head-actions">
+                  <span id="chatAiStatus" class="badge badge-muted">AI 未开启</span>
+                  <button id="chatAiStart" class="button button-primary" type="button" hidden><svg class="icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#play"></use></svg><span>开启 AI 客服</span></button>
+                  <button id="chatAiStop" class="button button-secondary" type="button" hidden><svg class="icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#square"></use></svg><span>暂停 AI 客服</span></button>
+                  <span id="chatTakeoverBadge" class="badge badge-amber" hidden>人工接管</span>
+                  <button id="markConversationRead" class="icon-button" type="button" aria-label="标记已读" title="标记已读" hidden><svg class="icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#check"></use></svg></button>
+                  <button id="toggleChatTakeover" class="button button-secondary" type="button" hidden><svg class="icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#shield-check"></use></svg><span>人工接管</span></button>
+                </div>
+              </header>
+              <div class="chat-history-search-bar">
+                <svg class="icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#search"></use></svg>
+                <input id="chatMessageSearch" class="chat-history-search-input" type="search" maxlength="120" autocomplete="off" placeholder="输入关键词搜索当前全部历史聊天记录">
+                <span id="chatMessageMatchCount" class="chat-history-search-badge">0 条匹配</span>
+              </div>
+              <div id="chatPinnedProduct" class="chat-pinned-product">
+                <span id="chatPinnedProductThumb" class="chat-pinned-thumb">商</span>
+                <div class="chat-pinned-info"><strong id="chatPinnedProductTitle">当前会话未关联商品</strong><small id="chatPinnedProductMeta">等待选择买家会话</small></div>
+                <span id="chatPinnedProductPrice" class="chat-pinned-price">--</span>
+              </div>
+              <div id="chatMessages" class="chat-messages"></div>
+              <form id="manualReplyForm" class="reply-form">
+                <div id="quickRepliesBar" class="chat-quick-toolbar" aria-label="快捷短语"></div>
+                <textarea id="manualReplyInput" rows="2" maxlength="4000" placeholder="输入回复内容（Enter 发送，Shift+Enter 换行）"></textarea>
+                <div id="manualReplyDropzone" class="reply-attachment-row" aria-label="图片附件区域">
+                  <div class="reply-attachment-actions">
+                    <label class="button button-secondary reply-image-button" for="manualReplyFile">
+                      <svg class="icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#file-text"></use></svg><span>选择图片</span>
+                    </label>
+                    <input id="manualReplyFile" type="file" accept="image/jpeg,image/png,image/gif,image/webp" hidden>
+                    <span id="manualReplyDropHint" class="reply-drop-hint">拖入或粘贴图片即可预览</span>
+                  </div>
+                  <div id="manualReplyPreview" class="reply-image-preview" hidden>
+                    <img id="manualReplyPreviewImage" alt="待发送图片">
+                    <div class="reply-image-copy">
+                      <strong id="manualReplyFileName"></strong>
+                      <small id="manualReplyFileMeta"></small>
+                    </div>
+                    <button id="clearManualReplyFile" class="icon-button" type="button" aria-label="移除待发送图片" title="移除待发送图片"><svg class="icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#x"></use></svg></button>
+                  </div>
+                </div>
+                <div><span id="replyMessage" class="form-message" aria-live="polite"></span><button class="button button-primary" type="submit"><svg class="icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#send-horizontal"></use></svg><span>发送</span></button></div>
+              </form>
+            </section>
+          </div>
+        </section>
+
+        <!-- 智能客服中心：AI 客服设置 -->
+        <section data-panel="ai-config" class="view-panel" hidden>
+          <div class="page-head">
+            <div class="page-head-copy"><h1><svg class="icon page-head-icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#bot"></use></svg>智能客服中心</h1></div>
+            <div class="sub-tabs-bar" role="tablist" aria-label="智能客服功能">
+              <button type="button" class="sub-tab-btn" data-view="chat" role="tab" aria-selected="false">会话工作台</button>
+              <button type="button" class="sub-tab-btn is-active" data-view="ai-config" role="tab" aria-selected="true">AI 客服设置</button>
+              <button type="button" class="sub-tab-btn" data-view="auto-reply" role="tab" aria-selected="false">规则客服</button>
+            </div>
+          </div>
+
+          <div class="ai-config-context" role="status" aria-live="polite">
+            <strong id="aiConfigShopName">当前店铺</strong>
+            <span id="aiOverallStatus" class="badge badge-muted">正在读取 AI 状态</span>
+          </div>
+
+          <div class="ai-config-grid">
+            <div class="ai-config-column">
+              <section class="card-section ai-connection-card" aria-labelledby="aiConnectionTitle">
+                <div class="section-title">
+                  <div><h2 id="aiConnectionTitle"><svg class="icon section-icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#bot"></use></svg>模型连接</h2></div>
+                  <span id="aiConnectionBadge" class="badge badge-muted">未配置</span>
+                </div>
+                <form id="aiConnectionForm" class="stack-form" novalidate autocomplete="off">
+                  <label class="field-group"><span>接口格式</span><select id="aiProvider" name="provider" aria-label="选择 AI 接口格式"><option value="openai_chat_completions">OpenAI / 兼容接口</option><option value="openai_responses">OpenAI Responses</option><option value="anthropic_messages">Anthropic Claude</option><option value="google_gemini">Google Gemini</option><option value="ollama_chat">Ollama 本地服务</option></select></label>
+                  <label class="field-group"><span id="aiBaseUrlLabel">服务地址</span><input id="aiBaseUrl" name="base_url" type="url" inputmode="url" autocomplete="off" maxlength="2048" placeholder="填写服务的 HTTPS 基础地址" required></label>
+                  <label class="field-group"><span><span id="aiKeyLabel">API Key</span> <small id="aiKeyState" class="ai-key-state">未配置</small></span><input id="aiApiKey" name="api_key" type="password" autocomplete="new-password" maxlength="4096" placeholder="首次配置请输入；已保存时留空表示保留"></label>
+                  <label class="field-group"><span>模型名</span><input id="aiModel" name="model" autocomplete="off" maxlength="200" placeholder="填写服务实际支持的模型名" required></label>
+                  <div id="aiConnectionMessage" class="inline-status ai-form-status" role="status" aria-live="polite" hidden><svg class="icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#circle-alert"></use></svg><span></span></div>
+                  <div class="ai-connection-actions">
+                    <button id="aiTestConnection" class="button button-secondary" type="button"><svg class="icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#play"></use></svg><span>测试连接</span></button>
+                    <div>
+                      <button id="aiDeleteKey" class="button button-danger button-compact" type="button"><svg class="icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#trash-2"></use></svg><span>删除 Key</span></button>
+                      <button id="aiSaveConnection" class="button button-primary" type="submit"><svg class="icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#save"></use></svg><span>保存连接</span></button>
+                    </div>
+                  </div>
+                </form>
+              </section>
+
+              <section class="card-section ai-persona-card" aria-labelledby="aiPersonaTitle">
+                <div class="section-title">
+                  <div><h2 id="aiPersonaTitle">店铺与客服说明</h2></div>
+                  <span id="aiPersonaStatus" class="badge badge-muted">未填写</span>
+                </div>
+                <form id="aiStoreForm" class="ai-store-form" novalidate>
+                  <label class="field-group ai-store-content-field"><span>店铺与客服说明</span><textarea id="aiStoreContent" rows="7" maxlength="8000" placeholder="例如：本店主营数字学习资料，通常 9:00—23:00 回复。请先直接回答商品问题；付款、退款、发货状态不确定时转人工确认。"></textarea></label>
+                  <div class="ai-persona-fields">
+                    <label class="field-group"><span>人格预设</span><select id="aiPersonaPreset"><option value="friendly">亲切客服</option><option value="professional">专业客服</option><option value="catgirl">小喵客服</option><option value="none">自然表达</option><option value="custom">自定义</option></select></label>
+                    <label class="field-group"><span>客服名称</span><input id="aiPersonaName" maxlength="80" placeholder="例如：小鲸客服"></label>
+                    <label class="field-group"><span>回复语气</span><select id="aiTone"><option value="friendly">亲切</option><option value="natural">自然</option><option value="professional">专业</option><option value="lively">活泼</option><option value="restrained">克制</option></select></label>
+                    <label class="field-group"><span>如何称呼买家</span><input id="aiBuyerAddress" maxlength="40" placeholder="例如：亲"></label>
+                    <label class="field-group"><span>回复长短</span><select id="aiReplyLength"><option value="short">简短</option><option value="standard">适中</option><option value="detailed">详细</option></select></label>
+                    <label class="field-group"><span>表情使用</span><select id="aiEmojiLevel"><option value="none">不使用</option><option value="low">少量</option><option value="medium">适量</option></select></label>
+                  </div>
+                  <div class="ai-boundary-fields">
+                    <label class="field-group"><span>禁止承诺</span><textarea id="aiForbiddenClaims" rows="4" maxlength="4000" placeholder="用自然语言写明不能承诺的事情，例如：不能编造库存，不能声称已经付款或发货，不能引导站外交易。"></textarea></label>
+                    <label class="field-group"><span>转人工条件</span><textarea id="aiHandoffRules" rows="4" maxlength="4000" placeholder="用自然语言写明需要店主处理的情况，例如：退款争议、付款状态不确定、买家投诉或资料不足。"></textarea></label>
+                  </div>
+                </form>
+                <div class="ai-editor-footer">
+                  <button id="aiOpenTemplates" class="button button-secondary" type="button"><svg class="icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#file-text"></use></svg><span>客服模板库</span></button>
+                  <span id="aiPersonaMessage" class="form-message" role="status" aria-live="polite"></span>
+                  <button id="aiSavePersona" class="button button-primary" type="button"><svg class="icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#save"></use></svg><span>保存并生效</span></button>
+                </div>
+              </section>
+            </div>
+
+            <div class="ai-config-column">
+              <section class="card-section ai-knowledge-card" aria-labelledby="aiKnowledgeTitle">
+                <div class="section-title">
+                  <div><h2 id="aiKnowledgeTitle">商品客服内容</h2></div>
+                  <span id="aiKnowledgeStatus" class="badge badge-muted">请选择商品</span>
+                </div>
+                <div class="knowledge-layout">
+                  <aside class="knowledge-item-list">
+                    <label class="knowledge-search"><svg class="icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#search"></use></svg><input id="aiProductSearch" type="search" maxlength="120" placeholder="搜索商品标题" aria-label="搜索商品"></label>
+                    <div id="aiProductList" class="knowledge-item-nav"></div>
+                  </aside>
+                  <div class="knowledge-editor-pane">
+                    <div class="knowledge-editor-heading"><strong id="aiKnowledgeProductTitle">尚未选择商品</strong><span id="aiKnowledgeEditMode" class="badge badge-muted">未补充</span></div>
+                    <div id="aiProductFacts" class="ai-product-facts" aria-label="实时商品事实">
+                      <div class="ai-facts-head"><strong>实时商品事实</strong><span>系统自动读取，只读</span></div>
+                      <dl>
+                        <div><dt>标题</dt><dd id="aiFactTitle">--</dd></div>
+                        <div><dt>价格</dt><dd id="aiFactPrice">--</dd></div>
+                        <div><dt>库存</dt><dd id="aiFactStock">--</dd></div>
+                        <div><dt>状态</dt><dd id="aiFactStatus">--</dd></div>
+                        <div class="ai-fact-wide"><dt>简介</dt><dd id="aiFactDescription">--</dd></div>
+                        <div class="ai-fact-wide"><dt>规格</dt><dd id="aiFactSkus">--</dd></div>
+                      </dl>
+                    </div>
+                    <label class="field-group ai-product-content-field"><span>商品补充内容</span><textarea id="aiKnowledgeContent" class="ai-knowledge-textarea" maxlength="12000" placeholder="填写适用人群、规格区别、使用方式、交付说明、售后口径和常见问答。价格、库存和上下架状态以实时事实为准。" disabled></textarea></label>
+                    <div class="ai-generator-bar">
+                      <strong><svg class="icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#sparkles"></use></svg>让 AI 帮你把现有内容整理得更清楚</strong>
+                      <div class="ai-generator-input-row"><textarea id="aiExtractInput" rows="3" maxlength="12000" placeholder="粘贴零散商品说明，AI 只会生成建议预览，不会修改或保存"></textarea><button id="aiExtractKnowledge" class="button button-secondary" type="button">AI 帮我整理</button></div>
+                      <div id="aiGeneratedKnowledgePreview" class="ai-generated-preview" hidden>
+                        <div class="ai-generated-preview-head"><strong>整理建议预览</strong><span class="badge badge-amber">尚未采用</span></div>
+                        <div id="aiGeneratedKnowledgeRaw" class="ai-generated-preview-content"></div>
+                        <div class="ai-generated-preview-actions"><span>采用后只会放进编辑区，仍需另行保存。</span><div><button id="aiDiscardGeneratedKnowledge" class="button button-secondary button-compact" type="button">放弃</button><button id="aiApplyGeneratedKnowledge" class="button button-primary button-compact" type="button">采用到编辑区</button></div></div>
+                      </div>
+                    </div>
+                    <div class="ai-knowledge-actions">
+                      <span id="aiKnowledgeMessage" class="form-message" role="status" aria-live="polite"></span>
+                      <div>
+                        <button id="aiSaveKnowledge" class="button button-primary" type="button" disabled><svg class="icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#save"></use></svg><span>保存并用于回答</span></button>
+                        <button id="aiDisableKnowledge" class="button button-danger button-compact" type="button" disabled>停用补充内容</button>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </section>
+
+              <section class="ai-test-console" aria-labelledby="aiPreviewTitle">
+                <div class="ai-test-head"><strong id="aiPreviewTitle"><svg class="icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#play"></use></svg>连续对话沙盘</strong><div><span class="badge badge-purple">仅模拟，不发送闲鱼</span><button id="aiClearPreview" class="button button-secondary button-compact" type="button">清空对话</button></div></div>
+                <div id="aiPreviewHistory" class="ai-preview-history"><span>还没有模拟对话。</span></div>
+                <div class="ai-preview-input-row"><textarea id="aiPreviewInput" rows="2" maxlength="2000" placeholder="输入当前买家问题"></textarea><button id="aiRunPreview" class="button button-primary" type="button">发送问题</button></div>
+                <div id="aiPreviewOutput" class="ai-test-output"><span>回复后会显示实际回复、使用资料、内容状态与安全状态。</span></div>
+              </section>
+            </div>
+          </div>
+        </section>
+
+        <!-- 订单 -->
+        <section data-panel="orders" class="view-panel" hidden>
+          <div class="page-head">
+            <div class="page-head-copy">
+              <h1><svg class="icon page-head-icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#package-check"></use></svg>订单</h1>
+            </div>
+            <button id="refreshOrders" class="button button-secondary" type="button">
+              <svg class="icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#refresh-cw"></use></svg><span>刷新</span>
+            </button>
+          </div>
+          <section class="card-section">
+            <div id="orderList" class="order-list"></div>
+            <div id="ordersEmpty" class="empty-panel" hidden>
+              <span class="empty-icon"><svg class="icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#package-check"></use></svg></span>
+              <h2>还没有订单</h2>
+              <p>支付订单出现后会自动显示在这里。</p>
+            </div>
+          </section>
+        </section>
+
+        <!-- 智能回复 -->
+        <section data-panel="auto-reply" class="view-panel" hidden>
+          <div class="page-head">
+            <div class="page-head-copy"><h1><svg class="icon page-head-icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#message-square-text"></use></svg>智能客服中心</h1></div>
+            <div class="sub-tabs-bar" role="tablist" aria-label="智能客服功能">
+              <button type="button" class="sub-tab-btn" data-view="chat" role="tab" aria-selected="false">会话工作台</button>
+              <button type="button" class="sub-tab-btn" data-view="ai-config" role="tab" aria-selected="false">AI 客服设置</button>
+              <button type="button" class="sub-tab-btn is-active" data-view="auto-reply" role="tab" aria-selected="true">规则客服</button>
+            </div>
+          </div>
+
+          <div class="automation-layout">
+            <div class="automation-left">
+              <section class="card-section automation-global-card">
+                <div class="section-title">
+                  <div><h2>全局客服设置</h2></div>
+                </div>
+
+                <label class="field-group automation-shop-select"><span>选择店铺账号</span>
+                  <select id="automationShopSelect" aria-label="选择店铺账号"></select>
+                </label>
+
+                <label class="setting-row automation-enabled-row">
+                  <span class="setting-copy"><strong>开启自动回复</strong><small>关闭并保存后，当前店铺会暂停自动回复。</small></span>
+                  <span class="toggle">
+                    <input id="automationEnabledToggle" type="checkbox" checked>
+                    <span class="toggle-visual" aria-hidden="true"></span>
+                  </span>
+                </label>
+
+                <label class="field-group automation-reply-field"><span>首次咨询回复（仅规则客服生效）</span>
+                  <textarea id="automationFirstReply" rows="2" maxlength="1000" placeholder="例如：你好，在的，请问想了解商品的哪一方面？"></textarea>
+                </label>
+
+                <label class="field-group automation-reply-field"><span>未匹配兜底回复（仅规则客服生效）</span>
+                  <textarea id="automationFallbackReply" rows="2" maxlength="1000" placeholder="例如：这个问题需要店主确认，我先为你转人工处理。"></textarea>
+                </label>
+
+                <div class="automation-delay-grid automation-delay-grid-four">
+                  <label class="field-group"><span>基础延迟（秒）</span><input id="automationDelayMin" type="number" min="0" max="60" value="0"></label>
+                  <label class="field-group"><span>随机延迟（秒）</span><input id="automationDelayMax" type="number" min="0" max="60" value="0"></label>
+                  <label class="field-group"><span>触发冷静期（秒）</span><input id="automationTriggerCooldown" type="number" min="0" max="300" value="0"></label>
+                  <label class="field-group"><span>人工接管冷静（秒）</span><input id="automationManualCooldown" type="number" min="0" max="300" value="0"></label>
+                </div>
+
+                <div class="business-hours-row">
+                  <label class="toggle-field business-hours-toggle"><input id="automationBusinessHoursEnabled" type="checkbox"><span>仅在营业时间内自动回复</span></label>
+                  <div class="business-hours-fields">
+                    <label><span class="sr-only">开始时间</span><input id="automationBusinessStart" type="time" value="09:00" aria-label="营业开始时间"></label>
+                    <span aria-hidden="true">—</span>
+                    <label><span class="sr-only">结束时间</span><input id="automationBusinessEnd" type="time" value="23:30" aria-label="营业结束时间"></label>
+                  </div>
+                </div>
+
+                <div class="automation-save-row">
+                  <span id="automationMessage" class="form-message" role="status" aria-live="polite"></span>
+                  <button id="saveAutomationButton" class="button button-primary" type="button"><svg class="icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#save"></use></svg><span>保存店铺配置</span></button>
+                </div>
+              </section>
+            </div>
+
+            <div class="automation-right">
+              <section class="card-section automation-rule-form-card">
+                <div class="section-title"><div><h2>新增关键词匹配规则</h2></div></div>
+                <form id="replyRuleForm" class="automation-rule-form" novalidate>
+                  <div class="automation-rule-form-grid">
+                    <label class="field-group"><span>规则名称</span><input id="replyRuleName" maxlength="80" placeholder="例：价格咨询" required></label>
+                    <label class="field-group"><span>关联商品 ID（留空为通用）</span><input id="replyRuleItemId" list="replyRuleProductOptions" inputmode="numeric" maxlength="64" placeholder="例：1002341"><datalist id="replyRuleProductOptions"></datalist></label>
+                  </div>
+                  <label class="field-group"><span>包含关键词（多个以英文逗号分隔）</span><input id="replyRuleKeywords" maxlength="420" placeholder="价格,多少钱,怎么卖,优惠" required></label>
+                  <label class="field-group"><span>自动回复话术内容</span><textarea id="replyRuleReply" rows="2" maxlength="1000" placeholder="你好，在的，页面标价是当前售价，如需确认优惠我可以转店主处理。" required></textarea></label>
+                  <div class="automation-rule-form-actions">
+                    <label class="toggle-field"><input id="replyRuleEnabled" type="checkbox" checked><span>启用该规则</span></label>
+                    <div>
+                      <button id="cancelReplyRuleEdit" class="button button-secondary" type="button" hidden>取消编辑</button>
+                      <button id="saveReplyRuleButton" class="button button-primary" type="submit"><svg class="icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#save"></use></svg><span>保存规则</span></button>
+                    </div>
+                  </div>
+                  <span id="replyRuleMessage" class="form-message" role="alert"></span>
+                </form>
+              </section>
+
+              <section class="card-section automation-rule-list-card">
+                <div class="section-title">
+                  <div><h2>已配置规则列表</h2></div>
+                  <span id="replyRuleCount" class="eyebrow">0 条</span>
+                </div>
+                <div class="rule-table-scroll" tabindex="0" aria-label="已配置规则列表，可横向滚动">
+                  <table id="replyRuleTable" class="rule-table">
+                    <thead><tr><th scope="col">规则</th><th scope="col">关键词</th><th scope="col">回复话术</th><th scope="col">状态</th><th scope="col">操作</th></tr></thead>
+                    <tbody id="replyRuleList"></tbody>
+                  </table>
+                </div>
+                <div id="replyRuleEmpty" class="automation-empty" hidden>还没有回复规则，请先在上方新增一条。</div>
+              </section>
+            </div>
+          </div>
+        </section>
+
+        <!-- 发货模板 -->
+        <section data-panel="templates" class="view-panel" hidden>
+          <div class="page-head">
+            <div class="page-head-copy"><h1><svg class="icon page-head-icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#box"></use></svg>自动化履约中心</h1></div>
+            <div class="sub-tabs-bar" role="tablist" aria-label="履约中心功能">
+              <button type="button" class="sub-tab-btn" data-view="goods" role="tab" aria-selected="false">在售商品与发货资料</button>
+              <button type="button" class="sub-tab-btn is-active" data-view="templates" role="tab" aria-selected="true">发货模板库</button>
+              <button type="button" class="sub-tab-btn" data-view="cards" role="tab" aria-selected="false">卡密库存池</button>
+            </div>
+          </div>
+          <div class="panel-toolbar"><button id="createTemplateButton" class="button button-primary button-compact" type="button"><svg class="icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#plus"></use></svg><span>新建发货模板</span></button></div>
+
+          <section class="card-section">
+            <div class="section-title">
+              <div><h2><svg class="icon section-icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#layers"></use></svg>发货模板列表</h2></div>
+              <span id="templateCount" class="eyebrow">0 个模板</span>
+            </div>
+            <div id="templateGrid" class="template-grid" aria-label="发货模板"></div>
+            <div id="templatesEmpty" class="empty-panel" hidden>
+              <span class="empty-icon"><svg class="icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#layers"></use></svg></span>
+              <h2>还没有发货模板</h2>
+              <p>创建模板后，可以把回复话术、卡密池和商品绑定在一起自动发货。</p>
+              <button id="templatesEmptyAction" class="button button-primary" type="button" data-open-template-editor=""><svg class="icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#plus"></use></svg><span>创建新模板</span></button>
+            </div>
+          </section>
+        </section>
+
+        <!-- 卡密池 -->
+        <section data-panel="cards" class="view-panel" hidden>
+          <div class="page-head">
+            <div class="page-head-copy"><h1><svg class="icon page-head-icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#box"></use></svg>自动化履约中心</h1></div>
+            <div class="sub-tabs-bar" role="tablist" aria-label="履约中心功能">
+              <button type="button" class="sub-tab-btn" data-view="goods" role="tab" aria-selected="false">在售商品与发货资料</button>
+              <button type="button" class="sub-tab-btn" data-view="templates" role="tab" aria-selected="false">发货模板库</button>
+              <button type="button" class="sub-tab-btn is-active" data-view="cards" role="tab" aria-selected="true">卡密库存池</button>
+            </div>
+          </div>
+          <div class="panel-toolbar"><button id="importCardsButton" class="button button-primary button-compact" type="button"><svg class="icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#plus"></use></svg><span>批量导入卡密</span></button></div>
+
+        <div class="cards-layout">
+          <aside class="card-section cards-create-card">
+            <div class="section-title"><div><h2><svg class="icon section-icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#plus-circle"></use></svg>新建卡密池</h2></div></div>
+            <form id="cardsCreateForm" class="stack-form" novalidate>
+              <label class="field-group"><span>卡密池名称</span><input id="cardsCreateName" name="name" maxlength="120" placeholder="例：Python 软件卡密池" required></label>
+              <label class="field-group"><span>备注说明</span><textarea id="cardsCreateNote" name="note" rows="2" maxlength="500" placeholder="用于区分卡密批次或商品"></textarea></label>
+              <span id="cardsCreateMessage" class="form-message" role="alert"></span>
+              <button id="cardsCreateSubmit" class="button button-primary" type="submit"><svg class="icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#save"></use></svg><span>保存卡密池</span></button>
+            </form>
+          </aside>
+
+          <div class="cards-main">
+            <div id="cardsStats" class="stat-card-grid cards-stats" aria-label="卡密库存概览"></div>
+
+            <section class="card-section table-card">
+              <div class="table-head cards-table-head" role="row" aria-hidden="true">
+                <span>ID</span><span>卡密池</span><span>库存</span><span>状态</span><span>操作</span>
+              </div>
+              <div id="cardsList" class="cards-list"></div>
+            </section>
+            <div id="cardsEmpty" class="empty-panel" hidden>
+              <span class="empty-icon"><svg class="icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#key-round"></use></svg></span>
+              <h2>还没有卡密池</h2>
+              <p>导入卡密后，可以在发货模板里选择卡密池自动发货。</p>
+              <button id="cardsEmptyAction" class="button button-primary" type="button" data-open-cards-import=""><svg class="icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#plus"></use></svg><span>导入卡密</span></button>
+            </div>
+          </div>
+        </div>
+        </section>
+
+        <!-- 项目说明 -->
+        <section data-panel="docs" class="view-panel" hidden>
+          <div class="page-head"><div class="page-head-copy"><h1><svg class="icon page-head-icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#file-text"></use></svg>项目说明与技术手册</h1></div></div>
+          <div class="docs-container">
+            <section class="docs-github-card">
+              <div class="docs-github-left">
+                <span class="docs-github-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path fill="currentColor" d="M12 .7a11.5 11.5 0 0 0-3.64 22.41c.58.1.79-.25.79-.56v-2.23c-3.22.7-3.9-1.37-3.9-1.37-.53-1.34-1.29-1.7-1.29-1.7-1.05-.72.08-.71.08-.71 1.16.08 1.78 1.2 1.78 1.2 1.03 1.77 2.71 1.26 3.37.96.1-.75.4-1.26.73-1.55-2.57-.29-5.27-1.29-5.27-5.72 0-1.26.45-2.3 1.19-3.11-.12-.29-.52-1.47.11-3.07 0 0 .97-.31 3.16 1.19A10.9 10.9 0 0 1 12 6.05c.98 0 1.96.13 2.88.39 2.2-1.5 3.16-1.19 3.16-1.19.63 1.6.23 2.78.11 3.07.74.81 1.19 1.85 1.19 3.11 0 4.44-2.71 5.42-5.29 5.71.42.36.79 1.07.79 2.16v3.25c0 .31.21.67.8.56A11.5 11.5 0 0 0 12 .7Z"/></svg></span>
+                <div><h2>xianyu-saas 官方代码仓库</h2><p>查看当前项目的多店铺隔离、客服工作流、自动化履约与持续迭代说明。</p></div>
+              </div>
+              <a class="btn-github-portal" href="https://github.com/tswawa" target="_blank" rel="noopener noreferrer">访问 GitHub 项目</a>
+            </section>
+            <div class="docs-grid-cards">
+              <article class="docs-card"><h3><svg class="icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#shield-check"></use></svg>账号级风控策略</h3><p>支持基础延迟、随机延迟、冷静期、营业时间和人工接管。策略按当前店铺隔离，自动处理可随时暂停。</p><div class="docs-tag-list"><span>随机延迟</span><span>人工接管</span><span>营业时间</span></div></article>
+              <article class="docs-card"><h3><svg class="icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#package-check"></use></svg>订单核验后履约</h3><p>固定资料、网盘模板和卡密均以平台订单证明为执行前提；异常进入待处理，不依据买家文字直接发货。</p><div class="docs-tag-list"><span>订单核验</span><span>卡密预占</span><span>异常处理</span></div></article>
+              <article class="docs-card"><h3><svg class="icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#message-square-text"></use></svg>统一客服工作台</h3><p>会话按买家隔离，支持历史检索、未读筛选、快捷短语、图片回复与人工接管，发送状态以平台协议回执为准。</p><div class="docs-tag-list"><span>历史检索</span><span>快捷短语</span><span>富媒体回复</span></div></article>
+              <article class="docs-card"><h3><svg class="icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#store"></use></svg>多店铺上下文隔离</h3><p>商品、规则、会话、订单、模板和库存均绑定当前店铺作用域；切换店铺会重新加载并丢弃旧请求的迟到结果。</p><div class="docs-tag-list"><span>店铺隔离</span><span>官方扫码</span><span>状态恢复</span></div></article>
+            </div>
+          </div>
+        </section>
+
+      </main>
+    </div>
+  </section>
+
+  <dialog id="aiTemplatesDialog" class="dialog ai-templates-dialog" aria-labelledby="aiTemplatesTitle">
+    <div class="dialog-head"><h2 id="aiTemplatesTitle">客服模板库</h2><button type="button" class="icon-button" data-close-dialog="aiTemplatesDialog" aria-label="关闭客服模板库"><svg class="icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#x"></use></svg></button></div>
+    <form id="aiTemplateForm" class="ai-template-form" novalidate>
+      <label class="field-group"><span>模板名称</span><input id="aiTemplateName" maxlength="80" autocomplete="off" placeholder="例如：小喵售前客服" required></label>
+      <button id="aiSaveTemplate" class="button button-primary" type="submit"><svg class="icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#save"></use></svg><span>保存当前配置</span></button>
+    </form>
+    <span id="aiTemplateMessage" class="form-message" role="status" aria-live="polite"></span>
+    <div id="aiTemplateList" class="ai-template-list"></div>
+  </dialog>
+
+  <dialog id="quickRepliesDialog" class="dialog quick-replies-dialog" aria-labelledby="quickRepliesTitle">
+    <div class="dialog-head"><h2 id="quickRepliesTitle">管理快捷短语</h2><button type="button" class="icon-button" data-close-dialog="quickRepliesDialog" aria-label="关闭快捷短语管理"><svg class="icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#x"></use></svg></button></div>
+    <form id="quickReplyForm" class="quick-reply-form" novalidate>
+      <label class="field-group"><span>短语标题</span><input id="quickReplyTitle" maxlength="10" placeholder="例如：拍下秒发" required></label>
+      <label class="field-group"><span>回复内容</span><textarea id="quickReplyContent" rows="3" maxlength="1000" placeholder="输入常用回复内容" required></textarea></label>
+      <span id="quickReplyMessage" class="form-message" role="alert"></span>
+      <button class="button button-primary" type="submit"><svg class="icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#plus"></use></svg><span>添加到快捷栏</span></button>
+    </form>
+    <div id="quickRepliesManager" class="quick-replies-manager"></div>
+  </dialog>
+
+  <dialog id="xianyuLoginDialog" class="dialog xianyu-login-dialog" aria-labelledby="xianyuLoginTitle">
+    <div class="dialog-head">
+      <h2 id="xianyuLoginTitle">登录闲鱼</h2>
+      <button id="closeXianyuLogin" type="button" class="icon-button" aria-label="关闭"><svg class="icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#x"></use></svg></button>
+    </div>
+    <div class="xianyu-login-body">
+      <div class="qr-login-frame">
+        <div id="qrLoginPlaceholder" class="qr-login-placeholder" aria-hidden="true"><svg class="icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#refresh-cw"></use></svg></div>
+        <img id="xianyuQrImage" alt="闲鱼登录二维码" hidden>
+      </div>
+      <div class="qr-login-copy" role="status" aria-live="polite"><strong id="xianyuLoginStatus">正在打开登录</strong><p id="xianyuLoginMessage">请稍候</p></div>
+      <button id="refreshXianyuLogin" class="button button-secondary" type="button" hidden><svg class="icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#refresh-cw"></use></svg><span>刷新二维码</span></button>
+    </div>
+  </dialog>
+
+  <dialog id="batchDeliveryDialog" class="dialog batch-delivery-dialog" aria-labelledby="batchDeliveryTitle">
+    <form id="batchDeliveryForm" method="dialog">
+      <div class="dialog-head">
+        <div><h2 id="batchDeliveryTitle">批量设置资料</h2><p class="dialog-subtitle">先检查影响范围，确认后一次保存。</p></div>
+        <button type="button" class="icon-button" data-close-dialog="batchDeliveryDialog" aria-label="关闭批量设置"><svg class="icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#x"></use></svg></button>
+      </div>
+      <div class="batch-delivery-body">
+        <div id="batchDeliveryModes" class="batch-delivery-modes" role="group" aria-label="批量操作">
+          <button type="button" data-batch-mode="set" aria-pressed="true">统一设置</button>
+          <button type="button" data-batch-mode="pause" aria-pressed="false">批量暂停</button>
+        </div>
+        <div class="batch-selection-head">
+          <label><input id="batchDeliveryAll" type="checkbox"><span>选择全部商品</span></label>
+          <span id="batchDeliverySelected">已选 0 个</span>
+        </div>
+        <div id="batchDeliveryProducts" class="batch-product-list" aria-label="选择商品"></div>
+        <label id="batchDeliveryMaterialField" class="field-group"><span>统一发送的资料</span><textarea id="batchDeliveryMaterial" rows="5" maxlength="8000" placeholder="填写付款后发送的文字、链接或使用说明"></textarea></label>
+        <div id="batchDeliveryPreview" class="batch-delivery-preview" hidden role="status" aria-live="polite"><strong id="batchDeliveryPreviewTitle"></strong><p id="batchDeliveryPreviewMessage"></p></div>
+        <span id="batchDeliveryMessage" class="form-message" role="alert"></span>
+      </div>
+      <div class="dialog-actions batch-delivery-actions">
+        <button class="button button-secondary" type="button" data-close-dialog="batchDeliveryDialog">取消</button>
+        <button id="batchDeliveryCheck" class="button button-secondary" type="button"><svg class="icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#circle-check"></use></svg><span>检查</span></button>
+        <button id="batchDeliveryCommit" class="button button-primary" type="submit" disabled><svg class="icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#save"></use></svg><span>确认保存</span></button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="templateEditorDialog" class="dialog template-editor-dialog" aria-labelledby="templateEditorTitle">
+    <form id="templateEditorForm" name="automationTemplateForm" method="dialog" novalidate>
+      <input id="templateDeliveryTypeInput" name="delivery-type" type="hidden" value="redeem">
+      <div class="dialog-head">
+        <div><h2 id="templateEditorTitle">创建发货模板</h2><p class="dialog-subtitle">组合发货话术与卡密池，并绑定到指定商品。</p></div>
+        <button type="button" class="icon-button" data-close-dialog="templateEditorDialog" aria-label="关闭模板编辑"><svg class="icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#x"></use></svg></button>
+      </div>
+      <div class="template-editor-body">
+        <label class="field-group"><span>模板名称</span><input id="templateNameInput" name="name" maxlength="120" placeholder="例如：卡密自动发货模板" required></label>
+        <label class="field-group"><span>模板说明</span><textarea id="templateDeliveryInput" rows="3" maxlength="500" placeholder="例如：卡密自动发货，绑定指定商品。"></textarea></label>
+        <label class="field-group"><span>价格（可选）</span><input id="templatePriceInput" name="price" maxlength="40" placeholder="留空表示不限制"></label>
+        <div class="field-group">
+          <span>绑定的卡密池（可选，留空则为纯话术/网盘发货）</span>
+          <select id="templateCardPoolSelect" aria-label="绑定卡密池">
+            <option value="">无（纯话术/网盘链接）</option>
+          </select>
+        </div>
+        <div class="field-group">
+          <span>绑定商品（最多显示前 20 个）</span>
+          <div id="templateProductPicker" class="template-product-picker" role="group" aria-label="选择绑定商品"></div>
+        </div>
+        <span id="templateEditorMessage" class="form-message" role="alert"></span>
+      </div>
+      <div class="dialog-actions">
+        <button class="button button-secondary" type="button" data-close-dialog="templateEditorDialog">取消</button>
+        <button id="templateEditorCommit" class="button button-primary" type="submit"><svg class="icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#save"></use></svg><span>保存模板</span></button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="cardsEditorDialog" class="dialog cards-editor-dialog" aria-labelledby="cardsEditorTitle">
+    <form id="cardsEditorForm" method="dialog" novalidate>
+      <div class="dialog-head">
+        <div><h2 id="cardsEditorTitle">导入卡密</h2><p class="dialog-subtitle">每一行一个卡密，可粘贴整段文本。</p></div>
+        <button type="button" class="icon-button" data-close-dialog="cardsEditorDialog" aria-label="关闭卡密编辑"><svg class="icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#x"></use></svg></button>
+      </div>
+      <div class="cards-editor-body">
+        <label class="field-group"><span>卡密池名称</span><input id="cardsPoolNameInput" name="name" maxlength="120" placeholder="例如：Python 软件卡密池" required></label>
+        <label class="field-group"><span>备注说明</span><textarea id="cardsNoteInput" rows="2" maxlength="500" placeholder="例如：用于区分卡密批次或商品"></textarea></label>
+        <label class="field-group"><span>卡密（每行一个）</span><textarea id="cardsCodesInput" rows="8" maxlength="200000" placeholder="粘贴卡密，每行一个" required></textarea></label>
+        <span id="cardsEditorMessage" class="form-message" role="alert"></span>
+        <p class="cards-editor-hint">只会导入新增且未去重的卡密，已使用过的卡密会标记为已消耗。</p>
+      </div>
+      <div class="dialog-actions">
+        <button class="button button-secondary" type="button" data-close-dialog="cardsEditorDialog">取消</button>
+        <button id="cardsEditorCommit" class="button button-primary" type="submit"><svg class="icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#save"></use></svg><span>保存卡密</span></button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="confirmDialog" class="dialog" aria-labelledby="confirmTitle">
+    <div class="dialog-head">
+      <h2 id="confirmTitle">确认操作</h2>
+      <button type="button" class="icon-button" data-close-dialog="confirmDialog" aria-label="关闭"><svg class="icon"><use href="/xianyu-saas/assets/icons.svg?v=20260828-01#x"></use></svg></button>
+    </div>
+    <p id="confirmMessage"></p>
+    <div class="dialog-actions">
+      <button id="confirmCancel" class="button button-secondary" type="button">取消</button>
+      <button id="confirmAction" class="button button-danger" type="button">确认</button>
+    </div>
+  </dialog>
+</body>
+</html>

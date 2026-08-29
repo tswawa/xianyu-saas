@@ -1,0 +1,3 @@
+此文件仅为旧部署包兼容占位，不参与 Worker 运行时回复。
+
+真实客服主链不在 Worker 内分类，也不使用多 Agent 路由；Worker 只调用账号作用域的内部业务接口 `/internal/v1/ai/reply`。

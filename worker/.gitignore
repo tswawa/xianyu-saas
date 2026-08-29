@@ -1,0 +1,76 @@
+# 环境变量文件（包含敏感信息）
+.env
+.env.*
+!.env.example
+
+# 自动发货库存、发送账本与运行态目录（包含兑换信息或买家数据）
+redeem_codes.json*
+redeem_sent.json*
+trial_codes.json*
+trial_sent.json*
+pan_links.json*
+pan_sent.json*
+reply_rules.json*
+legacy_delivery_ledger.json*
+delivery_state.db*
+data/
+runtime-data/
+
+# 提示词文件
+*_prompt.txt
+# Python缓存文件
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# 虚拟环境
+venv/
+ENV/
+env/
+.venv/
+
+# 日志文件
+logs/
+*.log
+
+# 数据库文件
+*.db
+*.db-*
+*.db.*
+*.sqlite3
+*.sqlite3-*
+*.sqlite3.*
+*.sqlite
+*.sqlite-*
+*.sqlite.*
+
+# 其他临时文件
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+.coverage
+htmlcov/
+.pytest_cache/
+.tox/
+.nox/
+.hypothesis/
+.coverage.*
