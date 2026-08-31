@@ -7,10 +7,11 @@ Wants=network-online.target
 Type=simple
 User=xianyu-saas
 Group=xianyu-saas
-WorkingDirectory=/opt/xianyu-saas/backend
+WorkingDirectory=/opt/xianyu-saas/current/backend
 EnvironmentFile=/etc/xianyu-saas.env
 Environment=PYTHONDONTWRITEBYTECODE=1
-ExecStart=/opt/xianyu-saas/backend/.venv/bin/python -m job_consumer
+Environment=SAAS_CURRENT_ROOT=/opt/xianyu-saas/current
+ExecStart=/opt/xianyu-saas/runtime/backend-venv/bin/python -m job_consumer
 
 Restart=on-failure
 RestartSec=5

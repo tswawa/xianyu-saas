@@ -1,0 +1,8 @@
+# Temporary drop-in for the one-time first-admin bootstrap.
+# Install as /etc/systemd/system/xianyu-saas.service.d/bootstrap.conf only while
+# completing initialization, then remove it and run daemon-reload + restart.
+[Service]
+LoadCredential=bootstrap-token:/etc/xianyu-saas/bootstrap-token
+Environment=SAAS_BOOTSTRAP_ENABLED=1
+Environment=SAAS_BOOTSTRAP_TOKEN_FILE=bootstrap-token
+Environment=SAAS_BOOTSTRAP_TRUSTED_SOURCES=127.0.0.1,::1

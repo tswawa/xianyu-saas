@@ -50,10 +50,12 @@ def fake_shop_sync(cookie_header: str) -> dict:
 
 
 def login(client: TestClient) -> int:
-    assert client.post(
-        "/api/auth/register",
-        json={"username": "auto-worker-owner", "password": "password-123"},
-    ).status_code == 200
+    app.db.create_user(
+        "auto-worker-owner",
+        "password-123",
+        role="owner",
+        initializer=app._new_user_initializer({}),
+    )
     response = client.post(
         "/api/auth/login",
         json={"username": "auto-worker-owner", "password": "password-123"},

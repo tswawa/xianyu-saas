@@ -158,10 +158,12 @@ def seed_account(root: Path, today: datetime) -> None:
 
 def main() -> None:
     client = TestClient(app.app)
-    register = client.post(
-        "/api/auth/register", json={"username": "analytics-owner", "password": "password-123"}
+    app.db.create_user(
+        "analytics-owner",
+        "password-123",
+        role="owner",
+        initializer=app._new_user_initializer({}),
     )
-    assert register.status_code == 200, register.text
     login = client.post(
         "/api/auth/login", json={"username": "analytics-owner", "password": "password-123"}
     )

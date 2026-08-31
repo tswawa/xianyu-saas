@@ -225,7 +225,24 @@ def main():
             insert_retention_job(f"batch-dead-{index}", "dead_letter", old_dead_letter_at)
         retention.con.commit()
         first_pass = retention.prune_retention(now=retention_now, batch_size=2)
-        assert first_pass == {"tokens": 0, "completed_jobs": 2, "dead_letter_jobs": 2}
+        assert {
+            key: first_pass[key]
+            for key in ("tokens", "completed_jobs", "dead_letter_jobs")
+        } == {"tokens": 0, "completed_jobs": 2, "dead_letter_jobs": 2}
+        assert {
+            key: first_pass[key]
+            for key in (
+                "login_failures",
+                "audit_log",
+                "admin_confirmations",
+                "platform_updates",
+            )
+        } == {
+            "login_failures": 0,
+            "audit_log": 0,
+            "admin_confirmations": 0,
+            "platform_updates": 0,
+        }
         assert retention.con.execute(
             "SELECT COUNT(*) FROM jobs WHERE idempotency_key LIKE 'batch-completed-%'"
         ).fetchone()[0] == 1
@@ -233,7 +250,19 @@ def main():
             "SELECT COUNT(*) FROM jobs WHERE idempotency_key LIKE 'batch-dead-%'"
         ).fetchone()[0] == 1
         second_pass = retention.prune_retention(now=retention_now, batch_size=2)
-        assert second_pass == {"tokens": 0, "completed_jobs": 1, "dead_letter_jobs": 1}
+        assert {
+            key: second_pass[key]
+            for key in ("tokens", "completed_jobs", "dead_letter_jobs")
+        } == {"tokens": 0, "completed_jobs": 1, "dead_letter_jobs": 1}
+        assert all(
+            second_pass[key] == 0
+            for key in (
+                "login_failures",
+                "audit_log",
+                "admin_confirmations",
+                "platform_updates",
+            )
+        )
 
     # Existing installations may have a shop_accounts table without the
     # fencing column. Opening such a database must migrate it in place.

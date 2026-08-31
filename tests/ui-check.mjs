@@ -28,6 +28,7 @@ for (const staleName of [
   "analytics-member-desktop.png", "orders-member-desktop.png",
   "ai-config-desktop.png", "ai-config-mobile.png", "ai-templates-mobile.png",
   "ai-generated-preview-desktop.png", "ai-generated-preview-mobile.png",
+  "docs-manual-desktop.png", "docs-manual-mobile.png",
 ]) {
   fs.rmSync(path.join(resultRoot, staleName), { force: true });
 }
@@ -59,7 +60,42 @@ const defaultAiStoreConfig = {
   handoff_rules: "",
 };
 const fixtures = {
-  me: { username: "owner-demo", expires_at: 0, active: false, plan: "free", plan_label: "免费", permissions: selfUsePermissions },
+  authCapabilities: { registration_enabled: true, bootstrap_available: false, password_min_length: 12 },
+  bootstrapRequests: [],
+  passwordRequests: [],
+  me: {
+    username: "owner-demo", expires_at: 0, active: false, plan: "free", plan_label: "免费",
+    role: "owner", role_label: "店主", is_admin: false, permissions: selfUsePermissions, platform_permissions: [],
+  },
+  version: {
+    version: "0.1.0",
+    commit: "ui-contract",
+    build_time: "2026-08-31T00:00:00Z",
+    asset_version: "20260831-01",
+    update_channel: "stable",
+    release_notes: "本地说明 <img src=x onerror=window.__releaseNotesInjected=true>",
+    latest_update: null,
+  },
+  adminSettings: {
+    registration: { environment_allowed: true, database_open: false, users_exist: true, effective: false },
+    update_channel: "stable",
+  },
+  adminUsers: [
+    { id: 1, username: "admin-demo", role: "admin", role_label: "管理员", enabled: true, locked: false, session_count: 1, created_at: 1788134400, password_changed_at: 1788134400 },
+    { id: 2, username: "owner-demo", role: "owner", role_label: "店主", enabled: true, locked: true, session_count: 2, created_at: 1788134400, password_changed_at: 1788134400 },
+  ],
+  auditEvents: [
+    { id: 1, event_type: "auth.login_succeeded", actor_user_id: 1, target_type: "user", target_id: "1", outcome: "success", source_hash: "source-hash", metadata: {}, created_at: 1788134400 },
+  ],
+  updateStatus: {
+    current: { version: "0.1.0", commit: "ui-contract", build_time: "2026-08-31T00:00:00Z", asset_version: "20260831-01", update_channel: "stable" },
+    latest_update: null,
+    rollback_versions: ["0.0.9"],
+  },
+  updateRequests: [],
+  adminUserRequests: [],
+  adminSettingRequests: [],
+  adminConfirmRequests: [],
   bot: {
     running: false,
     cookies_set: true,
@@ -274,7 +310,17 @@ function createServer() {
       const contentType = String(req.headers["content-type"] || "").toLowerCase();
       const payload = contentType.includes("application/json") && rawBody ? JSON.parse(rawBody) : {};
       if (apiPath === "/api/auth/capabilities" && req.method === "GET") {
-        return json(res, { registration_enabled: true });
+        return json(res, fixtures.authCapabilities);
+      }
+      if (apiPath === "/api/auth/bootstrap" && req.method === "POST") {
+        fixtures.bootstrapRequests.push({
+          payload,
+          token: String(req.headers["x-bootstrap-token"] || ""),
+          browserIntent: String(req.headers["x-saas-browser-intent"] || ""),
+          url: req.url,
+        });
+        fixtures.authCapabilities = { ...fixtures.authCapabilities, bootstrap_available: false };
+        return json(res, { ok: true });
       }
       if (apiPath === "/api/auth/login" && req.method === "POST") {
         loggedIn = true;
@@ -288,6 +334,103 @@ function createServer() {
       if (!loggedIn) return json(res, { detail: "未登录" }, 401);
       if (req.headers["x-shop-account"]) fixtures.shopAccountHeaders.push(String(req.headers["x-shop-account"]));
       if (apiPath === "/api/me") return json(res, fixtures.me);
+      if (apiPath === "/api/auth/password" && req.method === "POST") {
+        fixtures.passwordRequests.push(payload);
+        return json(res, { ok: true, other_sessions_revoked: true });
+      }
+      if (apiPath === "/api/version" && req.method === "GET") return json(res, fixtures.version);
+      if (apiPath.startsWith("/api/admin/") && fixtures.me?.is_admin !== true) {
+        return json(res, { detail: { code: "admin_required", message: "需要管理员权限" } }, 403);
+      }
+      if (apiPath === "/api/admin/settings" && req.method === "GET") return json(res, fixtures.adminSettings);
+      if (apiPath === "/api/admin/settings" && req.method === "PUT") {
+        fixtures.adminSettingRequests.push(payload);
+        if (typeof payload.registration_open === "boolean") {
+          fixtures.adminSettings.registration.database_open = payload.registration_open;
+          fixtures.adminSettings.registration.effective = fixtures.adminSettings.registration.environment_allowed && payload.registration_open && fixtures.adminSettings.registration.users_exist;
+        }
+        if (["stable", "beta"].includes(payload.update_channel)) {
+          fixtures.adminSettings.update_channel = payload.update_channel;
+          fixtures.version.update_channel = payload.update_channel;
+          fixtures.updateStatus.current.update_channel = payload.update_channel;
+        }
+        return json(res, fixtures.adminSettings);
+      }
+      if (apiPath === "/api/admin/users" && req.method === "GET") {
+        return json(res, { users: fixtures.adminUsers, next_cursor: null });
+      }
+      const adminUserMatch = apiPath.match(/^\/api\/admin\/users\/(\d+)$/);
+      if (adminUserMatch && req.method === "PATCH") {
+        const user = fixtures.adminUsers.find((item) => String(item.id) === adminUserMatch[1]);
+        if (!user) return json(res, { detail: { code: "user_not_found", message: "账号不存在" } }, 404);
+        fixtures.adminUserRequests.push({ action: "patch", userId: user.id, payload });
+        if (["owner", "admin"].includes(payload.role)) {
+          user.role = payload.role;
+          user.role_label = payload.role === "admin" ? "管理员" : "店主";
+        }
+        if (typeof payload.enabled === "boolean") user.enabled = payload.enabled;
+        return json(res, { user });
+      }
+      const adminUnlockMatch = apiPath.match(/^\/api\/admin\/users\/(\d+)\/unlock$/);
+      if (adminUnlockMatch && req.method === "POST") {
+        const user = fixtures.adminUsers.find((item) => String(item.id) === adminUnlockMatch[1]);
+        if (!user) return json(res, { detail: { code: "user_not_found", message: "账号不存在" } }, 404);
+        fixtures.adminUserRequests.push({ action: "unlock", userId: user.id });
+        user.locked = false;
+        return json(res, { ok: true });
+      }
+      const adminSessionsMatch = apiPath.match(/^\/api\/admin\/users\/(\d+)\/sessions\/revoke$/);
+      if (adminSessionsMatch && req.method === "POST") {
+        const user = fixtures.adminUsers.find((item) => String(item.id) === adminSessionsMatch[1]);
+        if (!user) return json(res, { detail: { code: "user_not_found", message: "账号不存在" } }, 404);
+        fixtures.adminUserRequests.push({ action: "revoke", userId: user.id });
+        const revoked = Math.max(Number(user.session_count || 0) - (user.username === fixtures.me.username ? 1 : 0), 0);
+        user.session_count = user.username === fixtures.me.username ? 1 : 0;
+        return json(res, { ok: true, sessions_revoked: revoked });
+      }
+      if (apiPath === "/api/admin/audit" && req.method === "GET") {
+        return json(res, { events: fixtures.auditEvents, next_cursor: null });
+      }
+      if (apiPath === "/api/admin/updates" && req.method === "GET") return json(res, fixtures.updateStatus);
+      if (apiPath === "/api/admin/updates/check" && req.method === "POST") {
+        fixtures.updateRequests.push({ action: "check", payload });
+        fixtures.updateStatus.latest_update = {
+          version: "0.2.0", channel: fixtures.adminSettings.update_channel, status: "available",
+          release_notes: "Release 0.2.0 <script>window.__releaseNotesInjected=true</script>", error_code: "", updated_at: 1788134400,
+        };
+        return json(res, {
+          available: true, current_version: fixtures.version.version, version: "0.2.0",
+          channel: fixtures.adminSettings.update_channel, published_at: "2026-08-31T00:00:00Z",
+          release_notes: fixtures.updateStatus.latest_update.release_notes,
+        });
+      }
+      if (apiPath === "/api/admin/updates/download" && req.method === "POST") {
+        fixtures.updateRequests.push({ action: "download", payload });
+        fixtures.updateStatus.latest_update = {
+          ...fixtures.updateStatus.latest_update,
+          version: String(payload.version || "0.2.0"), status: "staged", updated_at: 1788134401,
+        };
+        return json(res, {
+          version: fixtures.updateStatus.latest_update.version,
+          channel: fixtures.adminSettings.update_channel,
+          status: "staged",
+          release_notes: fixtures.updateStatus.latest_update.release_notes,
+        });
+      }
+      if (apiPath === "/api/admin/confirm" && req.method === "POST") {
+        fixtures.adminConfirmRequests.push(payload);
+        return json(res, { confirmation_token: "ui-one-time-confirmation", expires_in: 180 });
+      }
+      if (["/api/admin/updates/apply", "/api/admin/updates/rollback"].includes(apiPath) && req.method === "POST") {
+        const action = apiPath.endsWith("/apply") ? "apply" : "rollback";
+        fixtures.updateRequests.push({ action, payload });
+        fixtures.updateStatus.latest_update = {
+          ...(fixtures.updateStatus.latest_update || {}),
+          version: String(payload.version || ""), channel: fixtures.adminSettings.update_channel,
+          status: action === "apply" ? "apply_requested" : "rollback_requested", error_code: "", updated_at: 1788134402,
+        };
+        return json(res, { queued: true, action, version: String(payload.version || "") }, 202);
+      }
       if (apiPath === "/api/bot/accounts" && req.method === "GET") return json(res, { accounts: fixtures.shopAccounts });
       if (apiPath === "/api/bot/accounts" && req.method === "POST") {
         const name = String(payload.name || "").trim();
@@ -1218,12 +1361,6 @@ async function openView(page, view) {
   await page.waitForSelector(`[data-panel="${view}"]:not([hidden])`);
 }
 
-async function dismissIntroCurtain(page) {
-  if (!await page.locator("#introCurtain").isVisible()) return;
-  await page.click("#enterWorkspaceButton");
-  await page.waitForSelector("#introCurtain", { state: "hidden" });
-}
-
 async function run() {
   const server = createServer();
   const port = await listen(server);
@@ -1243,6 +1380,29 @@ async function run() {
   let expectedManualReplyNotFoundConsole = 0;
   let expectedManualReplyNotFoundResponses = 0;
   try {
+    const bootstrapToken = "bootstrap-ui-contract-token-0123456789abcdef";
+    fixtures.authCapabilities = { registration_enabled: false, bootstrap_available: true, password_min_length: 12 };
+    const bootstrapPage = await browser.newPage({ viewport: { width: 1440, height: 900 }, deviceScaleFactor: 1 });
+    await bootstrapPage.goto(`http://127.0.0.1:${port}/xianyu-saas/`, { waitUntil: "networkidle" });
+    assert.equal(await bootstrapPage.locator("#bootstrapTab").isVisible(), true, "trusted first-admin state must expose bootstrap only");
+    assert.equal(await bootstrapPage.locator("#registerTab").isVisible(), false, "bootstrap must not imply public registration");
+    await bootstrapPage.click("#bootstrapTab");
+    assert.match(await bootstrapPage.locator("#authTitle").textContent(), /首个管理员/);
+    await bootstrapPage.fill("#authUsername", "bootstrap-admin");
+    await bootstrapPage.fill("#authPassword", "Bootstrap-Pass-123!");
+    await bootstrapPage.fill("#bootstrapToken", bootstrapToken);
+    await bootstrapPage.click("#authSubmit");
+    await bootstrapPage.waitForFunction(() => document.querySelector("#authTitle")?.textContent === "登录工作台");
+    assert.equal(fixtures.bootstrapRequests.length, 1, "bootstrap UI must submit exactly once");
+    assert.deepEqual(fixtures.bootstrapRequests[0].payload, { username: "bootstrap-admin", password: "Bootstrap-Pass-123!" });
+    assert.equal(fixtures.bootstrapRequests[0].token, bootstrapToken, "bootstrap token must use the dedicated header");
+    assert.equal(fixtures.bootstrapRequests[0].browserIntent, "browser-write", "bootstrap remains subject to browser write checks");
+    assert.equal(fixtures.bootstrapRequests[0].url.includes(bootstrapToken), false, "bootstrap token must never enter the URL");
+    assert.equal(JSON.stringify(fixtures.bootstrapRequests[0].payload).includes(bootstrapToken), false, "bootstrap token must never enter JSON");
+    assert.equal((await bootstrapPage.locator("body").innerHTML()).includes(bootstrapToken), false, "bootstrap token must be cleared from rendered DOM");
+    await bootstrapPage.close();
+    fixtures.authCapabilities = { registration_enabled: true, bootstrap_available: false, password_min_length: 12 };
+
     const page = await browser.newPage({ viewport: { width: 1440, height: 900 }, deviceScaleFactor: 1 });
     await page.route("https://cdn.example/**", (route) => route.fulfill({
       status: 200,
@@ -1303,9 +1463,9 @@ async function run() {
 
     await page.goto(`http://127.0.0.1:${port}/xianyu-saas/`, { waitUntil: "networkidle" });
     assert.deepEqual(errors, [], `initial page must bind without runtime errors: ${errors.join(" | ")}`);
-    assert.equal(await page.locator("#introCurtain").isVisible(), true, "startup curtain should be visible on first load");
-    await dismissIntroCurtain(page);
-    assert.equal(await page.locator("#authScreen").isVisible(), true, "login screen should be visible");
+    assert.equal(await page.locator("#introCurtain").count(), 0, "startup curtain must be removed from the first-load DOM");
+    assert.equal(await page.locator("#enterWorkspaceButton").count(), 0, "startup entry button must be removed");
+    assert.equal(await page.locator("#authScreen").isVisible(), true, "login screen should be visible without a startup curtain");
     await page.click("#registerTab");
     assert.match(await page.locator("#authTitle").textContent(), /创建/, "register tab must switch the auth title");
     await page.click("#loginTab");
@@ -1346,6 +1506,83 @@ async function run() {
     assert.equal(await page.evaluate(() => localStorage.getItem("whale_token")), null, "access token must not use localStorage");
     assert.equal(await page.locator('[data-panel="home"] .page-head-copy p').count(), 0, "page headers keep a clean title without annotation microcopy");
     assert.equal(await page.locator('[data-panel="home"] .section-title p').count(), 0, "section titles keep a clean heading without annotation microcopy");
+
+    // 项目说明保持为单一连续说明书，正文只保留三个小节，作者链接固定在文末页脚。
+    await openView(page, "docs");
+    await waitForPanelSettled(page);
+    assert.equal(await page.locator(".docs-manual").count(), 1, "project docs must use one manual surface");
+    assert.deepEqual(await page.locator(".docs-manual-section h3").allTextContents(), ["一、项目概览", "二、日常操作与异常处理", "三、技术与安全边界"], "project docs must keep exactly three body sections");
+    assert.equal(await page.locator(".docs-manual-section").count(), 3, "project docs must not fragment into many feature panels");
+    assert.deepEqual(await page.locator("#docsBusinessDomains tbody th").allTextContents(), ["运营概览", "智能客服", "履约中心", "订单管理", "店铺管理", "项目说明"], "six business domains must remain a compact manual table");
+    assert.equal(await page.locator(".docs-github-card, .docs-grid-cards, .docs-card, .btn-github-portal, .docs-manual-notice, .docs-manual-kicker").count(), 0, "legacy documentation card layout must be removed");
+    // 正式文档版式：外层不再是带阴影的卡片，标题和页脚使用实线分隔而不是色块。
+    assert.deepEqual(await page.evaluate(() => {
+      const manual = getComputedStyle(document.querySelector(".docs-manual"));
+      return [manual.boxShadow, manual.borderTopWidth];
+    }), ["none", "0px"], "the manual must read as a flat document instead of a stacked card");
+    assert.equal(await page.evaluate(() => getComputedStyle(document.querySelector(".docs-manual-footer")).backgroundColor), "rgba(0, 0, 0, 0)", "the closing signature must not become another tinted card");
+    assert.equal(await page.locator(".docs-manual-table").count(), 2, "supporting facts stay in lightweight manual tables");
+    assert.equal(await page.locator(".docs-manual-table caption").count(), 2, "every manual table keeps a caption");
+    assert.equal(await page.locator(".docs-manual > .docs-manual-footer").evaluate((footer) => footer === footer.parentElement.lastElementChild), true, "author links must stay in the final manual footer");
+    for (const [selector, href] of [["#docsAuthorGithub", "https://github.com/tswawa"], ["#docsProjectGithub", "https://github.com/tswawa/xianyu-saas"]]) {
+      const link = page.locator(selector);
+      assert.equal(await link.getAttribute("href"), href, `${selector} must point to the expected GitHub destination`);
+      assert.equal(await link.getAttribute("target"), "_blank", `${selector} must open in a new tab`);
+      assert.equal(await link.getAttribute("rel"), "noopener noreferrer", `${selector} must use a safe external-link policy`);
+    }
+    assert.equal(await page.locator(".docs-manual-footer").textContent().then((value) => value.includes("作者 GitHub") && value.includes("项目仓库")), true, "manual footer must label author and project links");
+    // 作者信息只出现在文末，不能回到首屏或页头横幅。
+    assert.equal(await page.locator('[data-panel="docs"] .page-head a[href*="github.com"], .docs-manual-head a[href*="github.com"]').count(), 0, "author links must not return to the top banner");
+    assert.ok(await page.evaluate(() => {
+      const manual = document.querySelector(".docs-manual");
+      const footer = document.querySelector(".docs-manual-footer");
+      return footer.getBoundingClientRect().top > manual.getBoundingClientRect().top + manual.getBoundingClientRect().height * 0.6;
+    }), "the signature block must sit at the end of the manual");
+    await assertNoOverflow(page, "project manual desktop");
+    await captureScreenshot(page, { path: path.join(resultRoot, "docs-manual-desktop.png"), fullPage: true });
+    await page.setViewportSize({ width: 390, height: 844 });
+    await waitForPanelSettled(page);
+    await assertNoOverflow(page, "project manual mobile");
+    // 移动端表格改为分块堆叠，说明书正文不得出现横向滚动。
+    assert.ok(await page.evaluate(() => Array.from(document.querySelectorAll(".docs-manual-table")).every((table) => table.scrollWidth <= table.clientWidth + 1)), "manual tables must not scroll horizontally at 390px");
+    // 表格标题在窄视口必须保持横向排版，不能被压成逐字竖排。
+    assert.ok(await page.evaluate(() => Array.from(document.querySelectorAll(".docs-manual-table-caption")).every((caption) => {
+      const box = caption.getBoundingClientRect();
+      const line = parseFloat(getComputedStyle(caption).fontSize) * 2.4;
+      return box.width > 120 && box.height < line;
+    })), "manual table captions must stay on a single horizontal line at 390px");
+    await captureScreenshot(page, { path: path.join(resultRoot, "docs-manual-mobile.png"), fullPage: true });
+    await page.setViewportSize({ width: 1440, height: 900 });
+
+    // All signed-in owners can inspect version metadata and change their own password,
+    // while platform account, audit and update actions remain hidden.
+    assert.equal(await page.locator('[data-docs-tab="accounts"]').isVisible(), false, "owners must not see platform account administration");
+    assert.equal(await page.locator('[data-docs-tab="audit"]').isVisible(), false, "owners must not see platform audit records");
+    await page.click('[data-docs-tab="version"]');
+    await page.waitForSelector('[data-docs-panel="version"]:not([hidden])');
+    await page.waitForFunction(() => document.querySelector("#currentVersionValue")?.textContent === "v0.1.0");
+    assert.equal(await page.locator("#currentAssetVersionValue").textContent(), "20260831-01");
+    assert.equal(await page.locator("#adminUpdateControls").isVisible(), false, "owners can read releases but cannot operate updates");
+    assert.match(await page.locator("#versionReleaseNotes").textContent(), /<img src=x onerror=/, "release notes remain literal text");
+    assert.equal(await page.locator("#versionReleaseNotes img, #versionReleaseNotes script").count(), 0, "release notes must not create executable nodes");
+    assert.notEqual(await page.evaluate(() => window.__releaseNotesInjected), true, "release notes must never execute markup");
+    await page.fill("#currentPasswordInput", "password-123");
+    await page.fill("#newPasswordInput", "Owner-New-Pass-123!");
+    const passwordChangeResponse = page.waitForResponse((response) => response.url().endsWith("/api/auth/password") && response.request().method() === "POST");
+    await page.click('#passwordChangeForm button[type="submit"]');
+    assert.equal((await passwordChangeResponse).status(), 200, "password change must reach the authenticated API");
+    await page.waitForFunction(() => document.querySelector("#passwordChangeMessage")?.textContent.includes("其他会话已撤销"));
+    assert.deepEqual(fixtures.passwordRequests.at(-1), { current_password: "password-123", new_password: "Owner-New-Pass-123!" });
+    await page.setViewportSize({ width: 390, height: 844 });
+    await waitForPanelSettled(page);
+    await assertNoOverflow(page, "owner version and password mobile");
+    await page.setViewportSize({ width: 1440, height: 900 });
+
+    await openView(page, "home");
+    await page.waitForSelector('[data-panel="home"]:not([hidden])');
+    await waitForPanelSettled(page);
+    await assertNoOverflow(page, "dashboard after project manual");
+
     await assertNoOverflow(page, "free dashboard desktop");
     await page.setViewportSize({ width: 1366, height: 768 });
     await page.waitForTimeout(220);
@@ -2048,7 +2285,6 @@ async function run() {
     await page.waitForTimeout(250);
     assert.ok(fixtures.shopAccountHeaders.includes("shop-ui-2"), "account-scoped requests must include the selected account");
     await page.reload({ waitUntil: "networkidle" });
-    await dismissIntroCurtain(page);
     await page.waitForSelector("#workspace:not([hidden])");
     await page.evaluate(() => window.scrollTo(0, 0));
     await page.waitForTimeout(250);
@@ -2066,7 +2302,6 @@ async function run() {
     fixtures.bot.products_set = false;
     fixtures.bot.catalog_state = "empty";
     await page.reload({ waitUntil: "networkidle" });
-    await dismissIntroCurtain(page);
     await page.waitForSelector("#workspace:not([hidden])");
     await page.click('#sideNav [data-view="goods"]');
     await page.waitForSelector('#productsEmpty:not([hidden])');
@@ -2080,7 +2315,6 @@ async function run() {
     fixtures.bot.products_set = originalProductsSet;
     delete fixtures.bot.catalog_state;
     await page.reload({ waitUntil: "networkidle" });
-    await dismissIntroCurtain(page);
     await page.evaluate(() => window.scrollTo(0, 0));
     await page.waitForTimeout(250);
     await page.click('#sideNav [data-view="goods"]');
@@ -2375,12 +2609,19 @@ async function run() {
     for (const removed of ["aiPersonaJson", "aiKnowledgeJson", "批准发布", "结构化知识库", "配置文件", "知识命中", "智能生成配置"]) assert.equal(aiPanelText.includes(removed), false);
     const htmlSource = fs.readFileSync(path.join(staticRoot, "index.html"), "utf8");
     const appSource = fs.readFileSync(path.join(staticRoot, "assets", "app.js"), "utf8");
+    const cssSource = fs.readFileSync(path.join(staticRoot, "assets", "app.css"), "utf8");
     assert.equal(htmlSource.includes("aiPersonaJson"), false);
     assert.equal(htmlSource.includes("aiKnowledgeJson"), false);
+    assert.equal(htmlSource.includes("introCurtain"), false);
+    assert.equal(htmlSource.includes("enterWorkspaceButton"), false);
     assert.equal(htmlSource.includes("20260826-03"), false);
-    assert.match(htmlSource, /app\.css\?v=20260828-01/);
-    assert.match(htmlSource, /app\.js\?v=20260828-01/);
-    assert.match(appSource, /ASSET_VERSION = "20260828-01"/);
+    assert.match(htmlSource, /app\.css\?v=20260831-01/);
+    assert.match(htmlSource, /app\.js\?v=20260831-01/);
+    assert.match(appSource, /ASSET_VERSION = "20260831-01"/);
+    assert.equal(appSource.includes("dismissIntroCurtain"), false);
+    assert.equal(cssSource.includes("intro-curtain"), false);
+    assert.equal(cssSource.includes("spotlight-stage"), false);
+    assert.equal(cssSource.includes("docs-github-card"), false);
     assert.equal(await page.inputValue("#aiStoreContent"), "");
     assert.equal(await page.inputValue("#aiKnowledgeContent"), "");
 
@@ -2731,6 +2972,100 @@ async function run() {
     await page.waitForTimeout(350);
     assert.equal(await page.inputValue("#manualReplyInput"), "", "a late reply response after logout must be ignored");
     assert.equal(await page.locator("#replyMessage").textContent(), "", "a late reply response after logout must not restore status");
+
+    // Platform administrators receive only account metadata, security events and
+    // signed-update controls inside the existing project documentation domain.
+    fixtures.me = {
+      username: "admin-demo", expires_at: 0, active: false, plan: "free", plan_label: "免费",
+      role: "admin", role_label: "管理员", is_admin: true, permissions: selfUsePermissions,
+      platform_permissions: ["platform.audit.read", "platform.settings.manage", "platform.updates.manage", "platform.users.manage"],
+    };
+    await page.fill("#authUsername", "admin-demo");
+    await page.fill("#authPassword", "Admin-Pass-123!");
+    await page.click("#authSubmit");
+    await page.waitForSelector("#workspace:not([hidden])");
+    await openView(page, "docs");
+    await page.waitForFunction(() => Array.from(document.querySelectorAll("[data-docs-tab]")).filter((node) => !node.hidden).length === 4);
+    assert.deepEqual(
+      await page.locator('[data-docs-tab]:visible').allTextContents(),
+      ["使用说明", "版本与更新", "账号与权限", "安全记录"],
+      "administration must remain inside the existing project domain",
+    );
+
+    await page.click('[data-docs-tab="accounts"]');
+    await page.waitForSelector('[data-docs-panel="accounts"]:not([hidden])');
+    await page.waitForFunction(() => document.querySelectorAll("#adminUsersBody [data-admin-user-id]").length === 2);
+    assert.match(await page.locator('[data-admin-user-id="2"]').textContent(), /owner-demo/);
+    assert.doesNotMatch(await page.locator('[data-admin-user-id="2"]').textContent(), /Cookie|订单正文|库存正文/);
+    await page.check("#registrationOpenToggle");
+    await page.selectOption("#updateChannelSelect", "beta");
+    await page.click('#platformSettingsForm button[type="submit"]');
+    await page.waitForFunction(() => document.querySelector("#platformSettingsMessage")?.textContent.includes("已保存"));
+    assert.deepEqual(fixtures.adminSettingRequests.at(-1), { registration_open: true, update_channel: "beta" });
+    const ownerAdminRow = page.locator('[data-admin-user-id="2"]');
+    const unlockResponse = page.waitForResponse((response) => response.url().endsWith("/api/admin/users/2/unlock") && response.request().method() === "POST");
+    await ownerAdminRow.locator('[data-admin-user-action="unlock"]').click();
+    assert.equal((await unlockResponse).status(), 200);
+    await page.waitForFunction(() => {
+      const row = document.querySelector('[data-admin-user-id="2"]');
+      return row && !row.textContent.includes("登录锁定") && row.querySelector('[data-admin-user-action="unlock"]')?.disabled === true;
+    });
+    assert.ok(fixtures.adminUserRequests.some((item) => item.action === "unlock" && item.userId === 2));
+    await ownerAdminRow.locator("[data-admin-user-role]").selectOption("admin");
+    const roleChangeResponse = page.waitForResponse((response) => response.url().endsWith("/api/admin/users/2") && response.request().method() === "PATCH");
+    await ownerAdminRow.locator('[data-admin-user-action="save"]').click();
+    assert.equal((await roleChangeResponse).status(), 200);
+    await page.waitForTimeout(100);
+    assert.equal(fixtures.adminUsers.find((item) => item.id === 2)?.role, "admin");
+    assert.equal(await page.locator('[data-admin-user-id="2"] [data-admin-user-role]').inputValue(), "admin");
+    assert.ok(fixtures.adminUserRequests.some((item) => item.action === "patch" && item.userId === 2 && item.payload.role === "admin"));
+
+    await page.click('[data-docs-tab="audit"]');
+    await page.waitForSelector('[data-docs-panel="audit"]:not([hidden])');
+    await page.waitForFunction(() => document.querySelectorAll("#auditEventList .audit-event").length === 1);
+    assert.match(await page.locator("#auditEventList").textContent(), /登录成功/);
+    assert.doesNotMatch(await page.locator("#auditEventList").textContent(), /Admin-Pass-123|bootstrap-ui-contract-token/);
+
+    await page.click('[data-docs-tab="version"]');
+    await page.waitForSelector('[data-docs-panel="version"]:not([hidden])');
+    assert.equal(await page.locator("#adminUpdateControls").isVisible(), true);
+    await page.click("#checkUpdateButton");
+    await page.waitForFunction(() => document.querySelector("#updateActionMessage")?.textContent.includes("v0.2.0"));
+    assert.equal(fixtures.updateRequests.at(-1).action, "check");
+    assert.match(await page.locator("#versionReleaseNotes").textContent(), /<script>/, "network release notes must remain visible as text");
+    assert.equal(await page.locator("#versionReleaseNotes script").count(), 0);
+    assert.notEqual(await page.evaluate(() => window.__releaseNotesInjected), true);
+    await page.click("#downloadUpdateButton");
+    await page.waitForFunction(() => document.querySelector("#updateActionMessage")?.textContent.includes("已校验"));
+    assert.deepEqual(fixtures.updateRequests.at(-1), { action: "download", payload: { version: "0.2.0" } });
+    await page.fill("#updateAdminPassword", "Admin-Pass-123!");
+    await page.click("#applyUpdateButton");
+    await page.waitForFunction(() => document.querySelector("#updateActionMessage")?.textContent.includes("独立 updater"));
+    assert.deepEqual(fixtures.adminConfirmRequests.at(-1), { password: "Admin-Pass-123!", action: "update.apply" });
+    assert.deepEqual(fixtures.updateRequests.at(-1), {
+      action: "apply", payload: { version: "0.2.0", confirmation_token: "ui-one-time-confirmation" },
+    });
+    await page.fill("#updateAdminPassword", "Admin-Pass-123!");
+    await page.selectOption("#rollbackVersionSelect", "0.0.9");
+    await page.click("#rollbackUpdateButton");
+    await page.waitForFunction(() => document.querySelector("#updateActionMessage")?.textContent.includes("回滚请求已提交"));
+    assert.deepEqual(fixtures.adminConfirmRequests.at(-1), { password: "Admin-Pass-123!", action: "update.rollback" });
+    assert.deepEqual(fixtures.updateRequests.at(-1), {
+      action: "rollback", payload: { version: "0.0.9", confirmation_token: "ui-one-time-confirmation" },
+    });
+
+    await page.setViewportSize({ width: 390, height: 844 });
+    await page.click('[data-docs-tab="accounts"]');
+    await page.waitForSelector('[data-docs-panel="accounts"]:not([hidden])');
+    await waitForPanelSettled(page);
+    await assertNoOverflow(page, "admin account controls mobile");
+    assert.ok(await page.evaluate(() => {
+      const wrapper = document.querySelector(".docs-table-wrap");
+      return wrapper && wrapper.scrollWidth >= wrapper.clientWidth;
+    }), "wide account controls must remain inside their bounded scroll wrapper");
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.click("#logoutButton");
+    await page.waitForSelector("#authScreen:not([hidden])");
 
     assert.deepEqual(fixtures.authorizationHeaders, [], "browser must not send bearer authorization");
     assert.equal(expectedQrFailureResponses, fixtures.qrSyncFailures, "retryable QR sync failures must match observed responses");

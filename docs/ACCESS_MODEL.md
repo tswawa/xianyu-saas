@@ -1,6 +1,6 @@
 # 闲鱼客服 SaaS 权限与服务边界
 
-更新日期：2026-08-18
+更新日期：2026-08-31
 
 ## 套餐判定
 
@@ -25,6 +25,40 @@
 
 停止机器人是安全操作，所有已登录用户均可执行，避免会员到期后无法关闭进程。
 
+## 平台角色与账号生命周期
+
+平台角色只有 `admin` 与 `owner`，角色不改变店铺业务数据的归属：
+
+| 能力 | `admin` | `owner` |
+| --- | --- | --- |
+| 管理自己的店铺、会话、订单、库存与自动化 | 是 | 是 |
+| 查看版本与本地/Release 更新说明 | 是 | 是 |
+| 修改自己的密码并撤销其他会话 | 是 | 是 |
+| 修改平台注册开关与更新通道 | 是 | 否 |
+| 管理平台账号角色、启停、登录锁和会话 | 是 | 否 |
+| 查看结构化安全审计 | 是 | 否 |
+| 检查、下载、申请应用或回滚签名版本 | 是 | 否 |
+| 读取其他用户的 Cookie、会话正文、订单、库存或买家数据 | 否 | 否 |
+
+- 旧实例如果已有用户但没有管理员，迁移会把 `created_at, id` 最早的用户幂等提升为 `admin`；已有管理员不变。
+- 可以存在多个管理员，但不能降级或停用最后一个启用的管理员；角色或启停状态变化会立即撤销目标账号会话。
+- `SAAS_ADMIN_TOKEN` 仅保留为受限的 loopback 应急入口，不是浏览器后台的常规认证方式，也不能签发高危更新确认。
+
+### 首次管理员 bootstrap
+
+- 空 `users` 表不会自动开放公开注册。首位管理员只能通过独立的 `POST /api/auth/bootstrap` 创建。
+- bootstrap 必须同时满足：部署显式设置 `SAAS_BOOTSTRAP_ENABLED=1`、0600 systemd credential/文件存在、请求来自 `SAAS_BOOTSTRAP_TRUSTED_SOURCES`、浏览器来源校验通过、数据库状态仍为 `pending`。
+- 一次性令牌只允许放在 `X-Bootstrap-Token` 请求头；数据库只保存 SHA-256 摘要，URL、请求体、响应、审计和浏览器日志都不得保存令牌。
+- 创建首位 `admin` 和消费 bootstrap 状态在同一 SQLite 事务中完成；并发请求最多创建一个首位管理员。消费后即使重启或重放原令牌也不能重新开放。
+- 初始化完成后，运维必须关闭 `SAAS_BOOTSTRAP_ENABLED`、移除 credential，并重启 API；删除账号或初始化补偿也不会重新打开 bootstrap。
+
+### 公开注册、密码与会话
+
+- 公开注册的最终条件固定为 `SAAS_ALLOW_REGISTRATION=1 AND platform_settings.registration_open=1 AND users.count>0`。生产环境上限默认为 0，后台开关不能越过部署上限。
+- 密码使用版本化 `pbkdf2_sha256$iterations$salt$digest`；旧 `salt$digest` 用户登录成功后惰性升级。未知账号执行同成本假哈希，登录错误不泄露账号是否存在。
+- 登录失败按账号摘要与可信客户端地址持久化退避；客户端地址只接受配置的可信代理链。活动会话数量有上限，改密、停用、角色变化和管理员吊销会话会立即失效。
+- 浏览器写请求继续要求自定义意图头与同源 Origin/Referer；应用更新和回滚还要求管理员重新输入密码并消费一次性确认令牌。
+
 ## API 边界
 
 - `/api/me` 返回账号、套餐和权限数组。
@@ -45,7 +79,9 @@
 - `/api/bot/conversations` 返回会话摘要；`/api/bot/messages?chat_id=...` 只返回选中买家的消息。人工回复接口只保存明确绑定会话的草稿，当前不会直接向闲鱼发送。
 - `GET/PUT /api/bot/templates` 与 `DELETE /api/bot/templates/{id}` 管理 redeem/pan 发货模板；只返回模板元数据与商品绑定，不回显 payload 原文。
 - `GET/PUT /api/bot/cards` 管理当前账号兑换码池元数据与统计；批量导入只接受码列表，不回传任何 Cookie/Token。
-- 管理接口继续使用独立的服务器端管理认证，不复用普通用户套餐权限。
+- `GET /api/version` 向已登录用户返回嵌入发布制品的版本、提交、构建时间、静态资源版本、更新通道和纯文本说明；`GET /api/version/public` 仅用于本机健康检查，字段更少。
+- `/api/admin/settings`、`/api/admin/users`、`/api/admin/audit` 与 `/api/admin/updates*` 统一校验 `role=admin`，不复用套餐权限，也不接受客户端提供更新 URL、仓库、owner、host 或 channel 之外的任意来源。
+- 更新检查与下载只访问服务端固定的 GitHub Release；应用/回滚接口只写 0600 更新意图，不能从 API 进程调用 systemd 或切换 `current`。
 
 ## 平台 AI 边界
 

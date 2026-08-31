@@ -64,9 +64,12 @@ def read_codes(user_id: int, account_key: str = "default") -> list:
 
 def main() -> None:
     client = TestClient(app.app)
-    assert client.post(
-        "/api/auth/register", json={"username": "templates-owner", "password": "password-123"}
-    ).status_code == 200
+    app.db.create_user(
+        "templates-owner",
+        "password-123",
+        role="owner",
+        initializer=app._new_user_initializer({}),
+    )
     login = client.post(
         "/api/auth/login", json={"username": "templates-owner", "password": "password-123"}
     )

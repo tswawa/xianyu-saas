@@ -4,7 +4,7 @@
 
   const API_PREFIX = "/xianyu-saas";
   const QR_LOGIN_POLL_MS = 1500;
-  const ASSET_VERSION = "20260828-01";
+  const ASSET_VERSION = "20260831-01";
   const AI_TEXT_PLACEHOLDERS = new Set(["无", "暂无", "没有", "未填写", "待填写", "待补充", "占位", "n/a", "na", "none", "null", "todo", "tbd"]);
   const ICONS = API_PREFIX + "/assets/icons.svg?v=" + ASSET_VERSION + "#";
   // 旧版视图 key → 新版视图 key（历史会话/书签兜底）。
@@ -26,6 +26,8 @@
   const state = {
     authMode: "login",
     registrationAllowed: false,
+    bootstrapAvailable: false,
+    passwordMinLength: 12,
     view: "home",
     me: null,
     accounts: [],
@@ -125,6 +127,17 @@
     templateEditor: { editingId: "", productIds: [] },
     cardsEditor: { editingId: "", mode: "import" },
     confirmAction: null,
+    docs: {
+      tab: "guide",
+      version: null,
+      update: null,
+      settings: null,
+      users: [],
+      audit: [],
+      availableVersion: "",
+      stagedVersion: "",
+      loading: false,
+    },
     qrLogin: {
       loginId: "",
       accountKey: "",
@@ -2212,23 +2225,51 @@
     try {
       const capabilities = await api("/api/auth/capabilities");
       state.registrationAllowed = capabilities?.registration_enabled === true;
+      state.bootstrapAvailable = capabilities?.bootstrap_available === true;
+      state.passwordMinLength = Math.max(12, Number(capabilities?.password_min_length || 12));
     } catch (_error) {
       state.registrationAllowed = false;
+      state.bootstrapAvailable = false;
+      state.passwordMinLength = 12;
     }
     const registerTab = $("#registerTab");
+    const bootstrapTab = $("#bootstrapTab");
     if (registerTab) registerTab.hidden = !state.registrationAllowed;
-    if (!state.registrationAllowed && state.authMode === "register") setAuthMode("login");
+    if (bootstrapTab) bootstrapTab.hidden = !state.bootstrapAvailable;
+    $("#authPassword")?.setAttribute("minlength", String(state.passwordMinLength));
+    $("#newPasswordInput")?.setAttribute("minlength", String(state.passwordMinLength));
+    if (
+      (state.authMode === "register" && !state.registrationAllowed)
+      || (state.authMode === "bootstrap" && !state.bootstrapAvailable)
+    ) setAuthMode("login");
   }
 
   function setAuthMode(mode) {
     const register = mode === "register" && state.registrationAllowed;
-    state.authMode = register ? "register" : "login";
-    $("#loginTab").setAttribute("aria-selected", String(!register));
-    $("#registerTab").setAttribute("aria-selected", String(register));
-    text("#authTitle", register ? "创建工作台账号" : "登录工作台");
-    text("#authDescription", register ? "注册后连接你的闲鱼店铺。" : "连接店铺后，商品会自动整理。");
-    text("#authSubmit span", register ? "创建账号" : "登录");
-    $("#authPassword").setAttribute("autocomplete", register ? "new-password" : "current-password");
+    const firstAdmin = mode === "bootstrap" && state.bootstrapAvailable;
+    state.authMode = register ? "register" : firstAdmin ? "bootstrap" : "login";
+    $("#loginTab").setAttribute("aria-selected", String(state.authMode === "login"));
+    $("#registerTab").setAttribute("aria-selected", String(state.authMode === "register"));
+    $("#bootstrapTab").setAttribute("aria-selected", String(state.authMode === "bootstrap"));
+    const tokenField = $("#bootstrapTokenField");
+    if (tokenField) tokenField.hidden = state.authMode !== "bootstrap";
+    const tokenInput = $("#bootstrapToken");
+    if (tokenInput) {
+      tokenInput.required = state.authMode === "bootstrap";
+      if (state.authMode !== "bootstrap") tokenInput.value = "";
+    }
+    text(
+      "#authTitle",
+      state.authMode === "bootstrap" ? "创建首个管理员账号" : register ? "创建工作台账号" : "登录工作台",
+    );
+    text(
+      "#authDescription",
+      state.authMode === "bootstrap"
+        ? "仅限受信任初始化入口；令牌成功使用后立即失效。"
+        : register ? "注册后连接你的闲鱼店铺。" : "连接店铺后，商品会自动整理。",
+    );
+    text("#authSubmit span", state.authMode === "bootstrap" ? "完成初始化" : register ? "创建账号" : "登录");
+    $("#authPassword").setAttribute("autocomplete", state.authMode === "login" ? "current-password" : "new-password");
     formMessage("#authError", "");
   }
 
@@ -2236,12 +2277,12 @@
     event.preventDefault();
     const username = $("#authUsername").value.trim();
     const password = $("#authPassword").value;
-    if (username.length < 3 || username.length > 32) {
-      formMessage("#authError", "账号长度需要在 3 至 32 位之间");
+    if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{2,31}$/.test(username)) {
+      formMessage("#authError", "账号需为 3 至 32 位字母、数字、点、下划线或短横线");
       return;
     }
-    if (password.length < 8) {
-      formMessage("#authError", "密码至少需要 8 位");
+    if (password.length < state.passwordMinLength || password.length > 1024) {
+      formMessage("#authError", "密码长度需要在 " + state.passwordMinLength + " 至 1024 位之间");
       return;
     }
     const button = $("#authSubmit");
@@ -2252,6 +2293,22 @@
         setAuthMode("login");
         $("#authPassword").value = "";
         formMessage("#authError", "注册成功，请登录", true);
+      } else if (state.authMode === "bootstrap") {
+        const bootstrapToken = $("#bootstrapToken").value.trim();
+        if (bootstrapToken.length < 32 || bootstrapToken.length > 256) {
+          formMessage("#authError", "一次性初始化令牌无效");
+          return;
+        }
+        await api("/api/auth/bootstrap", {
+          method: "POST",
+          headers: { "X-Bootstrap-Token": bootstrapToken },
+          body: JSON.stringify({ username, password }),
+        });
+        $("#bootstrapToken").value = "";
+        $("#authPassword").value = "";
+        await loadAuthCapabilities();
+        setAuthMode("login");
+        formMessage("#authError", "管理员账号已创建，请登录", true);
       } else {
         await api("/api/auth/login", { method: "POST", body: JSON.stringify({ username, password }) });
         await bootstrap();
@@ -2305,7 +2362,11 @@
     state.templateEditorOpenGeneration += 1;
     state.templateEditor = { editingId: "", productIds: [] };
     state.cardsEditor = { editingId: "", mode: "import" };
-    ["templateEditorForm", "cardsEditorForm", "cardsCreateForm", "batchDeliveryForm"].forEach((id) => $("#" + id)?.reset());
+    state.docs = {
+      tab: "guide", version: null, update: null, settings: null, users: [], audit: [],
+      availableVersion: "", stagedVersion: "", loading: false,
+    };
+    ["templateEditorForm", "cardsEditorForm", "cardsCreateForm", "batchDeliveryForm", "passwordChangeForm", "platformSettingsForm"].forEach((id) => $("#" + id)?.reset());
     [
       "homeStatCards", "homeProductGrid", "homeOrderList", "attentionList", "shopAccountsPanelList",
       "productGrid", "conversationItems", "chatMessages", "orderList", "replyRuleList",
@@ -2320,6 +2381,7 @@
     });
     $("#authUsername").value = "";
     $("#authPassword").value = "";
+    if ($("#bootstrapToken")) $("#bootstrapToken").value = "";
     $("#workspace").hidden = true;
     $("#authScreen").hidden = false;
     if (showMessage) showToast("已退出登录");
@@ -4345,6 +4407,359 @@
     renderAnalytics();
   }
 
+  function isPlatformAdmin() {
+    return state.me?.is_admin === true || String(state.me?.role || "") === "admin";
+  }
+
+  function setDocsTab(tab) {
+    const admin = isPlatformAdmin();
+    const allowed = new Set(["guide", "version", ...(admin ? ["accounts", "audit"] : [])]);
+    state.docs.tab = allowed.has(tab) ? tab : "guide";
+    $$('[data-docs-tab]').forEach((button) => {
+      const selected = button.dataset.docsTab === state.docs.tab;
+      button.classList.toggle("is-active", selected);
+      button.setAttribute("aria-selected", String(selected));
+    });
+    $$('[data-docs-panel]').forEach((panel) => {
+      const adminOnly = panel.hasAttribute("data-admin-only");
+      panel.hidden = panel.dataset.docsPanel !== state.docs.tab || (adminOnly && !admin);
+    });
+    if (state.docs.tab !== "guide") void loadDocsData();
+  }
+
+  function renderVersionPanel() {
+    const version = state.docs.version || {};
+    const update = state.docs.update || {};
+    const latest = update.latest_update || version.latest_update || null;
+    text("#currentVersionValue", version.version ? "v" + version.version : "--");
+    const buildParts = [];
+    if (version.commit) buildParts.push(String(version.commit));
+    if (version.build_time) buildParts.push(String(version.build_time));
+    text("#currentBuildValue", buildParts.join(" · ") || "开发构建");
+    text("#currentAssetVersionValue", version.asset_version || "--");
+    text("#currentUpdateChannelValue", version.update_channel === "beta" ? "测试版" : version.update_channel === "stable" ? "稳定版" : "--");
+    text("#currentUpdateStatusValue", latest?.status ? "更新状态：" + latest.status : "尚未检查");
+    const notes = latest?.release_notes || version.release_notes || "暂无本地更新说明";
+    text("#versionReleaseNotes", notes);
+
+    const availableVersion = state.docs.availableVersion
+      || (latest?.status === "available" ? String(latest.version || "") : "");
+    const stagedVersion = state.docs.stagedVersion
+      || (["staged", "apply_requested", "preparing", "stopping", "migrating", "switching", "verifying"].includes(String(latest?.status || ""))
+        ? String(latest.version || "") : "");
+    state.docs.availableVersion = availableVersion;
+    state.docs.stagedVersion = stagedVersion;
+    const download = $("#downloadUpdateButton");
+    const apply = $("#applyUpdateButton");
+    if (download) {
+      download.disabled = !availableVersion;
+      text(download, availableVersion ? "下载并校验 v" + availableVersion : "下载并校验");
+    }
+    if (apply) {
+      apply.disabled = !stagedVersion;
+      text(apply, stagedVersion ? "应用 v" + stagedVersion : "应用已校验版本");
+    }
+    const rollbackSelect = $("#rollbackVersionSelect");
+    if (rollbackSelect) {
+      const selected = rollbackSelect.value;
+      rollbackSelect.replaceChildren();
+      const versions = Array.isArray(update.rollback_versions) ? update.rollback_versions : [];
+      if (!versions.length) {
+        const option = document.createElement("option");
+        option.value = "";
+        option.textContent = "没有可用版本";
+        rollbackSelect.append(option);
+      } else {
+        versions.forEach((item) => {
+          const option = document.createElement("option");
+          option.value = String(item);
+          option.textContent = "v" + String(item);
+          rollbackSelect.append(option);
+        });
+        if (versions.includes(selected)) rollbackSelect.value = selected;
+      }
+      $("#rollbackUpdateButton").disabled = !rollbackSelect.value;
+    }
+  }
+
+  function renderPlatformSettings() {
+    const settings = state.docs.settings || null;
+    if (!settings) return;
+    const registration = settings.registration || {};
+    const toggle = $("#registrationOpenToggle");
+    if (toggle) {
+      toggle.checked = registration.database_open === true;
+      toggle.disabled = registration.environment_allowed !== true;
+    }
+    const channel = $("#updateChannelSelect");
+    if (channel) channel.value = settings.update_channel === "beta" ? "beta" : "stable";
+    text(
+      "#registrationCeilingHint",
+      registration.environment_allowed
+        ? (registration.effective ? "公开注册当前已生效。" : "环境允许注册；保存后台开关后才会生效。")
+        : "部署环境上限已关闭公开注册，后台开关不能越过该上限。",
+    );
+  }
+
+  function renderAdminUsers() {
+    const body = $("#adminUsersBody");
+    if (!body) return;
+    const users = Array.isArray(state.docs.users) ? state.docs.users : [];
+    if (!users.length) {
+      body.innerHTML = '<tr><td colspan="5">暂无平台账号</td></tr>';
+      return;
+    }
+    body.innerHTML = users.map((user) => {
+      const self = String(user.username) === String(state.me?.username || "");
+      const enabled = user.enabled !== false;
+      const locked = user.locked === true;
+      return '<tr data-admin-user-id="' + esc(user.id) + '">' +
+        '<td><strong>' + esc(user.username) + '</strong>' + (self ? '<small>当前账号</small>' : "") + '</td>' +
+        '<td><select data-admin-user-role ' + (self ? "disabled" : "") + '><option value="owner" ' + (user.role === "owner" ? "selected" : "") + '>店主</option><option value="admin" ' + (user.role === "admin" ? "selected" : "") + '>管理员</option></select></td>' +
+        '<td><span class="badge ' + (enabled ? "badge-green" : "badge-muted") + '">' + (enabled ? "启用" : "停用") + '</span>' + (locked ? '<span class="badge badge-red">登录锁定</span>' : "") + '</td>' +
+        '<td>' + esc(user.session_count || 0) + '</td>' +
+        '<td><div class="table-actions">' +
+          '<button type="button" class="button button-secondary" data-admin-user-action="save" ' + (self ? "disabled" : "") + '>保存角色</button>' +
+          '<button type="button" class="button button-secondary" data-admin-user-action="toggle" data-next-enabled="' + String(!enabled) + '" ' + (self ? "disabled" : "") + '>' + (enabled ? "停用" : "启用") + '</button>' +
+          '<button type="button" class="button button-secondary" data-admin-user-action="unlock" ' + (locked ? "" : "disabled") + '>解锁</button>' +
+          '<button type="button" class="button button-secondary" data-admin-user-action="revoke">撤销会话</button>' +
+        '</div></td></tr>';
+    }).join("");
+  }
+
+  const AUDIT_LABELS = {
+    "auth.bootstrap_succeeded": "首位管理员创建成功",
+    "auth.bootstrap_failed": "首位管理员初始化失败",
+    "auth.registration_succeeded": "账号注册成功",
+    "auth.registration_failed": "账号注册失败",
+    "auth.login_succeeded": "登录成功",
+    "auth.login_failed": "登录失败",
+    "auth.logout": "退出登录",
+    "auth.password_changed": "密码已修改",
+    "platform.settings_changed": "平台设置已修改",
+    "platform.user_changed": "账号角色或状态已修改",
+    "platform.user_unlocked": "账号登录锁已清除",
+    "platform.sessions_revoked": "账号会话已撤销",
+    "platform.update_checked": "已检查更新",
+    "platform.update_downloaded": "更新已下载并校验",
+    "platform.update_requested": "已请求应用更新",
+    "platform.rollback_requested": "已请求回滚版本",
+  };
+
+  function renderAuditEvents() {
+    const host = $("#auditEventList");
+    if (!host) return;
+    const events = Array.isArray(state.docs.audit) ? state.docs.audit : [];
+    host.replaceChildren();
+    if (!events.length) {
+      const empty = document.createElement("p");
+      empty.className = "muted-copy";
+      empty.textContent = "暂无安全记录";
+      host.append(empty);
+      return;
+    }
+    events.forEach((event) => {
+      const article = document.createElement("article");
+      article.className = "audit-event";
+      const title = document.createElement("strong");
+      title.textContent = AUDIT_LABELS[event.event_type] || String(event.event_type || "安全事件");
+      const details = document.createElement("p");
+      const metadata = event.metadata && typeof event.metadata === "object"
+        ? Object.entries(event.metadata).map(([key, value]) => key + "=" + String(value)).join(" · ") : "";
+      details.textContent = [
+        formatDate(event.created_at),
+        event.outcome === "success" ? "成功" : String(event.outcome || ""),
+        event.target_type && event.target_id ? String(event.target_type) + " #" + String(event.target_id) : "",
+        metadata,
+      ].filter(Boolean).join(" · ");
+      article.append(title, details);
+      host.append(article);
+    });
+  }
+
+  function renderDocs() {
+    const admin = isPlatformAdmin();
+    $$('[data-admin-only]').forEach((node) => {
+      if (!node.hasAttribute("data-docs-panel")) node.hidden = !admin;
+    });
+    if (!admin && ["accounts", "audit"].includes(state.docs.tab)) state.docs.tab = "guide";
+    setDocsTab(state.docs.tab || "guide");
+    renderVersionPanel();
+    if (admin) {
+      renderPlatformSettings();
+      renderAdminUsers();
+      renderAuditEvents();
+    }
+  }
+
+  async function loadDocsData({ force = false } = {}) {
+    if (!state.me || (state.docs.loading && !force)) return;
+    state.docs.loading = true;
+    try {
+      state.docs.version = await api("/api/version");
+      if (isPlatformAdmin()) {
+        const [update, settings, users, audit] = await Promise.all([
+          api("/api/admin/updates"),
+          api("/api/admin/settings"),
+          api("/api/admin/users?limit=100"),
+          api("/api/admin/audit?limit=100"),
+        ]);
+        state.docs.update = update;
+        state.docs.settings = settings;
+        state.docs.users = users.users || [];
+        state.docs.audit = audit.events || [];
+      }
+      renderDocs();
+    } catch (error) {
+      showToast(error.message || "项目信息读取失败", "error");
+    } finally {
+      state.docs.loading = false;
+    }
+  }
+
+  async function changeCurrentPassword(event) {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const currentPassword = $("#currentPasswordInput").value;
+    const newPassword = $("#newPasswordInput").value;
+    if (newPassword.length < state.passwordMinLength || newPassword.length > 1024) {
+      formMessage("#passwordChangeMessage", "新密码长度需要在 " + state.passwordMinLength + " 至 1024 位之间");
+      return;
+    }
+    const button = form.querySelector('button[type="submit"]');
+    setBusy(button, true);
+    try {
+      await api("/api/auth/password", {
+        method: "POST",
+        body: JSON.stringify({ current_password: currentPassword, new_password: newPassword }),
+      });
+      form.reset();
+      formMessage("#passwordChangeMessage", "密码已更新，其他会话已撤销", true);
+    } catch (error) {
+      formMessage("#passwordChangeMessage", error.message || "密码更新失败");
+    } finally {
+      setBusy(button, false);
+    }
+  }
+
+  async function savePlatformSettings(event) {
+    event.preventDefault();
+    const button = event.currentTarget.querySelector('button[type="submit"]');
+    setBusy(button, true);
+    try {
+      state.docs.settings = await api("/api/admin/settings", {
+        method: "PUT",
+        body: JSON.stringify({
+          registration_open: $("#registrationOpenToggle").checked,
+          update_channel: $("#updateChannelSelect").value,
+        }),
+      });
+      formMessage("#platformSettingsMessage", "平台设置已保存", true);
+      await loadDocsData({ force: true });
+    } catch (error) {
+      formMessage("#platformSettingsMessage", error.message || "平台设置保存失败");
+    } finally {
+      setBusy(button, false);
+    }
+  }
+
+  async function checkPlatformUpdate() {
+    const button = $("#checkUpdateButton");
+    setBusy(button, true);
+    formMessage("#updateActionMessage", "正在检查固定 Release 来源");
+    try {
+      const result = await api("/api/admin/updates/check", { method: "POST" });
+      state.docs.availableVersion = result.available ? String(result.version || "") : "";
+      formMessage(
+        "#updateActionMessage",
+        result.available ? "发现新版本 v" + result.version : "当前已是最新版本",
+        true,
+      );
+      await loadDocsData({ force: true });
+    } catch (error) {
+      formMessage("#updateActionMessage", error.message || "更新检查失败");
+    } finally {
+      setBusy(button, false);
+    }
+  }
+
+  async function downloadPlatformUpdate() {
+    const version = state.docs.availableVersion;
+    if (!version) return;
+    const button = $("#downloadUpdateButton");
+    setBusy(button, true);
+    formMessage("#updateActionMessage", "正在下载并校验签名、清单和文件哈希");
+    try {
+      const result = await api("/api/admin/updates/download", {
+        method: "POST",
+        body: JSON.stringify({ version }),
+      });
+      state.docs.stagedVersion = String(result.version || version);
+      formMessage("#updateActionMessage", "v" + state.docs.stagedVersion + " 已校验，可申请应用", true);
+      await loadDocsData({ force: true });
+    } catch (error) {
+      formMessage("#updateActionMessage", error.message || "更新下载失败");
+    } finally {
+      setBusy(button, false);
+    }
+  }
+
+  async function confirmAdminUpdate(action, version) {
+    const password = $("#updateAdminPassword").value;
+    if (!password) {
+      formMessage("#updateActionMessage", "请先输入当前管理员密码");
+      return;
+    }
+    const actionName = action === "apply" ? "update.apply" : "update.rollback";
+    const confirmation = await api("/api/admin/confirm", {
+      method: "POST",
+      body: JSON.stringify({ password, action: actionName }),
+    });
+    const endpoint = action === "apply" ? "/api/admin/updates/apply" : "/api/admin/updates/rollback";
+    await api(endpoint, {
+      method: "POST",
+      body: JSON.stringify({ version, confirmation_token: confirmation.confirmation_token }),
+    });
+    $("#updateAdminPassword").value = "";
+    formMessage(
+      "#updateActionMessage",
+      action === "apply" ? "更新请求已提交，独立 updater 将安全切换版本" : "回滚请求已提交",
+      true,
+    );
+    await loadDocsData({ force: true });
+  }
+
+  async function handleAdminUserAction(button) {
+    const row = button.closest("[data-admin-user-id]");
+    const userId = row?.dataset.adminUserId;
+    if (!userId) return;
+    const action = button.dataset.adminUserAction;
+    setBusy(button, true);
+    try {
+      if (action === "save") {
+        await api("/api/admin/users/" + encodeURIComponent(userId), {
+          method: "PATCH",
+          body: JSON.stringify({ role: row.querySelector("[data-admin-user-role]").value }),
+        });
+      } else if (action === "toggle") {
+        await api("/api/admin/users/" + encodeURIComponent(userId), {
+          method: "PATCH",
+          body: JSON.stringify({ enabled: button.dataset.nextEnabled === "true" }),
+        });
+      } else if (action === "unlock") {
+        await api("/api/admin/users/" + encodeURIComponent(userId) + "/unlock", { method: "POST" });
+      } else if (action === "revoke") {
+        await api("/api/admin/users/" + encodeURIComponent(userId) + "/sessions/revoke", { method: "POST" });
+      }
+      showToast("账号操作已完成");
+      await loadDocsData({ force: true });
+    } catch (error) {
+      showToast(error.message || "账号操作失败", "error");
+    } finally {
+      setBusy(button, false);
+    }
+  }
+
   async function bootstrap() {
     state.accountEpoch += 1;
     const epoch = state.accountEpoch;
@@ -4370,6 +4785,7 @@
     const catalogStatus = registerCatalogStatus(bot);
     renderNav();
     renderAccount();
+    renderDocs();
     renderOverview();
     await Promise.all([loadProducts({ force: true, catalogStatus }), loadAutomation().catch(() => {}), loadAiConfig().catch(() => {}), loadOverviewSignals(epoch)]);
     await Promise.all([loadMessages().catch(() => {}), loadOrders().catch(() => {}), loadQuickReplies().catch(() => {})]);
@@ -4449,6 +4865,7 @@
       loadMessages().catch((error) => showToast(error.message, "error"));
     }
     if (view === "orders") loadOrders().catch((error) => showToast(error.message, "error"));
+    if (view === "docs") loadDocsData().catch((error) => showToast(error.message || "项目信息读取失败", "error"));
     if (view === "templates") {
       loadTemplates().catch((error) => showToast(error.message, "error"));
       loadCards().catch((error) => showToast(error.message || "卡密池加载失败，请稍后重试", "error"));
@@ -4473,6 +4890,7 @@
     const catalogStatus = registerCatalogStatus(bot);
     renderNav();
     renderAccount();
+    renderDocs();
     renderOverview();
     await loadProducts({ force: true, catalogStatus });
     if (!refreshContextMatches(context)) return false;
@@ -5151,16 +5569,33 @@
   }
 
   function bindEvents() {
-    const dismissIntroCurtain = () => {
-      const curtain = $("#introCurtain");
-      if (!curtain || curtain.classList.contains("is-hidden")) return;
-      curtain.classList.add("is-hidden");
-      window.setTimeout(() => { curtain.hidden = true; }, 850);
-    };
-    $("#enterWorkspaceButton")?.addEventListener("click", dismissIntroCurtain);
     $("#loginTab").addEventListener("click", () => setAuthMode("login"));
     $("#registerTab").addEventListener("click", () => setAuthMode("register"));
+    $("#bootstrapTab").addEventListener("click", () => setAuthMode("bootstrap"));
     $("#authForm").addEventListener("submit", submitAuth);
+    $("#passwordChangeForm").addEventListener("submit", changeCurrentPassword);
+    $("#platformSettingsForm").addEventListener("submit", savePlatformSettings);
+    $("#refreshVersionButton").addEventListener("click", () => loadDocsData({ force: true }));
+    $("#refreshAdminUsers").addEventListener("click", () => loadDocsData({ force: true }));
+    $("#refreshAuditButton").addEventListener("click", () => loadDocsData({ force: true }));
+    $("#checkUpdateButton").addEventListener("click", checkPlatformUpdate);
+    $("#downloadUpdateButton").addEventListener("click", downloadPlatformUpdate);
+    $("#applyUpdateButton").addEventListener("click", () => {
+      const version = state.docs.stagedVersion;
+      if (version) void confirmAdminUpdate("apply", version).catch((error) => formMessage("#updateActionMessage", error.message || "更新申请失败"));
+    });
+    $("#rollbackUpdateButton").addEventListener("click", () => {
+      const version = $("#rollbackVersionSelect").value;
+      if (version) void confirmAdminUpdate("rollback", version).catch((error) => formMessage("#updateActionMessage", error.message || "回滚申请失败"));
+    });
+    $("#rollbackVersionSelect").addEventListener("change", (event) => {
+      $("#rollbackUpdateButton").disabled = !event.currentTarget.value;
+    });
+    $$('[data-docs-tab]').forEach((button) => button.addEventListener("click", () => setDocsTab(button.dataset.docsTab)));
+    $("#adminUsersBody").addEventListener("click", (event) => {
+      const button = event.target.closest("[data-admin-user-action]");
+      if (button) void handleAdminUserAction(button);
+    });
     $("#logoutButton").addEventListener("click", logout);
     $("#refreshButton").addEventListener("click", () => refreshState().then(() => showToast("已刷新")).catch((error) => showToast(error.message, "error")));
     $("#mobileMenu").addEventListener("click", () => setSidebarOpen(true));
@@ -5168,12 +5603,6 @@
     $(".sidebar-scrim").addEventListener("click", () => setSidebarOpen(false));
     window.addEventListener("resize", syncSidebarAccessibility);
     document.addEventListener("keydown", (event) => {
-      const curtain = $("#introCurtain");
-      if (curtain && !curtain.hidden && !curtain.classList.contains("is-hidden") && (event.key === "Enter" || event.key === " ")) {
-        event.preventDefault();
-        dismissIntroCurtain();
-        return;
-      }
       if (event.key === "Escape" && $("#sidebar").classList.contains("is-open")) {
         setSidebarOpen(false);
       }

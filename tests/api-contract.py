@@ -413,6 +413,10 @@ def main():
     app.qr_logins = fake_qr_logins
     app.sync_shop = fake_shop_sync
     app.reserve_sync = lambda _user_id: None
+    bootstrap_admin_id = app.db.create_user(
+        "contract-bootstrap-admin", "contract-bootstrap-password", role="admin"
+    )
+    app.db.set_platform_setting("registration_open", "1", bootstrap_admin_id)
 
     health = client.get("/api/health")
     assert health.status_code == 200
@@ -433,7 +437,16 @@ def main():
         unavailable = client.get("/api/ready")
     assert unavailable.status_code == 503
     assert unavailable.json()["detail"]["code"] == "database_unavailable"
-    assert client.get("/api/auth/capabilities").json() == {"registration_enabled": True}
+    assert client.get("/api/auth/capabilities").json() == {
+        "registration_enabled": True,
+        "bootstrap_available": False,
+        "password_min_length": 12,
+    }
+    assert client.get("/api/version/public").json() == {
+        "version": "0.1.0",
+        "asset_version": "20260831-01",
+    }
+    assert client.get("/api/version").status_code == 401
     assert client.get("/xianyu-saas/index.html").status_code == 404
     assert_bot_manager_access_contract()
 
@@ -445,7 +458,7 @@ def main():
         else:
             raise AssertionError("production mode must reject SAAS_TESTING=1")
 
-    with patch.object(app, "ALLOW_REGISTRATION", False):
+    with patch.dict(os.environ, {"SAAS_ALLOW_REGISTRATION": "0"}, clear=False):
         registration_disabled = client.post(
             "/api/auth/register",
             json={"username": "blocked-registration", "password": "password-123"},
@@ -482,12 +495,27 @@ def main():
     me = client.get("/api/me")
     assert me.status_code == 200
     assert me.json()["plan"] == "free"
+    assert me.json()["role"] == "owner"
+    assert me.json()["role_label"] == "店主"
+    assert me.json()["is_admin"] is False
+    assert me.json()["platform_permissions"] == []
     assert set(me.json()["permissions"]) == {
         "shop.configure", "products.manage", "automation.rules", "automation.ai",
         "fulfillment.basic", "fulfillment.manage", "records.read", "runtime.logs",
         "analytics.read",
     }
     assert "token" not in me.json()
+    version = client.get("/api/version")
+    assert version.status_code == 200
+    version_payload = version.json()
+    assert version_payload["version"] == "0.1.0"
+    assert version_payload["asset_version"] == "20260831-01"
+    assert version_payload["update_channel"] == "stable"
+    assert set(version_payload) == {
+        "version", "commit", "build_time", "asset_version", "update_channel",
+        "release_notes", "latest_update",
+    }
+    assert ".git" not in json.dumps(version_payload, ensure_ascii=False)
     user_id = int(app.db.get_user("free-user")["id"])
     tenant_dir = Path(TENANTS_PATH) / str(user_id)
     rules_path = tenant_dir / "reply_rules.json"

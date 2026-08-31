@@ -9,6 +9,8 @@ from __future__ import annotations
 import atexit
 import fcntl
 import hashlib
+import hmac
+import ipaddress
 import json
 import os
 import re
@@ -18,13 +20,14 @@ import stat
 import threading
 import time
 import uuid
+from pathlib import Path
 from urllib.parse import urlsplit
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from access import account_payload, has_permission, plan_for
+from access import account_payload, has_permission, is_platform_admin, plan_for
 from account_storage import AccountStorage, AccountStorageError, DEFAULT_ACCOUNT_ID, normalize_account_key
 from ai_customer_service import AIServiceError, catgirl_preset, service as ai_service
 from ai_provider_adapters import provider_catalog
@@ -58,13 +61,32 @@ from bot_manager import (
     write_secret,
 )
 from connector_handoff import handoffs
-from db import DB, DB_PATH, verify_password
+from db import (
+    DB,
+    DB_PATH,
+    DUMMY_PASSWORD_HASH,
+    BootstrapTokenError,
+    BootstrapUnavailableError,
+    LastAdminError,
+    RegistrationClosedError,
+    verify_password,
+    verify_password_details,
+)
 from platform_ai import (
     MAX_REQUEST_BYTES,
     PlatformAIError,
     forward as platform_forward,
     identify_scope,
     is_configured as platform_ai_configured,
+)
+from platform_update import (
+    PlatformUpdateError,
+    available_rollback_versions,
+    fetch_release,
+    release_payload,
+    stage_release,
+    validate_candidate,
+    write_update_intent,
 )
 import records
 from shop_sync import (
@@ -78,6 +100,7 @@ from shop_sync import (
     sync_status_payload,
 )
 from shop_sync_service import ShopSyncPersistenceError, run_shop_sync_inner
+from version import version_payload
 from xianyu_login import XianyuLoginError, qr_logins
 
 
@@ -85,17 +108,61 @@ ADMIN_TOKEN = os.environ.get("SAAS_ADMIN_TOKEN", "")
 SESSION_COOKIE = "xianyu_saas_session"
 COOKIE_PATH = "/xianyu-saas/"
 COOKIE_SECURE = os.environ.get("SAAS_COOKIE_SECURE", "1").strip().lower() not in {"0", "false", "no"}
-ALLOW_REGISTRATION = os.environ.get("SAAS_ALLOW_REGISTRATION", "0").strip().lower() in {"1", "true", "yes", "on"}
+PASSWORD_MIN_LENGTH = 12
 BROWSER_LOGS_MODE = os.environ.get("SAAS_BROWSER_LOGS_MODE", "off").strip().lower()
 BROWSER_WRITE_HEADER = "X-SaaS-Browser-Intent"
 BROWSER_WRITE_HEADER_VALUE = "browser-write"
+BOOTSTRAP_TOKEN_HEADER = "X-Bootstrap-Token"
 PUBLIC_ORIGIN = os.environ.get("SAAS_PUBLIC_ORIGIN", "").strip()
+_AUDIT_HMAC_KEY = (
+    os.environ.get("SAAS_AUDIT_HMAC_KEY", "").encode("utf-8") or secrets.token_bytes(32)
+)
+USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{2,31}$")
+AUDIT_EVENT_TYPES = frozenset(
+    {
+        "auth.bootstrap_succeeded",
+        "auth.bootstrap_failed",
+        "auth.registration_succeeded",
+        "auth.registration_failed",
+        "auth.login_succeeded",
+        "auth.login_failed",
+        "auth.logout",
+        "auth.password_changed",
+        "platform.settings_changed",
+        "platform.user_changed",
+        "platform.user_unlocked",
+        "platform.sessions_revoked",
+        "platform.confirmation_issued",
+        "platform.update_checked",
+        "platform.update_downloaded",
+        "platform.update_requested",
+        "platform.rollback_requested",
+    }
+)
+AUDIT_METADATA_KEYS = frozenset(
+    {
+        "code",
+        "role",
+        "enabled",
+        "setting",
+        "value",
+        "version",
+        "channel",
+        "status",
+        "sessions_revoked",
+    }
+)
 TRUSTED_BROWSER_HOSTS = {
     host.strip().lower()
     for host in os.environ.get("SAAS_TRUSTED_HOSTS", "").split(",")
     if host.strip()
 }
 TRUSTED_BROWSER_HOSTS.update({"127.0.0.1", "::1", "localhost", "testserver"})
+TRUSTED_PROXY_IPS = {
+    item.strip()
+    for item in os.environ.get("SAAS_TRUSTED_PROXY_IPS", "127.0.0.1,::1").split(",")
+    if item.strip()
+}
 
 
 def _acquire_api_process_lock():
@@ -140,6 +207,159 @@ def _assert_not_testing_in_production() -> None:
 
 
 _assert_not_testing_in_production()
+
+
+def _env_true(name: str, default: str = "0") -> bool:
+    return os.environ.get(name, default).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _registration_env_allowed() -> bool:
+    """Read the deployment ceiling at request time so operators can close it."""
+    return _env_true("SAAS_ALLOW_REGISTRATION", "0")
+
+
+def _client_address(request: Request) -> str:
+    peer = str(request.client.host if request.client else "unknown").strip() or "unknown"
+    candidate = peer
+    if peer in TRUSTED_PROXY_IPS:
+        forwarded = request.headers.get("x-real-ip", "").strip()
+        if not forwarded:
+            forwarded = request.headers.get("x-forwarded-for", "").split(",", 1)[0].strip()
+        if forwarded:
+            candidate = forwarded
+    try:
+        return ipaddress.ip_address(candidate).compressed
+    except ValueError:
+        return candidate[:120]
+
+
+def _source_matches(value: str, configured: str) -> bool:
+    value = str(value or "").strip()
+    configured = str(configured or "").strip()
+    if not value or not configured:
+        return False
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError:
+        return secrets.compare_digest(value.lower(), configured.lower())
+    try:
+        return address in ipaddress.ip_network(configured, strict=False)
+    except ValueError:
+        try:
+            return address == ipaddress.ip_address(configured)
+        except ValueError:
+            return False
+
+
+def _bootstrap_source_trusted(request: Request) -> bool:
+    sources = [
+        item.strip()
+        for item in os.environ.get("SAAS_BOOTSTRAP_TRUSTED_SOURCES", "").split(",")
+        if item.strip()
+    ]
+    address = _client_address(request)
+    return bool(sources and any(_source_matches(address, item) for item in sources))
+
+
+def _audit_hash(namespace: str, value: str) -> str:
+    message = f"{namespace}:{value}".encode("utf-8", "replace")
+    return hmac.new(_AUDIT_HMAC_KEY, message, hashlib.sha256).hexdigest()[:32]
+
+
+def _username_hash(username: str) -> str:
+    """Stable, non-reversible login-throttle key that survives restarts."""
+    normalized = str(username).strip().casefold().encode("utf-8", "replace")
+    return hashlib.sha256(b"username:" + normalized).hexdigest()
+
+
+def _login_client_hash(request: Request) -> str:
+    address = _client_address(request).encode("utf-8", "replace")
+    return hashlib.sha256(b"client:" + address).hexdigest()
+
+
+def _client_hash(request: Request) -> str:
+    return _audit_hash("client", _client_address(request))
+
+
+def _audit(
+    event_type: str,
+    request: Request | None = None,
+    *,
+    actor_user_id=None,
+    target_type="",
+    target_id="",
+    outcome="success",
+    metadata=None,
+) -> None:
+    if event_type not in AUDIT_EVENT_TYPES:
+        raise ValueError("unsupported audit event")
+    safe_metadata = {
+        str(key): value
+        for key, value in (metadata or {}).items()
+        if str(key) in AUDIT_METADATA_KEYS
+        and isinstance(value, (str, int, float, bool, type(None)))
+    }
+    try:
+        db.append_audit(
+            event_type,
+            actor_user_id=actor_user_id,
+            target_type=target_type,
+            target_id=str(target_id)[:120],
+            outcome=outcome,
+            ip_hash=_client_hash(request) if request is not None else "",
+            metadata=safe_metadata,
+        )
+    except (sqlite3.Error, ValueError):
+        # Audit failure must not leak a sensitive exception to the browser.
+        return
+
+
+def _bootstrap_token_file() -> Path | None:
+    raw = os.environ.get("SAAS_BOOTSTRAP_TOKEN_FILE", "").strip()
+    if not raw:
+        return None
+    path = Path(raw)
+    if not path.is_absolute():
+        credentials_dir = os.environ.get("CREDENTIALS_DIRECTORY", "").strip()
+        if not credentials_dir or path.name != raw:
+            return None
+        path = Path(credentials_dir) / path
+    return path
+
+
+def _bootstrap_token_digest() -> str:
+    """Read only a secure one-time credential and persist only its digest."""
+    if not _env_true("SAAS_BOOTSTRAP_ENABLED", "0"):
+        return ""
+    path = _bootstrap_token_file()
+    if path is None:
+        return ""
+    descriptor = None
+    try:
+        metadata = path.lstat()
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+            return ""
+        if metadata.st_uid not in {0, os.geteuid()} or metadata.st_mode & 0o077:
+            return ""
+        if metadata.st_size <= 0 or metadata.st_size > 512:
+            return ""
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(path, flags)
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode) or opened.st_mode & 0o077 or opened.st_size > 512:
+            return ""
+        value = os.read(descriptor, 513).decode("utf-8", "strict").strip()
+        if not (32 <= len(value) <= 256) or any(character.isspace() for character in value):
+            return ""
+        digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
+        return digest if db.configure_bootstrap(digest) else ""
+    except (OSError, UnicodeError):
+        return ""
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
 
 
 def _normalize_origin(value: str | None) -> str | None:
@@ -191,7 +411,7 @@ def _configured_public_origin(request: Request) -> str | None:
 _BROWSER_LOG_REDACTIONS = (
     (re.compile(r"(?i)\b(bearer\s+)[^\s,;]+"), r"\1[redacted]"),
     (re.compile(r"(?i)\b(cookie|authorization|token|password|secret)=([^&\s]+)"), r"\1=[redacted]"),
-    (re.compile(r"(?i)\b(x-admin-token):\s*[^\s,;]+"), r"\1: [redacted]"),
+    (re.compile(r"(?i)\b(x-admin-token|x-bootstrap-token):\s*[^\s,;]+"), r"\1: [redacted]"),
 )
 
 
@@ -243,6 +463,11 @@ def _require_browser_write_origin(request: Request) -> None:
             403,
             detail={"code": "browser_origin_untrusted", "message": "浏览器写入来源不匹配"},
         )
+
+
+def _require_public_write_origin(request: Request) -> None:
+    if os.environ.get("SAAS_TESTING") != "1":
+        _require_browser_write_origin(request)
 
 
 @app.middleware("http")
@@ -297,9 +522,52 @@ def ready():
     return {"ok": True, "service": "xianyu-saas-api", "database": "ready"}
 
 
+def _local_release_notes() -> str:
+    try:
+        return (Path(__file__).resolve().parents[1] / "CHANGELOG.md").read_text(
+            encoding="utf-8"
+        )[:16_000]
+    except (OSError, UnicodeError):
+        return ""
+
+
+def _platform_update_payload(row) -> dict | None:
+    if row is None:
+        return None
+    return {
+        "version": str(row["version"]),
+        "channel": str(row["channel"]),
+        "status": str(row["status"]),
+        "release_notes": str(row["release_notes"] or ""),
+        "error_code": str(row["error_code"] or ""),
+        "updated_at": float(row["updated_at"]),
+    }
+
+
+@app.get("/api/version/public")
+def public_version():
+    payload = version_payload("stable")
+    return {
+        "version": payload["version"],
+        "asset_version": payload["asset_version"],
+    }
+
+
 @app.get("/api/auth/capabilities")
-def auth_capabilities():
-    return {"registration_enabled": ALLOW_REGISTRATION}
+def auth_capabilities(request: Request):
+    env_allowed = _registration_env_allowed()
+    registration_open = db.get_platform_setting("registration_open", "0") == "1"
+    users_exist = db.user_count() > 0
+    bootstrap_trusted = _bootstrap_source_trusted(request)
+    bootstrap_digest = _bootstrap_token_digest() if bootstrap_trusted else ""
+    bootstrap_available = bool(
+        bootstrap_digest and db.bootstrap_available(bootstrap_digest)
+    )
+    return {
+        "registration_enabled": bool(env_allowed and registration_open and users_exist),
+        "bootstrap_available": bootstrap_available,
+        "password_min_length": PASSWORD_MIN_LENGTH,
+    }
 
 
 def _request_token(request: Request, authorization: str = "") -> str:
@@ -319,13 +587,59 @@ class Auth:
         if user_id is None:
             raise HTTPException(401, "未登录或登录已过期")
         user = db.get_user_by_id(user_id)
-        if user is None:
+        if user is None or user["disabled_at"] is not None:
+            db.delete_token(token)
             raise HTTPException(401, "未登录或登录已过期")
         return user
 
     @staticmethod
     def current_token(request: Request, authorization: str = Header(default="")) -> str:
         return _request_token(request, authorization)
+
+
+@app.get("/api/version")
+def get_version(user=Depends(Auth.current_user)):
+    channel = db.get_platform_setting("update_channel", "stable")
+    return {
+        **version_payload(channel),
+        "release_notes": _local_release_notes(),
+        "latest_update": _platform_update_payload(db.latest_platform_update(channel)),
+    }
+
+
+def _loopback_request(request: Request) -> bool:
+    try:
+        return ipaddress.ip_address(_client_address(request)).is_loopback
+    except ValueError:
+        return os.environ.get("SAAS_TESTING") == "1"
+
+
+def require_platform_admin(
+    request: Request,
+    authorization: str = Header(default=""),
+    x_admin_token: str = Header(default=""),
+):
+    token = _request_token(request, authorization)
+    user_id = db.get_token_user(token) if token else None
+    if user_id is not None:
+        user = db.get_user_by_id(user_id)
+        if user is not None and user["disabled_at"] is None and is_platform_admin(user):
+            return user
+        raise HTTPException(
+            403,
+            detail={"code": "admin_required", "message": "需要管理员权限"},
+        )
+    if (
+        ADMIN_TOKEN
+        and x_admin_token
+        and _loopback_request(request)
+        and secrets.compare_digest(x_admin_token, ADMIN_TOKEN)
+    ):
+        return {"id": 0, "username": "emergency-admin", "role": "admin", "disabled_at": None}
+    raise HTTPException(
+        403,
+        detail={"code": "admin_required", "message": "需要管理员权限"},
+    )
 
 
 def current_shop_account(
@@ -433,10 +747,63 @@ class RegisterIn(BaseModel):
     username: str
     password: str
 
+    class Config:
+        extra = "forbid"
+
 
 class LoginIn(BaseModel):
     username: str
     password: str
+
+    class Config:
+        extra = "forbid"
+
+
+class PasswordChangeIn(BaseModel):
+    current_password: str
+    new_password: str
+
+    class Config:
+        extra = "forbid"
+
+
+class PlatformSettingsIn(BaseModel):
+    registration_open: bool | None = None
+    update_channel: str | None = None
+
+    class Config:
+        extra = "forbid"
+
+
+class PlatformUserUpdateIn(BaseModel):
+    role: str | None = None
+    enabled: bool | None = None
+
+    class Config:
+        extra = "forbid"
+
+
+class AdminConfirmationIn(BaseModel):
+    password: str
+    action: str
+
+    class Config:
+        extra = "forbid"
+
+
+class PlatformUpdateDownloadIn(BaseModel):
+    version: str = ""
+
+    class Config:
+        extra = "forbid"
+
+
+class PlatformUpdateApplyIn(BaseModel):
+    version: str
+    confirmation_token: str
+
+    class Config:
+        extra = "forbid"
 
 
 class ConfigIn(BaseModel):
@@ -2096,38 +2463,208 @@ def _discard_new_account_storage(user_id: int, account_key: str = DEFAULT_ACCOUN
         return False
 
 
-@app.post("/api/auth/register")
-def register(body: RegisterIn):
-    if not ALLOW_REGISTRATION:
+def _validate_password(password: str) -> None:
+    password = str(password or "")
+    if not (PASSWORD_MIN_LENGTH <= len(password) <= 1024):
         raise HTTPException(
-            403,
-            detail={"code": "registration_disabled", "message": "注册已关闭"},
+            400,
+            detail={
+                "code": "password_invalid",
+                "message": f"密码长度需为 {PASSWORD_MIN_LENGTH}-1024 位",
+            },
         )
-    username = body.username.strip()
-    if not (3 <= len(username) <= 32):
-        raise HTTPException(400, "用户名长度 3-32")
-    if len(body.password) < 8:
-        raise HTTPException(400, "密码至少 8 位")
-    if db.get_user(username) is not None:
-        raise HTTPException(409, "用户名已存在")
-    user_id = db.create_user(username, body.password)
-    try:
+
+
+def _validate_new_credentials(username: str, password: str) -> str:
+    username = str(username or "").strip()
+    if not USERNAME_PATTERN.fullmatch(username):
+        raise HTTPException(
+            400,
+            detail={
+                "code": "username_invalid",
+                "message": "账号需为 3-32 位字母、数字、点、下划线或短横线",
+            },
+        )
+    _validate_password(password)
+    return username
+
+
+def _new_user_initializer(holder: dict):
+    def initialize(user_id: int) -> None:
         from bot_manager import ensure_dir as ensure_bot_dir
 
+        holder["user_id"] = int(user_id)
         ensure_bot_dir(user_id, DEFAULT_ACCOUNT_ID, initialize=True)
-    except OSError as exc:
-        removed = db.remove_unconfigured_user(user_id)
-        if removed:
-            _discard_new_account_storage(user_id, DEFAULT_ACCOUNT_ID)
-        raise HTTPException(503, "账号初始化失败，请稍后重试") from exc
+
+    return initialize
+
+
+def _registration_disabled() -> HTTPException:
+    return HTTPException(
+        403,
+        detail={"code": "registration_disabled", "message": "注册当前未开放"},
+    )
+
+
+@app.post("/api/auth/bootstrap")
+def bootstrap_admin(
+    body: RegisterIn,
+    request: Request,
+    x_bootstrap_token: str = Header(default="", alias=BOOTSTRAP_TOKEN_HEADER),
+):
+    _require_public_write_origin(request)
+    if not _env_true("SAAS_BOOTSTRAP_ENABLED", "0") or not _bootstrap_source_trusted(request):
+        _audit("auth.bootstrap_failed", request, outcome="denied", metadata={"code": "unavailable"})
+        raise HTTPException(
+            403,
+            detail={"code": "bootstrap_unavailable", "message": "初始化入口不可用"},
+        )
+    bootstrap_state = db.get_bootstrap_state()
+    if (
+        bootstrap_state is None
+        or str(bootstrap_state["state"]) != "pending"
+        or db.user_count() != 0
+    ):
+        _audit("auth.bootstrap_failed", request, outcome="conflict", metadata={"code": "consumed"})
+        raise HTTPException(
+            409,
+            detail={"code": "bootstrap_consumed", "message": "初始化已完成"},
+        )
+    configured_digest = _bootstrap_token_digest()
+    supplied = str(x_bootstrap_token or "").strip()
+    supplied_digest = hashlib.sha256(supplied.encode("utf-8")).hexdigest()
+    if (
+        not configured_digest
+        or not (32 <= len(supplied) <= 256)
+        or not secrets.compare_digest(configured_digest, supplied_digest)
+    ):
+        _audit("auth.bootstrap_failed", request, outcome="denied", metadata={"code": "invalid"})
+        raise HTTPException(
+            403,
+            detail={"code": "bootstrap_denied", "message": "无法完成初始化"},
+        )
+    username = _validate_new_credentials(body.username, body.password)
+    holder: dict[str, int] = {}
+    try:
+        user_id = db.bootstrap_user(
+            username,
+            body.password,
+            supplied_digest,
+            initializer=_new_user_initializer(holder),
+        )
+    except BootstrapTokenError as exc:
+        _audit("auth.bootstrap_failed", request, outcome="denied", metadata={"code": "invalid"})
+        raise HTTPException(
+            403,
+            detail={"code": "bootstrap_denied", "message": "无法完成初始化"},
+        ) from exc
+    except BootstrapUnavailableError as exc:
+        _audit("auth.bootstrap_failed", request, outcome="conflict", metadata={"code": "consumed"})
+        raise HTTPException(
+            409,
+            detail={"code": "bootstrap_consumed", "message": "初始化已完成"},
+        ) from exc
+    except sqlite3.IntegrityError as exc:
+        _audit("auth.bootstrap_failed", request, outcome="conflict", metadata={"code": "conflict"})
+        raise HTTPException(
+            409,
+            detail={"code": "bootstrap_consumed", "message": "初始化已完成"},
+        ) from exc
+    except (OSError, sqlite3.Error) as exc:
+        if holder.get("user_id") is not None:
+            _discard_new_account_storage(holder["user_id"], DEFAULT_ACCOUNT_ID)
+        _audit("auth.bootstrap_failed", request, outcome="failed", metadata={"code": "storage"})
+        raise HTTPException(
+            503,
+            detail={"code": "account_initialization_failed", "message": "账号初始化失败，请稍后重试"},
+        ) from exc
+    _audit(
+        "auth.bootstrap_succeeded",
+        request,
+        actor_user_id=user_id,
+        target_type="user",
+        target_id=user_id,
+        metadata={"role": "admin"},
+    )
+    return {"ok": True}
+
+
+@app.post("/api/auth/register")
+def register(body: RegisterIn, request: Request):
+    _require_public_write_origin(request)
+    if not _registration_env_allowed():
+        raise _registration_disabled()
+    username = _validate_new_credentials(body.username, body.password)
+    holder: dict[str, int] = {}
+    try:
+        user_id = db.register_user(
+            username,
+            body.password,
+            initializer=_new_user_initializer(holder),
+        )
+    except RegistrationClosedError as exc:
+        raise _registration_disabled() from exc
+    except sqlite3.IntegrityError as exc:
+        _audit("auth.registration_failed", request, outcome="conflict", metadata={"code": "username_conflict"})
+        raise HTTPException(
+            409,
+            detail={"code": "username_unavailable", "message": "账号名称不可用"},
+        ) from exc
+    except (OSError, sqlite3.Error) as exc:
+        if holder.get("user_id") is not None:
+            _discard_new_account_storage(holder["user_id"], DEFAULT_ACCOUNT_ID)
+        _audit("auth.registration_failed", request, outcome="failed", metadata={"code": "storage"})
+        raise HTTPException(
+            503,
+            detail={"code": "account_initialization_failed", "message": "账号初始化失败，请稍后重试"},
+        ) from exc
+    _audit(
+        "auth.registration_succeeded",
+        request,
+        actor_user_id=user_id,
+        target_type="user",
+        target_id=user_id,
+        metadata={"role": "owner"},
+    )
     return {"ok": True}
 
 
 @app.post("/api/auth/login")
-def login(body: LoginIn, response: Response):
-    user = db.get_user(body.username.strip())
-    if user is None or not verify_password(body.password, user["password_hash"]):
-        raise HTTPException(401, "用户名或密码错误")
+def login(body: LoginIn, request: Request, response: Response):
+    _require_public_write_origin(request)
+    username = str(body.username or "").strip()
+    username_digest = _username_hash(username)
+    client_digest = _login_client_hash(request)
+    rate = db.login_rate_status(username_digest, client_digest)
+    user = db.get_user(username) if len(username) <= 128 else None
+    stored_hash = str(user["password_hash"]) if user is not None else DUMMY_PASSWORD_HASH
+    password = str(body.password or "")
+    valid, needs_upgrade = verify_password_details(
+        password if len(password) <= 1024 else "invalid-password-length",
+        stored_hash,
+    )
+    valid = bool(valid and user is not None and user["disabled_at"] is None and not rate["locked"])
+    if not valid:
+        retry_after = db.record_login_failure(username_digest, client_digest)
+        _audit(
+            "auth.login_failed",
+            request,
+            target_type="account",
+            target_id=username_digest,
+            outcome="denied",
+            metadata={"code": "login_failed"},
+        )
+        detail = {"code": "login_failed", "message": "账号或密码错误，请稍后重试"}
+        if rate["locked"] or retry_after:
+            raise HTTPException(
+                429,
+                detail=detail,
+                headers={"Retry-After": str(max(rate["retry_after"], retry_after, 1))},
+            )
+        raise HTTPException(401, detail=detail)
+    db.clear_login_failures(username_digest, client_digest)
+    if needs_upgrade:
+        db.upgrade_password_hash(user["id"], stored_hash, password)
     token = db.create_token(user["id"])
     response.set_cookie(
         key=SESSION_COOKIE,
@@ -2137,6 +2674,13 @@ def login(body: LoginIn, response: Response):
         secure=COOKIE_SECURE,
         samesite="strict",
         path=COOKIE_PATH,
+    )
+    _audit(
+        "auth.login_succeeded",
+        request,
+        actor_user_id=user["id"],
+        target_type="user",
+        target_id=user["id"],
     )
     return {"ok": True}
 
@@ -2159,7 +2703,45 @@ def logout(
         clear_handoffs(user["id"])
     db.delete_token(token)
     response.delete_cookie(SESSION_COOKIE, path=COOKIE_PATH, secure=COOKIE_SECURE, samesite="strict")
+    _audit(
+        "auth.logout",
+        request,
+        actor_user_id=user["id"],
+        target_type="user",
+        target_id=user["id"],
+    )
     return {"ok": True}
+
+
+@app.post("/api/auth/password")
+def change_current_password(
+    body: PasswordChangeIn,
+    request: Request,
+    user=Depends(Auth.current_user),
+    token=Depends(Auth.current_token),
+):
+    _validate_password(body.new_password)
+    if not verify_password(body.current_password, user["password_hash"]):
+        raise HTTPException(
+            400,
+            detail={"code": "password_change_denied", "message": "当前密码不正确"},
+        )
+    changed = db.change_password(
+        user["id"], user["password_hash"], body.new_password, keep_token=token
+    )
+    if not changed:
+        raise HTTPException(
+            409,
+            detail={"code": "password_changed_elsewhere", "message": "密码已发生变化，请重新登录"},
+        )
+    _audit(
+        "auth.password_changed",
+        request,
+        actor_user_id=user["id"],
+        target_type="user",
+        target_id=user["id"],
+    )
+    return {"ok": True, "other_sessions_revoked": True}
 
 
 @app.get("/api/me")
@@ -4674,24 +5256,534 @@ async def internal_chat(request: Request):
 # ---------------- Administrator APIs ----------------
 
 
-def _admin(x_admin_token: str = Header(default="")):
-    if not ADMIN_TOKEN or not secrets.compare_digest(x_admin_token, ADMIN_TOKEN):
-        raise HTTPException(403, "管理令牌无效")
-    return True
+def _platform_settings_payload() -> dict:
+    environment_allowed = _registration_env_allowed()
+    database_open = db.get_platform_setting("registration_open", "0") == "1"
+    users_exist = db.user_count() > 0
+    return {
+        "registration": {
+            "environment_allowed": environment_allowed,
+            "database_open": database_open,
+            "users_exist": users_exist,
+            "effective": bool(environment_allowed and database_open and users_exist),
+        },
+        "update_channel": db.get_platform_setting("update_channel", "stable"),
+    }
+
+
+def _platform_user_payload(row) -> dict:
+    username = str(row["username"])
+    lock = db.username_lock_status(_username_hash(username))
+    try:
+        session_count = int(row["session_count"] or 0)
+    except (KeyError, TypeError, IndexError):
+        session_count = 0
+    return {
+        "id": int(row["id"]),
+        "username": username,
+        "role": str(row["role"]),
+        "role_label": "管理员" if str(row["role"]) == "admin" else "店主",
+        "enabled": row["disabled_at"] is None,
+        "locked": bool(lock["locked"]),
+        "session_count": session_count,
+        "created_at": float(row["created_at"]),
+        "password_changed_at": (
+            float(row["password_changed_at"])
+            if row["password_changed_at"] is not None
+            else None
+        ),
+    }
+
+
+@app.get("/api/admin/settings")
+def admin_get_settings(_=Depends(require_platform_admin)):
+    return _platform_settings_payload()
+
+
+@app.put("/api/admin/settings")
+def admin_save_settings(
+    body: PlatformSettingsIn,
+    request: Request,
+    admin=Depends(require_platform_admin),
+):
+    if body.registration_open is None and body.update_channel is None:
+        raise HTTPException(
+            400,
+            detail={"code": "settings_empty", "message": "没有可保存的平台设置"},
+        )
+    if body.update_channel is not None and body.update_channel not in {"stable", "beta"}:
+        raise HTTPException(
+            400,
+            detail={"code": "update_channel_invalid", "message": "更新通道无效"},
+        )
+    changed = []
+    if body.registration_open is not None:
+        db.set_platform_setting(
+            "registration_open", "1" if body.registration_open else "0", admin["id"]
+        )
+        changed.append("registration_open")
+    if body.update_channel is not None:
+        db.set_platform_setting("update_channel", body.update_channel, admin["id"])
+        changed.append("update_channel")
+    for setting in changed:
+        _audit(
+            "platform.settings_changed",
+            request,
+            actor_user_id=admin["id"],
+            target_type="setting",
+            target_id=setting,
+            metadata={"setting": setting, "value": db.get_platform_setting(setting)},
+        )
+    return _platform_settings_payload()
 
 
 @app.get("/api/admin/users")
-def admin_list_users(_=Depends(_admin)):
-    with db._lock:
-        rows = db.con.execute(
-            "SELECT id, username, expires_at, created_at FROM users ORDER BY id DESC LIMIT 500"
-        ).fetchall()
+def admin_list_users(
+    cursor: int | None = None,
+    limit: int = 50,
+    _=Depends(require_platform_admin),
+):
+    rows, next_cursor = db.list_platform_users(cursor=cursor, limit=limit)
     return {
-        "users": [
-            {**account_payload(row), "id": row["id"], "created_at": row["created_at"]}
-            for row in rows
-        ]
+        "users": [_platform_user_payload(row) for row in rows],
+        "next_cursor": next_cursor,
     }
+
+
+@app.patch("/api/admin/users/{target_user_id}")
+def admin_update_user(
+    target_user_id: int,
+    body: PlatformUserUpdateIn,
+    request: Request,
+    admin=Depends(require_platform_admin),
+):
+    if body.role is None and body.enabled is None:
+        raise HTTPException(
+            400,
+            detail={"code": "user_change_empty", "message": "没有可保存的账号变更"},
+        )
+    if body.role is not None and body.role not in {"admin", "owner"}:
+        raise HTTPException(
+            400,
+            detail={"code": "role_invalid", "message": "角色无效"},
+        )
+    if int(admin["id"]) == int(target_user_id):
+        raise HTTPException(
+            400,
+            detail={"code": "self_change_forbidden", "message": "不能修改自己的角色或状态"},
+        )
+    try:
+        row = db.update_platform_user(
+            target_user_id,
+            role=body.role,
+            enabled=body.enabled,
+        )
+    except LastAdminError as exc:
+        raise HTTPException(
+            409,
+            detail={"code": "last_admin_protected", "message": "必须保留至少一个启用的管理员"},
+        ) from exc
+    if row is None:
+        raise HTTPException(
+            404,
+            detail={"code": "user_not_found", "message": "账号不存在"},
+        )
+    _audit(
+        "platform.user_changed",
+        request,
+        actor_user_id=admin["id"],
+        target_type="user",
+        target_id=target_user_id,
+        metadata={"role": str(row["role"]), "enabled": row["disabled_at"] is None},
+    )
+    return {"user": _platform_user_payload(row)}
+
+
+@app.post("/api/admin/users/{target_user_id}/unlock")
+def admin_unlock_user(
+    target_user_id: int,
+    request: Request,
+    admin=Depends(require_platform_admin),
+):
+    row = db.get_user_by_id(target_user_id)
+    if row is None:
+        raise HTTPException(
+            404,
+            detail={"code": "user_not_found", "message": "账号不存在"},
+        )
+    cleared = db.clear_login_failures(_username_hash(str(row["username"])))
+    _audit(
+        "platform.user_unlocked",
+        request,
+        actor_user_id=admin["id"],
+        target_type="user",
+        target_id=target_user_id,
+        metadata={"sessions_revoked": cleared},
+    )
+    return {"ok": True}
+
+
+@app.post("/api/admin/users/{target_user_id}/sessions/revoke")
+def admin_revoke_user_sessions(
+    target_user_id: int,
+    request: Request,
+    admin=Depends(require_platform_admin),
+):
+    row = db.get_user_by_id(target_user_id)
+    if row is None:
+        raise HTTPException(
+            404,
+            detail={"code": "user_not_found", "message": "账号不存在"},
+        )
+    keep_token = _request_token(request) if int(admin["id"]) == int(target_user_id) else ""
+    revoked = db.revoke_user_sessions(target_user_id, keep_token=keep_token)
+    _audit(
+        "platform.sessions_revoked",
+        request,
+        actor_user_id=admin["id"],
+        target_type="user",
+        target_id=target_user_id,
+        metadata={"sessions_revoked": revoked},
+    )
+    return {"ok": True, "sessions_revoked": revoked}
+
+
+@app.post("/api/admin/confirm")
+def admin_create_confirmation(
+    body: AdminConfirmationIn,
+    request: Request,
+    admin=Depends(require_platform_admin),
+):
+    if body.action not in {"update.apply", "update.rollback"}:
+        raise HTTPException(
+            400,
+            detail={"code": "confirmation_action_invalid", "message": "确认操作无效"},
+        )
+    if int(admin["id"]) <= 0 or not verify_password(body.password, admin["password_hash"]):
+        raise HTTPException(
+            403,
+            detail={"code": "reauthentication_failed", "message": "管理员密码校验失败"},
+        )
+    confirmation = db.create_admin_confirmation(admin["id"], body.action, ttl_seconds=180)
+    _audit(
+        "platform.confirmation_issued",
+        request,
+        actor_user_id=admin["id"],
+        target_type="operation",
+        target_id=body.action,
+    )
+    return {"confirmation_token": confirmation, "expires_in": 180}
+
+
+@app.get("/api/admin/audit")
+def admin_list_audit(
+    cursor: int | None = None,
+    limit: int = 50,
+    event_type: str = "",
+    _=Depends(require_platform_admin),
+):
+    if event_type and event_type not in AUDIT_EVENT_TYPES:
+        raise HTTPException(
+            400,
+            detail={"code": "audit_event_invalid", "message": "审计事件类型无效"},
+        )
+    rows, next_cursor = db.list_audit(cursor=cursor, limit=limit, event_type=event_type)
+    events = []
+    for row in rows:
+        try:
+            metadata = json.loads(str(row["metadata_json"] or "{}"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            metadata = {}
+        events.append(
+            {
+                "id": int(row["id"]),
+                "event_type": str(row["event_type"]),
+                "actor_user_id": (
+                    int(row["actor_user_id"]) if row["actor_user_id"] is not None else None
+                ),
+                "target_type": str(row["target_type"]),
+                "target_id": str(row["target_id"]),
+                "outcome": str(row["outcome"]),
+                "source_hash": str(row["ip_hash"]),
+                "metadata": metadata if isinstance(metadata, dict) else {},
+                "created_at": float(row["created_at"]),
+            }
+        )
+    return {"events": events, "next_cursor": next_cursor}
+
+
+_UPDATE_ERROR_MESSAGES = {
+    "update_channel_invalid": "更新通道无效",
+    "release_version_invalid": "发布版本无效",
+    "update_downgrade_rejected": "不能安装当前版本或更旧版本",
+    "update_dependency_change_rejected": "发布制品包含未审批的依赖变化",
+    "update_signature_invalid": "发布签名校验失败",
+    "update_artifact_hash_mismatch": "发布制品完整性校验失败",
+    "update_archive_hash_mismatch": "发布文件完整性校验失败",
+    "update_intent_pending": "已有更新操作等待执行",
+    "update_candidate_invalid": "候选版本已失效，请重新下载",
+    "update_release_not_found": "没有找到可用发布版本",
+}
+
+
+def _raise_update_error(error: PlatformUpdateError):
+    code = str(error.code)
+    if code in {
+        "update_downgrade_rejected",
+        "update_intent_pending",
+        "update_release_exists",
+        "update_version_already_current",
+    }:
+        status = 409
+    elif code.startswith("release_") or code.startswith("update_archive_") or code in {
+        "update_channel_invalid",
+        "update_dependency_change_rejected",
+        "update_signature_invalid",
+        "update_artifact_hash_mismatch",
+        "update_candidate_invalid",
+    }:
+        status = 400
+    elif code.startswith("update_source_") or code.startswith("update_download_"):
+        status = 502
+    else:
+        status = 503
+    raise HTTPException(
+        status,
+        detail={
+            "code": code,
+            "message": _UPDATE_ERROR_MESSAGES.get(code, "更新操作暂时不可用"),
+        },
+    ) from error
+
+
+def _begin_platform_update_lease(seconds: float = 600) -> tuple[_AccountLease, str]:
+    owner = f"api-update:{os.getpid()}:{threading.get_ident()}:{time.time_ns()}"
+    try:
+        result = db.acquire_control_lease(
+            "platform-update",
+            owner,
+            lease_seconds=max(float(seconds), 30.0),
+            cooldown_seconds=0,
+        )
+    except (OSError, sqlite3.Error, ValueError) as exc:
+        raise HTTPException(
+            503,
+            detail={"code": "update_lock_unavailable", "message": "更新锁暂时不可用"},
+        ) from exc
+    if result != "acquired":
+        raise HTTPException(
+            409,
+            detail={"code": "update_busy", "message": "已有更新操作正在进行"},
+        )
+    return _AccountLease("platform-update", owner, max(float(seconds), 30.0)), owner
+
+
+def _admin_update_status_payload() -> dict:
+    channel = db.get_platform_setting("update_channel", "stable")
+    current = version_payload(channel)
+    return {
+        "current": current,
+        "latest_update": _platform_update_payload(db.latest_platform_update(channel)),
+        "rollback_versions": available_rollback_versions(current["version"]),
+    }
+
+
+@app.get("/api/admin/updates")
+def admin_update_status(_=Depends(require_platform_admin)):
+    return _admin_update_status_payload()
+
+
+@app.post("/api/admin/updates/check")
+def admin_check_update(
+    request: Request,
+    admin=Depends(require_platform_admin),
+):
+    channel = db.get_platform_setting("update_channel", "stable")
+    current = version_payload(channel)
+    lease, owner = _begin_platform_update_lease(120)
+    try:
+        release = fetch_release(channel, current["version"])
+        payload = release_payload(release, channel, current["version"])
+        if release is not None:
+            db.upsert_platform_update(
+                release.version,
+                channel,
+                "available",
+                release_id=release.release_id,
+                release_notes=release.notes,
+                requested_by=admin["id"],
+            )
+        _audit(
+            "platform.update_checked",
+            request,
+            actor_user_id=admin["id"],
+            target_type="version",
+            target_id=release.version if release is not None else current["version"],
+            metadata={
+                "version": release.version if release is not None else current["version"],
+                "channel": channel,
+                "status": "available" if release is not None else "current",
+            },
+        )
+        return payload
+    except PlatformUpdateError as exc:
+        _raise_update_error(exc)
+    finally:
+        _release_account_lease(lease, owner)
+
+
+@app.post("/api/admin/updates/download")
+def admin_download_update(
+    body: PlatformUpdateDownloadIn,
+    request: Request,
+    admin=Depends(require_platform_admin),
+):
+    channel = db.get_platform_setting("update_channel", "stable")
+    current = version_payload(channel)
+    lease, owner = _begin_platform_update_lease(900)
+    try:
+        release = fetch_release(channel, current["version"])
+        if release is None:
+            raise HTTPException(
+                409,
+                detail={"code": "update_not_available", "message": "当前已是最新版本"},
+            )
+        requested_version = str(body.version or "").strip()
+        if requested_version and requested_version != release.version:
+            raise HTTPException(
+                409,
+                detail={"code": "update_version_changed", "message": "发布版本已变化，请重新检查"},
+            )
+        staged = stage_release(release, channel, current["version"])
+        db.upsert_platform_update(
+            release.version,
+            channel,
+            "staged",
+            release_id=release.release_id,
+            manifest_sha256=staged["manifest_sha256"],
+            candidate_path=staged["candidate_path"],
+            release_notes=release.notes,
+            requested_by=admin["id"],
+        )
+        _audit(
+            "platform.update_downloaded",
+            request,
+            actor_user_id=admin["id"],
+            target_type="version",
+            target_id=release.version,
+            metadata={"version": release.version, "channel": channel, "status": "staged"},
+        )
+        return {
+            "version": release.version,
+            "channel": channel,
+            "status": "staged",
+            "release_notes": release.notes,
+        }
+    except PlatformUpdateError as exc:
+        _raise_update_error(exc)
+    finally:
+        _release_account_lease(lease, owner)
+
+
+@app.post("/api/admin/updates/apply", status_code=202)
+def admin_apply_update(
+    body: PlatformUpdateApplyIn,
+    request: Request,
+    admin=Depends(require_platform_admin),
+):
+    channel = db.get_platform_setting("update_channel", "stable")
+    row = db.get_platform_update(body.version, channel)
+    if row is None or str(row["status"]) != "staged":
+        raise HTTPException(
+            409,
+            detail={"code": "update_not_staged", "message": "请先下载并校验该版本"},
+        )
+    if not db.consume_admin_confirmation(
+        body.confirmation_token, admin["id"], "update.apply"
+    ):
+        raise HTTPException(
+            403,
+            detail={"code": "confirmation_invalid", "message": "二次确认已失效，请重新确认"},
+        )
+    try:
+        validate_candidate(
+            str(row["candidate_path"]), body.version, str(row["manifest_sha256"])
+        )
+        queued = write_update_intent(
+            "apply",
+            body.version,
+            channel=channel,
+            requested_by=admin["id"],
+            candidate_path=str(row["candidate_path"]),
+            manifest_sha256=str(row["manifest_sha256"]),
+        )
+    except PlatformUpdateError as exc:
+        _raise_update_error(exc)
+    db.upsert_platform_update(
+        body.version,
+        channel,
+        "apply_requested",
+        release_id=str(row["release_id"]),
+        manifest_sha256=str(row["manifest_sha256"]),
+        candidate_path=str(row["candidate_path"]),
+        release_notes=str(row["release_notes"]),
+        requested_by=admin["id"],
+    )
+    _audit(
+        "platform.update_requested",
+        request,
+        actor_user_id=admin["id"],
+        target_type="version",
+        target_id=body.version,
+        metadata={"version": body.version, "channel": channel, "status": "queued"},
+    )
+    return queued
+
+
+@app.post("/api/admin/updates/rollback", status_code=202)
+def admin_rollback_update(
+    body: PlatformUpdateApplyIn,
+    request: Request,
+    admin=Depends(require_platform_admin),
+):
+    channel = db.get_platform_setting("update_channel", "stable")
+    current = version_payload(channel)
+    if body.version not in available_rollback_versions(current["version"]):
+        raise HTTPException(
+            404,
+            detail={"code": "rollback_version_unavailable", "message": "该回滚版本不可用"},
+        )
+    if not db.consume_admin_confirmation(
+        body.confirmation_token, admin["id"], "update.rollback"
+    ):
+        raise HTTPException(
+            403,
+            detail={"code": "confirmation_invalid", "message": "二次确认已失效，请重新确认"},
+        )
+    try:
+        queued = write_update_intent(
+            "rollback",
+            body.version,
+            channel=channel,
+            requested_by=admin["id"],
+        )
+    except PlatformUpdateError as exc:
+        _raise_update_error(exc)
+    db.upsert_platform_update(
+        body.version,
+        channel,
+        "rollback_requested",
+        requested_by=admin["id"],
+    )
+    _audit(
+        "platform.rollback_requested",
+        request,
+        actor_user_id=admin["id"],
+        target_type="version",
+        target_id=body.version,
+        metadata={"version": body.version, "channel": channel, "status": "queued"},
+    )
+    return queued
 
 
 def _runtime_value(runtime, name: str, default=None):

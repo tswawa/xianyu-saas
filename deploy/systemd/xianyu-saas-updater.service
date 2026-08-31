@@ -1,0 +1,35 @@
+[Unit]
+Description=Xianyu SaaS signed release updater
+After=local-fs.target network.target
+RequiresMountsFor=/opt/xianyu-saas /var/lib/xianyu-saas
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+EnvironmentFile=/etc/xianyu-saas.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=SAAS_CURRENT_ROOT=/opt/xianyu-saas/current
+Environment=SAAS_CURRENT_LINK=/opt/xianyu-saas/current
+Environment=SAAS_RELEASES_DIR=/opt/xianyu-saas/releases
+Environment=SAAS_STATE_DIR=/var/lib/xianyu-saas
+Environment=SAAS_UPDATE_STAGING_DIR=/var/lib/xianyu-saas/update-staging
+Environment=SAAS_UPDATE_INTENT_FILE=/var/lib/xianyu-saas/update-intents/intent.json
+ExecStart=/opt/xianyu-saas/runtime/backend-venv/bin/python /opt/xianyu-saas/current/deploy/updater/updater.py
+TimeoutStartSec=15min
+UMask=0077
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_FOWNER CAP_CHOWN
+ReadWritePaths=/opt/xianyu-saas /var/lib/xianyu-saas

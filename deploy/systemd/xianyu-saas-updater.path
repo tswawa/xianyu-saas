@@ -1,0 +1,11 @@
+[Unit]
+Description=Watch for verified Xianyu SaaS update intents
+
+[Path]
+PathExists=/var/lib/xianyu-saas/update-intents/intent.json
+Unit=xianyu-saas-updater.service
+MakeDirectory=true
+DirectoryMode=0700
+
+[Install]
+WantedBy=multi-user.target

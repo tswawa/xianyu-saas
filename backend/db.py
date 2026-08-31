@@ -13,6 +13,7 @@ import secrets
 import sqlite3
 import threading
 import time
+from collections.abc import Callable
 
 from account_storage import AccountStorageError, normalize_account_key
 
@@ -21,23 +22,89 @@ DB_PATH = os.environ.get("SAAS_DB", os.path.join(BASE_DIR, "saas.db"))
 TOKEN_TTL_SECONDS = 30 * 86400
 COMPLETED_JOB_RETENTION_SECONDS = 7 * 86400
 DEAD_LETTER_JOB_RETENTION_SECONDS = 30 * 86400
+LOGIN_FAILURE_RETENTION_SECONDS = 30 * 86400
+AUDIT_RETENTION_SECONDS = 180 * 86400
+UPDATE_RETENTION_SECONDS = 365 * 86400
 RETENTION_CLEANUP_INTERVAL_SECONDS = 3600
 RETENTION_CLEANUP_BATCH_SIZE = 500
+PASSWORD_SCHEME = "pbkdf2_sha256"
+PASSWORD_ITERATIONS = 600_000
+LEGACY_PASSWORD_ITERATIONS = 120_000
+MAX_ACTIVE_SESSIONS = 8
+VALID_ROLES = frozenset({"admin", "owner"})
+VALID_UPDATE_CHANNELS = frozenset({"stable", "beta"})
 logger = logging.getLogger(__name__)
 
 
-def hash_password(password, salt=None):
-    salt = salt or secrets.token_hex(16)
-    digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 120_000)
-    return f"{salt}${digest.hex()}"
+class RegistrationClosedError(RuntimeError):
+    """Raised when the durable registration guard rejects a new owner."""
+
+
+class BootstrapUnavailableError(RuntimeError):
+    """Raised when bootstrap is disabled, consumed, or races another request."""
+
+
+class BootstrapTokenError(RuntimeError):
+    """Raised when a bootstrap token digest does not match the pending state."""
+
+
+class LastAdminError(RuntimeError):
+    """Raised when an operation would remove the last enabled administrator."""
+
+
+def _password_digest(password: str, salt: str, iterations: int) -> str:
+    return hashlib.pbkdf2_hmac(
+        "sha256",
+        str(password).encode("utf-8"),
+        str(salt).encode("ascii"),
+        int(iterations),
+    ).hex()
+
+
+def hash_password(password, salt=None, iterations=PASSWORD_ITERATIONS):
+    salt = str(salt or secrets.token_hex(16))
+    iterations = int(iterations)
+    if iterations < PASSWORD_ITERATIONS:
+        iterations = PASSWORD_ITERATIONS
+    digest = _password_digest(password, salt, iterations)
+    return f"{PASSWORD_SCHEME}${iterations}${salt}${digest}"
+
+
+def verify_password_details(password, stored):
+    """Return ``(valid, needs_upgrade)`` for versioned and legacy hashes."""
+    value = str(stored or "")
+    parts = value.split("$")
+    try:
+        if len(parts) == 4 and parts[0] == PASSWORD_SCHEME:
+            iterations = int(parts[1])
+            salt = parts[2]
+            digest = parts[3]
+            if not (100_000 <= iterations <= 10_000_000 and salt and len(digest) == 64):
+                return False, False
+            valid = secrets.compare_digest(
+                _password_digest(password, salt, iterations), digest.lower()
+            )
+            return valid, bool(valid and iterations < PASSWORD_ITERATIONS)
+        if len(parts) == 2:
+            salt, digest = parts
+            if not salt or len(digest) != 64:
+                return False, False
+            valid = secrets.compare_digest(
+                _password_digest(password, salt, LEGACY_PASSWORD_ITERATIONS), digest.lower()
+            )
+            return valid, bool(valid)
+    except (TypeError, ValueError, UnicodeError):
+        return False, False
+    return False, False
 
 
 def verify_password(password, stored):
-    try:
-        salt, digest = stored.split("$", 1)
-    except ValueError:
-        return False
-    return secrets.compare_digest(hash_password(password, salt).split("$", 1)[1], digest)
+    return verify_password_details(password, stored)[0]
+
+
+# Unknown accounts still execute the current production cost.  The value is
+# process-local and never persisted, returned, audited, or logged.
+DUMMY_PASSWORD_HASH = hash_password("xianyu-saas-dummy-password", salt="0" * 32)
 
 
 class DB:
@@ -58,6 +125,9 @@ class DB:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     username TEXT UNIQUE NOT NULL,
                     password_hash TEXT NOT NULL,
+                    role TEXT NOT NULL DEFAULT 'owner',
+                    disabled_at REAL,
+                    password_changed_at REAL,
                     expires_at REAL NOT NULL DEFAULT 0,
                     created_at REAL NOT NULL
                 );
@@ -68,6 +138,8 @@ class DB:
                 );
                 CREATE INDEX IF NOT EXISTS idx_tokens_created_at
                     ON tokens(created_at, token);
+                CREATE INDEX IF NOT EXISTS idx_tokens_user_created
+                    ON tokens(user_id, created_at, token);
                 CREATE TABLE IF NOT EXISTS activation_codes (
                     code TEXT PRIMARY KEY,
                     days INTEGER NOT NULL,
@@ -165,8 +237,78 @@ class DB:
                 );
                 CREATE INDEX IF NOT EXISTS idx_attention_acknowledgements_updated
                     ON attention_acknowledgements(updated_at);
+                CREATE TABLE IF NOT EXISTS bootstrap_state (
+                    singleton_id INTEGER PRIMARY KEY CHECK(singleton_id = 1),
+                    state TEXT NOT NULL,
+                    token_digest TEXT NOT NULL DEFAULT '',
+                    created_at REAL NOT NULL,
+                    consumed_at REAL,
+                    created_user_id INTEGER
+                );
+                CREATE TABLE IF NOT EXISTS platform_settings (
+                    setting_key TEXT PRIMARY KEY,
+                    setting_value TEXT NOT NULL,
+                    updated_at REAL NOT NULL,
+                    updated_by INTEGER
+                );
+                CREATE TABLE IF NOT EXISTS login_failures (
+                    username_hash TEXT NOT NULL,
+                    client_hash TEXT NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    locked_until REAL NOT NULL DEFAULT 0,
+                    last_failed_at REAL NOT NULL,
+                    updated_at REAL NOT NULL,
+                    PRIMARY KEY(username_hash, client_hash)
+                );
+                CREATE INDEX IF NOT EXISTS idx_login_failures_client
+                    ON login_failures(client_hash, locked_until, updated_at);
+                CREATE INDEX IF NOT EXISTS idx_login_failures_username
+                    ON login_failures(username_hash, locked_until, updated_at);
+                CREATE TABLE IF NOT EXISTS audit_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_type TEXT NOT NULL,
+                    actor_user_id INTEGER,
+                    target_type TEXT NOT NULL DEFAULT '',
+                    target_id TEXT NOT NULL DEFAULT '',
+                    outcome TEXT NOT NULL DEFAULT 'success',
+                    ip_hash TEXT NOT NULL DEFAULT '',
+                    metadata_json TEXT NOT NULL DEFAULT '{}',
+                    created_at REAL NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_audit_log_created
+                    ON audit_log(created_at DESC, id DESC);
+                CREATE INDEX IF NOT EXISTS idx_audit_log_event
+                    ON audit_log(event_type, created_at DESC, id DESC);
+                CREATE TABLE IF NOT EXISTS admin_confirmations (
+                    token_digest TEXT PRIMARY KEY,
+                    user_id INTEGER NOT NULL,
+                    action TEXT NOT NULL,
+                    expires_at REAL NOT NULL,
+                    used_at REAL,
+                    created_at REAL NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_admin_confirmations_expiry
+                    ON admin_confirmations(expires_at, used_at);
+                CREATE TABLE IF NOT EXISTS platform_updates (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    version TEXT NOT NULL,
+                    channel TEXT NOT NULL,
+                    release_id TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL,
+                    manifest_sha256 TEXT NOT NULL DEFAULT '',
+                    candidate_path TEXT NOT NULL DEFAULT '',
+                    release_notes TEXT NOT NULL DEFAULT '',
+                    error_code TEXT NOT NULL DEFAULT '',
+                    requested_by INTEGER,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL,
+                    UNIQUE(version, channel)
+                );
+                CREATE INDEX IF NOT EXISTS idx_platform_updates_status
+                    ON platform_updates(status, updated_at DESC, id DESC);
                 """
             )
+            self._migrate_auth_platform_locked()
             self._migrate_shop_accounts_locked()
             # Existing installations have users but no account rows.  The
             # default account is intentionally metadata-only and keeps all
@@ -176,6 +318,78 @@ class DB:
             self._backfill_worker_runtimes_locked()
             self._prune_retention_locked(time.time(), RETENTION_CLEANUP_BATCH_SIZE)
             self.con.commit()
+
+    def _migrate_auth_platform_locked(self):
+        """Idempotently add platform roles and close unsafe legacy bootstrap gaps."""
+        columns = {
+            str(row["name"])
+            for row in self.con.execute("PRAGMA table_info(users)").fetchall()
+        }
+        additions = {
+            "role": "ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'owner'",
+            "disabled_at": "ALTER TABLE users ADD COLUMN disabled_at REAL",
+            "password_changed_at": "ALTER TABLE users ADD COLUMN password_changed_at REAL",
+        }
+        for name, statement in additions.items():
+            if name in columns:
+                continue
+            try:
+                self.con.execute(statement)
+            except sqlite3.OperationalError as error:
+                if "duplicate column name" not in str(error).lower():
+                    raise
+
+        now = time.time()
+        self.con.execute(
+            "UPDATE users SET role = 'owner' WHERE role NOT IN ('admin', 'owner') OR role IS NULL"
+        )
+        user_count = int(self.con.execute("SELECT COUNT(*) FROM users").fetchone()[0])
+        initial_state = "consumed" if user_count else "pending"
+        self.con.execute(
+            """
+            INSERT OR IGNORE INTO bootstrap_state(
+                singleton_id, state, token_digest, created_at, consumed_at, created_user_id
+            ) VALUES (1, ?, '', ?, ?, NULL)
+            """,
+            (initial_state, now, now if user_count else None),
+        )
+        if user_count:
+            self.con.execute(
+                """
+                UPDATE bootstrap_state
+                SET state = 'consumed', token_digest = '',
+                    consumed_at = COALESCE(consumed_at, ?)
+                WHERE singleton_id = 1
+                """,
+                (now,),
+            )
+            admin_count = int(
+                self.con.execute("SELECT COUNT(*) FROM users WHERE role = 'admin'").fetchone()[0]
+            )
+            if admin_count == 0:
+                first = self.con.execute(
+                    "SELECT id FROM users ORDER BY created_at ASC, id ASC LIMIT 1"
+                ).fetchone()
+                if first is not None:
+                    self.con.execute(
+                        "UPDATE users SET role = 'admin' WHERE id = ?", (int(first["id"]),)
+                    )
+        self.con.execute(
+            """
+            INSERT OR IGNORE INTO platform_settings(
+                setting_key, setting_value, updated_at, updated_by
+            ) VALUES ('registration_open', '0', ?, NULL)
+            """,
+            (now,),
+        )
+        self.con.execute(
+            """
+            INSERT OR IGNORE INTO platform_settings(
+                setting_key, setting_value, updated_at, updated_by
+            ) VALUES ('update_channel', 'stable', ?, NULL)
+            """,
+            (now,),
+        )
 
     def _migrate_shop_accounts_locked(self):
         """Add account fencing metadata to databases created before it existed."""
@@ -203,12 +417,15 @@ class DB:
             return RETENTION_CLEANUP_BATCH_SIZE
 
     def _prune_retention_locked(self, now, batch_size):
-        """Delete only expired sessions and terminal jobs in bounded batches."""
+        """Delete expired control-plane rows in deterministic bounded batches."""
         now = float(now)
         batch_size = self._cleanup_batch_size(batch_size)
         token_cutoff = now - TOKEN_TTL_SECONDS
         completed_cutoff = now - COMPLETED_JOB_RETENTION_SECONDS
         dead_letter_cutoff = now - DEAD_LETTER_JOB_RETENTION_SECONDS
+        login_cutoff = now - LOGIN_FAILURE_RETENTION_SECONDS
+        audit_cutoff = now - AUDIT_RETENTION_SECONDS
+        update_cutoff = now - UPDATE_RETENTION_SECONDS
         token_cur = self.con.execute(
             """
             DELETE FROM tokens WHERE token IN (
@@ -241,14 +458,66 @@ class DB:
                 (status, cutoff, cutoff, batch_size),
             )
             counts[key] = max(cur.rowcount, 0)
+        retention_deletes = (
+            (
+                "login_failures",
+                """
+                DELETE FROM login_failures WHERE rowid IN (
+                    SELECT rowid FROM login_failures
+                    WHERE updated_at <= ? ORDER BY updated_at, rowid LIMIT ?
+                )
+                """,
+                (login_cutoff, batch_size),
+            ),
+            (
+                "audit_log",
+                """
+                DELETE FROM audit_log WHERE id IN (
+                    SELECT id FROM audit_log
+                    WHERE created_at <= ? ORDER BY created_at, id LIMIT ?
+                )
+                """,
+                (audit_cutoff, batch_size),
+            ),
+            (
+                "admin_confirmations",
+                """
+                DELETE FROM admin_confirmations WHERE token_digest IN (
+                    SELECT token_digest FROM admin_confirmations
+                    WHERE expires_at <= ? OR used_at IS NOT NULL
+                    ORDER BY expires_at, token_digest LIMIT ?
+                )
+                """,
+                (now, batch_size),
+            ),
+            (
+                "platform_updates",
+                """
+                DELETE FROM platform_updates WHERE id IN (
+                    SELECT id FROM platform_updates
+                    WHERE updated_at <= ? AND status IN ('succeeded', 'rolled_back', 'failed')
+                    ORDER BY updated_at, id LIMIT ?
+                )
+                """,
+                (update_cutoff, batch_size),
+            ),
+        )
+        for key, statement, params in retention_deletes:
+            cur = self.con.execute(statement, params)
+            counts[key] = max(cur.rowcount, 0)
         self._next_retention_cleanup_at = now + RETENTION_CLEANUP_INTERVAL_SECONDS
         total = sum(counts.values())
         if total:
             logger.info(
-                "control_plane_retention_pruned tokens=%d completed_jobs=%d dead_letter_jobs=%d",
+                "control_plane_retention_pruned tokens=%d completed_jobs=%d dead_letter_jobs=%d "
+                "login_failures=%d audit_log=%d confirmations=%d platform_updates=%d",
                 counts["tokens"],
                 counts["completed_jobs"],
                 counts["dead_letter_jobs"],
+                counts["login_failures"],
+                counts["audit_log"],
+                counts["admin_confirmations"],
+                counts["platform_updates"],
             )
         return counts
 
@@ -1271,26 +1540,194 @@ class DB:
                     )
         return items[:limit]
 
-    # ---- users ----
-    def create_user(self, username, password):
-        """Atomically create the user, default shop and initial worker intent."""
+    # ---- users, bootstrap and platform access ----
+    def _insert_user_account_locked(self, username, password, role, now):
+        if role not in VALID_ROLES:
+            raise ValueError("invalid role")
+        cur = self.con.execute(
+            """
+            INSERT INTO users(
+                username, password_hash, role, disabled_at, password_changed_at,
+                expires_at, created_at
+            ) VALUES (?, ?, ?, NULL, ?, 0, ?)
+            """,
+            (str(username), hash_password(password), role, now, now),
+        )
+        user_id = int(cur.lastrowid)
+        account_cur = self.con.execute(
+            """
+            INSERT INTO shop_accounts(
+                user_id, account_key, platform, status, enabled, created_at, updated_at
+            ) VALUES (?, 'default', 'xianyu', 'unconfigured', 1, ?, ?)
+            """,
+            (user_id, now, now),
+        )
+        self._ensure_worker_runtime_locked(user_id, int(account_cur.lastrowid))
+        return user_id
+
+    def user_count(self):
+        with self._lock:
+            return int(self.con.execute("SELECT COUNT(*) FROM users").fetchone()[0])
+
+    def get_bootstrap_state(self):
+        with self._lock:
+            return self.con.execute(
+                """
+                SELECT state, created_at, consumed_at, created_user_id,
+                       CASE WHEN token_digest <> '' THEN 1 ELSE 0 END AS token_configured
+                FROM bootstrap_state WHERE singleton_id = 1
+                """
+            ).fetchone()
+
+    def configure_bootstrap(self, token_digest):
+        """Bind the first secure token digest without ever allowing replacement."""
+        digest = str(token_digest or "").strip().lower()
+        if len(digest) != 64:
+            return False
+        with self._lock:
+            try:
+                self.con.execute("BEGIN IMMEDIATE")
+                state = self.con.execute(
+                    "SELECT state, token_digest FROM bootstrap_state WHERE singleton_id = 1"
+                ).fetchone()
+                users = int(self.con.execute("SELECT COUNT(*) FROM users").fetchone()[0])
+                if state is None or state["state"] != "pending" or users != 0:
+                    self.con.rollback()
+                    return False
+                stored = str(state["token_digest"] or "")
+                if stored and not secrets.compare_digest(stored, digest):
+                    self.con.rollback()
+                    return False
+                if not stored:
+                    self.con.execute(
+                        "UPDATE bootstrap_state SET token_digest = ? WHERE singleton_id = 1 AND state = 'pending'",
+                        (digest,),
+                    )
+                self.con.commit()
+                return True
+            except BaseException:
+                if self.con.in_transaction:
+                    self.con.rollback()
+                raise
+
+    def bootstrap_available(self, token_digest):
+        digest = str(token_digest or "").strip().lower()
+        if len(digest) != 64:
+            return False
+        with self._lock:
+            row = self.con.execute(
+                """
+                SELECT state, token_digest,
+                       (SELECT COUNT(*) FROM users) AS user_count
+                FROM bootstrap_state WHERE singleton_id = 1
+                """
+            ).fetchone()
+            return bool(
+                row
+                and row["state"] == "pending"
+                and int(row["user_count"] or 0) == 0
+                and row["token_digest"]
+                and secrets.compare_digest(str(row["token_digest"]), digest)
+            )
+
+    def bootstrap_user(
+        self,
+        username,
+        password,
+        token_digest,
+        initializer: Callable[[int], None] | None = None,
+    ):
+        """Create and consume the sole first-admin bootstrap transaction."""
+        now = time.time()
+        digest = str(token_digest or "").strip().lower()
+        with self._lock:
+            try:
+                self.con.execute("BEGIN IMMEDIATE")
+                state = self.con.execute(
+                    "SELECT state, token_digest FROM bootstrap_state WHERE singleton_id = 1"
+                ).fetchone()
+                if state is None or state["state"] != "pending":
+                    raise BootstrapUnavailableError("bootstrap unavailable")
+                if int(self.con.execute("SELECT COUNT(*) FROM users").fetchone()[0]) != 0:
+                    raise BootstrapUnavailableError("bootstrap unavailable")
+                stored = str(state["token_digest"] or "")
+                if not stored or len(digest) != 64 or not secrets.compare_digest(stored, digest):
+                    raise BootstrapTokenError("bootstrap token mismatch")
+                user_id = self._insert_user_account_locked(username, password, "admin", now)
+                if initializer is not None:
+                    initializer(user_id)
+                consumed = self.con.execute(
+                    """
+                    UPDATE bootstrap_state
+                    SET state = 'consumed', token_digest = '', consumed_at = ?, created_user_id = ?
+                    WHERE singleton_id = 1 AND state = 'pending' AND token_digest = ?
+                    """,
+                    (now, user_id, stored),
+                )
+                if consumed.rowcount != 1:
+                    raise BootstrapUnavailableError("bootstrap raced")
+                self.con.commit()
+                return user_id
+            except BaseException:
+                if self.con.in_transaction:
+                    self.con.rollback()
+                raise
+
+    def register_user(
+        self,
+        username,
+        password,
+        initializer: Callable[[int], None] | None = None,
+    ):
+        """Create an owner only while the durable switch is open and users exist."""
         now = time.time()
         with self._lock:
             try:
-                cur = self.con.execute(
-                    "INSERT INTO users(username, password_hash, created_at) VALUES (?, ?, ?)",
-                    (username, hash_password(password), now),
+                self.con.execute("BEGIN IMMEDIATE")
+                users = int(self.con.execute("SELECT COUNT(*) FROM users").fetchone()[0])
+                setting = self.con.execute(
+                    "SELECT setting_value FROM platform_settings WHERE setting_key = 'registration_open'"
+                ).fetchone()
+                if users <= 0 or setting is None or str(setting["setting_value"]) != "1":
+                    raise RegistrationClosedError("registration closed")
+                user_id = self._insert_user_account_locked(username, password, "owner", now)
+                if initializer is not None:
+                    initializer(user_id)
+                self.con.commit()
+                return user_id
+            except BaseException:
+                if self.con.in_transaction:
+                    self.con.rollback()
+                raise
+
+    def create_user(
+        self,
+        username,
+        password,
+        role=None,
+        initializer: Callable[[int], None] | None = None,
+    ):
+        """Trusted local/contract helper; public registration uses guarded methods."""
+        now = time.time()
+        with self._lock:
+            try:
+                self.con.execute("BEGIN IMMEDIATE")
+                users = int(self.con.execute("SELECT COUNT(*) FROM users").fetchone()[0])
+                effective_role = role or ("admin" if users == 0 else "owner")
+                user_id = self._insert_user_account_locked(
+                    username, password, effective_role, now
                 )
-                user_id = int(cur.lastrowid)
-                account_cur = self.con.execute(
-                    """
-                    INSERT INTO shop_accounts(
-                        user_id, account_key, platform, status, enabled, created_at, updated_at
-                    ) VALUES (?, 'default', 'xianyu', 'unconfigured', 1, ?, ?)
-                    """,
-                    (user_id, now, now),
-                )
-                self._ensure_worker_runtime_locked(user_id, int(account_cur.lastrowid))
+                if initializer is not None:
+                    initializer(user_id)
+                if users == 0:
+                    self.con.execute(
+                        """
+                        UPDATE bootstrap_state
+                        SET state = 'consumed', token_digest = '', consumed_at = ?, created_user_id = ?
+                        WHERE singleton_id = 1
+                        """,
+                        (now, user_id),
+                    )
                 self.con.commit()
                 return user_id
             except BaseException:
@@ -1299,15 +1736,17 @@ class DB:
                 raise
 
     def remove_unconfigured_user(self, user_id):
-        """Compensate a failed registration before the account becomes usable."""
+        """Compensate a failed trusted initialization before a session exists."""
         user_id = int(user_id)
         with self._lock:
             try:
+                self.con.execute("BEGIN IMMEDIATE")
                 accounts = self.con.execute(
                     "SELECT id, account_key, status, enabled, generation FROM shop_accounts WHERE user_id = ?",
                     (user_id,),
                 ).fetchall()
                 if len(accounts) != 1:
+                    self.con.rollback()
                     return False
                 account = accounts[0]
                 if not (
@@ -1316,16 +1755,23 @@ class DB:
                     and int(account["enabled"] or 0) == 1
                     and int(account["generation"] or 0) == 0
                 ):
+                    self.con.rollback()
                     return False
                 if self.con.execute("SELECT 1 FROM tokens WHERE user_id = ? LIMIT 1", (user_id,)).fetchone():
+                    self.con.rollback()
                     return False
                 if self.con.execute("SELECT 1 FROM jobs WHERE user_id = ? LIMIT 1", (user_id,)).fetchone():
+                    self.con.rollback()
                     return False
                 self.con.execute("DELETE FROM worker_runtimes WHERE user_id = ?", (user_id,))
                 self.con.execute("DELETE FROM shop_accounts WHERE user_id = ?", (user_id,))
                 self.con.execute("DELETE FROM tenant_configs WHERE user_id = ?", (user_id,))
                 self.con.execute("DELETE FROM attention_acknowledgements WHERE user_id = ?", (user_id,))
                 cur = self.con.execute("DELETE FROM users WHERE id = ?", (user_id,))
+                # A consumed bootstrap is irreversible.  Failed initializers roll
+                # back their surrounding transaction before this helper is ever
+                # needed, so deleting a trusted test/local user must never reopen
+                # the one-time first-admin window.
                 self.con.commit()
                 return cur.rowcount == 1
             except BaseException:
@@ -1336,24 +1782,157 @@ class DB:
     def get_user(self, username):
         with self._lock:
             return self.con.execute(
-                "SELECT * FROM users WHERE username = ?", (username,)
+                "SELECT * FROM users WHERE username = ?", (str(username),)
             ).fetchone()
 
     def get_user_by_id(self, user_id):
         with self._lock:
             return self.con.execute(
-                "SELECT * FROM users WHERE id = ?", (user_id,)
+                "SELECT * FROM users WHERE id = ?", (int(user_id),)
             ).fetchone()
 
-    # ---- tokens ----
+    def list_platform_users(self, cursor=None, limit=50):
+        limit = min(max(int(limit), 1), 100)
+        cursor_value = int(cursor or 0)
+        with self._lock:
+            rows = self.con.execute(
+                """
+                SELECT id, username, role, disabled_at, password_changed_at,
+                       expires_at, created_at,
+                       (SELECT COUNT(*) FROM tokens t WHERE t.user_id = users.id) AS session_count
+                FROM users
+                WHERE (? = 0 OR id < ?)
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (cursor_value, cursor_value, limit + 1),
+            ).fetchall()
+        return rows[:limit], (int(rows[limit - 1]["id"]) if len(rows) > limit else None)
+
+    def count_enabled_admins(self):
+        with self._lock:
+            return int(
+                self.con.execute(
+                    "SELECT COUNT(*) FROM users WHERE role = 'admin' AND disabled_at IS NULL"
+                ).fetchone()[0]
+            )
+
+    def update_platform_user(self, target_user_id, *, role=None, enabled=None):
+        target_user_id = int(target_user_id)
+        if role is not None and role not in VALID_ROLES:
+            raise ValueError("invalid role")
+        with self._lock:
+            try:
+                self.con.execute("BEGIN IMMEDIATE")
+                row = self.con.execute(
+                    "SELECT * FROM users WHERE id = ?", (target_user_id,)
+                ).fetchone()
+                if row is None:
+                    self.con.rollback()
+                    return None
+                next_role = role or str(row["role"])
+                next_disabled = row["disabled_at"]
+                if enabled is True:
+                    next_disabled = None
+                elif enabled is False and row["disabled_at"] is None:
+                    next_disabled = time.time()
+                removes_admin = (
+                    row["role"] == "admin"
+                    and row["disabled_at"] is None
+                    and (next_role != "admin" or next_disabled is not None)
+                )
+                if removes_admin:
+                    other_admins = int(
+                        self.con.execute(
+                            """
+                            SELECT COUNT(*) FROM users
+                            WHERE id <> ? AND role = 'admin' AND disabled_at IS NULL
+                            """,
+                            (target_user_id,),
+                        ).fetchone()[0]
+                    )
+                    if other_admins == 0:
+                        raise LastAdminError("last admin protected")
+                changed = next_role != row["role"] or next_disabled != row["disabled_at"]
+                self.con.execute(
+                    "UPDATE users SET role = ?, disabled_at = ? WHERE id = ?",
+                    (next_role, next_disabled, target_user_id),
+                )
+                if changed:
+                    self.con.execute("DELETE FROM tokens WHERE user_id = ?", (target_user_id,))
+                result = self.con.execute(
+                    "SELECT * FROM users WHERE id = ?", (target_user_id,)
+                ).fetchone()
+                self.con.commit()
+                return result
+            except BaseException:
+                if self.con.in_transaction:
+                    self.con.rollback()
+                raise
+
+    def upgrade_password_hash(self, user_id, expected_hash, password):
+        with self._lock:
+            cur = self.con.execute(
+                """
+                UPDATE users SET password_hash = ?, password_changed_at = ?
+                WHERE id = ? AND password_hash = ? AND disabled_at IS NULL
+                """,
+                (hash_password(password), time.time(), int(user_id), str(expected_hash)),
+            )
+            self.con.commit()
+            return cur.rowcount == 1
+
+    def change_password(self, user_id, expected_hash, new_password, keep_token=""):
+        now = time.time()
+        with self._lock:
+            try:
+                self.con.execute("BEGIN IMMEDIATE")
+                cur = self.con.execute(
+                    """
+                    UPDATE users SET password_hash = ?, password_changed_at = ?
+                    WHERE id = ? AND password_hash = ? AND disabled_at IS NULL
+                    """,
+                    (hash_password(new_password), now, int(user_id), str(expected_hash)),
+                )
+                if cur.rowcount != 1:
+                    self.con.rollback()
+                    return False
+                if keep_token:
+                    self.con.execute(
+                        "DELETE FROM tokens WHERE user_id = ? AND token <> ?",
+                        (int(user_id), str(keep_token)),
+                    )
+                else:
+                    self.con.execute("DELETE FROM tokens WHERE user_id = ?", (int(user_id),))
+                self.con.commit()
+                return True
+            except BaseException:
+                if self.con.in_transaction:
+                    self.con.rollback()
+                raise
+
+    # ---- sessions and login throttling ----
     def create_token(self, user_id):
         token = secrets.token_hex(32)
         now = time.time()
+        try:
+            max_sessions = min(max(int(os.environ.get("SAAS_MAX_ACTIVE_SESSIONS", MAX_ACTIVE_SESSIONS)), 1), 32)
+        except (TypeError, ValueError):
+            max_sessions = MAX_ACTIVE_SESSIONS
         with self._lock:
             self._maybe_prune_retention_locked(now)
             self.con.execute(
                 "INSERT INTO tokens(token, user_id, created_at) VALUES (?, ?, ?)",
-                (token, user_id, now),
+                (token, int(user_id), now),
+            )
+            self.con.execute(
+                """
+                DELETE FROM tokens WHERE token IN (
+                    SELECT token FROM tokens WHERE user_id = ?
+                    ORDER BY created_at DESC, token DESC LIMIT -1 OFFSET ?
+                )
+                """,
+                (int(user_id), max_sessions),
             )
             self.con.commit()
         return token
@@ -1361,20 +1940,373 @@ class DB:
     def get_token_user(self, token, max_age=TOKEN_TTL_SECONDS):
         with self._lock:
             row = self.con.execute(
-                "SELECT user_id, created_at FROM tokens WHERE token = ?", (token,)
+                "SELECT user_id, created_at FROM tokens WHERE token = ?", (str(token),)
             ).fetchone()
             if row and row["created_at"] + max_age <= time.time():
-                self.con.execute("DELETE FROM tokens WHERE token = ?", (token,))
+                self.con.execute("DELETE FROM tokens WHERE token = ?", (str(token),))
                 self.con.commit()
                 return None
         return row["user_id"] if row else None
 
     def delete_token(self, token):
         if not token:
-            return
+            return 0
         with self._lock:
-            self.con.execute("DELETE FROM tokens WHERE token = ?", (token,))
+            cur = self.con.execute("DELETE FROM tokens WHERE token = ?", (str(token),))
             self.con.commit()
+            return max(cur.rowcount, 0)
+
+    def revoke_user_sessions(self, user_id, keep_token=""):
+        with self._lock:
+            if keep_token:
+                cur = self.con.execute(
+                    "DELETE FROM tokens WHERE user_id = ? AND token <> ?",
+                    (int(user_id), str(keep_token)),
+                )
+            else:
+                cur = self.con.execute("DELETE FROM tokens WHERE user_id = ?", (int(user_id),))
+            self.con.commit()
+            return max(cur.rowcount, 0)
+
+    @staticmethod
+    def _login_delay(attempts):
+        attempts = max(int(attempts), 0)
+        if attempts < 5:
+            return 0
+        return min(2 ** min(attempts - 5, 10), 900)
+
+    def login_rate_status(self, username_hash, client_hash, now=None):
+        now = time.time() if now is None else float(now)
+        with self._lock:
+            row = self.con.execute(
+                """
+                SELECT MAX(locked_until) AS locked_until, MAX(attempts) AS attempts
+                FROM login_failures
+                WHERE (username_hash = ? AND client_hash IN (?, '*'))
+                   OR (username_hash = '*' AND client_hash = ?)
+                """,
+                (str(username_hash), str(client_hash), str(client_hash)),
+            ).fetchone()
+        locked_until = float(row["locked_until"] or 0) if row else 0.0
+        return {
+            "locked": locked_until > now,
+            "locked_until": locked_until,
+            "retry_after": max(int(locked_until - now + 0.999), 0),
+            "attempts": int(row["attempts"] or 0) if row else 0,
+        }
+
+    def record_login_failure(self, username_hash, client_hash, now=None):
+        now = time.time() if now is None else float(now)
+        scopes = (
+            (str(username_hash), str(client_hash)),
+            (str(username_hash), "*"),
+            ("*", str(client_hash)),
+        )
+        locked_until = 0.0
+        with self._lock:
+            try:
+                self.con.execute("BEGIN IMMEDIATE")
+                for username_scope, client_scope in scopes:
+                    row = self.con.execute(
+                        """
+                        SELECT attempts, last_failed_at FROM login_failures
+                        WHERE username_hash = ? AND client_hash = ?
+                        """,
+                        (username_scope, client_scope),
+                    ).fetchone()
+                    attempts = 1
+                    if row is not None and float(row["last_failed_at"] or 0) + 3600 > now:
+                        attempts = int(row["attempts"] or 0) + 1
+                    delay = self._login_delay(attempts)
+                    scope_locked_until = now + delay if delay else 0.0
+                    locked_until = max(locked_until, scope_locked_until)
+                    self.con.execute(
+                        """
+                        INSERT INTO login_failures(
+                            username_hash, client_hash, attempts, locked_until,
+                            last_failed_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(username_hash, client_hash) DO UPDATE SET
+                            attempts = excluded.attempts,
+                            locked_until = excluded.locked_until,
+                            last_failed_at = excluded.last_failed_at,
+                            updated_at = excluded.updated_at
+                        """,
+                        (
+                            username_scope,
+                            client_scope,
+                            attempts,
+                            scope_locked_until,
+                            now,
+                            now,
+                        ),
+                    )
+                self._maybe_prune_retention_locked(now)
+                self.con.commit()
+            except BaseException:
+                if self.con.in_transaction:
+                    self.con.rollback()
+                raise
+        return max(int(locked_until - now + 0.999), 0)
+
+    def clear_login_failures(self, username_hash, client_hash=""):
+        with self._lock:
+            if client_hash:
+                cur = self.con.execute(
+                    """
+                    DELETE FROM login_failures
+                    WHERE username_hash = ? AND client_hash IN (?, '*')
+                    """,
+                    (str(username_hash), str(client_hash)),
+                )
+            else:
+                cur = self.con.execute(
+                    "DELETE FROM login_failures WHERE username_hash = ?",
+                    (str(username_hash),),
+                )
+            self.con.commit()
+            return max(cur.rowcount, 0)
+
+    def username_lock_status(self, username_hash, now=None):
+        now = time.time() if now is None else float(now)
+        with self._lock:
+            row = self.con.execute(
+                """
+                SELECT MAX(locked_until) AS locked_until
+                FROM login_failures WHERE username_hash = ?
+                """,
+                (str(username_hash),),
+            ).fetchone()
+        locked_until = float(row["locked_until"] or 0) if row else 0.0
+        return {"locked": locked_until > now, "locked_until": locked_until}
+
+    # ---- platform settings, audit and high-risk confirmations ----
+    def get_platform_setting(self, key, default=""):
+        with self._lock:
+            row = self.con.execute(
+                "SELECT setting_value FROM platform_settings WHERE setting_key = ?",
+                (str(key),),
+            ).fetchone()
+            return str(row["setting_value"]) if row is not None else str(default)
+
+    def set_platform_setting(self, key, value, updated_by=None):
+        key = str(key)
+        value = str(value)
+        if key == "registration_open" and value not in {"0", "1"}:
+            raise ValueError("invalid registration setting")
+        if key == "update_channel" and value not in VALID_UPDATE_CHANNELS:
+            raise ValueError("invalid update channel")
+        if key not in {"registration_open", "update_channel"}:
+            raise ValueError("unsupported platform setting")
+        now = time.time()
+        with self._lock:
+            self.con.execute(
+                """
+                INSERT INTO platform_settings(setting_key, setting_value, updated_at, updated_by)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(setting_key) DO UPDATE SET
+                    setting_value = excluded.setting_value,
+                    updated_at = excluded.updated_at,
+                    updated_by = excluded.updated_by
+                """,
+                (key, value, now, int(updated_by) if updated_by is not None else None),
+            )
+            self.con.commit()
+        return value
+
+    def append_audit(
+        self,
+        event_type,
+        *,
+        actor_user_id=None,
+        target_type="",
+        target_id="",
+        outcome="success",
+        ip_hash="",
+        metadata=None,
+        created_at=None,
+    ):
+        encoded = json.dumps(metadata or {}, ensure_ascii=False, separators=(",", ":"))
+        if len(encoded.encode("utf-8")) > 2048:
+            raise ValueError("audit metadata too large")
+        now = time.time() if created_at is None else float(created_at)
+        with self._lock:
+            self._maybe_prune_retention_locked(now)
+            cur = self.con.execute(
+                """
+                INSERT INTO audit_log(
+                    event_type, actor_user_id, target_type, target_id,
+                    outcome, ip_hash, metadata_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(event_type)[:80],
+                    int(actor_user_id) if actor_user_id is not None else None,
+                    str(target_type)[:40],
+                    str(target_id)[:120],
+                    str(outcome)[:20],
+                    str(ip_hash)[:80],
+                    encoded,
+                    now,
+                ),
+            )
+            self.con.commit()
+            return int(cur.lastrowid)
+
+    def list_audit(self, *, cursor=None, limit=50, event_type=""):
+        limit = min(max(int(limit), 1), 100)
+        cursor_value = int(cursor or 0)
+        event_type = str(event_type or "")
+        with self._lock:
+            if event_type:
+                rows = self.con.execute(
+                    """
+                    SELECT id, event_type, actor_user_id, target_type, target_id,
+                           outcome, ip_hash, metadata_json, created_at
+                    FROM audit_log
+                    WHERE (? = 0 OR id < ?) AND event_type = ?
+                    ORDER BY id DESC LIMIT ?
+                    """,
+                    (cursor_value, cursor_value, event_type, limit + 1),
+                ).fetchall()
+            else:
+                rows = self.con.execute(
+                    """
+                    SELECT id, event_type, actor_user_id, target_type, target_id,
+                           outcome, ip_hash, metadata_json, created_at
+                    FROM audit_log
+                    WHERE (? = 0 OR id < ?)
+                    ORDER BY id DESC LIMIT ?
+                    """,
+                    (cursor_value, cursor_value, limit + 1),
+                ).fetchall()
+        return rows[:limit], (int(rows[limit - 1]["id"]) if len(rows) > limit else None)
+
+    def create_admin_confirmation(self, user_id, action, ttl_seconds=300):
+        raw = secrets.token_urlsafe(32)
+        digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+        now = time.time()
+        with self._lock:
+            self.con.execute(
+                """
+                INSERT INTO admin_confirmations(
+                    token_digest, user_id, action, expires_at, used_at, created_at
+                ) VALUES (?, ?, ?, ?, NULL, ?)
+                """,
+                (digest, int(user_id), str(action), now + max(int(ttl_seconds), 30), now),
+            )
+            self.con.commit()
+        return raw
+
+    def consume_admin_confirmation(self, raw_token, user_id, action):
+        digest = hashlib.sha256(str(raw_token or "").encode("utf-8")).hexdigest()
+        now = time.time()
+        with self._lock:
+            try:
+                self.con.execute("BEGIN IMMEDIATE")
+                row = self.con.execute(
+                    """
+                    SELECT user_id, action, expires_at, used_at
+                    FROM admin_confirmations WHERE token_digest = ?
+                    """,
+                    (digest,),
+                ).fetchone()
+                valid = bool(
+                    row
+                    and row["used_at"] is None
+                    and float(row["expires_at"]) > now
+                    and int(row["user_id"]) == int(user_id)
+                    and secrets.compare_digest(str(row["action"]), str(action))
+                )
+                if not valid:
+                    self.con.rollback()
+                    return False
+                cur = self.con.execute(
+                    """
+                    UPDATE admin_confirmations SET used_at = ?
+                    WHERE token_digest = ? AND used_at IS NULL AND expires_at > ?
+                    """,
+                    (now, digest, now),
+                )
+                self.con.commit()
+                return cur.rowcount == 1
+            except BaseException:
+                if self.con.in_transaction:
+                    self.con.rollback()
+                raise
+
+    # ---- platform update status ----
+    def upsert_platform_update(
+        self,
+        version,
+        channel,
+        status,
+        *,
+        release_id="",
+        manifest_sha256="",
+        candidate_path="",
+        release_notes="",
+        error_code="",
+        requested_by=None,
+    ):
+        now = time.time()
+        if str(channel) not in VALID_UPDATE_CHANNELS:
+            raise ValueError("invalid update channel")
+        with self._lock:
+            self.con.execute(
+                """
+                INSERT INTO platform_updates(
+                    version, channel, release_id, status, manifest_sha256,
+                    candidate_path, release_notes, error_code, requested_by,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(version, channel) DO UPDATE SET
+                    release_id = excluded.release_id,
+                    status = excluded.status,
+                    manifest_sha256 = excluded.manifest_sha256,
+                    candidate_path = excluded.candidate_path,
+                    release_notes = excluded.release_notes,
+                    error_code = excluded.error_code,
+                    requested_by = COALESCE(excluded.requested_by, platform_updates.requested_by),
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    str(version),
+                    str(channel),
+                    str(release_id)[:120],
+                    str(status)[:40],
+                    str(manifest_sha256)[:64],
+                    str(candidate_path)[:1024],
+                    str(release_notes)[:16000],
+                    str(error_code)[:80],
+                    int(requested_by) if requested_by is not None else None,
+                    now,
+                    now,
+                ),
+            )
+            self.con.commit()
+            return self.get_platform_update(version, channel)
+
+    def get_platform_update(self, version, channel):
+        with self._lock:
+            return self.con.execute(
+                "SELECT * FROM platform_updates WHERE version = ? AND channel = ?",
+                (str(version), str(channel)),
+            ).fetchone()
+
+    def latest_platform_update(self, channel=""):
+        with self._lock:
+            if channel:
+                return self.con.execute(
+                    """
+                    SELECT * FROM platform_updates WHERE channel = ?
+                    ORDER BY updated_at DESC, id DESC LIMIT 1
+                    """,
+                    (str(channel),),
+                ).fetchone()
+            return self.con.execute(
+                "SELECT * FROM platform_updates ORDER BY updated_at DESC, id DESC LIMIT 1"
+            ).fetchone()
 
     # ---- activation ----
     def generate_codes(self, count, days):

@@ -83,10 +83,12 @@ def seed_chat(root: Path, buyer: str, item: str, *, legacy_draft: bool = False) 
 
 def main() -> None:
     client = TestClient(app.app)
-    assert client.post(
-        "/api/auth/register",
-        json={"username": "reply-owner", "password": "password-123"},
-    ).status_code == 200
+    app.db.create_user(
+        "reply-owner",
+        "password-123",
+        role="owner",
+        initializer=app._new_user_initializer({}),
+    )
     login = client.post(
         "/api/auth/login",
         json={"username": "reply-owner", "password": "password-123"},

@@ -56,9 +56,12 @@ def main() -> None:
     app.sync_shop = fake_sync
     app.reserve_sync = lambda *_args: None
     client = TestClient(app.app)
-    assert client.post(
-        "/api/auth/register", json={"username": "async-owner", "password": "password-123"}
-    ).status_code == 200
+    app.db.create_user(
+        "async-owner",
+        "password-123",
+        role="owner",
+        initializer=app._new_user_initializer({}),
+    )
     login = client.post(
         "/api/auth/login", json={"username": "async-owner", "password": "password-123"}
     )

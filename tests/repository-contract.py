@@ -21,11 +21,21 @@ REQUIRED = (
     ".gitattributes",
     "package.json",
     "backend/requirements-dev.txt",
+    "backend/version.py",
+    "backend/platform_update.py",
     "config/saas.env.example",
     "docs/ARCHITECTURE.md",
     "docs/NEW_UBUNTU_HANDOFF.md",
     "docs/DEPLOYMENT.md",
     "docs/PUBLIC_RELEASE_CHECKLIST.md",
+    "deploy/updater/updater.py",
+    "deploy/systemd/xianyu-saas-updater.service",
+    "deploy/systemd/xianyu-saas-updater.path",
+    "deploy/systemd/xianyu-saas-bootstrap.conf.example",
+    "tests/auth-roles-contract.py",
+    "tests/auth-security-contract.py",
+    "tests/platform-admin-contract.py",
+    "tests/platform-update-contract.py",
     "handoff/AGENTS.md",
     "handoff/MEMORY.md",
     "worker/LICENSE",
@@ -112,7 +122,12 @@ for relative in PORTABLE_PATHS:
     target = ROOT / relative
     paths = [target] if target.is_file() else list(target.rglob("*"))
     for path in paths:
-        if not path.is_file() or path.name == Path(__file__).name:
+        relative_path = path.relative_to(ROOT) if path.is_absolute() else path
+        if (
+            not path.is_file()
+            or path.name == Path(__file__).name
+            or relative_path == Path("tests/deploy-contract.py")
+        ):
             continue
         try:
             text = path.read_text(encoding="utf-8")
@@ -129,6 +144,13 @@ worker_example = (ROOT / "worker/.env.example").read_text(encoding="utf-8")
 dev_api = (ROOT / "scripts/dev-api.sh").read_text(encoding="utf-8")
 assert "SAAS_PLATFORM_AI_KEY=\n" in saas_example
 assert "SAAS_AI_MASTER_KEY=\n" in saas_example
+assert "SAAS_ADMIN_TOKEN=\n" in saas_example
+assert "SAAS_AUDIT_HMAC_KEY=\n" in saas_example
+assert "SAAS_ALLOW_REGISTRATION=0\n" in saas_example
+assert "SAAS_BOOTSTRAP_ENABLED=0\n" in saas_example
+assert "SAAS_BOOTSTRAP_TOKEN_FILE=\n" in saas_example
+assert "SAAS_BOOTSTRAP_TRUSTED_SOURCES=127.0.0.1,::1\n" in saas_example
+assert "SAAS_GITHUB_READ_TOKEN=\n" in saas_example
 assert "ensure_development_master_key" in dev_api and ".local/ai-master-key" in dev_api
 assert "COOKIES_STR=\n" in worker_example and "API_KEY=\n" in worker_example
 
@@ -143,8 +165,27 @@ dev_requirements = (ROOT / "backend/requirements-dev.txt").read_text(encoding="u
 assert "httpx2" not in runtime_requirements
 assert "httpx2==2.10.0" in dev_requirements
 package = json.loads((ROOT / "package.json").read_text(encoding="utf-8"))
+package_lock = json.loads((ROOT / "package-lock.json").read_text(encoding="utf-8"))
 assert package.get("private") is True
 assert package.get("license") == "GPL-3.0-only"
 assert package.get("repository", {}).get("url", "").endswith("tswawa/xianyu-saas.git")
+assert package_lock.get("version") == package.get("version")
+assert package_lock.get("packages", {}).get("", {}).get("version") == package.get("version")
+version_source = (ROOT / "backend/version.py").read_text(encoding="utf-8")
+version_match = re.search(r'^VERSION\s*=\s*["\']([^"\']+)["\']\s*$', version_source, re.MULTILINE)
+asset_match = re.search(r'^ASSET_VERSION\s*=\s*["\']([^"\']+)["\']\s*$', version_source, re.MULTILINE)
+assert version_match and version_match.group(1) == package.get("version")
+assert asset_match
+app_js = (ROOT / "frontend/assets/app.js").read_text(encoding="utf-8")
+index_html = (ROOT / "frontend/index.html").read_text(encoding="utf-8")
+assert f'const ASSET_VERSION = "{asset_match.group(1)}";' in app_js
+assert set(re.findall(r"[?&]v=([0-9]{8}-[0-9]{2})", index_html)) == {asset_match.group(1)}
+update_source = (ROOT / "backend/platform_update.py").read_text(encoding="utf-8")
+assert 'RELEASE_OWNER = "tswawa"' in update_source
+assert 'RELEASE_REPOSITORY = "xianyu-saas"' in update_source
+assert 'GITHUB_API_HOST = "api.github.com"' in update_source
+assert "allow_redirects=False" in update_source
+assert "git pull" not in update_source.lower()
+assert "/api/admin/updates" not in update_source, "update verifier must not depend on browser routes"
 
 print("repository contract: portable layout, provenance and secret exclusions passed")

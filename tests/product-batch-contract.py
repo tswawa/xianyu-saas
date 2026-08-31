@@ -99,9 +99,12 @@ def read_config(user_id: int, account_key: str = "default") -> dict:
 
 def main() -> None:
     client = TestClient(app.app)
-    assert client.post(
-        "/api/auth/register", json={"username": "batch-owner", "password": "password-123"}
-    ).status_code == 200
+    app.db.create_user(
+        "batch-owner",
+        "password-123",
+        role="owner",
+        initializer=app._new_user_initializer({}),
+    )
     login = client.post(
         "/api/auth/login", json={"username": "batch-owner", "password": "password-123"}
     )
