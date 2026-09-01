@@ -7,6 +7,8 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const frontend = path.join(root, "frontend");
 const assets = path.join(frontend, "assets");
 const port = Number.parseInt(process.env.SAAS_DEV_WEB_PORT || "4173", 10);
+// 默认只绑回环；容器内需要设为 0.0.0.0 才能被宿主访问。
+const host = process.env.SAAS_DEV_WEB_HOST || "127.0.0.1";
 const apiOrigin = process.env.SAAS_DEV_API_ORIGIN || "http://127.0.0.1:8096";
 const maxBodyBytes = 16 * 1024 * 1024;
 
@@ -115,6 +117,7 @@ const server = http.createServer(async (request, response) => {
   send(response, 404, "Not found", { "content-type": "text/plain; charset=utf-8" });
 });
 
-server.listen(port, "127.0.0.1", () => {
-  process.stdout.write(`DeepWhale 闲鱼客服本地页面: http://127.0.0.1:${port}/xianyu-saas/\n`);
+server.listen(port, host, () => {
+  const display = host === "0.0.0.0" || host === "::" ? "127.0.0.1" : host;
+  process.stdout.write(`DeepWhale 闲鱼客服本地页面: http://${display}:${port}/xianyu-saas/\n`);
 });

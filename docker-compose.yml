@@ -1,0 +1,26 @@
+services:
+  xianyu-saas:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: xianyu-saas:local
+    container_name: xianyu-saas
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:4173:4173"
+      - "127.0.0.1:8096:8096"
+    env_file:
+      - config/saas.env
+    environment:
+      SAAS_DB: /data/saas.db
+      SAAS_TENANTS_DIR: /data/tenants
+      SAAS_BOT_ROOT: /app/worker
+    volumes:
+      - ./data:/data
+    # 控制面派生 Worker 时用 RLIMIT_AS 限制内存，需要允许进程自设资源上限。
+    ulimits:
+      nofile:
+        soft: 4096
+        hard: 8192
+    security_opt:
+      - no-new-privileges:true
