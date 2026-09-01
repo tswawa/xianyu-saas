@@ -16,7 +16,8 @@
 - GitHub、模型平台、支付平台或内部 API 的 Token、Key、密码；
 - 闲鱼 Cookie、验证码、二维码登录态或浏览器导出的凭据；
 - 真实订单号、买家昵称、聊天正文、库存、兑换码、网盘资料、数据库和日志；
-- 生产主机路径、备份位置或未公开域名。
+- 生产主机路径、备份位置或未公开域名；
+- 容器数据卷 `data/`、构建产物和本机 `config/saas.env`。
 
 测试请使用本地临时目录、固定假数据和模拟上游。真实账号、真实订单、真实发货和第三方模型请求不属于默认 CI 范围。
 
@@ -24,8 +25,9 @@
 
 - 一个提交只解决一个主题，提交标题使用 Conventional Commits 风格，例如 `fix(worker): ...`、`test(api): ...`、`docs(repo): ...`。
 - 只暂存明确审阅过的路径，不使用未经检查的 `git add .`。
-- 新增环境变量时同步更新对应的 `*.example` 模板，并只放占位值。
-- 影响 `worker/` 的改动必须保留 GPL-3.0 和上游 NOTICE 边界。
+- 新增环境变量时同步更新对应的 `*.example` 模板，并只放占位值；影响容器运行的变量还需同步 `config/saas.env.docker.example`。
+- 改动 `Dockerfile`、`docker-compose.yml` 或 `docker/entrypoint.sh` 时，需说明是否影响控制面派生 Worker 所依赖的 `<SAAS_BOT_ROOT>/.venv/bin/python` 布局。
+- 影响 `worker/` 的改动必须保留 GPL-3.0 和上游 NOTICE 边界；镜像分发同样需要保留 `worker/NOTICE.md` 与 `LICENSE`。
 - 不要为了格式化而重写无关的大文件；先说明必要性和回归风险。
 
 ## 本地门禁

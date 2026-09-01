@@ -108,7 +108,60 @@
   <em>图6: 订单与发货状态</em>
 </div>
 
-## 🚴 快速开始
+## 🚴 运行环境
+
+| 平台 | 安装方式 |
+| --- | --- |
+| Linux | Docker 或源码安装 |
+| Windows | Docker Desktop（WSL2 后端） |
+| macOS | Docker Desktop |
+
+控制面依赖 Linux 的进程与文件系统特性（`RLIMIT_AS` 内存限制、`/proc` 进程身份校验、`flock` 单实例锁）来隔离各店铺 Worker，因此 Windows 与 macOS 通过容器运行。
+
+## 🐳 方式一：Docker（推荐）
+
+需要 Docker 20.10+ 与 Docker Compose v2。
+
+```bash
+git clone https://github.com/tswawa/xianyu-saas.git
+cd xianyu-saas
+
+# 生成配置文件
+cp config/saas.env.docker.example config/saas.env
+
+# 构建并启动
+docker compose up -d --build
+```
+
+工作台在 `http://127.0.0.1:4173/xianyu-saas/`，API 健康检查在 `http://127.0.0.1:8096/health`。
+
+数据库与店铺数据保存在宿主的 `./data` 目录，重建容器不会丢失。查看日志与停止：
+
+```bash
+docker compose logs -f
+docker compose down
+```
+
+从其他机器访问时，需把 `config/saas.env` 里的 `SAAS_PUBLIC_ORIGIN` 与 `SAAS_TRUSTED_HOSTS` 改成该机器可见的地址，并把 `docker-compose.yml` 的端口映射从 `127.0.0.1:4173:4173` 改为 `4173:4173`，否则写请求会被来源校验拒绝。
+
+容器内创建首位管理员：
+
+```bash
+docker compose exec xianyu-saas sh -c \
+  'install -m 600 /dev/null /data/bootstrap-token && \
+   python3 -c "import secrets;print(secrets.token_urlsafe(32))" > /data/bootstrap-token && \
+   cat /data/bootstrap-token'
+```
+
+把 `config/saas.env` 改为下面三行后执行 `docker compose restart`，在登录页选择「创建首位管理员」并填入上面输出的令牌。完成后将 `SAAS_BOOTSTRAP_ENABLED` 恢复为 `0`、删除令牌文件并再次重启。
+
+```ini
+SAAS_BOOTSTRAP_ENABLED=1
+SAAS_BOOTSTRAP_TOKEN_FILE=/data/bootstrap-token
+SAAS_BOOTSTRAP_TRUSTED_SOURCES=127.0.0.1,::1
+```
+
+## 🚴 方式二：源码安装（Linux）
 
 ### 环境要求
 
@@ -197,7 +250,7 @@ npm run dev
 | `SAAS_AUDIT_HMAC_KEY` | 审计日志脱敏 HMAC 密钥 |
 | `SAAS_UPDATE_PUBLIC_KEY_FILE` | 版本更新验签公钥绝对路径 |
 
-完整变量说明见 `config/saas.env.example`。
+完整变量说明见 `config/saas.env.example`；Docker 部署见 `config/saas.env.docker.example`。
 
 ## 🧪 测试
 
@@ -224,9 +277,24 @@ frontend/             工作台前端
 backend/              控制面服务（FastAPI）
 worker/               闲鱼消息监听、回复引擎与履约状态机
 deploy/               Nginx、systemd 与更新器配置
+docker/               容器入口脚本
 scripts/              初始化与启动脚本
 tests/                接口与界面测试
+Dockerfile            整站运行镜像
+docker-compose.yml    一键启动编排
 ```
+
+## 📚 文档
+
+| 文档 | 内容 |
+| --- | --- |
+| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | 组件边界、数据流与平台依赖 |
+| [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) | 容器部署与 systemd 生产发布 |
+| [`docs/NEW_UBUNTU_HANDOFF.md`](docs/NEW_UBUNTU_HANDOFF.md) | 开发环境搭建 |
+| [`docs/ACCESS_MODEL.md`](docs/ACCESS_MODEL.md) | 角色与权限模型 |
+| [`CONTRIBUTING.md`](CONTRIBUTING.md) | 贡献流程与本地门禁 |
+| [`SECURITY.md`](SECURITY.md) | 漏洞报告与敏感信息边界 |
+| [`CHANGELOG.md`](CHANGELOG.md) | 版本变更记录 |
 
 ## 🛡 注意事项
 

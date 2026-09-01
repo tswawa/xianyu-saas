@@ -16,7 +16,7 @@
 - `backend/` 是 FastAPI 控制面，负责会话、权限、店铺连接、同步、任务、配置和 Worker 生命周期；
 - `backend/job_consumer.py` 是异步同步任务的单写者消费者；
 - `worker/` 处理 WebSocket 入站、规则/AI 回复、人工 outbox 和订单证明后的履约；
-- `deploy/` 提供 nginx、systemd、Docker 和日志轮转模板；
+- `deploy/` 提供 nginx、systemd 和日志轮转模板，根目录 `Dockerfile` 与 `docker-compose.yml` 提供整站容器运行方式；
 - `tests/` 与 `worker/tests/` 将账号隔离、幂等、恢复、部署和 UI 边界写成可执行合同。
 
 详细数据流见 [`ARCHITECTURE.md`](ARCHITECTURE.md)。

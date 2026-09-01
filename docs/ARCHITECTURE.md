@@ -54,7 +54,15 @@ FastAPI 控制面负责：
 
 ### `deploy/`
 
-提供 nginx、systemd、Docker 和日志轮转模板。模板中的路径、域名和密钥均应由部署者在目标环境明确配置，不能把本机运行态复制进 Git。
+提供 nginx、systemd 和日志轮转模板，用于版本化 release 加独立 updater 的生产部署。模板中的路径、域名和密钥均应由部署者在目标环境明确配置，不能把本机运行态复制进 Git。
+
+### 根目录容器化
+
+`Dockerfile`、`docker-compose.yml` 和 `docker/entrypoint.sh` 提供整站单容器运行方式，用于开发与自托管。控制面在容器内派生 Worker 子进程并校验解释器真实路径，因此 backend 与 worker 必须位于同一镜像，且保持 `<SAAS_BOT_ROOT>/.venv/bin/python` 布局。该方式与 `deploy/` 的版本化发布互斥：容器内不使用 `current` 符号链接切换，签名更新链路只适用于 systemd 部署。
+
+### 平台依赖
+
+控制面依赖 Linux 特性实现店铺隔离：`resource.setrlimit(RLIMIT_AS)` 配合 `preexec_fn` 限制单个 Worker 地址空间；`/proc/<pid>/stat` 与 `/proc/<pid>/environ` 校验进程身份，防止 PID 重用误杀或误接管；`fcntl.flock` 保证单个控制面数据库只有一个 API supervisor。这些接口在 Windows 上不存在，因此非 Linux 平台通过容器运行。
 
 ## 关键一致性规则
 
@@ -75,4 +83,6 @@ FastAPI 控制面负责：
 | AI 内容模型与 provider | `backend/ai_customer_service.py`、`backend/ai_provider_adapters.py` |
 | 消息与履约 | `worker/main.py`、`worker/context_manager.py`、`worker/delivery_store.py` |
 | 前端状态与请求作用域 | `frontend/assets/app.js` |
+| 整站容器运行 | `Dockerfile`、`docker-compose.yml`、`docker/entrypoint.sh` |
+| 生产发布与原子切换 | `deploy/systemd/`、`deploy/updater/updater.py` |
 | 离线合同与浏览器验收 | `tests/`、`worker/tests/` |

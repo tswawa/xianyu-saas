@@ -2,6 +2,35 @@
 
 本文面向负责部署的维护者。仓库只提供模板和验证步骤，不包含任何生产凭据、真实运行态或固定主机信息。生产部署应在目标环境中明确设置路径、域名、用户、密钥和权限。
 
+## 部署方式选择
+
+| 方式 | 适用场景 | 签名自动更新 |
+| --- | --- | --- |
+| 容器（`docker-compose.yml`） | 开发、自托管、非 Linux 宿主 | 不支持，需重新构建镜像 |
+| 版本化 release + systemd（`deploy/`） | 生产 | 支持 |
+
+两种方式互斥，不要在同一主机混用：容器方式没有 `current` 符号链接，`deploy/updater/` 的原子切换与回滚只适用于 systemd 部署。本文其余章节除「容器部署」外均针对 systemd 生产方式。
+
+## 容器部署
+
+需要 Docker 20.10+ 与 Compose v2。控制面在容器内派生 Worker 子进程，因此 backend 与 worker 位于同一镜像。
+
+```bash
+cp config/saas.env.docker.example config/saas.env
+docker compose up -d --build
+```
+
+要点：
+
+- 数据库、店铺目录与 AI 主密钥都在数据卷 `./data`（容器内 `/data`），重建容器不丢失；备份对象就是这个目录，需在停止写入后复制。
+- `config/saas.env` 的 `SAAS_PUBLIC_ORIGIN` 与 `SAAS_TRUSTED_HOSTS` 必须与浏览器地址栏一致，否则写请求被来源校验拒绝。
+- compose 默认把端口映射到宿主回环。对外发布时应保留回环映射并在前面放 TLS 反向代理，参考 `deploy/nginx/`；不要直接把容器端口暴露到公网。
+- 镜像内代码为 root 拥有且不可写，服务以非特权用户 `xianyu` 运行，容器带 `no-new-privileges`。
+- 升级方式是拉取新代码后 `docker compose up -d --build`；管理后台的签名更新入口在容器方式下不可用。
+- 生产应显式提供 `SAAS_AI_MASTER_KEY`，不要依赖首次启动在数据卷内生成的回退密钥。
+
+容器方式的镜像构建与启动尚未在本仓库的自动化门禁中验证，首次部署应自行确认 `/health`、`/api/ready`、工作台静态资源与 Worker 派生均正常。
+
 ## 推荐目录变量
 
 以下变量仅用于说明，部署时请替换为目标环境的实际值：
@@ -29,6 +58,7 @@
 | `frontend/` | 静态工作台 |
 | `worker/` | 店铺消息与履约 Worker |
 | `backend/job_consumer.py` | 异步同步任务消费者 |
+| `Dockerfile`、`docker-compose.yml`、`docker/` | 整站容器运行方式 |
 | `deploy/nginx/` | 反向代理、限流和安全响应头 |
 | `deploy/systemd/` | API、消费者和独立 updater 服务模板 |
 | `deploy/updater/` | 只消费已验签意图的原子切换与回滚程序 |

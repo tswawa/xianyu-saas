@@ -4,7 +4,23 @@
 
 ## [未发布]
 
-后续改动将在这里记录。当前仓库仍以 private 内部构建方式维护，未承诺公共 Release 节奏。
+### 新增
+
+- 整站容器化：根目录 `Dockerfile`、`docker-compose.yml`、`docker/entrypoint.sh` 与 `config/saas.env.docker.example`，Windows 与 macOS 可通过容器运行。
+- 静态页面服务器支持 `SAAS_DEV_WEB_HOST` 配置监听地址，默认仍为 `127.0.0.1`。
+
+### 变更
+
+- README 改为面向使用者的结构：功能特性表格、界面截图、容器与源码两种安装方式。
+- `docs/ARCHITECTURE.md` 补充平台依赖与容器组件说明，纠正 Docker 模板位置。
+- `docs/DEPLOYMENT.md` 增加容器部署章节，并明确其与 systemd 版本化发布互斥。
+- `docs/NEW_UBUNTU_HANDOFF.md` 增加容器开发路径，改用 `npm run dev` 单命令启动。
+
+### 修复
+
+- `蒸馏/` 目录下的本地开发图片虽已在 `.gitignore` 中声明，但因先于规则入库仍被跟踪，现已脱离版本控制。
+
+容器镜像构建与启动尚未纳入自动化门禁，首次部署需自行验证。当前仓库仍以内部构建方式维护，未承诺公共 Release 节奏。
 
 ## [0.1.0] - 2026-08-28
 
