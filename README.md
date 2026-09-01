@@ -1,109 +1,241 @@
-# xianyu-saas
-
-按店铺账号隔离的闲鱼客服工作台：集中管理店铺、商品、会话、AI 回复和订单履约。
+# 🐟 xianyu-saas - 闲鱼多店铺客服与自动履约系统
 
 [![CI](https://github.com/tswawa/xianyu-saas/actions/workflows/ci.yml/badge.svg)](https://github.com/tswawa/xianyu-saas/actions/workflows/ci.yml)
 [![License: GPL-3.0-only](https://img.shields.io/badge/license-GPL--3.0--only-blue.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
 
-## 项目预览
-<p align="center">
-  <img src="docs/assets/readme/overview.png" alt="运营概览" width="49%" />
-  <img src="docs/assets/readme/customer-service.png" alt="客服会话工作台" width="49%" />
-</p>
+面向闲鱼多店铺卖家的自动化运营系统。支持规则与大模型分层应答、订单驱动的自动发货、多店铺环境隔离与并行托管，并提供完整的可视化运营工作台。
 
-截图来自脱敏本地测试夹具，只用于展示界面布局。
+## 🌟 核心特性
 
-## 运行要求
+### 多店铺管理与环境隔离
 
-- Linux（Ubuntu 22.04/24.04 或兼容发行版）
+| 功能模块 | 关键特性 |
+| --- | --- |
+| 官方扫码接入 | 服务端代理闲鱼官方授权接口生成二维码，扫码即可绑定店铺并设置备注名 |
+| 店铺快速切换 | 顶部下拉切换当前店铺，页面自动重载对应数据，切换过程中不会串号 |
+| 环境隔离 | 每个店铺拥有独立数据目录、独立数据库与独立运行进程，商品与订单互不覆盖 |
+| 配置隔离 | 登录状态、商品快照、客服规则、AI 配置、会话记录、订单、发货模板与卡密库存均按店铺独立存放 |
+| 故障隔离 | 单店凭据失效或触发风控时仅暂停该店铺，其余店铺持续运行 |
+| 并发管控 | 可配置最大并发店铺进程数与单进程内存上限 |
+| 连接状态监控 | 实时展示各店铺登录状态、进程存活与最近同步时间 |
+
+### 智能客服
+
+| 功能模块 | 关键特性 |
+| --- | --- |
+| 分层应答 | 关键词规则优先命中，未覆盖场景交由大模型接管 |
+| 关键词规则 | 支持商品级与全店级规则，包含匹配、大小写不敏感，商品级优先 |
+| 多模型接入 | 兼容 OpenAI 兼容接口、OpenAI Responses、Anthropic Messages、Google Gemini、Ollama |
+| 人格预设 | 内置亲切客服、专业客服、小喵客服、自然表达四种预设及自定义模式 |
+| 人格微调 | 可调角色名、表达要求、语气、买家称呼、回复长度与表情密度 |
+| 上下文感知 | 结合商品实时价格、上下架状态与历史会话生成回复 |
+| 对话沙盘 | 发布前连续模拟买家提问，展示命中层级、响应耗时与校验结果 |
+| 配置版本管理 | 草稿与线上版本分离，支持发布、回滚与并发冲突检测 |
+| 客服模板库 | 整套客服配置另存为命名模板，便于多套口径切换 |
+| 人工接管 | 客户端关键词或工作台一键切换，支持超时自动交回与退出冷却 |
+| 图片回复 | 人工回复支持拖入或粘贴图片，发送前可预览 |
+| 快捷短语 | 常用话术一键插入 |
+| 营业时间 | 按时段控制自动应答，支持跨天窗口 |
+| 首询欢迎语 | 新会话首次咨询自动发送 |
+| 拟人延迟 | 可配置随机延迟区间 |
+| 统一收件箱 | 会话列表支持全部、未读、接管三档筛选与关键词搜索 |
+
+### 自动履约
+
+| 功能模块 | 关键特性 |
+| --- | --- |
+| 订单核验 | 基于平台付款事件，双接口交叉核对订单号、商品、买家、卖家、订单状态与数量 |
+| 卡密库存 | 批量导入，实时统计可用、预占与已消耗 |
+| 发货模板 | 发货话术与卡密池组合配置，按商品绑定 |
+| 发货形式 | 兑换码、网盘链接、固定资料 |
+| 批量配置 | 商品发货资料批量设置，提交前预览影响范围 |
+| 并发控制 | 事务内预留扣减，杜绝同一卡密重复发放 |
+| 库存不足 | 整单转人工复核，不执行部分发货 |
+| 失败重试 | 发送失败自动重试并退避，超限转人工处理 |
+| 平台核销 | 发货完成后自动执行「无需邮寄」发货 |
+
+### 运营与管理
+
+| 功能模块 | 关键特性 |
+| --- | --- |
+| 运营看板 | 1 / 7 / 30 天维度统计消息量、自动回复、人工接管与履约结果，含趋势图表 |
+| 待办预警 | 汇总异常店铺、发送失败与待复核订单，支持标记已处理 |
+| 商品同步 | 同步在售商品的标题、简介、价格与上下架状态 |
+| 商品资料 | 维护商品客服口径，支持 AI 整理与发布前预览 |
+| 角色权限 | 管理员与店主两级角色，敏感操作需二次确认 |
+| 账号管理 | 管理员可调整角色、启停账号、解锁登录锁定与吊销会话 |
+| 安全审计 | 记录登录、权限变更与更新操作等结构化安全事件 |
+| 运行日志 | 按店铺查看 Worker 运行日志 |
+| 企业级界面 | 统一图标系统与一致的交互反馈，支持无障碍与减弱动效 |
+| 版本更新 | 固定 Release 源，签名校验与健康检查失败自动回滚 |
+
+## 🎨 效果图
+
+<div align="center">
+  <img src="docs/assets/readme/overview.png" width="700" alt="运营概览">
+  <br>
+  <em>图1: 运营概览</em>
+</div>
+
+<div align="center">
+  <img src="docs/assets/readme/shops.png" width="700" alt="店铺管理">
+  <br>
+  <em>图2: 多店铺管理与连接状态</em>
+</div>
+
+<div align="center">
+  <img src="docs/assets/readme/customer-service.png" width="700" alt="客服会话">
+  <br>
+  <em>图3: 客服会话工作台</em>
+</div>
+
+<div align="center">
+  <img src="docs/assets/readme/ai-config.png" width="700" alt="AI 客服设置">
+  <br>
+  <em>图4: AI 人格配置与连续对话沙盘</em>
+</div>
+
+<div align="center">
+  <img src="docs/assets/readme/cards.png" width="700" alt="卡密库存池">
+  <br>
+  <em>图5: 卡密库存池</em>
+</div>
+
+<div align="center">
+  <img src="docs/assets/readme/orders.png" width="700" alt="订单列表">
+  <br>
+  <em>图6: 订单与发货状态</em>
+</div>
+
+## 🚴 快速开始
+
+### 环境要求
+
+- Linux（Ubuntu 22.04 / Debian 12）
 - Python 3.10+
-- Node.js 20+、npm 10+
-- 完整 `npm test` 包含 UI 合同，首次运行前需安装 Playwright Chromium；真实闲鱼、模型和订单接入需要单独的受控环境
+- Node.js 18+
 
-## 快速启动
+### 安装步骤
 
 ```bash
+# 1. 克隆仓库
 git clone https://github.com/tswawa/xianyu-saas.git
 cd xianyu-saas
+
+# 2. 初始化，建立虚拟环境、安装依赖并生成配置文件
 ./scripts/bootstrap-dev.sh
 ```
 
-初始化脚本会安装 API、Worker 和 Node 开发依赖，并创建未跟踪的 `config/saas.env`、`worker/.env` 与 `.local/`。复制/编辑 `config/saas.env` 时，本地开发请将 `SAAS_PUBLIC_ORIGIN` 设为 `http://127.0.0.1:4173`（或实际工作台地址），否则浏览器写请求来源校验可能失败。
+### 配置访问地址
 
-首次运行完整 `npm test` 前执行：
+修改 `config/saas.env`，地址需与实际访问地址一致，否则写请求会被来源校验拒绝：
 
-```bash
-npx playwright install --with-deps chromium
+```ini
+SAAS_PUBLIC_ORIGIN=http://127.0.0.1:4173
+SAAS_TRUSTED_HOSTS=127.0.0.1:4173,127.0.0.1:8096
+SAAS_COOKIE_SECURE=0
 ```
 
-编辑配置后运行：
+### 创建首位管理员
+
+空数据库不开放注册，首位管理员通过一次性令牌创建：
+
+```bash
+install -m 600 /dev/null "$PWD/.local/bootstrap-token"
+python3 -c 'import secrets; print(secrets.token_urlsafe(32))' > "$PWD/.local/bootstrap-token"
+```
+
+在 `config/saas.env` 中开启通道，令牌文件使用绝对路径：
+
+```ini
+SAAS_BOOTSTRAP_ENABLED=1
+SAAS_BOOTSTRAP_TOKEN_FILE=/path/to/xianyu-saas/.local/bootstrap-token
+SAAS_BOOTSTRAP_TRUSTED_SOURCES=127.0.0.1,::1
+```
+
+### 启动服务
 
 ```bash
 npm run dev
 ```
 
-默认地址：工作台 `http://127.0.0.1:4173/xianyu-saas/`；API 健康检查 `http://127.0.0.1:8096/health`。
-`npm run dev` 会同时启动 API、consumer 和 Web；按 `Ctrl+C` 一起停止。
+- 工作台：`http://127.0.0.1:4173/xianyu-saas/`
+- 健康检查：`http://127.0.0.1:8096/health`
 
-## 首位管理员
+登录页选择「创建首位管理员」并填入令牌。完成后将 `SAAS_BOOTSTRAP_ENABLED` 恢复为 `0`、删除令牌文件并重启。
 
-空数据库不会自动开放公开注册。公开注册开关只控制普通账号注册，不能单独创建首位管理员。
+### 接入店铺
 
-1. 在受控初始化窗口显式启用 `SAAS_BOOTSTRAP_ENABLED=1`，配置 `SAAS_BOOTSTRAP_TOKEN_FILE` 指向权限为 `0600` 的一次性令牌文件/凭据，并限制 `SAAS_BOOTSTRAP_TRUSTED_SOURCES`。
-2. 从受信任入口提交首位管理员表单；服务端原子创建 `admin` 并消费令牌。
-3. 登录确认后关闭 bootstrap、移除令牌文件/凭据并重启 API。
+进入「店铺管理」，扫码完成授权并设置备注名。可绑定多个店铺，通过顶部下拉切换当前操作的店铺。
 
-## 主要功能
+### 配置 AI 客服
 
-- **店铺管理**：服务端官方二维码授权、多店铺切换、店铺级登录态/数据/Worker 隔离。
-- **商品管理**：同步标题、简介、价格、上下架状态；补充资料可用 AI 整理预览，确认后保存。
-- **智能客服**：规则优先、AI 补充、人工接管；支持连续对话、快捷回复、文字和图片消息。
-- **对话沙盘**：与实际客服共用控制面引擎，只回显测试结果，不向闲鱼发送消息。
-- **订单与履约**：核验订单号、商品、买家、卖家、状态和数量；事务预留库存，异常转人工复核。
-- **运营与管理**：查看连接、Worker、消息和待办状态，维护发货模板、卡密池、账号权限和版本状态。
+进入「智能客服中心 → AI 客服设置」，填写模型接口地址、模型名与 API Key，支持 OpenAI 兼容、OpenAI Responses、Anthropic Messages、Google Gemini、Ollama 五种格式。连接测试通过后填写店铺与客服说明、选择人格预设并发布启用。发布前可在沙盘中连续模拟对话验证效果。
 
-AI 仅作用于客服交互层，不直接改订单或触发发货。平台 ACK 只表示接口受理，不表示买家已读或最终送达。
+### 配置自动发货
 
-> **当前边界**：离线合同和本地测试已覆盖主要 API、认证、隔离、AI 适配器、Worker 与 UI；真实闲鱼扫码/验证码/风控、真实模型调用质量、真实订单履约、Nginx/systemd 生产部署仍未验收。
+进入「自动化履约中心」，依次完成：
 
-## 配置
+1. 「卡密库存池」新建池并批量导入卡密
+2. 「发货模板库」新建模板，配置发货话术并绑定卡密池
+3. 「在售商品与发货资料」将模板绑定到对应商品
 
-开发配置由初始化脚本创建：`config/saas.env`（控制面与本地运行参数）和 `worker/.env`（Worker 参数）。
+买家付款后系统自动核验订单并发货。
 
-常用变量：
+## ⚙️ 主要配置项
 
-| 变量 | 作用 |
+| 变量 | 说明 |
 | --- | --- |
-| `SAAS_DB`、`SAAS_TENANTS_DIR` | SQLite 数据库与账号私有目录 |
-| `SAAS_PUBLIC_ORIGIN` | 浏览器写请求来源，保持与工作台的协议、主机和端口一致 |
-| `SAAS_TRUSTED_HOSTS` | 允许的 Host |
-| `SAAS_ALLOW_REGISTRATION` | 普通注册开关，生产保持 `0` |
-| `SAAS_AI_MASTER_KEY` | 加密保存账号级 AI 连接 |
-| `SAAS_BOOTSTRAP_*` | 首位管理员一次性初始化（含 `SAAS_BOOTSTRAP_TOKEN_FILE` 指向的令牌文件/凭据） |
+| `SAAS_PUBLIC_ORIGIN` | 工作台访问地址，需与实际地址一致 |
+| `SAAS_TRUSTED_HOSTS` | 允许的 Host，多个以逗号分隔 |
+| `SAAS_COOKIE_SECURE` | 本地 HTTP 调试设 `0`，线上设 `1` |
+| `SAAS_AI_MASTER_KEY` | 模型凭据加密主密钥，生产环境必填 |
+| `SAAS_MAX_BOTS` | 最大并发店铺进程数 |
+| `SAAS_BOT_MEM_MB` | 单店铺进程内存上限 |
+| `SAAS_ALLOW_REGISTRATION` | 是否开放注册，生产环境保持 `0` |
+| `SAAS_AUDIT_HMAC_KEY` | 审计日志脱敏 HMAC 密钥 |
+| `SAAS_UPDATE_PUBLIC_KEY_FILE` | 版本更新验签公钥绝对路径 |
 
-平台凭证、Cookie、Token、API Key 和主密钥只放在未跟踪配置或外部秘密系统中。
+完整变量说明见 `config/saas.env.example`。
 
-## 开发验证
+## 🧪 测试
 
 ```bash
+# 首次运行前安装 Chromium
+npx playwright install --with-deps chromium
+
+# 全量测试
 npm test
-npm run test:ui
-npm run test:repository
-git diff --check
+
+# 分模块测试
+npm run test:worker       # 履约状态机与消息处理
+npm run test:isolation    # 多店铺隔离
+npm run test:ai           # 模型接入与安全校验
+npm run test:auth         # 注册、角色与权限
+npm run test:ui           # 工作台界面
+npm run test:repository   # 仓库文件合规
 ```
 
-## 项目结构
+## 📁 目录结构
 
-- `frontend/`：静态工作台
-- `backend/`：FastAPI 控制面
-- `backend/job_consumer.py`：异步同步任务消费者
-- `worker/`：消息处理、规则/AI 回复与履约 Worker
-- `deploy/nginx/`、`deploy/systemd/`、`deploy/updater/`：生产模板与更新器；`tests/`、`worker/tests/`：API、隔离、Worker 和浏览器合同
+```text
+frontend/             工作台前端
+backend/              控制面服务（FastAPI）
+worker/               闲鱼消息监听、回复引擎与履约状态机
+deploy/               Nginx、systemd 与更新器配置
+scripts/              初始化与启动脚本
+tests/                接口与界面测试
+```
 
-## 安全与许可证
+## 🛡 注意事项
 
-- 不要把 Cookie、Token、API Key、密码、验证码、订单/买家消息、库存、数据库或日志提交到 Git。
-- 发现安全问题请通过 [`SECURITY.md`](SECURITY.md) 私下报告。
-- 原创代码采用 [`GPL-3.0-only`](LICENSE)。
-- `worker/` 基于 [`shaxiu/XianyuAutoAgent`](https://github.com/shaxiu/XianyuAutoAgent)，来源和许可见 [`worker/NOTICE.md`](worker/NOTICE.md)。
-- 本项目与闲鱼、淘宝、阿里巴巴或模型供应商无官方关联；使用者需遵守法律法规和平台规则。
+⚠️ 本项目仅供学习与交流使用。
+
+本项目与闲鱼、淘宝、阿里巴巴集团及各模型服务商无官方关联。使用者需遵守平台规则与当地法律法规，自行承担账号安全与数据合规风险。
+
+## 📄 许可证
+
+本项目基于 [GPL-3.0-only](LICENSE) 发布。
+
+`worker/` 基于 [shaxiu/XianyuAutoAgent](https://github.com/shaxiu/XianyuAutoAgent) 二次开发，遵循原作者署名与许可协议，详见 [`worker/NOTICE.md`](worker/NOTICE.md)。
