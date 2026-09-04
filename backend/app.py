@@ -1035,6 +1035,13 @@ class ManualReplyIn(BaseModel):
         extra = "forbid"
 
 
+class ManualImageDeleteIn(BaseModel):
+    path: str
+
+    class Config:
+        extra = "forbid"
+
+
 class ConversationReadIn(BaseModel):
     read: bool = True
 
@@ -4810,6 +4817,34 @@ async def upload_manual_image(
     return {"ok": True, "media": media}
 
 
+@app.delete("/api/bot/messages/image")
+def delete_manual_image(
+    body: ManualImageDeleteIn,
+    user=Depends(Auth.current_user),
+    account=Depends(current_shop_account),
+):
+    _require_permission(user, "records.read")
+    status = records.manual_image_delete_status(
+        user["id"], body.path, str(account["account_key"])
+    )
+    if status == "active":
+        raise HTTPException(
+            409,
+            detail={"code": "image_in_use", "message": "图片已进入发送队列，不能删除"},
+        )
+    if status == "unavailable":
+        raise HTTPException(
+            503,
+            detail={"code": "image_delete_unavailable", "message": "图片暂时无法删除，请稍后重试"},
+        )
+    if status == "invalid":
+        raise HTTPException(
+            404,
+            detail={"code": "image_not_found", "message": "图片不存在或已失效"},
+        )
+    return {"ok": True, "deleted": status == "deleted"}
+
+
 @app.get("/api/bot/messages")
 def get_messages(
     user=Depends(Auth.current_user),
@@ -4887,6 +4922,8 @@ def post_manual_reply(
             "status": message.get("status", "queued"),
             "attempts": message.get("attempts", 0),
             "platform_acknowledged": bool(message.get("platform_acknowledged")),
+            "current_part": message.get("current_part"),
+            "parts": message.get("parts", []),
         },
         "message": message,
     }

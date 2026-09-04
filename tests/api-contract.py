@@ -48,6 +48,7 @@ import app  # noqa: E402
 import bot_manager  # noqa: E402
 import shop_sync  # noqa: E402
 from platform_ai import identify_scope, issue_token, revoke_token  # noqa: E402
+from version import ASSET_VERSION, VERSION  # noqa: E402
 
 
 class UpstreamHandler(BaseHTTPRequestHandler):
@@ -424,8 +425,8 @@ def main():
         "password_min_length": 12,
     }
     assert client.get("/api/version/public").json() == {
-        "version": "0.1.0",
-        "asset_version": "20260831-01",
+        "version": VERSION,
+        "asset_version": ASSET_VERSION,
     }
     assert client.get("/api/version").status_code == 401
     assert client.get("/xianyu-saas/index.html").status_code == 404
@@ -489,8 +490,8 @@ def main():
     version = client.get("/api/version")
     assert version.status_code == 200
     version_payload = version.json()
-    assert version_payload["version"] == "0.1.0"
-    assert version_payload["asset_version"] == "20260831-01"
+    assert version_payload["version"] == VERSION
+    assert version_payload["asset_version"] == ASSET_VERSION
     assert version_payload["update_channel"] == "stable"
     assert set(version_payload) == {
         "version", "commit", "build_time", "asset_version", "update_channel",

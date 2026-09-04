@@ -4,7 +4,7 @@
 
   const API_PREFIX = "/xianyu-saas";
   const QR_LOGIN_POLL_MS = 1500;
-  const ASSET_VERSION = "20260831-01";
+  const ASSET_VERSION = "20260904-01";
   const AI_TEXT_PLACEHOLDERS = new Set(["无", "暂无", "没有", "未填写", "待填写", "待补充", "占位", "n/a", "na", "none", "null", "todo", "tbd"]);
   const ICONS = API_PREFIX + "/assets/icons.svg?v=" + ASSET_VERSION + "#";
   // 旧版视图 key → 新版视图 key（历史会话/书签兜底）。
@@ -22,6 +22,11 @@
   const ACTIVE_ACCOUNT_STORAGE_PREFIX = "xianyu-saas.active-account:";
   const INBOX_STORAGE_PREFIX = "xianyu-saas.inbox:";
   const MANUAL_IMAGE_MAX_BYTES = 8 * 1024 * 1024;
+  const MANUAL_IMAGE_MAX_COUNT = 8;
+  const MANUAL_REPLY_UPLOAD_TIMEOUT_MS = 30_000;
+  const MANUAL_REPLY_POST_TIMEOUT_MS = 30_000;
+  const MANUAL_REPLY_DELETE_TIMEOUT_MS = 10_000;
+  const MANUAL_REPLY_OPERATION_WAIT_TIMEOUT_MS = 35_000;
   const MANUAL_IMAGE_TYPES = new Set(["image/jpeg", "image/png", "image/gif", "image/webp"]);
   const state = {
     authMode: "login",
@@ -95,13 +100,14 @@
     messageSelectionInFlight: false,
     manualReply: {
       request: null,
-      file: null,
-      media: null,
-      attachmentKey: "",
-      previewUrl: "",
+      attachments: [],
       dragging: false,
       submitting: false,
       uploading: false,
+      uploadingIndex: -1,
+      cleaning: false,
+      operation: null,
+      destructiveOperation: null,
       polling: new Set(),
       generation: 0,
     },
@@ -1648,11 +1654,100 @@
       && state.conversationCommands[context.kind]?.get(context.chatId) === context.generation;
   }
 
-  function revokeManualReplyPreview() {
-    if (state.manualReply.previewUrl) {
-      URL.revokeObjectURL(state.manualReply.previewUrl);
-      state.manualReply.previewUrl = "";
+  function revokeManualReplyAttachmentPreview(attachment) {
+    const previewUrl = String(attachment?.previewUrl || "");
+    if (previewUrl) URL.revokeObjectURL(previewUrl);
+    if (attachment) attachment.previewUrl = "";
+  }
+
+  async function deleteManualReplyUploadedMedia(media, accountKey = state.activeAccountKey, { strict = false } = {}) {
+    const path = String(media?.path || "").trim();
+    if (!path) return false;
+    try {
+      await api("/api/bot/messages/image", {
+        method: "DELETE",
+        headers: accountKey ? { "X-Shop-Account": accountKey } : {},
+        body: JSON.stringify({ path }),
+        timeoutMs: MANUAL_REPLY_DELETE_TIMEOUT_MS,
+        suppressSessionReset: true,
+      });
+      return true;
+    } catch (error) {
+      if (strict) throw error;
+      return false;
     }
+  }
+
+  async function cleanupManualReplyUploadedMedia(accountKey = state.activeAccountKey) {
+    const uploaded = state.manualReply.attachments.filter((attachment) => attachment?.media?.path);
+    if (!uploaded.length) return true;
+    state.manualReply.cleaning = true;
+    renderChat();
+    let firstError = null;
+    try {
+      for (const attachment of uploaded) {
+        try {
+          await deleteManualReplyUploadedMedia(attachment.media, accountKey, { strict: true });
+          attachment.media = null;
+        } catch (error) {
+          if (!firstError) firstError = error;
+        }
+      }
+    } finally {
+      state.manualReply.cleaning = false;
+      renderChat();
+    }
+    if (firstError) throw firstError;
+    return true;
+  }
+
+  function manualReplyOperationInFlight() {
+    return Boolean(state.manualReply.operation || state.manualReply.destructiveOperation);
+  }
+
+  function waitForManualReplyOperation(operation) {
+    if (!operation?.promise) return Promise.resolve();
+    let timer = 0;
+    const timeout = new Promise((_, reject) => {
+      timer = window.setTimeout(() => {
+        reject(new ApiError("当前回复请求超时，未执行操作，请刷新后重试", 408, "manual_reply_operation_timeout"));
+      }, MANUAL_REPLY_OPERATION_WAIT_TIMEOUT_MS);
+    });
+    return Promise.race([operation.promise, timeout]).finally(() => {
+      if (timer) window.clearTimeout(timer);
+    });
+  }
+
+  async function prepareManualReplyForDestructiveAction(accountKey = state.activeAccountKey) {
+    const operation = state.manualReply.operation;
+    if (operation) {
+      operation.cancelled = true;
+      await waitForManualReplyOperation(operation);
+    }
+    return cleanupManualReplyUploadedMedia(accountKey);
+  }
+
+  function runManualReplyDestructiveAction(task) {
+    if (state.manualReply.destructiveOperation) return state.manualReply.destructiveOperation;
+    const operation = Promise.resolve().then(task);
+    state.manualReply.destructiveOperation = operation;
+    operation.then(
+      () => { if (state.manualReply.destructiveOperation === operation) state.manualReply.destructiveOperation = null; },
+      () => { if (state.manualReply.destructiveOperation === operation) state.manualReply.destructiveOperation = null; },
+    );
+    return operation;
+  }
+
+  function releaseManualReplyAttachments({ cleanupUploaded = false, accountKey = state.activeAccountKey } = {}) {
+    const attachments = state.manualReply.attachments.splice(0);
+    const cleanupTasks = [];
+    attachments.forEach((attachment) => {
+      revokeManualReplyAttachmentPreview(attachment);
+      if (cleanupUploaded && attachment?.media?.path) {
+        cleanupTasks.push(deleteManualReplyUploadedMedia(attachment.media, accountKey));
+      }
+    });
+    return cleanupTasks;
   }
 
   function setManualReplyDragActive(active) {
@@ -1662,29 +1757,36 @@
     $(".chat-window")?.classList.toggle("is-drag-active", state.manualReply.dragging);
   }
 
-  function resetManualReplyContext({ clearInput = true } = {}) {
+  function resetManualReplyContext({ clearInput = true, cleanupUploaded = true, accountKey = state.activeAccountKey, force = false } = {}) {
+    const activeOperation = state.manualReply.operation;
+    if (activeOperation && !force) {
+      activeOperation.cancelled = true;
+      return waitForManualReplyOperation(activeOperation)
+        .then(() => resetManualReplyContext({ clearInput, cleanupUploaded, accountKey, force: true }))
+        .catch((error) => {
+          if (error?.code === "manual_reply_operation_timeout") {
+            showToast("当前回复仍在处理中，未执行清理操作", "error");
+          }
+          return false;
+        });
+    }
+    const shouldCleanupUploaded = cleanupUploaded && (!state.manualReply.submitting || state.manualReply.uploading);
     state.manualReply.generation += 1;
     state.manualReply.request = null;
-    state.manualReply.file = null;
-    state.manualReply.media = null;
-    state.manualReply.attachmentKey = "";
-    revokeManualReplyPreview();
+    const cleanupTasks = releaseManualReplyAttachments({ cleanupUploaded: shouldCleanupUploaded, accountKey });
     setManualReplyDragActive(false);
     state.manualReply.submitting = false;
     state.manualReply.uploading = false;
+    state.manualReply.uploadingIndex = -1;
     state.manualReply.polling.clear();
     const input = $("#manualReplyInput");
     const file = $("#manualReplyFile");
     if (clearInput && input) input.value = "";
     if (file) file.value = "";
-    text("#manualReplyFileName", "");
-    text("#manualReplyFileMeta", "");
-    $("#manualReplyPreview")?.setAttribute("hidden", "");
-    $("#manualReplyPreviewImage")?.removeAttribute("src");
-    $("#clearManualReplyFile")?.setAttribute("hidden", "");
     formMessage("#replyMessage", "");
     setBusy($("#manualReplyForm button[type=submit]"), false);
     renderManualReplyAttachment();
+    return Promise.allSettled(cleanupTasks);
   }
 
   function manualReplyContextMatches(chatId, epoch, accountKey, generation) {
@@ -1874,20 +1976,70 @@
     if (state.activeAccountKey && path.startsWith("/api/") && !headers["X-Shop-Account"]) {
       headers["X-Shop-Account"] = state.activeAccountKey;
     }
-    let response;
+    let timeoutMs = Number(options.timeoutMs || 0);
+    if (!Number.isFinite(timeoutMs) || timeoutMs < 0) timeoutMs = 0;
+    const fetchOptions = Object.assign({}, options, {
+      credentials: "same-origin",
+      headers,
+    });
+    delete fetchOptions.timeoutMs;
+    const suppressSessionReset = Boolean(fetchOptions.suppressSessionReset);
+    delete fetchOptions.suppressSessionReset;
+    let controller = null;
+    let detachAbort = null;
+    if (timeoutMs > 0 && typeof AbortController === "function") {
+      controller = new AbortController();
+      const originalSignal = options.signal;
+      if (originalSignal) {
+        if (originalSignal.aborted) controller.abort();
+        else {
+          const onAbort = () => controller.abort();
+          originalSignal.addEventListener("abort", onAbort, { once: true });
+          detachAbort = () => originalSignal.removeEventListener("abort", onAbort);
+        }
+      }
+      fetchOptions.signal = controller.signal;
+    }
+    const clearRequestTimer = () => {
+      if (detachAbort) detachAbort();
+      detachAbort = null;
+    };
+    let timeoutTimer = 0;
+    let timedOutByPromise = false;
+    const requestPromise = fetch(API_PREFIX + path, fetchOptions).then(async (response) => {
+      if (response.status === 401 && !path.startsWith("/api/auth/") && !suppressSessionReset) {
+        clearSession(false);
+        throw new ApiError("登录已过期，请重新登录", 401);
+      }
+      return readResponse(response);
+    });
+    // A timed-out fetch may reject after the race settles; attach a handler so
+    // cancellation never becomes an unhandled browser rejection.
+    requestPromise.catch(() => {});
     try {
-      response = await fetch(API_PREFIX + path, Object.assign({}, options, {
-        credentials: "same-origin",
-        headers,
-      }));
+      if (timeoutMs > 0) {
+        const timeoutPromise = new Promise((_, reject) => {
+          timeoutTimer = window.setTimeout(() => {
+            timedOutByPromise = true;
+            if (controller) controller.abort();
+            reject(new ApiError("请求超时，请稍后重试", 408, "request_timeout"));
+          }, timeoutMs);
+        });
+        return await Promise.race([requestPromise, timeoutPromise]);
+      }
+      return await requestPromise;
     } catch (error) {
+      if (timedOutByPromise) {
+        throw new ApiError("请求超时，请稍后重试", 408, "request_timeout");
+      }
+      if (error instanceof ApiError) throw error;
+      if (error?.name === "AbortError") throw new ApiError("请求已取消，请稍后重试", 499, "request_cancelled");
       throw new ApiError("网络连接失败，请稍后重试");
+    } finally {
+      if (timeoutTimer) window.clearTimeout(timeoutTimer);
+      timeoutTimer = 0;
+      clearRequestTimer();
     }
-    if (response.status === 401 && !path.startsWith("/api/auth/")) {
-      clearSession(false);
-      throw new ApiError("登录已过期，请重新登录", 401);
-    }
-    return readResponse(response);
   }
 
   function setBusy(button, busy) {
@@ -2325,6 +2477,7 @@
     stopMerchantPolling();
     ["xianyuLoginDialog", "quickRepliesDialog", "batchDeliveryDialog", "templateEditorDialog", "cardsEditorDialog", "confirmDialog"].forEach(closeDialog);
     state.confirmAction = null;
+    resetManualReplyContext();
     state.view = "home";
     state.me = null;
     state.accounts = [];
@@ -2333,7 +2486,6 @@
     state.accountEpoch += 1;
     state.messageLoadGeneration += 1;
     state.messageSelectionInFlight = false;
-    resetManualReplyContext();
     resetConversationCommands();
     state.config = null;
     state.bot = null;
@@ -2387,14 +2539,27 @@
     if (showMessage) showToast("已退出登录");
   }
 
-  async function logout() {
-    await cancelQrLogin(true, true);
-    try {
-      await api("/api/auth/logout", { method: "POST" });
-    } catch (error) {
-      // The session may already have expired.
-    }
-    clearSession(true);
+  function logout() {
+    return runManualReplyDestructiveAction(async () => {
+      await cancelQrLogin(true, true);
+      const accountKey = state.activeAccountKey;
+      try {
+        await prepareManualReplyForDestructiveAction(accountKey);
+      } catch (error) {
+        if (error?.status !== 401) {
+          showToast(error.message || "待发送图片清理失败，请稍后重试", "error");
+          return;
+        }
+        // An already-expired session cannot authorize cleanup; local logout must still finish.
+      }
+      await resetManualReplyContext({ cleanupUploaded: false, accountKey });
+      try {
+        await api("/api/auth/logout", { method: "POST" });
+      } catch (error) {
+        // The session may already have expired.
+      }
+      clearSession(true);
+    });
   }
 
   async function loadAccounts() {
@@ -2419,6 +2584,10 @@
     const key = String(accountKey || "").trim();
     const account = state.accounts.find((item) => item.key === key && item.enabled !== false);
     if (!account || key === state.activeAccountKey) return;
+    if (manualReplyOperationInFlight()) {
+      showToast("请等待当前回复处理完成后再切换店铺", "warning");
+      return;
+    }
     if (!confirmDiscardAiChanges("店铺")) return;
     resetManualReplyContext();
     state.activeAccountKey = key;
@@ -2589,8 +2758,12 @@
     text("#confirmTitle", "删除店铺");
     text("#confirmMessage", "删除后会停止该店铺的自动处理并从列表隐藏，其他店铺不受影响。");
     text("#confirmAction", "确认删除");
-    state.confirmAction = async () => {
+    state.confirmAction = () => runManualReplyDestructiveAction(async () => {
       const wasActive = state.activeAccountKey === account.key;
+      if (wasActive) {
+        await prepareManualReplyForDestructiveAction(account.key);
+        await resetManualReplyContext({ cleanupUploaded: false, accountKey: account.key });
+      }
       await api("/api/bot/accounts/" + encodeURIComponent(account.key), { method: "DELETE" });
       await loadAccounts();
       if (wasActive) {
@@ -2601,7 +2774,6 @@
           state.accountEpoch += 1;
           state.messageLoadGeneration += 1;
           state.messageSelectionInFlight = false;
-          resetManualReplyContext();
           resetConversationCommands();
           state.config = null;
           state.bot = null;
@@ -2628,7 +2800,7 @@
       renderOverview();
       showView("shops", true);
       showToast("店铺已删除");
-    };
+    });
     const dialog = $("#confirmDialog");
     if (typeof dialog?.showModal === "function") dialog.showModal();
     else dialog?.setAttribute("open", "");
@@ -3800,6 +3972,10 @@
     ].join(":");
   }
 
+  function manualReplyAttachmentSnapshot() {
+    return JSON.stringify(state.manualReply.attachments.map((attachment) => String(attachment?.key || "")));
+  }
+
   function validateManualImageFile(file) {
     const mime = String(file?.type || "").split(";", 1)[0].trim().toLowerCase();
     const size = Number(file?.size || 0);
@@ -3811,66 +3987,80 @@
   }
 
   function renderManualReplyAttachment() {
-    const file = state.manualReply.file;
-    const media = state.manualReply.media;
-    const hasAttachment = Boolean(file || media);
-    const name = file ? manualImageFileName(file) : String(media?.name || media?.label || "图片");
-    const fileName = $("#manualReplyFileName");
-    const fileMeta = $("#manualReplyFileMeta");
+    const attachments = state.manualReply.attachments;
     const preview = $("#manualReplyPreview");
-    const previewImage = $("#manualReplyPreviewImage");
-    const hint = $("#manualReplyDropHint");
-    const clear = $("#clearManualReplyFile");
+    const count = $("#manualReplyImageCount");
     const dropzone = $("#manualReplyDropzone");
-    if (fileName) fileName.textContent = hasAttachment ? "已选择：" + name : "";
-    if (fileMeta) fileMeta.textContent = file ? "图片 · " + manualImageFileSize(file.size) : hasAttachment ? "图片已准备发送" : "";
-    if (preview) preview.hidden = !file || !state.manualReply.previewUrl;
-    if (previewImage) {
-      if (file && state.manualReply.previewUrl) {
-        previewImage.src = state.manualReply.previewUrl;
-        previewImage.alt = name || "待发送图片";
-      } else {
-        previewImage.removeAttribute("src");
-      }
+    const locked = state.manualReply.submitting || state.manualReply.uploading || state.manualReply.cleaning || manualReplyOperationInFlight();
+    if (count) count.textContent = attachments.length + " / " + MANUAL_IMAGE_MAX_COUNT + " 张";
+    if (preview) {
+      preview.hidden = !attachments.length;
+      preview.innerHTML = attachments.map((attachment, index) => {
+        const file = attachment?.file;
+        const name = manualImageFileName(file);
+        const placeholderMarkup = '<span class="reply-image-placeholder"' + (attachment?.previewUrl ? " hidden" : "") + '><svg class="icon"><use href="' + ICONS + 'file-text"></use></svg></span>';
+        const previewMarkup = '<span class="reply-image-thumb">' + (attachment?.previewUrl
+          ? '<img src="' + esc(attachment.previewUrl) + '" alt="第 ' + (index + 1) + ' 张待发送图片" onerror="this.hidden=true;this.nextElementSibling.hidden=false">'
+          : "") + placeholderMarkup + '</span>';
+        const status = state.manualReply.uploadingIndex === index
+          ? "正在上传"
+          : attachment?.media
+            ? "已上传，等待提交"
+            : "待上传";
+        return '<article class="reply-image-card" data-manual-attachment="' + index + '">' +
+          '<span class="reply-image-order" aria-hidden="true">' + (index + 1) + '</span>' +
+          previewMarkup +
+          '<div class="reply-image-copy"><strong>' + esc(name) + '</strong><small>' + esc(status + " · " + manualImageFileSize(file?.size)) + '</small></div>' +
+          '<button class="icon-button" type="button" data-remove-manual-attachment="' + index + '" aria-label="移除第 ' + (index + 1) + ' 张待发送图片" title="移除这张图片"' + (locked ? " disabled" : "") + '><svg class="icon"><use href="' + ICONS + 'x"></use></svg></button>' +
+          '</article>';
+      }).join("");
     }
-    if (hint) hint.hidden = hasAttachment;
-    if (clear) clear.hidden = !hasAttachment;
-    if (dropzone) dropzone.classList.toggle("has-attachment", hasAttachment);
+    if (dropzone) dropzone.classList.toggle("has-attachment", attachments.length > 0);
     setManualReplyDragActive(state.manualReply.dragging);
   }
 
-  function setManualReplyImage(file) {
+  function appendManualReplyImages(files) {
+    if (state.manualReply.submitting || state.manualReply.uploading || state.manualReply.cleaning || manualReplyOperationInFlight()) return false;
+    const selectedFiles = Array.from(files || []).filter(Boolean);
+    if (!selectedFiles.length) return false;
     const selected = state.conversations.find((item) => String(item.chat_id) === String(state.selectedChatId));
     if (!selected || !conversationTakeover(selected)) {
       formMessage("#replyMessage", "请先人工接管当前对话再发送图片");
       return false;
     }
-    if (!validateManualImageFile(file)) return false;
-    revokeManualReplyPreview();
-    state.manualReply.request = null;
-    state.manualReply.file = file;
-    state.manualReply.media = null;
-    state.manualReply.attachmentKey = manualImageAttachmentKey(file);
-    state.manualReply.previewUrl = URL.createObjectURL(file);
-    formMessage("#replyMessage", "图片已加入待发送回复，点击发送后上传", true);
-    renderChat();
-    return true;
-  }
-
-  function chooseManualReplyImage(files) {
-    const selectedFiles = Array.from(files || []).filter(Boolean);
-    if (!selectedFiles.length) return false;
-    if (selectedFiles.length > 1) {
-      formMessage("#replyMessage", "目前一次只能发送一张图片");
+    if (state.manualReply.attachments.length + selectedFiles.length > MANUAL_IMAGE_MAX_COUNT) {
+      formMessage("#replyMessage", "人工回复最多可添加 8 张图片，本次选择未加入");
       return false;
     }
-    return setManualReplyImage(selectedFiles[0]);
+    if (!selectedFiles.every(validateManualImageFile)) return false;
+    state.manualReply.request = null;
+    selectedFiles.forEach((file) => {
+      let previewUrl = "";
+      try {
+        previewUrl = URL.createObjectURL(file);
+      } catch (error) {
+        previewUrl = "";
+      }
+      state.manualReply.attachments.push({
+        key: manualImageAttachmentKey(file),
+        file,
+        media: null,
+        previewUrl,
+      });
+    });
+    formMessage(
+      "#replyMessage",
+      selectedFiles.length + " 张图片已追加，将按当前顺序逐张发送",
+      true,
+    );
+    renderChat();
+    return true;
   }
 
   function handleManualReplyFileSelection(event) {
     const files = Array.from(event.currentTarget.files || []);
     event.currentTarget.value = "";
-    chooseManualReplyImage(files);
+    appendManualReplyImages(files);
   }
 
   async function uploadManualReplyFile(file, chatId) {
@@ -3881,6 +4071,8 @@
         "X-File-Name": manualImageFileName(file),
       },
       body: file,
+      timeoutMs: MANUAL_REPLY_UPLOAD_TIMEOUT_MS,
+      suppressSessionReset: true,
     });
     const media = result?.media;
     if (!media || media.type !== "image" || !media.path) {
@@ -3889,18 +4081,25 @@
     return media;
   }
 
-  function clearManualReplyImage() {
-    if (state.manualReply.uploading) return;
+  function removeManualReplyAttachment(index) {
+    if (state.manualReply.submitting || state.manualReply.uploading || state.manualReply.cleaning || manualReplyOperationInFlight()) return;
+    const attachmentIndex = Number(index);
+    if (!Number.isInteger(attachmentIndex) || attachmentIndex < 0 || attachmentIndex >= state.manualReply.attachments.length) return;
+    const accountKey = state.activeAccountKey;
+    const [attachment] = state.manualReply.attachments.splice(attachmentIndex, 1);
     state.manualReply.request = null;
-    state.manualReply.file = null;
-    state.manualReply.media = null;
-    state.manualReply.attachmentKey = "";
-    revokeManualReplyPreview();
+    revokeManualReplyAttachmentPreview(attachment);
     const file = $("#manualReplyFile");
     if (file) file.value = "";
-    formMessage("#replyMessage", "");
-    renderManualReplyAttachment();
+    formMessage("#replyMessage", "已移除第 " + (attachmentIndex + 1) + " 张待发送图片", true);
     renderChat();
+    if (attachment?.media?.path) void deleteManualReplyUploadedMedia(attachment.media, accountKey);
+  }
+
+  function handleManualReplyAttachmentClick(event) {
+    const button = event.target.closest("[data-remove-manual-attachment]");
+    if (!button) return;
+    removeManualReplyAttachment(button.dataset.removeManualAttachment);
   }
 
   function transferHasFiles(transfer) {
@@ -3922,7 +4121,7 @@
     if (!files.length) return;
     event.preventDefault();
     event.stopPropagation();
-    chooseManualReplyImage(files);
+    appendManualReplyImages(files);
   }
 
   function handleManualReplyDragEnter(event) {
@@ -3953,7 +4152,115 @@
     event.preventDefault();
     event.stopPropagation();
     setManualReplyDragActive(false);
-    chooseManualReplyImage(event.dataTransfer.files);
+    appendManualReplyImages(event.dataTransfer.files);
+  }
+
+  const MANUAL_REPLY_STATUS_LABELS = {
+    draft: "未发送",
+    queued: "等待发送",
+    sending: "正在发送",
+    retry: "正在重试",
+    acknowledged: "闲鱼已接收",
+    dead_letter: "发送终止，需处理",
+    manual_review: "未发送，需重新处理",
+    failed: "未发送",
+    waiting: "等待前序消息",
+    unknown: "状态待确认",
+  };
+
+  function manualReplyStatusClass(status) {
+    if (status === "acknowledged") return "is-success";
+    if (["dead_letter", "manual_review", "failed"].includes(status)) return "is-error";
+    if (status === "retry") return "is-retry";
+    if (["sending", "queued"].includes(status)) return "is-active";
+    return "is-waiting";
+  }
+
+  function normaliseManualReplyParts(value) {
+    if (!Array.isArray(value)) return [];
+    const statuses = new Set(Object.keys(MANUAL_REPLY_STATUS_LABELS));
+    return value.slice(0, MANUAL_IMAGE_MAX_COUNT + 1).map((part, position) => {
+      const kind = String(part?.kind || "").toLowerCase();
+      if (!["image", "text"].includes(kind)) return null;
+      const index = Number(part?.index);
+      const status = String(part?.status || "unknown").toLowerCase();
+      return {
+        index: Number.isInteger(index) && index >= 0 ? index : position,
+        kind,
+        status: statuses.has(status) ? status : "unknown",
+      };
+    }).filter(Boolean).sort((left, right) => left.index - right.index);
+  }
+
+  function manualReplyProgressSummary(parts, parentStatus) {
+    const imageParts = parts.filter((part) => part.kind === "image");
+    const textPart = parts.find((part) => part.kind === "text");
+    const acknowledgedImages = imageParts.filter((part) => part.status === "acknowledged").length;
+    const current = parts.find((part) => part.status !== "acknowledged") || null;
+    if (parentStatus === "acknowledged" || !current) return "全部分段已被闲鱼接收";
+    const terminal = ["dead_letter", "manual_review", "failed"].includes(parentStatus)
+      || ["dead_letter", "manual_review", "failed"].includes(current.status);
+    if (current.kind === "image") {
+      const imageNumber = imageParts.findIndex((part) => part.index === current.index) + 1;
+      if (terminal) {
+        return (acknowledgedImages ? "已接收 " + acknowledgedImages + "/" + imageParts.length + " 张图片，" : "")
+          + "第 " + imageNumber + " 张及后续内容未发送";
+      }
+      const currentCopy = {
+        queued: "等待发送",
+        sending: "正在发送",
+        retry: "正在重试",
+        waiting: "等待前序消息",
+        unknown: "状态待确认",
+      }[current.status] || MANUAL_REPLY_STATUS_LABELS[current.status];
+      return (acknowledgedImages ? "已接收 " + acknowledgedImages + "/" + imageParts.length + " 张图片，" : "")
+        + "第 " + imageNumber + "/" + imageParts.length + " 张图片" + currentCopy;
+    }
+    if (current.kind === "text") {
+      const prefix = imageParts.length ? acknowledgedImages + " 张图片已接收，" : "";
+      if (terminal) return prefix + "文字未发送，需重新处理";
+      const currentCopy = {
+        queued: "等待发送",
+        sending: "正在发送",
+        retry: "正在重试",
+        waiting: "等待前序消息",
+        unknown: "状态待确认",
+      }[current.status] || MANUAL_REPLY_STATUS_LABELS[current.status];
+      return prefix + "文字" + currentCopy;
+    }
+    return textPart ? "图片按顺序发送，文字最后发送" : "图片按顺序逐张发送";
+  }
+
+  function manualReplyDeliveryMarkup(item) {
+    const status = String(item?.delivery_status || item?.status || "unknown").toLowerCase();
+    const safeStatus = Object.prototype.hasOwnProperty.call(MANUAL_REPLY_STATUS_LABELS, status) ? status : "unknown";
+    const parts = normaliseManualReplyParts(item?.parts);
+    const statusClass = manualReplyStatusClass(safeStatus);
+    if (!parts.length) {
+      const fallback = item?.role === "assistant_manual_draft" ? "未发送" : "";
+      const label = MANUAL_REPLY_STATUS_LABELS[safeStatus] || fallback;
+      return label ? '<span class="message-status ' + statusClass + '">' + esc(label) + '</span>' : "";
+    }
+    let imageNumber = 0;
+    const partsMarkup = parts.map((part) => {
+      const label = part.kind === "image" ? "图片 " + (++imageNumber) : "文字";
+      return '<li class="message-part-status ' + manualReplyStatusClass(part.status) + '" data-part-kind="' + part.kind + '" data-part-status="' + part.status + '"><span>' + esc(label) + '</span><strong>' + esc(MANUAL_REPLY_STATUS_LABELS[part.status]) + '</strong></li>';
+    }).join("");
+    return '<div class="message-delivery" data-parent-status="' + safeStatus + '">' +
+      '<div class="message-delivery-parent ' + statusClass + '"><span>父任务</span><strong>' + esc(MANUAL_REPLY_STATUS_LABELS[safeStatus]) + '</strong></div>' +
+      '<p class="message-delivery-summary">' + esc(manualReplyProgressSummary(parts, safeStatus)) + '</p>' +
+      '<ol class="message-part-list" aria-label="发送分段状态">' + partsMarkup + '</ol>' +
+      '</div>';
+  }
+
+  function manualReplyFeedbackText(reply) {
+    const status = String(reply?.status || reply?.delivery_status || "queued").toLowerCase();
+    const safeStatus = Object.prototype.hasOwnProperty.call(MANUAL_REPLY_STATUS_LABELS, status) ? status : "unknown";
+    const parts = normaliseManualReplyParts(reply?.parts);
+    if (safeStatus === "acknowledged") return parts.length > 1 ? "全部发送分段已被闲鱼接收" : "闲鱼已接收这条回复";
+    if (["dead_letter", "manual_review", "failed"].includes(safeStatus)) return "父任务未完成，剩余分段需要重新处理";
+    if (parts.length) return "父任务已提交；" + manualReplyProgressSummary(parts, safeStatus);
+    return safeStatus === "unknown" ? "回复状态暂时无法确认，请刷新查看" : "回复已排队，等待闲鱼确认";
   }
 
   function renderChat(options = {}) {
@@ -3998,11 +4305,12 @@
     const uploadButton = $(".reply-image-button");
     const dropzone = $("#manualReplyDropzone");
     const hasSelection = Boolean(state.selectedChatId);
-    input.disabled = !hasSelection || state.manualReply.uploading;
-    submit.disabled = !hasSelection || !selectedTakeover || state.manualReply.submitting || state.manualReply.uploading;
-    if (upload) upload.disabled = !hasSelection || !selectedTakeover || state.manualReply.uploading;
-    if (uploadButton) uploadButton.classList.toggle("is-disabled", !hasSelection || !selectedTakeover || state.manualReply.uploading);
-    if (dropzone) dropzone.classList.toggle("is-disabled", !hasSelection || !selectedTakeover || state.manualReply.uploading);
+    const replyLocked = state.manualReply.submitting || state.manualReply.uploading || state.manualReply.cleaning || manualReplyOperationInFlight();
+    input.disabled = !hasSelection || replyLocked;
+    submit.disabled = !hasSelection || !selectedTakeover || replyLocked;
+    if (upload) upload.disabled = !hasSelection || !selectedTakeover || replyLocked;
+    if (uploadButton) uploadButton.classList.toggle("is-disabled", !hasSelection || !selectedTakeover || replyLocked);
+    if (dropzone) dropzone.classList.toggle("is-disabled", !hasSelection || !selectedTakeover || replyLocked);
     if (!hasSelection) input.placeholder = "选择一个对话后回复";
     else input.placeholder = selectedTakeover ? "输入回复内容（Enter 发送，Shift+Enter 换行）" : "需要人工处理时，先点击“人工接管”";
     renderManualReplyAttachment();
@@ -4016,23 +4324,12 @@
       const buyer = item.role === "user";
       const manual = item.role === "assistant_manual" || item.role === "assistant_manual_draft";
       const role = buyer ? "买家" : item.role === "assistant_manual_draft" ? "仅草稿" : manual ? "人工回复" : "AI 客服";
-      const status = String(item.delivery_status || item.status || "");
-      const statusLabels = {
-        draft: "未发送",
-        queued: "等待发送",
-        sending: "正在发送",
-        retry: "正在重试",
-        acknowledged: "闲鱼已接收",
-        manual_review: "未发送，需重新处理",
-        failed: "未发送",
-        unknown: "状态待确认",
-      };
-      const statusText = manual ? (statusLabels[status] || (item.role === "assistant_manual_draft" ? "未发送" : "")) : "";
       const content = messageContentText(item);
       const mediaMarkup = messageMediaMarkup(item.media, item.content_type, item.content);
       const contentMarkup = content ? '<div class="message-text">' + esc(content) + '</div>' : '';
       const matched = state.messageSearch && item.matched === true;
-      return '<div class="message-row ' + (buyer ? "is-buyer" : "is-seller") + '"><span class="message-role">' + role + '</span><div class="message-bubble' + (matched ? " is-matched" : "") + '">' + contentMarkup + mediaMarkup + '</div><time>' + esc(formatDate(item.time)) + '</time>' + (statusText ? '<span class="message-status' + (status === "manual_review" || status === "failed" ? " is-error" : status === "acknowledged" ? " is-success" : "") + '">' + esc(statusText) + '</span>' : '') + "</div>";
+      const deliveryMarkup = manual ? manualReplyDeliveryMarkup(item) : "";
+      return '<div class="message-row ' + (buyer ? "is-buyer" : "is-seller") + '"><span class="message-role">' + role + '</span><div class="message-bubble' + (matched ? " is-matched" : "") + '">' + contentMarkup + mediaMarkup + '</div><time>' + esc(formatDate(item.time)) + '</time>' + deliveryMarkup + "</div>";
     }).join("");
     if (!options.preserveScroll || nearBottom) area.scrollTop = area.scrollHeight;
     if (last && !selected) text("#chatItemName", productTitle(last.item_id));
@@ -4267,11 +4564,14 @@
     state.conversations = Array.isArray(conversationData?.conversations) ? conversationData.conversations : [];
     const hasConversation = (candidate) => state.conversations.some((item) => String(item.chat_id || "") === candidate);
     const currentChatId = String(state.selectedChatId || "");
-    const nextChatId = requestedChatId && hasConversation(requestedChatId)
+    let nextChatId = requestedChatId && hasConversation(requestedChatId)
       ? requestedChatId
       : currentChatId && hasConversation(currentChatId)
         ? currentChatId
         : String(state.conversations[0]?.chat_id || "");
+    if (manualReplyOperationInFlight() && currentChatId && nextChatId !== currentChatId) {
+      nextChatId = currentChatId;
+    }
     if (nextChatId !== currentChatId) {
       resetManualReplyContext();
       state.selectedChatId = nextChatId;
@@ -4349,6 +4649,10 @@
       if (conversationUnread(state.conversations.find((item) => item.chat_id === selected))) {
         void markConversationRead(selected, { silent: true });
       }
+      return;
+    }
+    if (manualReplyOperationInFlight()) {
+      showToast("请等待当前回复处理完成后再切换对话", "warning");
       return;
     }
     state.messageSelectionInFlight = true;
@@ -4995,12 +5299,12 @@
 
   async function sendManualReply(event) {
     event.preventDefault();
-    if (state.manualReply.submitting || state.manualReply.uploading) return;
+    if (state.manualReply.submitting || state.manualReply.uploading || state.manualReply.cleaning || manualReplyOperationInFlight()) return;
     const input = $("#manualReplyInput");
     const content = input.value.trim();
-    const hasAttachment = Boolean(state.manualReply.file || state.manualReply.media);
+    const hasAttachment = state.manualReply.attachments.length > 0;
     if (!content && !hasAttachment) {
-      formMessage("#replyMessage", "请输入回复内容或选择一张图片");
+      formMessage("#replyMessage", "请输入回复内容或选择图片");
       return;
     }
     if (!state.selectedChatId) {
@@ -5016,63 +5320,97 @@
     const epoch = state.accountEpoch;
     const accountKey = state.activeAccountKey;
     const generation = state.manualReply.generation;
+    const mediaKey = manualReplyAttachmentSnapshot();
     const existingRequest = state.manualReply.request;
-    const attachmentKey = state.manualReply.attachmentKey
-      || String(state.manualReply.media?.path || state.manualReply.media?.url || state.manualReply.media?.name || "");
     const requestId = existingRequest?.generation === generation
       && existingRequest?.chatId === chatId
       && existingRequest?.content === content
-      && existingRequest?.mediaKey === attachmentKey
+      && existingRequest?.mediaKey === mediaKey
       ? existingRequest.id
       : newClientRequestId();
-    state.manualReply.request = { id: requestId, chatId, content, mediaKey: attachmentKey, generation };
-    const button = event.submitter;
+    state.manualReply.request = { id: requestId, chatId, content, mediaKey, generation };
+    let finishOperation;
+    const operation = {
+      cancelled: false,
+      promise: new Promise((resolve) => { finishOperation = resolve; }),
+    };
+    state.manualReply.operation = operation;
+    const button = event.submitter || $("#manualReplyForm button[type=submit]");
     state.manualReply.submitting = true;
     setBusy(button, true);
     renderChat();
     try {
-      let media = state.manualReply.media ? [state.manualReply.media] : [];
-      if (!media.length && state.manualReply.file) {
-        state.manualReply.uploading = true;
-        renderChat();
-        const uploaded = await uploadManualReplyFile(state.manualReply.file, chatId);
-        if (!manualReplyContextMatches(chatId, epoch, accountKey, generation)) return;
-        state.manualReply.media = uploaded;
-        media = [uploaded];
-        state.manualReply.uploading = false;
-        renderChat();
+      const media = [];
+      for (let index = 0; index < state.manualReply.attachments.length; index += 1) {
+        if (operation.cancelled) return;
+        const attachment = state.manualReply.attachments[index];
+        if (!attachment.media) {
+          state.manualReply.uploading = true;
+          state.manualReply.uploadingIndex = index;
+          renderChat();
+          const uploaded = await uploadManualReplyFile(attachment.file, chatId);
+          attachment.media = uploaded;
+          if (operation.cancelled) return;
+          if (!manualReplyContextMatches(chatId, epoch, accountKey, generation)) {
+            attachment.media = null;
+            void deleteManualReplyUploadedMedia(uploaded, accountKey);
+            return;
+          }
+        }
+        media.push(attachment.media);
       }
+      state.manualReply.uploading = false;
+      state.manualReply.uploadingIndex = -1;
+      renderChat();
+      if (operation.cancelled) return;
       if (!manualReplyContextMatches(chatId, epoch, accountKey, generation)) return;
       const result = await api("/api/bot/messages/reply", {
         method: "POST",
         headers: { "Idempotency-Key": requestId },
         body: JSON.stringify({ content, chat_id: chatId, media }),
+        timeoutMs: MANUAL_REPLY_POST_TIMEOUT_MS,
+        suppressSessionReset: true,
       });
       if (!manualReplyContextMatches(chatId, epoch, accountKey, generation)) return;
-      mergeManualReplyMessage(result.message);
+      const reply = Object.assign({}, result?.message || {}, result?.reply || {});
+      const message = result?.message || Object.assign({
+        role: "assistant_manual",
+        content,
+        content_type: media.length ? (content ? "rich" : "image") : "text",
+        media,
+        time: new Date().toISOString(),
+        chat_id: chatId,
+        reply_id: requestId,
+      }, reply, { delivery_status: reply.status || "queued" });
+      mergeManualReplyMessage(message);
       if (input.value.trim() === content) input.value = "";
       if (state.manualReply.request?.id === requestId) state.manualReply.request = null;
-      if (state.manualReply.attachmentKey === attachmentKey) {
-        state.manualReply.file = null;
-        state.manualReply.media = null;
-        state.manualReply.attachmentKey = "";
-        revokeManualReplyPreview();
-        const file = $("#manualReplyFile");
-        if (file) file.value = "";
-      }
-      formMessage("#replyMessage", result?.reply?.status === "acknowledged" ? "闲鱼已接收这条回复" : "回复已排队，等待闲鱼确认", true);
+      releaseManualReplyAttachments({ cleanupUploaded: false });
+      const file = $("#manualReplyFile");
+      if (file) file.value = "";
+      formMessage("#replyMessage", manualReplyFeedbackText(reply), reply.status === "acknowledged");
       renderChat();
-      void pollManualReply(requestId, chatId, epoch, accountKey, generation);
+      if (ACTIVE_MANUAL_REPLY_STATUSES.has(String(reply.status || "queued"))) {
+        void pollManualReply(requestId, chatId, epoch, accountKey, generation);
+      } else {
+        void refreshManualReplyMessages(chatId, epoch, accountKey, generation);
+      }
     } catch (error) {
       if (manualReplyContextMatches(chatId, epoch, accountKey, generation)) {
         formMessage("#replyMessage", error.message || "回复发送失败，请稍后重试");
       }
     } finally {
-      if (manualReplyContextMatches(chatId, epoch, accountKey, generation)) {
-        state.manualReply.submitting = false;
-        state.manualReply.uploading = false;
-        setBusy(button, false);
-        renderChat();
+      try {
+        if (manualReplyContextMatches(chatId, epoch, accountKey, generation)) {
+          state.manualReply.submitting = false;
+          state.manualReply.uploading = false;
+          state.manualReply.uploadingIndex = -1;
+          setBusy(button, false);
+          renderChat();
+        }
+      } finally {
+        if (state.manualReply.operation === operation) state.manualReply.operation = null;
+        finishOperation();
       }
     }
   }
@@ -5090,6 +5428,10 @@
   }
 
   const ACTIVE_MANUAL_REPLY_STATUSES = new Set(["queued", "sending", "retry"]);
+
+  function manualReplyPartsSignature(value) {
+    return JSON.stringify(normaliseManualReplyParts(value));
+  }
 
   function pollVisibleManualReplies() {
     const chatId = String(state.selectedChatId || "");
@@ -5110,7 +5452,22 @@
     if (!message) return;
     message.delivery_status = "unknown";
     message.status = "unknown";
+    const currentPart = Number(message.current_part);
+    if (Number.isInteger(currentPart) && Array.isArray(message.parts)) {
+      message.parts = message.parts.map((part) => Number(part?.index) === currentPart && part?.status !== "acknowledged"
+        ? Object.assign({}, part, { status: "unknown" })
+        : part);
+    }
     renderChat();
+  }
+
+  async function refreshManualReplyMessages(chatId, epoch, accountKey, generation) {
+    if (!manualReplyContextMatches(chatId, epoch, accountKey, generation)) return;
+    try {
+      await loadMessages(chatId, { preserveScroll: true });
+    } catch (error) {
+      // The next status poll or the regular inbox refresh retries this view.
+    }
   }
 
   async function pollManualReply(replyId, chatId, epoch, accountKey, generation) {
@@ -5137,20 +5494,24 @@
         const reply = result?.reply;
         if (!reply) continue;
         const message = state.messages.find((item) => String(item.reply_id || "") === replyId);
+        const previousParts = manualReplyPartsSignature(message?.parts);
+        const previousCurrentPart = String(message?.current_part ?? "");
         if (message) {
-          message.delivery_status = reply.status;
-          message.status = reply.status;
-          message.attempts = reply.attempts;
+          Object.assign(message, reply, {
+            delivery_status: reply.status,
+            status: reply.status,
+          });
           renderChat();
         }
-        if (!ACTIVE_MANUAL_REPLY_STATUSES.has(String(reply.status || ""))) {
-          formMessage(
-            "#replyMessage",
-            reply.status === "acknowledged" ? "闲鱼已接收这条回复" : "这条回复未发送，需要重新处理",
-            reply.status === "acknowledged",
-          );
-          return;
+        const partsChanged = previousParts !== manualReplyPartsSignature(reply.parts)
+          || previousCurrentPart !== String(reply.current_part ?? "");
+        const active = ACTIVE_MANUAL_REPLY_STATUSES.has(String(reply.status || ""));
+        if (partsChanged || !active) {
+          await refreshManualReplyMessages(chatId, epoch, accountKey, generation);
+          if (!manualReplyContextMatches(chatId, epoch, accountKey, generation)) return;
         }
+        formMessage("#replyMessage", manualReplyFeedbackText(reply), reply.status === "acknowledged");
+        if (!active) return;
       }
       if (manualReplyContextMatches(chatId, epoch, accountKey, generation)) {
         markManualReplyStatusUnknown(replyId);
@@ -5782,7 +6143,7 @@
       }
     });
     $("#manualReplyFile").addEventListener("change", handleManualReplyFileSelection);
-    $("#clearManualReplyFile").addEventListener("click", clearManualReplyImage);
+    $("#manualReplyPreview").addEventListener("click", handleManualReplyAttachmentClick);
     $(".chat-window").addEventListener("paste", handleManualReplyPaste);
     $(".chat-window").addEventListener("dragenter", handleManualReplyDragEnter);
     $(".chat-window").addEventListener("dragover", handleManualReplyDragOver);

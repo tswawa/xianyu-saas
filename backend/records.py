@@ -3,7 +3,9 @@ import hashlib
 import json
 import math
 import os
+import re
 import sqlite3
+import stat
 import time
 import uuid
 from datetime import date, datetime, timedelta
@@ -20,6 +22,13 @@ _MANUAL_IMAGE_MIME = {
     "image/gif": ("gif", (b"GIF87a", b"GIF89a")),
     "image/webp": ("webp", None),
 }
+_MANUAL_IMAGE_NAME = re.compile(
+    r"^manual_reply_[0-9a-f]{32}\.(?:jpg|png|gif|webp)$"
+)
+_MANUAL_IMAGE_TTL_SECONDS = 24 * 60 * 60
+_MANUAL_IMAGE_CLEANUP_SCAN_LIMIT = 256
+_MANUAL_IMAGE_CLEANUP_DELETE_LIMIT = 64
+_MANUAL_REPLY_ACTIVE_STATUSES = frozenset({"queued", "retry", "sending", "manual_review"})
 
 
 def _normalise_media(value, *, include_private=False):
@@ -100,6 +109,9 @@ def save_manual_image(user_id: int, data: bytes, filename: str = "", mime: str =
     if not detected_mime or (supplied_mime and supplied_mime != detected_mime):
         raise ValueError("仅支持有效的 JPG、PNG、GIF 或 WebP 图片")
     root = _account_root(user_id, account_key, create=True)
+    # Sweep old orphans before creating the new file so even a zero/clock-skewed
+    # cutoff can never remove the upload that this call is about to return.
+    cleanup_stale_manual_images(user_id, account_key)
     stored_name = f"manual_reply_{uuid.uuid4().hex}.{extension}"
     target = os.path.join(root, stored_name)
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
@@ -119,7 +131,7 @@ def save_manual_image(user_id: int, data: bytes, filename: str = "", mime: str =
         "alt": display_name or "图片",
         "label": display_name or "图片",
         "mime": detected_mime,
-        "name": display_name or stored_name,
+        "name": display_name or "图片",
     }
 
 
@@ -170,6 +182,182 @@ def _connect_writable(user_id: int, name: str, account_key: str = DEFAULT_ACCOUN
         return con
     except sqlite3.Error:
         return None
+
+
+def _manual_image_filename(value) -> str:
+    name = str(value or "").strip()
+    if not _MANUAL_IMAGE_NAME.fullmatch(name):
+        return ""
+    return name
+
+
+def _manual_reply_media_names(value):
+    """Return ordered private image names, or ``None`` for an unknown shape."""
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+    if not isinstance(value, list) or len(value) > 8:
+        return None
+    names = []
+    for raw in value:
+        if not isinstance(raw, dict):
+            return None
+        if str(raw.get("type") or "").strip().lower() != "image":
+            return None
+        raw_path = raw.get("path")
+        if raw_path in (None, ""):
+            continue
+        name = _manual_image_filename(raw_path)
+        if not name:
+            return None
+        names.append(name)
+    return names
+
+
+def _manual_image_is_active(con, name: str) -> bool:
+    if con is None:
+        return False
+    name = _manual_image_filename(name)
+    if not name:
+        return True
+    exists = con.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'manual_reply_drafts'"
+    ).fetchone()
+    if exists is None:
+        return False
+    columns = {
+        str(row[1]) for row in con.execute("PRAGMA table_info(manual_reply_drafts)").fetchall()
+    }
+    if "status" not in columns or "media_json" not in columns:
+        # An unknown legacy shape cannot prove that the file is unreferenced.
+        return True
+    parts_available = _table_exists(con, "manual_reply_parts")
+    rows = con.execute(
+        """SELECT id, media_json FROM manual_reply_drafts
+           WHERE status IN ('queued', 'retry', 'sending', 'manual_review')"""
+    ).fetchall()
+    for row in rows:
+        names = _manual_reply_media_names(row["media_json"])
+        if names is None:
+            return True
+        matching_indexes = [index for index, candidate in enumerate(names) if candidate == name]
+        if not matching_indexes:
+            continue
+        if not parts_available:
+            return True
+        for media_index in matching_indexes:
+            part = con.execute(
+                """SELECT acknowledged_at FROM manual_reply_parts
+                   WHERE outbox_id = ? AND kind = 'image' AND media_index = ?""",
+                (int(row["id"]), media_index),
+            ).fetchone()
+            if part is None or part["acknowledged_at"] is None:
+                return True
+    return False
+
+
+def _unlink_manual_image_at(root: str, name: str) -> bool:
+    name = _manual_image_filename(name)
+    if not name:
+        return False
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    root_fd = os.open(root, flags)
+    try:
+        try:
+            file_stat = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return False
+        if not stat.S_ISREG(file_stat.st_mode):
+            return False
+        os.unlink(name, dir_fd=root_fd)
+        return True
+    finally:
+        os.close(root_fd)
+
+
+def manual_image_delete_status(
+    user_id: int,
+    path: str,
+    account_key: str = DEFAULT_ACCOUNT_ID,
+) -> str:
+    """Return deleted/not_found/active/invalid/unavailable for one private image."""
+    name = _manual_image_filename(path)
+    if not name:
+        return "invalid"
+    try:
+        root = os.path.realpath(_account_root(user_id, account_key))
+    except OSError:
+        return "unavailable"
+    if not os.path.isdir(root):
+        return "not_found"
+    database_path = os.path.join(root, "chat_history.db")
+    con = _connect_writable(user_id, "chat_history.db", account_key)
+    if con is None and os.path.exists(database_path):
+        # Never delete without checking references when the account database
+        # exists but cannot be opened or locked safely.
+        return "unavailable"
+    try:
+        if con is not None:
+            con.execute("BEGIN IMMEDIATE")
+            if _manual_image_is_active(con, name):
+                con.rollback()
+                return "active"
+        deleted = _unlink_manual_image_at(root, name)
+        if con is not None:
+            con.commit()
+        return "deleted" if deleted else "not_found"
+    except (OSError, sqlite3.Error):
+        if con is not None:
+            con.rollback()
+        return "unavailable"
+    finally:
+        if con is not None:
+            con.close()
+
+
+def delete_manual_image(
+    user_id: int,
+    path: str,
+    account_key: str = DEFAULT_ACCOUNT_ID,
+) -> bool:
+    """Delete one unreferenced account-local temporary image."""
+    return manual_image_delete_status(user_id, path, account_key) == "deleted"
+
+
+def cleanup_stale_manual_images(
+    user_id: int,
+    account_key: str = DEFAULT_ACCOUNT_ID,
+    *,
+    ttl_seconds: float = _MANUAL_IMAGE_TTL_SECONDS,
+) -> int:
+    """Boundedly remove expired, unreferenced account-local manual reply images."""
+    try:
+        ttl_seconds = max(float(ttl_seconds), 0.0)
+        root = os.path.realpath(_account_root(user_id, account_key))
+        cutoff = time.time() - ttl_seconds
+        candidates = []
+        with os.scandir(root) as entries:
+            for inspected, entry in enumerate(entries, start=1):
+                if inspected > _MANUAL_IMAGE_CLEANUP_SCAN_LIMIT:
+                    break
+                name = _manual_image_filename(entry.name)
+                if not name:
+                    continue
+                try:
+                    file_stat = entry.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                if stat.S_ISREG(file_stat.st_mode) and file_stat.st_mtime <= cutoff:
+                    candidates.append((file_stat.st_mtime, name))
+        deleted = 0
+        for _mtime, name in sorted(candidates)[:_MANUAL_IMAGE_CLEANUP_DELETE_LIMIT]:
+            if delete_manual_image(user_id, name, account_key):
+                deleted += 1
+        return deleted
+    except (OSError, TypeError, ValueError):
+        return 0
 
 
 def _table_exists(con, table_name: str) -> bool:
@@ -258,6 +446,110 @@ class ManualReplyQueueError(RuntimeError):
         self.code = code
 
 
+def _normalise_manual_reply_media_input(media):
+    if media is None:
+        return []
+    if not isinstance(media, list) or len(media) > 8:
+        raise ManualReplyQueueError("invalid_media", "人工回复最多支持 8 张图片")
+    clean_media = []
+    seen_paths = set()
+    for raw in media:
+        if not isinstance(raw, dict) or str(raw.get("type") or "").strip().lower() != "image":
+            raise ManualReplyQueueError("invalid_media", "人工回复只支持 JPG、PNG、GIF 或 WebP 图片")
+        name = _manual_image_filename(raw.get("path"))
+        if not name or name in seen_paths:
+            raise ManualReplyQueueError("invalid_media", "图片已失效，请重新选择")
+        normalized = _normalise_media([raw], include_private=True)
+        if len(normalized) != 1 or normalized[0].get("path") != name:
+            raise ManualReplyQueueError("invalid_media", "图片已失效，请重新选择")
+        seen_paths.add(name)
+        normalized[0]["type"] = "image"
+        # Manual uploads are always sent from the account-local temporary file;
+        # a caller-provided remote URL is neither trusted nor part of delivery.
+        normalized[0]["url"] = ""
+        clean_media.append(normalized[0])
+    return clean_media
+
+
+def _normalise_manual_reply_private_media(media):
+    """Strictly parse every private image without the public 8-item truncation."""
+    if media is None:
+        raw_items = []
+    elif isinstance(media, str):
+        try:
+            raw_items = json.loads(media)
+        except (TypeError, ValueError, json.JSONDecodeError) as error:
+            raise sqlite3.IntegrityError("manual reply media is invalid") from error
+    else:
+        raw_items = media
+    if not isinstance(raw_items, list) or len(raw_items) > 8:
+        raise sqlite3.IntegrityError("manual reply media is invalid")
+    normalized = _normalise_media(raw_items, include_private=True)
+    if len(normalized) != len(raw_items):
+        raise sqlite3.IntegrityError("manual reply media is invalid")
+    seen_paths = set()
+    for raw, item in zip(raw_items, normalized):
+        if (
+            not isinstance(raw, dict)
+            or str(raw.get("type") or "").strip().lower() != "image"
+        ):
+            raise sqlite3.IntegrityError("manual reply media is invalid")
+        path = _manual_image_filename(raw.get("path"))
+        if not path or item.get("path") != path or path in seen_paths:
+            raise sqlite3.IntegrityError("manual reply media is invalid")
+        seen_paths.add(path)
+    return normalized
+
+
+def _validate_manual_reply_media(user_id: int, account_key: str, media):
+    clean_media = _normalise_manual_reply_media_input(media)
+    if not clean_media:
+        return []
+    try:
+        root = os.path.realpath(_account_root(user_id, account_key))
+        root_fd = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    except OSError as error:
+        raise ManualReplyQueueError("invalid_media", "图片已失效，请重新选择") from error
+    try:
+        for item in clean_media:
+            name = item["path"]
+            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+            try:
+                descriptor = os.open(name, flags, dir_fd=root_fd)
+                try:
+                    file_stat = os.fstat(descriptor)
+                    if (
+                        not stat.S_ISREG(file_stat.st_mode)
+                        or file_stat.st_size < 1
+                        or file_stat.st_size > _MANUAL_IMAGE_MAX_BYTES
+                    ):
+                        raise OSError("invalid media file")
+                    header = os.read(descriptor, 16)
+                finally:
+                    os.close(descriptor)
+            except OSError as error:
+                raise ManualReplyQueueError("invalid_media", "图片已失效，请重新选择") from error
+            detected_mime = ""
+            extension = name.rsplit(".", 1)[-1]
+            for candidate, (suffix, signature) in _MANUAL_IMAGE_MIME.items():
+                if candidate == "image/webp":
+                    matched = len(header) >= 12 and header[:4] == b"RIFF" and header[8:12] == b"WEBP"
+                elif isinstance(signature, tuple):
+                    matched = any(header.startswith(item) for item in signature)
+                else:
+                    matched = header.startswith(signature)
+                if matched and suffix == extension:
+                    detected_mime = candidate
+                    break
+            supplied_mime = str(item.get("mime") or "").split(";", 1)[0].strip().lower()
+            if not detected_mime or (supplied_mime and supplied_mime != detected_mime):
+                raise ManualReplyQueueError("invalid_media", "图片已失效，请重新选择")
+            item["mime"] = detected_mime
+    finally:
+        os.close(root_fd)
+    return clean_media
+
+
 def _ensure_manual_reply_outbox(con):
     """Migrate the old draft table into a durable account-local outbox."""
     con.execute(
@@ -302,6 +594,117 @@ def _ensure_manual_reply_outbox(con):
         """CREATE INDEX IF NOT EXISTS idx_manual_reply_available
            ON manual_reply_drafts(status, available_at, id)"""
     )
+    con.execute(
+        """CREATE TABLE IF NOT EXISTS manual_reply_parts (
+               outbox_id INTEGER NOT NULL,
+               part_index INTEGER NOT NULL,
+               kind TEXT NOT NULL CHECK (kind IN ('image', 'text')),
+               media_index INTEGER,
+               acknowledged_at REAL,
+               sent_media_json TEXT NOT NULL DEFAULT '[]',
+               PRIMARY KEY (outbox_id, part_index)
+           )"""
+    )
+    con.execute(
+        """CREATE INDEX IF NOT EXISTS idx_manual_reply_parts_pending
+           ON manual_reply_parts(outbox_id, acknowledged_at, part_index)"""
+    )
+
+
+def _manual_reply_part_specs(content, media):
+    images = _normalise_manual_reply_private_media(media)
+    parts = [(index, "image", index) for index, _item in enumerate(images)]
+    if str(content or "").strip():
+        parts.append((len(parts), "text", None))
+    return parts
+
+
+def _manual_reply_part_rows(con, outbox_id: int):
+    return con.execute(
+        """SELECT outbox_id, part_index, kind, media_index,
+                  acknowledged_at, sent_media_json
+           FROM manual_reply_parts
+           WHERE outbox_id = ? ORDER BY part_index""",
+        (int(outbox_id),),
+    ).fetchall()
+
+
+def _ensure_manual_reply_parts(con, row):
+    if row is None:
+        return []
+    outbox_id = int(row["id"])
+    parts = _manual_reply_part_rows(con, outbox_id)
+    status = str(row["status"] or "draft")
+    if _manual_reply_is_tombstone(row):
+        return parts
+    specs = _manual_reply_part_specs(row["content"], row["media_json"])
+    if not parts and status in _MANUAL_REPLY_ACTIVE_STATUSES:
+        if not specs:
+            raise sqlite3.IntegrityError("manual reply has no deliverable parts")
+        con.executemany(
+            """INSERT OR IGNORE INTO manual_reply_parts(
+                   outbox_id, part_index, kind, media_index,
+                   acknowledged_at, sent_media_json
+               ) VALUES (?, ?, ?, ?, NULL, '[]')""",
+            [(outbox_id, part_index, kind, media_index) for part_index, kind, media_index in specs],
+        )
+        parts = _manual_reply_part_rows(con, outbox_id)
+    if not parts:
+        return parts
+    actual = [
+        (
+            int(part["part_index"]),
+            str(part["kind"]),
+            None if part["media_index"] is None else int(part["media_index"]),
+        )
+        for part in parts
+    ]
+    if actual != specs:
+        raise sqlite3.IntegrityError("manual reply parts do not match the parent payload")
+    pending_seen = False
+    for part in parts:
+        if part["acknowledged_at"] is None:
+            pending_seen = True
+        elif pending_seen:
+            raise sqlite3.IntegrityError("manual reply acknowledgements are out of order")
+    if status == "acknowledged" and pending_seen:
+        raise sqlite3.IntegrityError("acknowledged manual reply has a pending part")
+    return parts
+
+
+def _manual_reply_parts_payload(status: str, parts):
+    parts = list(parts or [])
+    raw_status = str(status or "draft")
+    current_part = None
+    for part in parts:
+        if part["acknowledged_at"] is None:
+            current_part = int(part["part_index"])
+            break
+    # Legacy acknowledged rows deliberately have no parts.  Modern rows derive
+    # completion from their parts, while an inconsistent acknowledged parent is
+    # exposed fail-closed until its unfinished part is handled.
+    effective_status = raw_status
+    if parts and current_part is None:
+        effective_status = "acknowledged"
+    elif parts and raw_status == "acknowledged":
+        effective_status = "manual_review"
+    payload = []
+    for part in parts:
+        part_index = int(part["part_index"])
+        if part["acknowledged_at"] is not None:
+            part_status = "acknowledged"
+        elif part_index == current_part:
+            part_status = effective_status
+        else:
+            part_status = "waiting"
+        payload.append(
+            {
+                "index": part_index,
+                "kind": str(part["kind"]),
+                "status": part_status,
+            }
+        )
+    return effective_status, current_part, payload
 
 
 def _manual_reply_digest(chat_id: str, content: str, media=None) -> str:
@@ -317,20 +720,45 @@ def _manual_reply_digest(chat_id: str, content: str, media=None) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def _manual_reply_is_tombstone(row) -> bool:
+    if row is None or str(row["status"] or "") != "acknowledged":
+        return False
+    if (
+        str(row["chat_id"] or "")
+        or str(row["item_id"] or "")
+        or str(row["content"] or "")
+    ):
+        return False
+    try:
+        return not _normalise_manual_reply_private_media(row["media_json"])
+    except (sqlite3.IntegrityError, TypeError, ValueError, OverflowError):
+        return False
+
+
 def _compact_manual_reply_outbox(con) -> None:
-    """Bound retained reply text while keeping a large idempotency window."""
+    """Bound full acknowledged payloads while retaining digest tombstones."""
     rows = con.execute(
-        """SELECT id, chat_id, content, media_json
-           FROM manual_reply_drafts
-           WHERE status = 'acknowledged'
-             AND COALESCE(request_id, '') != ''
-             AND content != ''
-             AND id NOT IN (
-                 SELECT id FROM manual_reply_drafts
-                 WHERE status = 'acknowledged'
-                   AND COALESCE(request_id, '') != ''
-                   AND content != ''
-                 ORDER BY id DESC LIMIT ?
+        """SELECT drafts.id, drafts.chat_id, drafts.content, drafts.media_json
+           FROM manual_reply_drafts AS drafts
+           WHERE drafts.status = 'acknowledged'
+             AND COALESCE(drafts.request_id, '') != ''
+             AND COALESCE(drafts.chat_id, '') != ''
+             AND NOT EXISTS (
+                 SELECT 1 FROM manual_reply_parts AS unfinished
+                 WHERE unfinished.outbox_id = drafts.id
+                   AND unfinished.acknowledged_at IS NULL
+             )
+             AND drafts.id NOT IN (
+                 SELECT kept.id FROM manual_reply_drafts AS kept
+                 WHERE kept.status = 'acknowledged'
+                   AND COALESCE(kept.request_id, '') != ''
+                   AND COALESCE(kept.chat_id, '') != ''
+                   AND NOT EXISTS (
+                       SELECT 1 FROM manual_reply_parts AS unfinished_kept
+                       WHERE unfinished_kept.outbox_id = kept.id
+                         AND unfinished_kept.acknowledged_at IS NULL
+                   )
+                 ORDER BY kept.id DESC LIMIT ?
              )""",
         (_MANUAL_REPLY_FULL_RETENTION,),
     ).fetchall()
@@ -348,28 +776,189 @@ def _compact_manual_reply_outbox(con) -> None:
                 for row in rows
             ],
         )
+        con.executemany(
+            "UPDATE manual_reply_parts SET sent_media_json = '[]' WHERE outbox_id = ?",
+            [(int(row["id"]),) for row in rows],
+        )
     con.execute(
         """DELETE FROM manual_reply_drafts
            WHERE status = 'acknowledged'
              AND COALESCE(request_id, '') != ''
+             AND COALESCE(chat_id, '') = ''
+             AND COALESCE(item_id, '') = ''
              AND content = ''
+             AND COALESCE(media_json, '[]') = '[]'
              AND COALESCE(payload_digest, '') != ''
              AND id NOT IN (
                  SELECT id FROM manual_reply_drafts
                  WHERE status = 'acknowledged'
                    AND COALESCE(request_id, '') != ''
+                   AND COALESCE(chat_id, '') = ''
+                   AND COALESCE(item_id, '') = ''
                    AND content = ''
+                   AND COALESCE(media_json, '[]') = '[]'
                    AND COALESCE(payload_digest, '') != ''
                  ORDER BY id DESC LIMIT ?
              )""",
         (_MANUAL_REPLY_TOMBSTONE_RETENTION,),
     )
+    con.execute(
+        """DELETE FROM manual_reply_parts
+           WHERE outbox_id NOT IN (SELECT id FROM manual_reply_drafts)"""
+    )
 
 
-def _manual_reply_payload(row, *, include_content: bool = False):
+def _manual_reply_public_media(value):
+    media = _normalise_media(value)
+    for item in media:
+        item.pop("name", None)
+        if item.get("type") == "image" and not item.get("url"):
+            item["alt"] = "图片"
+            item["label"] = "图片"
+    return media
+
+
+def _mark_manual_reply_invalid_payload(con, row) -> None:
+    """Best-effort quarantine for an active malformed parent inside its reader transaction."""
+    if row is None or str(row["status"] or "") not in _MANUAL_REPLY_ACTIVE_STATUSES:
+        return
+    try:
+        con.execute(
+            """UPDATE manual_reply_drafts
+               SET status = 'manual_review', lease_owner = NULL,
+                   lease_until = NULL, last_error_code = 'invalid_payload',
+                   updated_at = ?
+               WHERE id = ?
+                 AND status IN ('queued', 'retry', 'sending', 'manual_review')
+                 AND (
+                     status != 'manual_review'
+                     OR lease_owner IS NOT NULL
+                     OR lease_until IS NOT NULL
+                     OR COALESCE(last_error_code, '') != 'invalid_payload'
+                 )""",
+            (time.time(), int(row["id"])),
+        )
+    except (sqlite3.Error, TypeError, ValueError, OverflowError):
+        return
+
+
+def _manual_reply_redacted_payload(row, *, include_content: bool = False):
+    """Return only safe metadata for a malformed manual reply."""
+    try:
+        attempts = int(row["attempts"] or 0)
+    except (TypeError, ValueError, OverflowError):
+        attempts = 0
+    try:
+        updated_at = float(row["updated_at"] or 0)
+    except (TypeError, ValueError, OverflowError):
+        updated_at = 0.0
+    if not math.isfinite(updated_at) or updated_at < 0:
+        updated_at = 0.0
+    payload = {
+        "reply_id": str(row["request_id"] or ""),
+        "outbox_id": int(row["id"]),
+        "chat_id": str(row["chat_id"] or ""),
+        "item_id": str(row["item_id"] or ""),
+        "status": "manual_review",
+        "attempts": max(attempts, 0),
+        "platform_acknowledged": False,
+        "current_part": None,
+        "parts": [],
+        "created_at": str(row["created_at"] or ""),
+        "updated_at": updated_at,
+    }
+    if include_content:
+        payload.update(
+            {
+                "role": "assistant_manual",
+                "content": "",
+                "content_type": "text",
+                "media": [],
+                "time": str(row["created_at"] or ""),
+                "delivery_status": "manual_review",
+            }
+        )
+    return payload
+
+
+def _manual_reply_content_type(content, media):
+    if not media:
+        return "text"
+    if len(media) == 1 and media[0].get("type") == "image":
+        return "image"
+    return "rich"
+
+
+def _manual_reply_source(value):
+    """Parse the legacy/base key and the planned per-part source suffixes."""
+    pieces = str(value or "").split(":")
+    if len(pieces) < 2 or pieces[0] != "manual_reply" or not pieces[1].isdigit():
+        return None
+    outbox_id = int(pieces[1])
+    if outbox_id < 1:
+        return None
+    if len(pieces) == 2:
+        return outbox_id, "base", 0
+    if len(pieces) == 3 and pieces[2] == "text":
+        return outbox_id, "text", None
+    if (
+        len(pieces) == 4
+        and pieces[2] == "image"
+        and pieces[3].isdigit()
+        and 2 <= int(pieces[3]) <= 8
+    ):
+        return outbox_id, "image", int(pieces[3]) - 1
+    return None
+
+
+def _manual_reply_source_part_index(source, parts):
+    if source is None:
+        return 0
+    _outbox_id, kind, part_index = source
+    if kind != "text":
+        return int(part_index or 0)
+    for part in parts or []:
+        if str(part["kind"]) == "text":
+            return int(part["part_index"])
+    # The canonical text suffix is only used when images precede it.  Keep an
+    # orphaned/corrupt source stable after every possible image part.
+    return 8
+
+
+def _manual_reply_pending_content(row, parts):
+    private_media = _normalise_manual_reply_private_media(row["media_json"])
+    pending_media = []
+    text_pending = False
+    for part in parts:
+        if part["acknowledged_at"] is not None:
+            continue
+        kind = str(part["kind"])
+        if kind == "text":
+            text_pending = True
+            continue
+        if kind != "image" or part["media_index"] is None:
+            raise sqlite3.IntegrityError("manual reply part is invalid")
+        media_index = int(part["media_index"])
+        if (
+            media_index < 0
+            or media_index >= len(private_media)
+            or private_media[media_index].get("type") != "image"
+        ):
+            raise sqlite3.IntegrityError("manual reply media part is invalid")
+        item = dict(private_media[media_index])
+        item["url"] = ""
+        pending_media.append(item)
+    content = _message_content(row["content"]) if text_pending else ""
+    return content, _manual_reply_public_media(pending_media)
+
+
+def _manual_reply_payload(row, *, include_content: bool = False, parts=None):
     if row is None:
         return None
-    status = str(row["status"] or "draft")
+    parts = list(parts or [])
+    raw_status = str(row["status"] or "draft")
+    status, current_part, parts_payload = _manual_reply_parts_payload(raw_status, parts)
+    platform_acknowledged = status == "acknowledged" and current_part is None
     payload = {
         "reply_id": str(row["request_id"] or ""),
         "outbox_id": int(row["id"]),
@@ -377,17 +966,35 @@ def _manual_reply_payload(row, *, include_content: bool = False):
         "item_id": str(row["item_id"] or ""),
         "status": status,
         "attempts": int(row["attempts"] or 0),
-        "platform_acknowledged": status == "acknowledged",
+        "platform_acknowledged": platform_acknowledged,
+        "current_part": current_part,
+        "parts": parts_payload,
         "created_at": str(row["created_at"] or ""),
         "updated_at": float(row["updated_at"] or 0),
     }
     if include_content:
-        media = _normalise_media(row["media_json"] if "media_json" in row.keys() else None)
+        if parts and current_part is not None:
+            content, media = _manual_reply_pending_content(row, parts)
+        elif parts and current_part is None:
+            # A completed multi-part parent is not itself a platform message.
+            # Return a single accurate part only when the task had exactly one.
+            if len(parts) == 1 and str(parts[0]["kind"]) == "text":
+                content, media = _message_content(row["content"]), []
+            elif len(parts) == 1 and str(parts[0]["kind"]) == "image":
+                content = ""
+                media = _manual_reply_public_media(parts[0]["sent_media_json"])
+            else:
+                content, media = "", []
+        else:
+            content = _message_content(row["content"])
+            media = _manual_reply_public_media(
+                row["media_json"] if "media_json" in row.keys() else None
+            )
         payload.update(
             {
                 "role": "assistant_manual_draft" if status == "draft" else "assistant_manual",
-                "content": _message_content(row["content"]),
-                "content_type": "image" if len(media) == 1 and media[0].get("type") == "image" else "rich" if media else "text",
+                "content": content,
+                "content_type": _manual_reply_content_type(content, media),
                 "media": media,
                 "time": str(row["created_at"] or ""),
                 "delivery_status": status,
@@ -443,6 +1050,22 @@ def _message_content(text, limit=16000):
     if not isinstance(text, str):
         return ""
     return text.strip()[:limit]
+
+
+def _message_time_value(value) -> float:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError, OverflowError):
+        numeric = 0.0
+    if math.isfinite(numeric) and numeric > 0:
+        return numeric
+    text = str(value or "").strip()
+    if not text:
+        return 0.0
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+    except (TypeError, ValueError, OverflowError, OSError):
+        return 0.0
 
 
 def _buyer_label(value) -> str:
@@ -593,10 +1216,12 @@ def messages(
     search: str = "",
 ):
     """Return complete messages for one selected chat, never a mixed inbox."""
-    con = _connect(user_id, "chat_history.db", account_key)
+    con = _connect_writable(user_id, "chat_history.db", account_key)
     if con is None:
         return []
     try:
+        con.execute("BEGIN IMMEDIATE")
+        _ensure_manual_reply_outbox(con)
         maximum = min(max(limit, 1), 200)
         selected = str(chat_id or "").strip()
         needle = str(search or "").strip().casefold()[:120]
@@ -639,14 +1264,21 @@ def messages(
                 (maximum,),
             ).fetchall()
         out = []
+        manual_parts_seen = set()
+        manual_last_sort = {}
         for row in reversed(rows):
             source_id = str(row["source_id"] or "")
-            manual = source_id.startswith("manual_reply:")
-            media = _normalise_media(row["media_json"])
+            try:
+                manual_source = _manual_reply_source(source_id)
+            except (TypeError, ValueError, OverflowError):
+                manual_source = None
+            manual = manual_source is not None
+            media = _manual_reply_public_media(row["media_json"])
             content_type = str(row["content_type"] or "text").strip().lower()
             if content_type not in {"text", "image", "emoji", "audio", "video", "file", "link", "rich", "unknown"}:
                 content_type = "unknown"
             content = _message_content(row["content"])
+            sort_time = _message_time_value(row["timestamp"])
             message = {
                 "role": "assistant_manual" if manual else row["role"],
                 "content": content,
@@ -655,77 +1287,109 @@ def messages(
                 "time": str(row["timestamp"] or ""),
                 "chat_id": str(row["chat_id"] or ""),
                 "item_id": str(row["item_id"] or ""),
+                "_sort_key": (sort_time, 0, int(row["id"]), 0),
                 **({"delivery_status": "acknowledged"} if manual else {}),
             }
+            if manual:
+                outbox_id = int(manual_source[0])
+                try:
+                    parts = _manual_reply_part_rows(con, outbox_id)
+                    part_index = _manual_reply_source_part_index(manual_source, parts)
+                except (TypeError, ValueError, OverflowError):
+                    part_index = 0
+                manual_parts_seen.add((outbox_id, part_index))
+                manual_last_sort[outbox_id] = max(sort_time, manual_last_sort.get(outbox_id, 0.0))
             if needle:
                 message["matched"] = needle in content.casefold()
             out.append(message)
-        has_drafts = con.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'manual_reply_drafts'"
-        ).fetchone()
-        if has_drafts:
-            draft_columns = {
-                str(row[1]) for row in con.execute("PRAGMA table_info(manual_reply_drafts)").fetchall()
-            }
-            modern = "status" in draft_columns
-            media_extra = ", media_json" if "media_json" in draft_columns else ", '[]' AS media_json"
-            extra = (
-                ", request_id, status, attempts, updated_at"
-                if modern
-                else ", NULL AS request_id, 'draft' AS status, 0 AS attempts, 0 AS updated_at"
-            ) + media_extra
-            if selected:
-                if needle:
-                    drafts = con.execute(
-                        f"""SELECT id, content, created_at, chat_id, item_id{extra}
-                            FROM manual_reply_drafts
-                            WHERE chat_id = ?
-                              AND INSTR(LOWER(COALESCE(content, '')), LOWER(?)) > 0
-                            ORDER BY id DESC LIMIT ?""",
-                        (selected, needle, maximum),
-                    ).fetchall()
-                else:
-                    drafts = con.execute(
-                        f"""SELECT id, content, created_at, chat_id, item_id{extra}
-                            FROM manual_reply_drafts WHERE chat_id = ?
-                            ORDER BY id DESC LIMIT ?""",
-                        (selected, maximum),
-                    ).fetchall()
+        if selected:
+            if needle:
+                drafts = con.execute(
+                    """SELECT id, request_id, content, created_at, chat_id, item_id,
+                              status, attempts, updated_at, media_json
+                       FROM manual_reply_drafts
+                       WHERE chat_id = ?
+                         AND INSTR(LOWER(COALESCE(content, '')), LOWER(?)) > 0
+                       ORDER BY id DESC LIMIT ?""",
+                    (selected, needle, maximum),
+                ).fetchall()
             else:
                 drafts = con.execute(
-                    f"""SELECT id, content, created_at, chat_id, item_id{extra}
-                        FROM manual_reply_drafts ORDER BY id DESC LIMIT ?""",
-                    (maximum,),
+                    """SELECT id, request_id, content, created_at, chat_id, item_id,
+                              status, attempts, updated_at, media_json
+                       FROM manual_reply_drafts WHERE chat_id = ?
+                       ORDER BY id DESC LIMIT ?""",
+                    (selected, maximum),
                 ).fetchall()
-            for draft in drafts:
-                status = str(draft["status"] or "draft")
-                if status == "acknowledged" and any(
-                    item.get("role") == "assistant_manual"
-                    and item.get("content") == _message_content(draft["content"])
-                    and item.get("chat_id") == str(draft["chat_id"] or "")
-                    for item in out
-                ):
-                    continue
-                draft_media = _normalise_media(draft["media_json"])
-                content = _message_content(draft["content"])
-                message = {
-                    "role": "assistant_manual_draft" if status == "draft" else "assistant_manual",
-                    "content": content,
-                    "content_type": "image" if len(draft_media) == 1 and draft_media[0].get("type") == "image" else "rich" if draft_media else "text",
-                    "media": draft_media,
-                    "time": str(draft["created_at"] or ""),
-                    "chat_id": str(draft["chat_id"] or ""),
-                    "item_id": str(draft["item_id"] or ""),
-                    "reply_id": str(draft["request_id"] or ""),
-                    "outbox_id": int(draft["id"]),
-                    "delivery_status": status,
-                }
+        else:
+            drafts = con.execute(
+                """SELECT id, request_id, content, created_at, chat_id, item_id,
+                          status, attempts, updated_at, media_json
+                   FROM manual_reply_drafts ORDER BY id DESC LIMIT ?""",
+                (maximum,),
+            ).fetchall()
+        for draft in drafts:
+            outbox_id = int(draft["id"])
+            created_sort = _message_time_value(draft["created_at"])
+            sort_time = max(created_sort, manual_last_sort.get(outbox_id, created_sort))
+            try:
+                raw_status = str(draft["status"] or "draft")
+                parts = _ensure_manual_reply_parts(con, draft)
+                status, current_part, parts_payload = _manual_reply_parts_payload(raw_status, parts)
+                if parts:
+                    if current_part is None:
+                        # Every modern part is represented by its independently
+                        # acknowledged messages; never synthesize a combined row.
+                        continue
+                    content, draft_media = _manual_reply_pending_content(draft, parts)
+                else:
+                    # Legacy drafts and acknowledged rows predate the parts table.
+                    # If their historical message already exists, do not duplicate it.
+                    if raw_status == "acknowledged" and (outbox_id, 0) in manual_parts_seen:
+                        continue
+                    content = _message_content(draft["content"])
+                    draft_media = _manual_reply_public_media(draft["media_json"])
+            except (sqlite3.IntegrityError, TypeError, ValueError, OverflowError):
+                _mark_manual_reply_invalid_payload(con, draft)
                 if needle:
-                    message["matched"] = needle in content.casefold()
+                    continue
+                message = _manual_reply_redacted_payload(draft, include_content=True)
+                message["_sort_key"] = (sort_time, 1, outbox_id, 0)
                 out.append(message)
-        out.sort(key=lambda item: item["time"])
-        return out[-maximum:]
-    except sqlite3.Error:
+                continue
+            if needle and needle not in content.casefold():
+                continue
+            if not content and not draft_media:
+                continue
+            message = {
+                "role": "assistant_manual_draft" if status == "draft" else "assistant_manual",
+                "content": content,
+                "content_type": _manual_reply_content_type(content, draft_media),
+                "media": draft_media,
+                "time": str(draft["created_at"] or ""),
+                "chat_id": str(draft["chat_id"] or ""),
+                "item_id": str(draft["item_id"] or ""),
+                "reply_id": str(draft["request_id"] or ""),
+                "outbox_id": outbox_id,
+                "delivery_status": status,
+                "current_part": current_part,
+                "parts": parts_payload,
+                "_sort_key": (sort_time, 1, outbox_id, current_part or 0),
+            }
+            if needle:
+                message["matched"] = True
+            out.append(message)
+        con.commit()
+        out.sort(key=lambda item: item["_sort_key"])
+        public = []
+        for item in out[-maximum:]:
+            clean = dict(item)
+            clean.pop("_sort_key", None)
+            public.append(clean)
+        return public
+    except (sqlite3.Error, TypeError, ValueError):
+        if con.in_transaction:
+            con.rollback()
         return []
     finally:
         con.close()
@@ -742,10 +1406,12 @@ def message_match_count(
     needle = str(search or "").strip()[:120]
     if not selected or not needle:
         return 0
-    con = _connect(user_id, "chat_history.db", account_key)
+    con = _connect_writable(user_id, "chat_history.db", account_key)
     if con is None:
         return 0
     try:
+        con.execute("BEGIN IMMEDIATE")
+        _ensure_manual_reply_outbox(con)
         message_row = con.execute(
             """SELECT COUNT(*) AS total FROM messages
                WHERE chat_id = ?
@@ -753,23 +1419,31 @@ def message_match_count(
             (selected, needle),
         ).fetchone()
         total = int(message_row["total"] or 0)
-        has_drafts = con.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'manual_reply_drafts'"
-        ).fetchone()
-        if not has_drafts:
-            return total
-        draft_columns = {
-            str(row[1]) for row in con.execute("PRAGMA table_info(manual_reply_drafts)").fetchall()
-        }
-        status_filter = " AND COALESCE(status, 'draft') != 'acknowledged'" if "status" in draft_columns else ""
-        draft_row = con.execute(
-            f"""SELECT COUNT(*) AS total FROM manual_reply_drafts
-                WHERE chat_id = ?
-                  AND INSTR(LOWER(COALESCE(content, '')), LOWER(?)) > 0{status_filter}""",
+        drafts = con.execute(
+            """SELECT id, content, media_json, status, chat_id, item_id
+               FROM manual_reply_drafts
+               WHERE chat_id = ?
+                 AND INSTR(LOWER(COALESCE(content, '')), LOWER(?)) > 0""",
             (selected, needle),
-        ).fetchone()
-        return total + int(draft_row["total"] or 0)
+        ).fetchall()
+        for draft in drafts:
+            try:
+                parts = _ensure_manual_reply_parts(con, draft)
+            except (sqlite3.IntegrityError, TypeError, ValueError, OverflowError):
+                _mark_manual_reply_invalid_payload(con, draft)
+                continue
+            if not parts:
+                if str(draft["status"] or "draft") != "acknowledged":
+                    total += 1
+                continue
+            text_part = next((part for part in parts if str(part["kind"]) == "text"), None)
+            if text_part is not None and text_part["acknowledged_at"] is None:
+                total += 1
+        con.commit()
+        return total
     except (sqlite3.Error, TypeError, ValueError):
+        if con.in_transaction:
+            con.rollback()
         return 0
     finally:
         con.close()
@@ -875,19 +1549,9 @@ def enqueue_manual_reply(
         raise ManualReplyQueueError("conversation_not_found", "当前还没有可回复的对话")
     selected = str(chat_id or "").strip()
     key = str(request_id or "").strip()
-    clean_media = _normalise_media(media, include_private=True)
-    if len(clean_media) > 1 or any(item.get("type") != "image" for item in clean_media):
-        raise ManualReplyQueueError("invalid_media", "人工回复目前只支持单张图片")
+    clean_media = _normalise_manual_reply_media_input(media)
     if not str(content or "").strip() and not clean_media:
-        raise ManualReplyQueueError("invalid_payload", "请输入文字或选择一张图片")
-    if clean_media:
-        try:
-            root = os.path.realpath(_account_root(user_id, account_key))
-            media_path = os.path.realpath(os.path.join(root, str(clean_media[0].get("path") or "")))
-            if not str(clean_media[0].get("path") or "") or os.path.dirname(media_path) != root or not os.path.isfile(media_path):
-                raise OSError("media file unavailable")
-        except OSError as error:
-            raise ManualReplyQueueError("invalid_media", "图片已失效，请重新选择") from error
+        raise ManualReplyQueueError("invalid_payload", "请输入文字或选择图片")
     payload_digest = _manual_reply_digest(selected, content, clean_media)
     now = time.time()
     created_at = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now))
@@ -914,8 +1578,9 @@ def enqueue_manual_reply(
                 raise ManualReplyQueueError(
                     "idempotency_conflict", "这次发送标识已用于另一条回复，请重新发送"
                 )
+            parts = _ensure_manual_reply_parts(con, existing)
             con.commit()
-            payload = _manual_reply_payload(existing, include_content=True)
+            payload = _manual_reply_payload(existing, include_content=True, parts=parts)
             if not str(existing["content"] or ""):
                 payload.update(
                     {
@@ -926,6 +1591,7 @@ def enqueue_manual_reply(
                 )
             return payload
 
+        clean_media = _validate_manual_reply_media(user_id, account_key, clean_media)
         manual_modes = _manual_mode_rows(user_id, account_key)
         if not manual_modes or selected not in manual_modes:
             raise ManualReplyQueueError(
@@ -966,6 +1632,7 @@ def enqueue_manual_reply(
                FROM manual_reply_drafts WHERE id = ?""",
             (int(cursor.lastrowid),),
         ).fetchone()
+        parts = _ensure_manual_reply_parts(con, row)
         con.execute(
             """DELETE FROM manual_reply_drafts
                WHERE status = 'draft'
@@ -978,7 +1645,7 @@ def enqueue_manual_reply(
         )
         _compact_manual_reply_outbox(con)
         con.commit()
-        return _manual_reply_payload(row, include_content=True)
+        return _manual_reply_payload(row, include_content=True, parts=parts)
     except ManualReplyQueueError:
         con.rollback()
         raise
@@ -999,26 +1666,32 @@ def manual_reply_status(
     request_id: str,
     account_key: str = DEFAULT_ACCOUNT_ID,
 ):
-    con = _connect(user_id, "chat_history.db", account_key)
-    if con is None or not _table_exists(con, "manual_reply_drafts"):
-        if con is not None:
-            con.close()
+    con = _connect_writable(user_id, "chat_history.db", account_key)
+    if con is None:
         return None
     try:
-        columns = {
-            str(row[1]) for row in con.execute("PRAGMA table_info(manual_reply_drafts)").fetchall()
-        }
-        if "request_id" not in columns:
-            return None
-        media_select = "media_json" if "media_json" in columns else "'[]' AS media_json"
+        con.execute("BEGIN IMMEDIATE")
+        _ensure_manual_reply_outbox(con)
         row = con.execute(
-            f"""SELECT id, request_id, chat_id, item_id, created_at, {media_select},
-                      status, attempts, updated_at
+            """SELECT id, request_id, chat_id, item_id, content, media_json,
+                      created_at, status, attempts, updated_at
                FROM manual_reply_drafts WHERE request_id = ?""",
             (str(request_id or "").strip(),),
         ).fetchone()
-        return _manual_reply_payload(row, include_content=False)
+        if row is None:
+            con.commit()
+            return None
+        try:
+            parts = _ensure_manual_reply_parts(con, row)
+            payload = _manual_reply_payload(row, include_content=False, parts=parts)
+        except (sqlite3.IntegrityError, TypeError, ValueError, OverflowError):
+            _mark_manual_reply_invalid_payload(con, row)
+            payload = _manual_reply_redacted_payload(row, include_content=False)
+        con.commit()
+        return payload
     except sqlite3.Error:
+        if con.in_transaction:
+            con.rollback()
         return None
     finally:
         con.close()

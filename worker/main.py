@@ -451,7 +451,7 @@ def read_number_env(name, default, minimum, maximum, *, integer=False):
 
 from utils.xianyu_utils import generate_mid, generate_uuid, trans_cookies, generate_device_id, decrypt
 from XianyuAgent import XianyuReplyBot
-from context_manager import ChatContextManager, normalize_media
+from context_manager import ChatContextManager, normalize_manual_reply_media, normalize_media
 from delivery_store import DeliveryStore
 
 
@@ -495,6 +495,8 @@ class XianyuLive:
     MAX_ITEM_DESCRIPTION_CHARS = 16_000
     MAX_RICH_MEDIA_ITEMS = 8
     MAX_RICH_MEDIA_URL_CHARS = 2048
+    COMPLETED_MANUAL_MEDIA_CLEANUP_INTERVAL = 60.0
+    COMPLETED_MANUAL_MEDIA_CLEANUP_LIMIT = 16
     IMAGE_URL_RE = re.compile(
         r'https?://[^\s"\'<>\u4e00-\u9fa5]+\.(?:jpe?g|png|webp|gif|heic|bmp)(?:\?[^\s"\'<>]*)?',
         re.IGNORECASE,
@@ -651,6 +653,8 @@ class XianyuLive:
             5.0, min(self.manual_reply_lease_seconds / 3.0, 30.0)
         )
         self.manual_reply_owner = f"{os.getpid()}:{uuid.uuid4().hex}"
+        self._completed_manual_media_cleanup_next_at = 0.0
+        self._completed_manual_media_cleanup_before_id = 0
         self.item_cache_ttl = read_number_env(
             "ITEM_CACHE_TTL", 300, 30, 3600
         )
@@ -2165,16 +2169,22 @@ class XianyuLive:
                     return
 
     async def _outgoing_image_content(self, media):
-        items = normalize_media(media)
-        if len(items) != 1 or items[0].get("type") != "image":
+        try:
+            items = normalize_manual_reply_media(media)
+        except sqlite3.IntegrityError as exc:
+            raise ValueError("manual reply media must contain one image") from exc
+        if len(items) != 1:
             raise ValueError("manual reply media must contain one image")
         relative_path = str(items[0].get("path") or "").strip()
         root = os.path.realpath(self.state_dir)
-        media_path = os.path.realpath(os.path.join(root, relative_path))
+        media_path = os.path.join(root, relative_path)
+        try:
+            file_stat = os.lstat(media_path)
+        except OSError as exc:
+            raise FileNotFoundError("manual reply image is unavailable") from exc
         if (
-            not relative_path
-            or os.path.dirname(media_path) != root
-            or not os.path.isfile(media_path)
+            os.path.dirname(os.path.realpath(media_path)) != root
+            or not stat.S_ISREG(file_stat.st_mode)
         ):
             raise FileNotFoundError("manual reply image is unavailable")
         result = await asyncio.to_thread(self.xianyu.upload_media, media_path)
@@ -2366,29 +2376,69 @@ class XianyuLive:
                 renewed = False
             if renewed:
                 continue
+            try:
+                reply = self.context_manager.get_manual_reply(reply_id)
+            except Exception:
+                reply = None
+            if reply is not None and str(reply.get("status") or "") == "acknowledged":
+                return
             lease_lost.set()
             if not send_task.done():
                 send_task.cancel()
             return
 
     def _cleanup_manual_media(self, media):
-        for item in normalize_media(media):
-            path = str(item.get("path") or "").strip()
-            if not path:
-                continue
-            root = os.path.realpath(self.state_dir)
-            candidate = os.path.realpath(os.path.join(root, path))
-            if os.path.dirname(candidate) != root:
-                continue
-            try:
-                os.unlink(candidate)
-            except FileNotFoundError:
-                pass
-            except OSError as error:
-                logger.warning("人工图片临时文件清理失败 error={}", type(error).__name__)
+        try:
+            items = normalize_manual_reply_media(media)
+        except sqlite3.IntegrityError:
+            logger.warning("人工图片临时文件清理已拒绝 invalid_payload")
+            return []
+        results = []
+        for item in items:
+            status = self.context_manager.cleanup_manual_reply_image(item.get("path"))
+            results.append(status)
+            if status in {"invalid", "unavailable"}:
+                logger.warning("人工图片临时文件清理未完成 status={}", status)
+        return results
+
+    def _cleanup_completed_manual_media_if_due(self):
+        """Boundedly compensate files left after a committed final ACK."""
+        now = time.monotonic()
+        next_at = float(
+            getattr(self, "_completed_manual_media_cleanup_next_at", 0.0) or 0.0
+        )
+        if now < next_at:
+            return []
+        self._completed_manual_media_cleanup_next_at = (
+            now + self.COMPLETED_MANUAL_MEDIA_CLEANUP_INTERVAL
+        )
+        before_id = int(
+            getattr(self, "_completed_manual_media_cleanup_before_id", 0) or 0
+        )
+        try:
+            batch = self.context_manager.completed_manual_reply_image_cleanup_batch(
+                before_id=before_id,
+                limit=self.COMPLETED_MANUAL_MEDIA_CLEANUP_LIMIT,
+            )
+        except Exception as error:
+            logger.warning(
+                "已完成人工图片补偿扫描失败 error={}", type(error).__name__
+            )
+            return []
+        self._completed_manual_media_cleanup_before_id = int(
+            batch.get("before_id") or 0
+        )
+        results = []
+        for path in batch.get("paths") or []:
+            status = self.context_manager.cleanup_manual_reply_image(path)
+            results.append(status)
+            if status in {"invalid", "unavailable"}:
+                logger.warning("已完成人工图片补偿清理未完成 status={}", status)
+        return results
 
     async def process_manual_outbox_once(self):
-        """Send at most one claimed seller reply and persist its ACK state."""
+        """Send one parent reply as ordered image parts followed by optional text."""
+        self._cleanup_completed_manual_media_if_due()
         claimed = self.context_manager.claim_manual_replies(
             self.manual_reply_owner,
             limit=1,
@@ -2401,15 +2451,48 @@ class XianyuLive:
         chat_id = str(reply.get("chat_id") or "").strip()
         recipient_id = str(reply.get("recipient_id") or "").strip()
         content = str(reply.get("content") or "")
-        media = normalize_media(reply.get("media_json"))
-        if (
+        try:
+            media = normalize_manual_reply_media(reply.get("media_json"))
+            parts = sorted(
+                [part for part in reply.get("parts", []) if isinstance(part, dict)],
+                key=lambda part: int(part.get("part_index", -1)),
+            )
+            expected_parts = [
+                (index, "image", index) for index in range(len(media))
+            ]
+            if content.strip():
+                expected_parts.append((len(expected_parts), "text", None))
+            actual_parts = [
+                (
+                    int(part.get("part_index", -1)),
+                    str(part.get("kind") or ""),
+                    None if part.get("media_index") is None else int(part.get("media_index")),
+                )
+                for part in parts
+            ]
+            pending_seen = False
+            acknowledgements_out_of_order = False
+            for part in parts:
+                if part.get("acknowledged_at") is None:
+                    pending_seen = True
+                elif pending_seen:
+                    acknowledgements_out_of_order = True
+                    break
+        except (sqlite3.IntegrityError, TypeError, ValueError, OverflowError):
+            media = []
+            parts = []
+            expected_parts = []
+            actual_parts = []
+            acknowledgements_out_of_order = True
+        invalid = (
             not chat_id
             or not recipient_id
             or (not content.strip() and not media)
             or len(content) > self.MAX_REPLY_CHARS
-            or len(media) > 1
-            or any(item.get("type") != "image" or not item.get("path") for item in media)
-        ):
+            or actual_parts != expected_parts
+            or acknowledgements_out_of_order
+        )
+        if invalid:
             self.context_manager.fail_manual_reply(
                 reply_id,
                 self.manual_reply_owner,
@@ -2417,6 +2500,11 @@ class XianyuLive:
                 terminal=True,
             )
             return "manual_review"
+
+        for part in parts:
+            if part.get("acknowledged_at") is not None and str(part.get("kind")) == "image":
+                media_index = int(part.get("media_index"))
+                self._cleanup_manual_media([media[media_index]])
 
         async def verify_takeover():
             if not self.context_manager.renew_manual_reply_lease(
@@ -2428,19 +2516,62 @@ class XianyuLive:
             if not self.is_manual_mode(chat_id):
                 raise ManualTakeoverError("manual takeover ended")
 
+        async def send_remaining_parts():
+            base_key = f"manual_reply:{self.account_key}:{reply_id}"
+            has_images = bool(media)
+            final_result = None
+            for part in parts:
+                if part.get("acknowledged_at") is not None:
+                    continue
+                part_index = int(part["part_index"])
+                kind = str(part["kind"])
+                sent_media = None
+                if kind == "image":
+                    media_index = int(part["media_index"])
+                    message_key = (
+                        base_key
+                        if media_index == 0
+                        else f"{base_key}:image:{media_index + 1}"
+                    )
+                    sent_media = await self.send_text_reliably(
+                        chat_id,
+                        recipient_id,
+                        "",
+                        message_key=message_key,
+                        before_attempt=verify_takeover,
+                        allow_manual=True,
+                        media=[media[media_index]],
+                    )
+                elif kind == "text":
+                    message_key = f"{base_key}:text" if has_images else base_key
+                    await self.send_text_reliably(
+                        chat_id,
+                        recipient_id,
+                        content,
+                        message_key=message_key,
+                        before_attempt=verify_takeover,
+                        allow_manual=True,
+                    )
+                else:
+                    raise ValueError("manual reply part kind is invalid")
+                final_result = self.context_manager.acknowledge_manual_reply_part(
+                    reply_id,
+                    self.manual_reply_owner,
+                    self.myid,
+                    part_index,
+                    sent_media=sent_media,
+                )
+                if final_result is None:
+                    raise ManualReplyLeaseLost("manual reply lease lost")
+                if final_result.get("complete"):
+                    self._cleanup_manual_media(media)
+                elif kind == "image":
+                    self._cleanup_manual_media([media[int(part["media_index"])]])
+            return final_result
+
         lease_done = asyncio.Event()
         lease_lost = asyncio.Event()
-        send_task = asyncio.create_task(
-            self.send_text_reliably(
-                chat_id,
-                recipient_id,
-                content,
-                message_key=f"manual_reply:{self.account_key}:{reply_id}",
-                before_attempt=verify_takeover,
-                allow_manual=True,
-                **({"media": media} if media else {}),
-            )
-        )
+        send_task = asyncio.create_task(send_remaining_parts())
         heartbeat_task = asyncio.create_task(
             self._manual_reply_lease_heartbeat(
                 reply_id,
@@ -2450,9 +2581,9 @@ class XianyuLive:
             )
         )
         send_error = None
-        sent_media = None
+        result = None
         try:
-            sent_media = await send_task
+            result = await send_task
         except asyncio.CancelledError:
             if lease_lost.is_set():
                 return "lease_lost"
@@ -2481,16 +2612,7 @@ class XianyuLive:
                 self._manual_reply_error_code(send_error),
                 retry_delay=min(300, 2 ** min(attempts, 8)),
             ) or "lease_lost"
-
-        acknowledged = self.context_manager.acknowledge_manual_reply(
-            reply_id,
-            self.manual_reply_owner,
-            self.myid,
-            sent_media=sent_media,
-        )
-        if acknowledged and media:
-            self._cleanup_manual_media(media)
-        return "acknowledged" if acknowledged else "lease_lost"
+        return "acknowledged" if result and result.get("complete") else "lease_lost"
 
     async def _manual_outbox_loop(self):
         while True:

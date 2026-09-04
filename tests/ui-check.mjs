@@ -11,6 +11,9 @@ const { chromium } = requireFromRepo("playwright");
 
 const staticRoot = path.join(repoRoot, "frontend");
 const resultRoot = path.join(repoRoot, "test-results");
+const versionSource = fs.readFileSync(path.join(repoRoot, "backend", "version.py"), "utf8");
+const assetVersion = versionSource.match(/^ASSET_VERSION\s*=\s*["']([^"']+)["']\s*$/m)?.[1] || "";
+assert.match(assetVersion, /^[0-9]{8}-[0-9]{2}$/);
 fs.mkdirSync(resultRoot, { recursive: true });
 for (const staleName of [
   "local-live-desktop.png", "local-live-mobile.png", "shop-connector-missing-desktop.png",
@@ -28,6 +31,7 @@ for (const staleName of [
   "analytics-member-desktop.png", "orders-member-desktop.png",
   "ai-config-desktop.png", "ai-config-mobile.png", "ai-templates-mobile.png",
   "ai-generated-preview-desktop.png", "ai-generated-preview-mobile.png",
+  "manual-reply-multi-desktop.png", "manual-reply-multi-mobile.png",
   "docs-manual-desktop.png", "docs-manual-mobile.png",
 ]) {
   fs.rmSync(path.join(resultRoot, staleName), { force: true });
@@ -63,6 +67,8 @@ const fixtures = {
   authCapabilities: { registration_enabled: true, bootstrap_available: false, password_min_length: 12 },
   bootstrapRequests: [],
   passwordRequests: [],
+  authLogoutRequests: 0,
+  requestSequence: [],
   me: {
     username: "owner-demo", expires_at: 0, active: false, plan: "free", plan_label: "免费",
     role: "owner", role_label: "店主", is_admin: false, permissions: selfUsePermissions, platform_permissions: [],
@@ -71,7 +77,7 @@ const fixtures = {
     version: "0.1.0",
     commit: "ui-contract",
     build_time: "2026-08-31T00:00:00Z",
-    asset_version: "20260831-01",
+    asset_version: assetVersion,
     update_channel: "stable",
     release_notes: "本地说明 <img src=x onerror=window.__releaseNotesInjected=true>",
     latest_update: null,
@@ -88,7 +94,7 @@ const fixtures = {
     { id: 1, event_type: "auth.login_succeeded", actor_user_id: 1, target_type: "user", target_id: "1", outcome: "success", source_hash: "source-hash", metadata: {}, created_at: 1788134400 },
   ],
   updateStatus: {
-    current: { version: "0.1.0", commit: "ui-contract", build_time: "2026-08-31T00:00:00Z", asset_version: "20260831-01", update_channel: "stable" },
+    current: { version: "0.1.0", commit: "ui-contract", build_time: "2026-08-31T00:00:00Z", asset_version: assetVersion, update_channel: "stable" },
     latest_update: null,
     rollback_versions: ["0.0.9"],
   },
@@ -228,6 +234,11 @@ const fixtures = {
   manualReplies: [],
   manualReplyRequests: [],
   manualImageRequests: [],
+  manualImageUploadDelayMs: 0,
+  manualImageDeletes: [],
+  manualImageDeleteMode: "success",
+  manualImageDeleteModes: [],
+  manualImageDeleteFailures: 0,
   manualReplyPolls: 0,
   manualReplyPollsById: new Map(),
   manualReplyPollModes: new Map(),
@@ -280,6 +291,120 @@ function takeLoaderDelay(kind, accountKey) {
   return delay;
 }
 
+function createManualReplyParts(content, media) {
+  const parts = media.map((_item, index) => ({ index, kind: "image", status: index === 0 ? "queued" : "waiting" }));
+  if (String(content || "").trim()) {
+    parts.push({ index: parts.length, kind: "text", status: parts.length ? "waiting" : "queued" });
+  }
+  return parts;
+}
+
+function manualReplyStatusPayload(parent) {
+  const current = parent.parts.find((part) => part.status !== "acknowledged");
+  return {
+    reply_id: parent.reply_id,
+    outbox_id: parent.outbox_id,
+    status: parent.status,
+    attempts: parent.attempts,
+    platform_acknowledged: parent.status === "acknowledged" && !current,
+    current_part: current ? current.index : null,
+    parts: parent.parts.map((part) => ({ ...part })),
+  };
+}
+
+function manualReplyPendingMessage(parent) {
+  const pending = parent.parts.filter((part) => part.status !== "acknowledged");
+  if (!pending.length) return null;
+  const pendingImageIndexes = pending.filter((part) => part.kind === "image").map((part) => part.index);
+  const textPending = pending.some((part) => part.kind === "text");
+  const media = pendingImageIndexes.map((partIndex) => {
+    const mediaIndex = parent.parts.slice(0, partIndex + 1).filter((part) => part.kind === "image").length - 1;
+    const source = parent.media[mediaIndex] || {};
+    return { type: "image", url: "", alt: "图片", label: "图片", mime: source.mime || "image/jpeg" };
+  });
+  const content = textPending ? parent.content : "";
+  return {
+    role: "assistant_manual",
+    content,
+    content_type: media.length ? (content || media.length > 1 ? "rich" : "image") : "text",
+    media,
+    time: parent.time,
+    chat_id: parent.chat_id,
+    item_id: parent.item_id,
+    reply_id: parent.reply_id,
+    outbox_id: parent.outbox_id,
+    delivery_status: parent.status,
+    status: parent.status,
+    attempts: parent.attempts,
+    current_part: manualReplyStatusPayload(parent).current_part,
+    parts: parent.parts.map((part) => ({ ...part })),
+    account_key: parent.account_key,
+  };
+}
+
+function manualReplyDisplayMessages(parent) {
+  const messages = [];
+  let imageNumber = 0;
+  for (const part of parent.parts) {
+    if (part.kind === "image") imageNumber += 1;
+    if (part.status !== "acknowledged") continue;
+    if (part.kind === "image") {
+      messages.push({
+        role: "assistant_manual",
+        content: "",
+        content_type: "image",
+        media: [{ type: "image", url: `https://cdn.example/manual-${parent.outbox_id}-${imageNumber}.png`, alt: "图片", label: "图片" }],
+        time: parent.time,
+        chat_id: parent.chat_id,
+        item_id: parent.item_id,
+        delivery_status: "acknowledged",
+        account_key: parent.account_key,
+      });
+    } else {
+      messages.push({
+        role: "assistant_manual",
+        content: parent.content,
+        content_type: "text",
+        media: [],
+        time: parent.time,
+        chat_id: parent.chat_id,
+        item_id: parent.item_id,
+        delivery_status: "acknowledged",
+        account_key: parent.account_key,
+      });
+    }
+  }
+  const pending = manualReplyPendingMessage(parent);
+  if (pending) messages.push(pending);
+  return messages;
+}
+
+function advanceManualReply(parent, mode, polls) {
+  const terminal = mode === "dead_letter" ? "dead_letter" : mode === "manual_review" ? "manual_review" : "";
+  if (terminal) {
+    const current = parent.parts.find((part) => part.status !== "acknowledged");
+    if (current) current.status = terminal;
+    parent.status = terminal;
+  } else if (mode === "pending") {
+    const current = parent.parts.find((part) => part.status !== "acknowledged");
+    if (current) current.status = "sending";
+    parent.status = "sending";
+  } else if (mode === "multipart_success" && parent.parts.length > 1 && polls <= 2) {
+    parent.parts.forEach((part, index) => {
+      part.status = index === 0 ? "acknowledged" : index === 1 ? (polls === 1 ? "sending" : "retry") : "waiting";
+    });
+    parent.status = polls === 1 ? "sending" : "retry";
+  } else if (polls === 1) {
+    const current = parent.parts.find((part) => part.status !== "acknowledged");
+    if (current) current.status = "retry";
+    parent.status = "retry";
+  } else {
+    parent.parts.forEach((part) => { part.status = "acknowledged"; });
+    parent.status = "acknowledged";
+  }
+  parent.attempts = polls;
+}
+
 function createServer() {
   let loggedIn = false;
   return http.createServer((req, res) => {
@@ -326,6 +451,8 @@ function createServer() {
       }
       if (apiPath === "/api/auth/register" && req.method === "POST") return json(res, { ok: true });
       if (apiPath === "/api/auth/logout" && req.method === "POST") {
+        fixtures.authLogoutRequests += 1;
+        fixtures.requestSequence.push("auth-logout");
         loggedIn = false;
         return json(res, { ok: true }, 200, { "set-cookie": "xianyu_saas_session=; Path=/xianyu-saas/; Max-Age=0; HttpOnly" });
       }
@@ -478,6 +605,7 @@ function createServer() {
         if (!account || account.enabled === false) return json(res, { detail: "店铺不存在" }, 404);
         if (key === "default") return json(res, { detail: "默认店铺不能删除" }, 409);
         fixtures.shopAccountDeleteRequests.push(key);
+        fixtures.requestSequence.push(`account-delete:${key}`);
         account.enabled = false;
         account.status = "disabled";
         return json(res, { ok: true, account: { ...account } });
@@ -1161,7 +1289,10 @@ function createServer() {
         const search = String(url.searchParams.get("search") || "").trim().toLowerCase();
         const messages = selected ? fixtures.messages.filter((item) => item.chat_id === selected) : fixtures.messages.filter((item) => item.chat_id === "chat-2");
         const accountKey = String(req.headers["x-shop-account"] || "default");
-        const allMessages = [...messages, ...fixtures.manualReplies.filter((item) => item.account_key === accountKey && (!selected || item.chat_id === selected))];
+        const manualMessages = fixtures.manualReplies
+          .filter((item) => item.account_key === accountKey && (!selected || item.chat_id === selected))
+          .flatMap(manualReplyDisplayMessages);
+        const allMessages = [...messages, ...manualMessages];
         const matchedMessages = search ? allMessages.filter((item) => String(item.content || "").toLowerCase().includes(search)).map((item) => ({ ...item, matched: true })) : allMessages;
         const response = { messages: matchedMessages, match_count: search ? matchedMessages.length : 0, search };
         fixtures.messageRequests.push({ chatId: selected || "", accountKey, search });
@@ -1180,25 +1311,50 @@ function createServer() {
           fileName: String(req.headers["x-file-name"] || ""),
           bytes: Buffer.byteLength(rawBody),
         });
-        return json(res, {
+        const uploadNumber = fixtures.manualImageRequests.length;
+        const response = {
           ok: true,
           media: {
             type: "image",
             url: "",
-            path: "manual_reply_test.jpg",
-            alt: "测试图片",
-            label: "测试图片",
-            name: "reply.jpg",
-            mime: "image/jpeg",
+            path: `manual_reply_test_${uploadNumber}.jpg`,
+            alt: "图片",
+            label: "图片",
+            name: "",
+            mime: contentType.split(";", 1)[0] || "image/jpeg",
           },
-        });
+        };
+        const delay = Number(fixtures.manualImageUploadDelayMs || 0);
+        fixtures.manualImageUploadDelayMs = 0;
+        if (delay > 0) {
+          setTimeout(() => json(res, response), delay);
+          return;
+        }
+        return json(res, response);
+      }
+      if (apiPath === "/api/bot/messages/image" && req.method === "DELETE") {
+        const accountKey = String(req.headers["x-shop-account"] || "default");
+        const path = String(payload.path || "");
+        const account = fixtures.shopAccounts.find((item) => item.key === accountKey);
+        fixtures.requestSequence.push(`image-delete:${accountKey}`);
+        if (!account || account.enabled === false) return json(res, { detail: "店铺不存在" }, 404);
+        const deleteMode = fixtures.manualImageDeleteModes.shift() || fixtures.manualImageDeleteMode;
+        if (deleteMode === "failure") {
+          fixtures.manualImageDeleteFailures += 1;
+          return json(res, { detail: { code: "image_delete_unavailable", message: "图片暂时无法删除，请稍后重试" } }, 503);
+        }
+        if (deleteMode === "active") {
+          return json(res, { detail: { code: "image_in_use", message: "图片已进入发送队列，不能删除" } }, 409);
+        }
+        fixtures.manualImageDeletes.push({ accountKey, path });
+        return json(res, { ok: true, deleted: true });
       }
       if (apiPath === "/api/bot/messages/reply" && req.method === "POST") {
         const selected = payload.chat_id || "chat-2";
         const accountKey = String(req.headers["x-shop-account"] || "default");
         const replyId = String(req.headers["idempotency-key"] || "");
-        const message = { role: "assistant_manual", content: payload.content, content_type: Array.isArray(payload.media) && payload.media.length ? "image" : "text", media: Array.isArray(payload.media) ? payload.media : [], time: "2026-08-15 15:20", chat_id: selected, item_id: selected === "chat-1" ? "100001" : "100002", reply_id: replyId, outbox_id: fixtures.manualReplies.length + 1, delivery_status: "queued", status: "queued", account_key: accountKey };
-        fixtures.manualReplyRequests.push({ chatId: selected, content: payload.content, media: Array.isArray(payload.media) ? payload.media : [], replyId, accountKey });
+        const media = Array.isArray(payload.media) ? payload.media.map((item) => ({ ...item })) : [];
+        fixtures.manualReplyRequests.push({ chatId: selected, content: payload.content, media, replyId, accountKey });
         const delay = Number(fixtures.manualReplyPostDelayMs || 0);
         fixtures.manualReplyPostDelayMs = 0;
         if (fixtures.manualReplyPostMode === "failure") {
@@ -1208,9 +1364,24 @@ function createServer() {
           else reject();
           return;
         }
-        fixtures.manualReplies.push(message);
+        const parent = {
+          content: String(payload.content || ""),
+          media,
+          time: "2026-08-15 15:20",
+          chat_id: selected,
+          item_id: selected === "chat-1" ? "100001" : "100002",
+          reply_id: replyId,
+          outbox_id: fixtures.manualReplies.length + 1,
+          status: "queued",
+          attempts: 0,
+          parts: createManualReplyParts(payload.content, media),
+          account_key: accountKey,
+        };
+        fixtures.manualReplies.push(parent);
         fixtures.manualReplyPollModes.set(replyId, fixtures.manualReplyPollMode);
-        const accept = () => json(res, { ok: true, accepted: true, saved: true, delivered: false, platform_acknowledged: false, reply: { reply_id: replyId, status: "queued", attempts: 0, platform_acknowledged: false }, message });
+        const reply = manualReplyStatusPayload(parent);
+        const message = manualReplyPendingMessage(parent);
+        const accept = () => json(res, { ok: true, accepted: true, saved: true, delivered: false, platform_acknowledged: false, reply, message });
         if (delay > 0) setTimeout(accept, delay);
         else accept();
         return;
@@ -1218,8 +1389,8 @@ function createServer() {
       const manualReplyStatusMatch = apiPath.match(/^\/api\/bot\/messages\/reply\/([^/]+)$/);
       if (manualReplyStatusMatch && req.method === "GET") {
         const replyId = decodeURIComponent(manualReplyStatusMatch[1]);
-        const message = fixtures.manualReplies.find((item) => item.reply_id === replyId);
-        if (!message) return json(res, { detail: "not found" }, 404);
+        const parent = fixtures.manualReplies.find((item) => item.reply_id === replyId);
+        if (!parent) return json(res, { detail: "not found" }, 404);
         const mode = fixtures.manualReplyPollModes.get(replyId) || "success";
         if (mode === "not_found") {
           fixtures.manualReplyPollNotFoundResponses += 1;
@@ -1228,9 +1399,8 @@ function createServer() {
         fixtures.manualReplyPolls += 1;
         const replyPolls = Number(fixtures.manualReplyPollsById.get(replyId) || 0) + 1;
         fixtures.manualReplyPollsById.set(replyId, replyPolls);
-        message.delivery_status = mode === "manual_review" ? "manual_review" : mode === "pending" ? "sending" : replyPolls === 1 ? "retry" : "acknowledged";
-        message.status = message.delivery_status;
-        return json(res, { reply: { reply_id: replyId, status: message.delivery_status, attempts: replyPolls, platform_acknowledged: message.delivery_status === "acknowledged" } });
+        advanceManualReply(parent, mode, replyPolls);
+        return json(res, { reply: manualReplyStatusPayload(parent) });
       }
       if (apiPath === "/api/bot/orders" && req.method === "GET") {
         const scoped = scopedFixture(req, "orders", fixtures.orders);
@@ -1340,6 +1510,19 @@ async function openView(page, view) {
   await page.waitForSelector(`[data-panel="${view}"]:not([hidden])`);
 }
 
+async function dispatchManualReplyImageEvent(page, type, file) {
+  await page.locator(".chat-window").evaluate((node, detail) => {
+    const transfer = new DataTransfer();
+    transfer.items.add(new File([new Uint8Array(detail.bytes)], detail.name, {
+      type: detail.mimeType,
+      lastModified: detail.lastModified,
+    }));
+    const event = new Event(detail.type, { bubbles: true, cancelable: true });
+    Object.defineProperty(event, detail.type === "paste" ? "clipboardData" : "dataTransfer", { value: transfer });
+    node.dispatchEvent(event);
+  }, { type, ...file });
+}
+
 async function run() {
   const server = createServer();
   const port = await listen(server);
@@ -1356,6 +1539,8 @@ async function run() {
   let expectedQrStageCancelResponses = 0;
   let expectedManualReplyFailureConsole = 0;
   let expectedManualReplyFailureResponses = 0;
+  let expectedManualImageDeleteFailureConsole = 0;
+  let expectedManualImageDeleteFailureResponses = 0;
   let expectedManualReplyNotFoundConsole = 0;
   let expectedManualReplyNotFoundResponses = 0;
   try {
@@ -1406,6 +1591,10 @@ async function run() {
       const expectedManualReplyFailure = message.type() === "error"
         && message.text().includes("status of 503")
         && expectedManualReplyFailureConsole < fixtures.manualReplyPostFailures;
+      const expectedManualImageDeleteFailure = message.type() === "error"
+        && message.text().includes("status of 503")
+        && !expectedManualReplyFailure
+        && expectedManualImageDeleteFailureConsole < fixtures.manualImageDeleteFailures;
       const expectedManualReplyNotFound = message.type() === "error"
         && message.text().includes("status of 404")
         && expectedManualReplyNotFoundConsole < fixtures.manualReplyPollNotFoundResponses;
@@ -1414,8 +1603,9 @@ async function run() {
       if (expectedQrStageFailure) expectedQrStageFailureConsole += 1;
       if (expectedQrStageCancel) expectedQrStageCancelConsole += 1;
       if (expectedManualReplyFailure) expectedManualReplyFailureConsole += 1;
+      if (expectedManualImageDeleteFailure) expectedManualImageDeleteFailureConsole += 1;
       if (expectedManualReplyNotFound) expectedManualReplyNotFoundConsole += 1;
-      if (message.type() === "error" && !expectedAnonymousProbe && !expectedCookieProbe && !expectedQrFailure && !expectedQrStageFailure && !expectedQrStageCancel && !expectedManualReplyFailure && !expectedManualReplyNotFound) errors.push(`console: ${message.text()}`);
+      if (message.type() === "error" && !expectedAnonymousProbe && !expectedCookieProbe && !expectedQrFailure && !expectedQrStageFailure && !expectedQrStageCancel && !expectedManualReplyFailure && !expectedManualImageDeleteFailure && !expectedManualReplyNotFound) errors.push(`console: ${message.text()}`);
     });
     page.on("response", (response) => {
       const expectedAnonymousProbe = response.status() === 401 && response.url().endsWith("/api/me");
@@ -1430,14 +1620,16 @@ async function run() {
         && response.url().includes("/api/bot/login/")
         && response.url().endsWith("/cancel");
       const expectedManualReplyFailure = response.status() === 503 && response.url().endsWith("/api/bot/messages/reply");
+      const expectedManualImageDeleteFailure = response.status() === 503 && response.url().endsWith("/api/bot/messages/image");
       const expectedManualReplyNotFound = response.status() === 404 && response.url().includes("/api/bot/messages/reply/");
       if (expectedCookieProbe) expectedCookieProbeResponses += 1;
       if (expectedQrFailure) expectedQrFailureResponses += 1;
       if (expectedQrStageFailure) expectedQrStageFailureResponses += 1;
       if (expectedQrStageCancel) expectedQrStageCancelResponses += 1;
       if (expectedManualReplyFailure) expectedManualReplyFailureResponses += 1;
+      if (expectedManualImageDeleteFailure) expectedManualImageDeleteFailureResponses += 1;
       if (expectedManualReplyNotFound) expectedManualReplyNotFoundResponses += 1;
-      if (response.status() >= 400 && !expectedAnonymousProbe && !expectedCookieProbe && !expectedQrFailure && !expectedQrStageFailure && !expectedQrStageCancel && !expectedManualReplyFailure && !expectedManualReplyNotFound) failedResponses.push(`${response.status()} ${response.url()}`);
+      if (response.status() >= 400 && !expectedAnonymousProbe && !expectedCookieProbe && !expectedQrFailure && !expectedQrStageFailure && !expectedQrStageCancel && !expectedManualReplyFailure && !expectedManualImageDeleteFailure && !expectedManualReplyNotFound) failedResponses.push(`${response.status()} ${response.url()}`);
     });
 
     await page.goto(`http://127.0.0.1:${port}/xianyu-saas/`, { waitUntil: "networkidle" });
@@ -1540,7 +1732,7 @@ async function run() {
     await page.click('[data-docs-tab="version"]');
     await page.waitForSelector('[data-docs-panel="version"]:not([hidden])');
     await page.waitForFunction(() => document.querySelector("#currentVersionValue")?.textContent === "v0.1.0");
-    assert.equal(await page.locator("#currentAssetVersionValue").textContent(), "20260831-01");
+    assert.equal(await page.locator("#currentAssetVersionValue").textContent(), assetVersion);
     assert.equal(await page.locator("#adminUpdateControls").isVisible(), false, "owners can read releases but cannot operate updates");
     assert.match(await page.locator("#versionReleaseNotes").textContent(), /<img src=x onerror=/, "release notes remain literal text");
     assert.equal(await page.locator("#versionReleaseNotes img, #versionReleaseNotes script").count(), 0, "release notes must not create executable nodes");
@@ -2594,9 +2786,13 @@ async function run() {
     assert.equal(htmlSource.includes("introCurtain"), false);
     assert.equal(htmlSource.includes("enterWorkspaceButton"), false);
     assert.equal(htmlSource.includes("20260826-03"), false);
-    assert.match(htmlSource, /app\.css\?v=20260831-01/);
-    assert.match(htmlSource, /app\.js\?v=20260831-01/);
-    assert.match(appSource, /ASSET_VERSION = "20260831-01"/);
+    assert.ok(htmlSource.includes(`app.css?v=${assetVersion}`));
+    assert.ok(htmlSource.includes(`app.js?v=${assetVersion}`));
+    assert.ok(appSource.includes(`ASSET_VERSION = "${assetVersion}"`));
+    assert.match(htmlSource, /id="manualReplyFile"[^>]*multiple/);
+    assert.match(htmlSource, /最多 8 张；图片会按顺序逐张发送，文字最后单独发送。/);
+    assert.match(appSource, /MANUAL_IMAGE_MAX_COUNT = 8/);
+    assert.match(appSource, /method: "DELETE"/);
     assert.equal(appSource.includes("dismissIntroCurtain"), false);
     assert.equal(cssSource.includes("intro-curtain"), false);
     assert.equal(cssSource.includes("spotlight-stage"), false);
@@ -2864,14 +3060,208 @@ async function run() {
     await page.waitForFunction(() => document.querySelectorAll("#conversationItems [data-chat-id]").length >= 1);
     if (await page.locator('#conversationItems [data-chat-id="chat-1"]').count()) await page.click('#conversationItems [data-chat-id="chat-1"]');
     assert.equal((await page.locator("#chatAiStatus").textContent()).includes("会员"), false, "AI controls remain independent of subscription language");
+    if (await page.locator('#manualReplyForm button[type="submit"]').isDisabled()) {
+      const takeoverResponse = page.waitForResponse((response) => response.url().includes("/api/bot/conversations/") && response.url().endsWith("/takeover") && response.request().method() === "POST");
+      await page.click("#toggleChatTakeover");
+      await takeoverResponse;
+      await page.waitForFunction(() => document.querySelector('#manualReplyForm button[type="submit"]')?.disabled === false);
+    }
 
-    // Switching accounts while a reply POST is pending invalidates the old
-    // form context. Its late success may not repopulate or unlock the new one.
+    // Manual replies accept ordered appends from the picker, clipboard and drop
+    // surface without uploading until the parent submit is clicked.
+    assert.equal(await page.locator("#manualReplyFile").getAttribute("multiple"), "");
+    const imageUploadsBeforeQueue = fixtures.manualImageRequests.length;
+    await page.locator("#manualReplyFile").setInputFiles([
+      { name: "01-select.png", mimeType: "image/jpeg", buffer: Buffer.from([1, 2, 3, 4]) },
+      { name: "02-select.png", mimeType: "image/png", buffer: Buffer.from([5, 6, 7, 8]) },
+    ]);
+    await page.waitForFunction(() => document.querySelectorAll("#manualReplyPreview .reply-image-card").length === 2);
+    await dispatchManualReplyImageEvent(page, "paste", { name: "03-paste.png", mimeType: "image/png", bytes: [9, 10, 11], lastModified: 3 });
+    await page.waitForFunction(() => document.querySelectorAll("#manualReplyPreview .reply-image-card").length === 3);
+    const droppedFile = { name: "04-drop.png", mimeType: "image/webp", bytes: [12, 13, 14], lastModified: 4 };
+    await dispatchManualReplyImageEvent(page, "dragenter", droppedFile);
+    assert.equal(await page.locator("#manualReplyDropzone").evaluate((node) => node.classList.contains("is-drag-active")), true);
+    await dispatchManualReplyImageEvent(page, "dragover", droppedFile);
+    await dispatchManualReplyImageEvent(page, "drop", droppedFile);
+    await page.waitForFunction(() => document.querySelectorAll("#manualReplyPreview .reply-image-card").length === 4);
+    assert.equal(await page.locator("#manualReplyDropzone").evaluate((node) => node.classList.contains("is-drag-active")), false);
+    await page.locator("#manualReplyFile").setInputFiles([
+      { name: "05-extra.png", mimeType: "image/jpeg", buffer: Buffer.from([15]) },
+      { name: "06-extra.png", mimeType: "image/jpeg", buffer: Buffer.from([16]) },
+      { name: "07-extra.png", mimeType: "image/jpeg", buffer: Buffer.from([17]) },
+      { name: "08-extra.png", mimeType: "image/jpeg", buffer: Buffer.from([18]) },
+    ]);
+    await page.waitForFunction(() => document.querySelectorAll("#manualReplyPreview .reply-image-card").length === 8);
+    assert.deepEqual(
+      await page.locator("#manualReplyPreview .reply-image-card strong").allTextContents(),
+      ["01-select.png", "02-select.png", "03-paste.png", "04-drop.png", "05-extra.png", "06-extra.png", "07-extra.png", "08-extra.png"],
+      "picker, paste and drop appends must keep the user's order",
+    );
+    await page.locator("#manualReplyFile").setInputFiles({ name: "09-rejected.png", mimeType: "image/jpeg", buffer: Buffer.from([19]) });
+    await page.waitForFunction(() => document.querySelector("#replyMessage")?.textContent.includes("最多可添加 8 张"));
+    assert.equal(await page.locator("#manualReplyPreview .reply-image-card").count(), 8, "the ninth image must reject the whole append");
+    assert.equal(fixtures.manualImageRequests.length, imageUploadsBeforeQueue, "selecting, pasting and dropping must not upload before submit");
+    await waitForPanelSettled(page);
+    await assertNoOverflow(page, "manual reply multi-image desktop");
+    await captureScreenshot(page, { path: path.join(resultRoot, "manual-reply-multi-desktop.png"), fullPage: true });
+    await page.setViewportSize({ width: 390, height: 844 });
+    await waitForPanelSettled(page);
+    await assertNoOverflow(page, "manual reply multi-image mobile");
+    assert.equal(await page.locator("#manualReplyPreview [data-remove-manual-attachment]").evaluateAll((buttons) => buttons.every((button) => {
+      const box = button.getBoundingClientRect();
+      return box.width >= 44 && box.height >= 44;
+    })), true, "every mobile attachment remove button must remain touchable");
+    await captureScreenshot(page, { path: path.join(resultRoot, "manual-reply-multi-mobile.png"), fullPage: true });
+    await page.setViewportSize({ width: 1440, height: 900 });
+    for (const name of ["02-select.png", "05-extra.png", "06-extra.png", "07-extra.png", "08-extra.png"]) {
+      await page.locator("#manualReplyPreview .reply-image-card", { hasText: name }).locator("button").click();
+    }
+    assert.deepEqual(
+      await page.locator("#manualReplyPreview .reply-image-card strong").allTextContents(),
+      ["01-select.png", "03-paste.png", "04-drop.png"],
+      "removing an attachment must preserve the relative order of the rest",
+    );
+
+    fixtures.manualReplyPostMode = "success";
+    fixtures.manualReplyPollMode = "multipart_success";
+    const multipartUploadStart = fixtures.manualImageRequests.length;
+    const multipartReplyStart = fixtures.manualReplyRequests.length;
+    const multipartContent = "三张图片按顺序发送，文字最后";
+    await page.fill("#manualReplyInput", multipartContent);
+    const multipartResponse = page.waitForResponse((response) => response.url().endsWith("/api/bot/messages/reply") && response.request().method() === "POST" && response.status() === 200);
+    await page.click('#manualReplyForm button[type="submit"]');
+    await multipartResponse;
+    assert.deepEqual(
+      fixtures.manualImageRequests.slice(multipartUploadStart).map((request) => request.fileName),
+      ["01-select.png", "03-paste.png", "04-drop.png"],
+      "uploads must follow the visible attachment order",
+    );
+    assert.equal(fixtures.manualReplyRequests.length, multipartReplyStart + 1, "one click must create one parent reply request");
+    const multipartRequest = fixtures.manualReplyRequests.at(-1);
+    assert.equal(multipartRequest.content, multipartContent);
+    assert.deepEqual(
+      multipartRequest.media.map((item) => item.path),
+      Array.from({ length: 3 }, (_item, index) => `manual_reply_test_${multipartUploadStart + index + 1}.jpg`),
+      "the parent media array must preserve upload order",
+    );
+    assert.ok(multipartRequest.replyId.length >= 8, "the parent request must use one client idempotency key");
+    await page.waitForSelector('#chatMessages .message-delivery[data-parent-status="queued"]');
+    assert.deepEqual(
+      await page.locator('#chatMessages .message-delivery[data-parent-status="queued"] .message-part-status').evaluateAll((parts) => parts.map((part) => [part.dataset.partKind, part.dataset.partStatus])),
+      [["image", "queued"], ["image", "waiting"], ["image", "waiting"], ["text", "waiting"]],
+      "the queued parent must expose every ordered segment",
+    );
+    assert.equal((await page.locator("body").innerText()).includes("manual_reply_test_"), false, "private upload paths must never be rendered");
+    await page.waitForFunction(() => {
+      const parent = document.querySelector('#chatMessages .message-delivery[data-parent-status="sending"]');
+      return parent && parent.querySelector('[data-part-status="acknowledged"]') && parent.querySelector('[data-part-status="sending"]');
+    });
+    await page.waitForFunction(() => {
+      const parent = document.querySelector('#chatMessages .message-delivery[data-parent-status="retry"]');
+      return parent && parent.querySelector('[data-part-status="acknowledged"]') && parent.querySelector('[data-part-status="retry"]');
+    });
+    await page.waitForFunction((expectedContent) => {
+      const rows = Array.from(document.querySelectorAll("#chatMessages .message-row")).filter((row) => row.querySelector(".message-role")?.textContent === "人工回复");
+      const latest = rows.slice(-4);
+      return latest.length === 4
+        && latest.slice(0, 3).every((row) => row.querySelector(".message-media-image img"))
+        && latest[3].querySelector(".message-text")?.textContent === expectedContent
+        && !document.querySelector('#chatMessages .message-delivery[data-parent-status="acknowledged"]');
+    }, multipartContent, { timeout: 8000 });
+    const multipartRendered = await page.evaluate((expectedContent) => {
+      const rows = Array.from(document.querySelectorAll("#chatMessages .message-row")).filter((row) => row.querySelector(".message-role")?.textContent === "人工回复").slice(-4);
+      return rows.map((row) => ({
+        content: row.querySelector(".message-text")?.textContent || "",
+        image: row.querySelector(".message-media-image img")?.getAttribute("src") || "",
+        status: row.querySelector(".message-status")?.textContent || "",
+      })).concat([{ expectedContent }]);
+    }, multipartContent);
+    assert.deepEqual(multipartRendered.slice(0, 3).map((item) => item.image), [
+      "https://cdn.example/manual-1-1.png",
+      "https://cdn.example/manual-1-2.png",
+      "https://cdn.example/manual-1-3.png",
+    ]);
+    assert.equal(multipartRendered[3].content, multipartContent);
+    assert.equal(multipartRendered.slice(0, 4).every((item) => item.status === "闲鱼已接收"), true);
+
+    // A failed parent submit keeps uploaded media for retry, reuses the same
+    // idempotency key and does not upload the image again.
+    await page.locator("#manualReplyFile").setInputFiles({ name: "retry-one.jpg", mimeType: "image/jpeg", buffer: Buffer.from([20, 21]) });
+    await page.fill("#manualReplyInput", "单图幂等重试");
+    fixtures.manualReplyPostMode = "failure";
+    fixtures.manualReplyPollMode = "dead_letter";
+    const retryUploadStart = fixtures.manualImageRequests.length;
+    const retryReplyStart = fixtures.manualReplyRequests.length;
+    const failedParentResponse = page.waitForResponse((response) => response.url().endsWith("/api/bot/messages/reply") && response.request().method() === "POST" && response.status() === 503);
+    await page.click('#manualReplyForm button[type="submit"]');
+    await failedParentResponse;
+    await page.waitForFunction(() => document.querySelector("#replyMessage")?.textContent.includes("暂时无法提交"));
+    assert.equal(fixtures.manualImageRequests.length, retryUploadStart + 1);
+    assert.match(await page.locator("#manualReplyPreview").innerText(), /已上传，等待提交/);
+    fixtures.manualReplyPostMode = "success";
+    const retriedParentResponse = page.waitForResponse((response) => response.url().endsWith("/api/bot/messages/reply") && response.request().method() === "POST" && response.status() === 200);
+    await page.click('#manualReplyForm button[type="submit"]');
+    await retriedParentResponse;
+    assert.equal(fixtures.manualImageRequests.length, retryUploadStart + 1, "retrying the same parent must not upload its image twice");
+    const retriedRequests = fixtures.manualReplyRequests.slice(retryReplyStart);
+    assert.equal(retriedRequests.length, 2);
+    assert.equal(retriedRequests[0].replyId, retriedRequests[1].replyId, "a failed parent retry must reuse its client request id");
+    assert.deepEqual(retriedRequests[0].media.map((item) => item.path), retriedRequests[1].media.map((item) => item.path));
+    await page.waitForFunction(() => {
+      const parent = document.querySelector('#chatMessages .message-delivery[data-parent-status="dead_letter"]');
+      return parent && parent.querySelector('[data-part-status="dead_letter"]') && parent.querySelector('[data-part-status="waiting"]');
+    }, null, { timeout: 5000 });
+    assert.match(await page.locator('#chatMessages .message-delivery[data-parent-status="dead_letter"]').innerText(), /父任务|需处理/);
+
+    // Removing an uploaded-but-not-queued image calls the scoped deletion API
+    // as best-effort cleanup and removes it from the preview immediately.
+    await page.locator("#manualReplyFile").setInputFiles({ name: "remove-uploaded.png", mimeType: "image/png", buffer: Buffer.from([22, 23]) });
+    await page.fill("#manualReplyInput", "上传后取消的图片");
+    fixtures.manualReplyPostMode = "failure";
+    const cleanupFailure = page.waitForResponse((response) => response.url().endsWith("/api/bot/messages/reply") && response.request().method() === "POST" && response.status() === 503);
+    await page.click('#manualReplyForm button[type="submit"]');
+    await cleanupFailure;
+    await page.waitForFunction(() => document.querySelector("#replyMessage")?.textContent.includes("暂时无法提交"));
+    const cleanupPath = fixtures.manualReplyRequests.at(-1).media[0].path;
+    const cleanupDelete = page.waitForResponse((response) => response.url().endsWith("/api/bot/messages/image") && response.request().method() === "DELETE");
+    await page.click("#manualReplyPreview [data-remove-manual-attachment]");
+    await cleanupDelete;
+    assert.equal(await page.locator("#manualReplyPreview .reply-image-card").count(), 0);
+    assert.deepEqual(fixtures.manualImageDeletes.at(-1), { accountKey: "default", path: cleanupPath });
+
+    // Pure text and the legacy single-image shape continue to use the same
+    // parent/parts flow without introducing extra media or text segments.
+    fixtures.manualReplyPostMode = "success";
+    fixtures.manualReplyPollMode = "success";
+    await page.fill("#manualReplyInput", "纯文字兼容回复");
+    const pureTextUploadCount = fixtures.manualImageRequests.length;
+    const pureTextResponse = page.waitForResponse((response) => response.url().endsWith("/api/bot/messages/reply") && response.request().method() === "POST" && response.status() === 200);
+    await page.click('#manualReplyForm button[type="submit"]');
+    await pureTextResponse;
+    assert.equal(fixtures.manualImageRequests.length, pureTextUploadCount);
+    assert.deepEqual(fixtures.manualReplyRequests.at(-1).media, []);
+    await page.waitForFunction(() => Array.from(document.querySelectorAll("#chatMessages .message-row")).some((row) => row.querySelector(".message-text")?.textContent === "纯文字兼容回复" && row.querySelector(".message-status")?.textContent === "闲鱼已接收"), null, { timeout: 5000 });
+
+    await page.locator("#manualReplyFile").setInputFiles({ name: "legacy-single.gif", mimeType: "image/gif", buffer: Buffer.from([24, 25]) });
+    assert.equal(await page.inputValue("#manualReplyInput"), "");
+    const singleImageResponse = page.waitForResponse((response) => response.url().endsWith("/api/bot/messages/reply") && response.request().method() === "POST" && response.status() === 200);
+    await page.click('#manualReplyForm button[type="submit"]');
+    await singleImageResponse;
+    assert.equal(fixtures.manualReplyRequests.at(-1).content, "");
+    assert.equal(fixtures.manualReplyRequests.at(-1).media.length, 1);
+    await page.waitForFunction(() => {
+      const rows = Array.from(document.querySelectorAll("#chatMessages .message-row"));
+      return rows.some((row) => row.querySelector('.message-media-image img[src*="manual-4-1.png"]') && row.querySelector(".message-status")?.textContent === "闲鱼已接收");
+    }, null, { timeout: 5000 });
+
+    // A pending reply operation owns its chat and account context. Conversation
+    // and account switches are blocked until it settles, so no later operation
+    // can overwrite the one destructive cleanup must await.
     await page.click('#sideNav [data-view="chat"]');
     await page.waitForFunction(() => document.querySelectorAll("#chatMessages .message-row").length >= 2);
     fixtures.manualReplyPostMode = "success";
     fixtures.manualReplyPollMode = "success";
-    fixtures.manualReplyPostDelayMs = 300;
+    fixtures.manualReplyPostDelayMs = 1500;
     if (await page.locator('#manualReplyForm button[type="submit"]').isDisabled()) {
       const takeoverResponse = page.waitForResponse((response) => response.url().includes("/api/bot/conversations/") && response.url().endsWith("/takeover") && response.request().method() === "POST");
       await page.click("#toggleChatTakeover");
@@ -2880,8 +3270,13 @@ async function run() {
     }
     await page.fill("#manualReplyInput", "切店铺时仍在发送");
     const accountSwitchReplyRequest = page.waitForRequest((request) => request.url().endsWith("/api/bot/messages/reply") && request.method() === "POST");
+    const accountSwitchReplyResponse = page.waitForResponse((response) => response.url().endsWith("/api/bot/messages/reply") && response.request().method() === "POST" && response.status() === 200);
+    const originalChatId = await page.locator("#conversationItems .conversation-item.is-active").getAttribute("data-chat-id");
+    const blockedChatId = await page.locator(`#conversationItems [data-chat-id]:not([data-chat-id="${originalChatId}"])`).first().getAttribute("data-chat-id");
     await page.click('#manualReplyForm button[type="submit"]');
     await accountSwitchReplyRequest;
+    await page.click(`#conversationItems [data-chat-id="${blockedChatId}"]`);
+    assert.equal(await page.locator("#conversationItems .conversation-item.is-active").getAttribute("data-chat-id"), originalChatId, "pending reply must block conversation switching");
     await openView(page, "shops");
     await page.waitForSelector('[data-panel="shops"]:not([hidden])');
     const currentAccountKey = await page.locator("#shopAccountsPanelList .shop-card.is-current").getAttribute("data-account-key");
@@ -2895,12 +3290,13 @@ async function run() {
       orders: [],
     };
     await page.click(`#shopAccountsPanelList [data-account-switch="${nextAccountKey}"]`);
+    assert.equal(await page.locator("#shopAccountsPanelList .shop-card.is-current").getAttribute("data-account-key"), currentAccountKey, "pending reply must block account switching");
+    await accountSwitchReplyResponse;
+    await page.waitForTimeout(20);
+    await page.click(`#shopAccountsPanelList [data-account-switch="${nextAccountKey}"]`);
     await page.waitForFunction((name) => document.querySelector("#accountTabs .account-tab.is-active .account-tab-name")?.textContent === name, nextAccountName);
-    assert.equal(await page.inputValue("#manualReplyInput"), "", "switching shops must clear the previous reply body");
-    assert.equal(await page.locator("#replyMessage").textContent(), "", "switching shops must clear the previous reply status");
-    await page.waitForTimeout(350);
-    assert.equal(await page.inputValue("#manualReplyInput"), "", "a late response from the previous shop must be ignored");
-    assert.equal(await page.locator("#replyMessage").textContent(), "", "a late response from the previous shop must not update status");
+    assert.equal(await page.inputValue("#manualReplyInput"), "", "switching shops after completion must clear the previous reply body");
+    assert.equal(await page.locator("#replyMessage").textContent(), "", "switching shops after completion must clear the previous reply status");
 
     // Store-scoped loaders must follow the selected account, not just the
     // header label. The fixture deliberately gives the second shop a smaller
@@ -2921,24 +3317,182 @@ async function run() {
       await page.waitForFunction(() => document.querySelector("#accountTabs .account-tab.is-active .account-tab-name")?.textContent === "海风数字店");
     }
 
-    // Deleting a non-default shop is a confirmed, scoped operation; the
-    // default shop remains visible and its delete action stays disabled.
+    // Deleting the current non-default shop must clean uploaded-but-not-queued
+    // media with the old shop scope before the account is disabled.
+    await openView(page, "shops");
+    await page.waitForSelector('[data-panel="shops"]:not([hidden])');
+    if (await page.locator('#shopAccountsPanelList .shop-card.is-current').getAttribute("data-account-key") !== "shop-ui-2") {
+      await page.click('#shopAccountsPanelList [data-account-switch="shop-ui-2"]');
+      await page.waitForFunction(() => document.querySelector("#accountTabs .account-tab.is-active")?.dataset.accountSwitch === "shop-ui-2");
+    }
+    await page.click('#sideNav [data-view="chat"]');
+    await page.waitForFunction(() => document.querySelectorAll("#conversationItems [data-chat-id]").length >= 1);
+    await page.locator("#conversationItems [data-chat-id]").first().click();
+    if (await page.locator('#manualReplyForm button[type="submit"]').isDisabled()) {
+      const takeoverResponse = page.waitForResponse((response) => response.url().includes("/api/bot/conversations/") && response.url().endsWith("/takeover") && response.request().method() === "POST");
+      await page.click("#toggleChatTakeover");
+      await takeoverResponse;
+      await page.waitForFunction(() => document.querySelector('#manualReplyForm button[type="submit"]')?.disabled === false);
+    }
+    fixtures.manualReplyPostMode = "failure";
+    fixtures.manualReplyPostDelayMs = 0;
+    await page.locator("#manualReplyFile").setInputFiles([
+      { name: "delete-shop-first.png", mimeType: "image/png", buffer: Buffer.from([26, 27]) },
+      { name: "delete-shop-second.png", mimeType: "image/png", buffer: Buffer.from([28, 29]) },
+    ]);
+    await page.fill("#manualReplyInput", "删除店铺前清理未入队图片");
+    const failedDeleteShopParent = page.waitForResponse((response) => response.url().endsWith("/api/bot/messages/reply") && response.request().method() === "POST" && response.status() === 503);
+    await page.click('#manualReplyForm button[type="submit"]');
+    await failedDeleteShopParent;
+    await page.waitForFunction(() => document.querySelector("#replyMessage")?.textContent.includes("暂时无法提交"));
+    const deleteShopCleanupPaths = fixtures.manualReplyRequests.at(-1).media.map((item) => item.path);
+    const imageDeleteStart = fixtures.manualImageDeletes.length;
+
+    await openView(page, "shops");
+    await page.waitForSelector('[data-panel="shops"]:not([hidden])');
+    fixtures.manualImageDeleteMode = "success";
+    fixtures.manualImageDeleteModes = ["success", "failure"];
+    await page.click('[data-account-delete="shop-ui-2"]');
+    await page.waitForSelector("#confirmDialog[open]");
+    assert.equal(await page.locator("#confirmTitle").textContent(), "删除店铺");
+    const failedScopedCleanup = page.waitForResponse((response) => response.url().endsWith("/api/bot/messages/image") && response.request().method() === "DELETE" && response.request().headers()["x-shop-account"] === "shop-ui-2" && response.status() === 503);
+    await page.click("#confirmAction");
+    assert.equal((await failedScopedCleanup).status(), 503);
+    await page.waitForTimeout(50);
+    assert.deepEqual(fixtures.shopAccountDeleteRequests, [], "failed media cleanup must block account deletion");
+    assert.equal(await page.locator("#shopAccountsPanelList .shop-card").count(), 2);
+    await page.click('#sideNav [data-view="chat"]');
+    await page.waitForSelector('[data-panel="chat"]:not([hidden])');
+    assert.equal(await page.locator("#manualReplyPreview .reply-image-card").count(), 2, "failed cleanup must retain both source files for retry");
+    assert.deepEqual(
+      await page.locator("#manualReplyPreview .reply-image-card").evaluateAll((cards) => cards.map((card) => ({
+        name: card.querySelector("strong")?.textContent || "",
+        status: card.querySelector("small")?.textContent || "",
+      }))),
+      [
+        { name: "delete-shop-first.png", status: "待上传 · 2 B" },
+        { name: "delete-shop-second.png", status: "已上传，等待提交 · 2 B" },
+      ],
+      "successfully deleted media must be cleared while failed media remains reusable",
+    );
+
+    fixtures.manualImageDeleteMode = "success";
+    const sequenceStart = fixtures.requestSequence.length;
     await openView(page, "shops");
     await page.waitForSelector('[data-panel="shops"]:not([hidden])');
     await page.click('[data-account-delete="shop-ui-2"]');
     await page.waitForSelector("#confirmDialog[open]");
-    assert.equal(await page.locator("#confirmTitle").textContent(), "删除店铺");
+    const scopedImageCleanup = page.waitForResponse((response) => response.url().endsWith("/api/bot/messages/image") && response.request().method() === "DELETE" && response.request().headers()["x-shop-account"] === "shop-ui-2");
+    const scopedAccountDelete = page.waitForResponse((response) => response.url().endsWith("/api/bot/accounts/shop-ui-2") && response.request().method() === "DELETE");
     await page.click("#confirmAction");
+    assert.equal((await scopedImageCleanup).status(), 200, "old-shop media cleanup must finish before disabling the account");
+    assert.equal((await scopedAccountDelete).status(), 200);
     await page.waitForFunction(() => document.querySelectorAll("#shopAccountsPanelList .shop-card").length === 1);
+    assert.deepEqual(fixtures.requestSequence.slice(sequenceStart, sequenceStart + 2), ["image-delete:shop-ui-2", "account-delete:shop-ui-2"]);
+    assert.deepEqual(fixtures.manualImageDeletes.slice(imageDeleteStart), [
+      { accountKey: "shop-ui-2", path: deleteShopCleanupPaths[0] },
+      { accountKey: "shop-ui-2", path: deleteShopCleanupPaths[1] },
+    ]);
     assert.deepEqual(fixtures.shopAccountDeleteRequests, ["shop-ui-2"], "delete must call the scoped DELETE endpoint once");
     assert.equal(await page.locator('[data-account-delete="default"]').isDisabled(), true, "default shop deletion must remain protected after cleanup");
+    fixtures.manualReplyPostMode = "success";
 
-    // The same guarantee applies to logout, so reply content cannot remain for
-    // the next person who opens the login screen in this browser.
+    // Logout must use the still-authenticated old account scope for uploaded
+    // media. A cleanup failure blocks logout and retains the attachment.
     await page.click('#sideNav [data-view="chat"]');
     await page.waitForFunction(() => document.querySelectorAll("#conversationItems [data-chat-id]").length >= 1);
     await page.click('[data-chat-id="chat-1"]');
     await page.waitForFunction(() => document.querySelectorAll("#chatMessages .message-row").length >= 2 && document.querySelector("#chatMessages")?.textContent.includes("你好，这个商品怎么使用"));
+    if (await page.locator('#manualReplyForm button[type="submit"]').isDisabled()) {
+      const takeoverResponse = page.waitForResponse((response) => response.url().includes("/api/bot/conversations/") && response.url().endsWith("/takeover") && response.request().method() === "POST");
+      await page.click("#toggleChatTakeover");
+      await takeoverResponse;
+      await page.waitForFunction(() => document.querySelector('#manualReplyForm button[type="submit"]')?.disabled === false);
+    }
+    fixtures.manualReplyPostMode = "failure";
+    await page.locator("#manualReplyFile").setInputFiles({ name: "logout-unqueued.png", mimeType: "image/png", buffer: Buffer.from([28, 29]) });
+    await page.fill("#manualReplyInput", "退出前清理未入队图片");
+    const failedLogoutParent = page.waitForResponse((response) => response.url().endsWith("/api/bot/messages/reply") && response.request().method() === "POST" && response.status() === 503);
+    await page.click('#manualReplyForm button[type="submit"]');
+    await failedLogoutParent;
+    await page.waitForFunction(() => document.querySelector("#replyMessage")?.textContent.includes("暂时无法提交"));
+    const logoutCleanupPath = fixtures.manualReplyRequests.at(-1).media[0].path;
+    const logoutCountBeforeFailure = fixtures.authLogoutRequests;
+    fixtures.manualImageDeleteMode = "failure";
+    const failedLogoutCleanup = page.waitForResponse((response) => response.url().endsWith("/api/bot/messages/image") && response.request().method() === "DELETE" && response.request().headers()["x-shop-account"] === "default");
+    await page.click("#logoutButton");
+    assert.equal((await failedLogoutCleanup).status(), 503);
+    await page.waitForTimeout(50);
+    assert.equal(fixtures.authLogoutRequests, logoutCountBeforeFailure, "failed image cleanup must block session logout");
+    assert.equal(await page.locator("#workspace").isVisible(), true);
+    assert.equal(await page.locator("#manualReplyPreview .reply-image-card").count(), 1, "failed logout cleanup must retain the attachment");
+
+    fixtures.manualImageDeleteMode = "success";
+    const logoutSequenceStart = fixtures.requestSequence.length;
+    const successfulLogoutCleanup = page.waitForResponse((response) => response.url().endsWith("/api/bot/messages/image") && response.request().method() === "DELETE" && response.request().headers()["x-shop-account"] === "default" && response.status() === 200);
+    const firstLogoutResponse = page.waitForResponse((response) => response.url().endsWith("/api/auth/logout") && response.request().method() === "POST");
+    await page.click("#logoutButton");
+    await successfulLogoutCleanup;
+    assert.equal((await firstLogoutResponse).status(), 200);
+    await page.waitForSelector("#authScreen:not([hidden])");
+    assert.deepEqual(fixtures.requestSequence.slice(logoutSequenceStart, logoutSequenceStart + 2), ["image-delete:default", "auth-logout"]);
+    assert.deepEqual(fixtures.manualImageDeletes.at(-1), { accountKey: "default", path: logoutCleanupPath });
+    assert.equal(fixtures.authLogoutRequests, logoutCountBeforeFailure + 1);
+    assert.equal(await page.inputValue("#manualReplyInput"), "", "logout must clear the reply body");
+    assert.equal(await page.locator("#replyMessage").textContent(), "", "logout must clear reply status");
+
+    // Preserve the existing late-response fence after signing in again: a text
+    // parent response arriving after logout may not restore the old form state.
+    fixtures.manualReplyPostMode = "success";
+    await page.fill("#authUsername", "owner-demo");
+    await page.fill("#authPassword", "password-123");
+    await page.click("#authSubmit");
+    await page.waitForSelector("#workspace:not([hidden])");
+    await page.click('#sideNav [data-view="chat"]');
+    await page.waitForFunction(() => document.querySelectorAll("#conversationItems [data-chat-id]").length >= 1);
+    await page.click('[data-chat-id="chat-1"]');
+    if (await page.locator('#manualReplyForm button[type="submit"]').isDisabled()) {
+      const takeoverResponse = page.waitForResponse((response) => response.url().includes("/api/bot/conversations/") && response.url().endsWith("/takeover") && response.request().method() === "POST");
+      await page.click("#toggleChatTakeover");
+      await takeoverResponse;
+      await page.waitForFunction(() => document.querySelector('#manualReplyForm button[type="submit"]')?.disabled === false);
+    }
+    fixtures.manualReplyPostMode = "success";
+    fixtures.manualImageUploadDelayMs = 300;
+    await page.locator("#manualReplyFile").setInputFiles({ name: "logout-during-upload.png", mimeType: "image/png", buffer: Buffer.from([30, 31]) });
+    await page.fill("#manualReplyInput", "上传中退出不应创建父任务");
+    const delayedUploadParentCount = fixtures.manualReplyRequests.length;
+    const delayedUploadLogoutCount = fixtures.authLogoutRequests;
+    const delayedUploadSequenceStart = fixtures.requestSequence.length;
+    const delayedUploadRequest = page.waitForRequest((request) => request.url().includes("/api/bot/messages/image?chat_id=") && request.method() === "POST");
+    const delayedUploadResponse = page.waitForResponse((response) => response.url().includes("/api/bot/messages/image?chat_id=") && response.request().method() === "POST" && response.status() === 200);
+    const delayedUploadCleanup = page.waitForResponse((response) => response.url().endsWith("/api/bot/messages/image") && response.request().method() === "DELETE" && response.request().headers()["x-shop-account"] === "default" && response.status() === 200);
+    const delayedUploadLogout = page.waitForResponse((response) => response.url().endsWith("/api/auth/logout") && response.request().method() === "POST");
+    await page.click('#manualReplyForm button[type="submit"]');
+    await delayedUploadRequest;
+    await page.click("#logoutButton");
+    const delayedUploadMedia = (await (await delayedUploadResponse).json()).media;
+    await delayedUploadCleanup;
+    assert.equal((await delayedUploadLogout).status(), 200);
+    await page.waitForSelector("#authScreen:not([hidden])");
+    assert.equal(fixtures.manualReplyRequests.length, delayedUploadParentCount, "logout during upload must cancel before parent enqueue");
+    assert.equal(fixtures.authLogoutRequests, delayedUploadLogoutCount + 1);
+    assert.deepEqual(fixtures.requestSequence.slice(delayedUploadSequenceStart, delayedUploadSequenceStart + 2), ["image-delete:default", "auth-logout"]);
+    assert.deepEqual(fixtures.manualImageDeletes.at(-1), { accountKey: "default", path: delayedUploadMedia.path });
+
+    await page.fill("#authUsername", "owner-demo");
+    await page.fill("#authPassword", "password-123");
+    await page.click("#authSubmit");
+    await page.waitForSelector("#workspace:not([hidden])");
+    await page.click('#sideNav [data-view="chat"]');
+    await page.waitForFunction(() => document.querySelectorAll("#conversationItems [data-chat-id]").length >= 1);
+    await page.click('[data-chat-id="chat-1"]');
+    if (await page.locator('#manualReplyForm button[type="submit"]').isDisabled()) {
+      const takeoverResponse = page.waitForResponse((response) => response.url().includes("/api/bot/conversations/") && response.url().endsWith("/takeover") && response.request().method() === "POST");
+      await page.click("#toggleChatTakeover");
+      await takeoverResponse;
+      await page.waitForFunction(() => document.querySelector('#manualReplyForm button[type="submit"]')?.disabled === false);
+    }
     fixtures.manualReplyPostDelayMs = 300;
     await page.fill("#manualReplyInput", "退出时仍在发送");
     const logoutReplyRequest = page.waitForRequest((request) => request.url().endsWith("/api/bot/messages/reply") && request.method() === "POST");
@@ -3054,7 +3608,9 @@ async function run() {
     assert.equal(expectedQrStageCancelResponses, fixtures.qrStageCancelNotFound, "closing a terminal QR failure may observe only its expected 404");
     assert.equal(expectedQrStageCancelConsole, fixtures.qrStageCancelNotFound, "only the terminal QR cancel 404 may reach the browser console");
     assert.equal(expectedManualReplyFailureResponses, fixtures.manualReplyPostFailures, "manual reply POST failures must be observed exactly once");
-    assert.equal(expectedManualReplyFailureConsole, fixtures.manualReplyPostFailures, "manual reply POST failures must be the only expected 503 console entries");
+    assert.equal(expectedManualReplyFailureConsole, fixtures.manualReplyPostFailures, "manual reply POST failures must be observed in the browser console");
+    assert.equal(expectedManualImageDeleteFailureResponses, fixtures.manualImageDeleteFailures, "manual image cleanup failures must be observed exactly once");
+    assert.equal(expectedManualImageDeleteFailureConsole, fixtures.manualImageDeleteFailures, "manual image cleanup failures must be observed in the browser console");
     assert.equal(expectedManualReplyNotFoundResponses, fixtures.manualReplyPollNotFoundResponses, "manual reply status 404s must be observed exactly once");
     assert.equal(expectedManualReplyNotFoundConsole, fixtures.manualReplyPollNotFoundResponses, "manual reply status 404s must be the only expected 404 console entries");
     assert.deepEqual(errors, [], "browser should have no page or console errors");
