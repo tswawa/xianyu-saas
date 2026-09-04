@@ -1,5 +1,5 @@
 blank_issues_enabled: false
 contact_links:
   - name: 安全漏洞与敏感信息
-    url: https://github.com/tswawa/xianyu-saas/security/policy
-    about: 请按 SECURITY.md 私下联系维护者；不要公开 Cookie、Token、API Key、订单号或聊天内容。
+    url: https://github.com/tswawa/xianyu-saas/security/advisories/new
+    about: 请使用私密安全报告入口；不要公开 Cookie、Token、API Key、订单号或聊天内容。
