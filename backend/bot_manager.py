@@ -69,7 +69,6 @@ AUTH_PHASES = {
     "NEEDS_HUMAN",
 }
 INITIAL_ACCOUNT_FILES = {
-    "trial_codes.json": "[]",
     "redeem_codes.json": "[]",
     "pan_links.json": '{"links": []}',
     "reply_rules.json": '{"version": 1, "rules": []}',

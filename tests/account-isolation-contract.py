@@ -40,7 +40,6 @@ import bot_manager  # noqa: E402
 import records  # noqa: E402
 import shop_sync  # noqa: E402
 from account_storage import AccountStorage  # noqa: E402
-from connector_handoff import HandoffStore  # noqa: E402
 
 
 def fake_shop_sync(cookie_header: str) -> dict:
@@ -341,17 +340,6 @@ def main() -> None:
     assert expired_status["connected"] is False
     bot_manager.clear_auth_status(user_id, "second")
     assert bot_manager.status(user_id, "second")["auth_code"] == "ok"
-
-    # Connector bridge tokens are scoped to the account and revoked together
-    # on logout; a token from one shop cannot be claimed for the other.
-    handoffs = HandoffStore(clock=lambda: 1000.0)
-    default_handoff, _ = handoffs.issue(user_id, "default")
-    second_handoff, _ = handoffs.issue(user_id, "second")
-    assert handoffs.begin_with_scope(default_handoff) == ("ok", user_id, "default")
-    handoffs.finish(default_handoff, success=False)
-    handoffs.clear_user(user_id)
-    assert handoffs.begin_with_scope(default_handoff)[0] == "handoff_invalid"
-    assert handoffs.begin_with_scope(second_handoff)[0] == "handoff_invalid"
 
     print("account-isolation contract: cookies, snapshots, automation, jobs, attention, records and worker paths passed")
 

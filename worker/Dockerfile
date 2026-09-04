@@ -34,7 +34,7 @@ RUN apk add --no-cache ca-certificates libstdc++ tzdata \
 WORKDIR /app
 
 COPY --from=builder /opt/venv /opt/venv
-COPY main.py XianyuAgent.py XianyuApis.py auth_state.py platform_profile.py private_auth_storage.py context_manager.py delivery_store.py tutorial_text.py products_config.json ./
+COPY main.py XianyuAgent.py XianyuApis.py auth_state.py platform_profile.py private_auth_storage.py context_manager.py delivery_store.py products_config.json ./
 COPY utils/ ./utils/
 COPY scripts/list_manual_reviews.py scripts/resolve_manual_review.py scripts/manage_inbound_dead_letters.py scripts/migrate_state.py ./scripts/
 COPY prompts/classify_prompt_example.txt ./prompts/classify_prompt.txt

@@ -88,7 +88,7 @@ start_service consumer ./scripts/dev-consumer.sh
 start_service web env SAAS_DEV_API_ORIGIN="http://127.0.0.1:$api_port" SAAS_DEV_WEB_PORT="$web_port" node scripts/dev-server.mjs
 
 printf '\n'
-printf '%s\n' '[dev] DeepWhale 本地开发环境已启动'
+printf '%s\n' '[dev] xianyu-saas 本地开发环境已启动'
 printf '      工作台：http://127.0.0.1:%s/xianyu-saas/\n' "$web_port"
 printf '      API 健康检查：http://127.0.0.1:%s/health\n' "$api_port"
 printf '      consumer：后台运行（无 HTTP 地址）\n'

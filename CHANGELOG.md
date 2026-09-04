@@ -16,9 +16,17 @@
 - `docs/DEPLOYMENT.md` 增加容器部署章节，并明确其与 systemd 版本化发布互斥。
 - `docs/NEW_UBUNTU_HANDOFF.md` 增加容器开发路径，改用 `npm run dev` 单命令启动。
 
+### 移除
+
+- 删除浏览器连接助手扩展 `connector-extension/`、预构建扩展 ZIP 及其合同测试：店铺连接已统一走服务端官方扫码，前端不再发起扩展握手。
+- 删除后端 `/api/bot/connector/handoff` 与 `/api/bot/connector/cookies` 端点、`connector_handoff` 模块，以及来源校验对连接端点的豁免，缩减可接收登录态的入口。
+- 删除 nginx 中对应的 connector location 与限流 zone。
+- 删除 `worker/tutorial_text.py` 及其测试：该文件是维护者个人转售业务的成品营销文案（含个人域名与自定折扣定价），此前随 worker 镜像分发，自建部署后会出现在发给买家的文本里；其测试还把具体价格断言成了合同。兑换码履约文本改为「配置话术优先 + 通用回落」，与网盘、资料两类发货行为一致。
+- 删除试用码链路：`send_trial_code` 无生产调用点，却依赖 `delivery_store` 的 7 个方法、`trial_claims` 表、启动恢复扫描和一条库存类型；它服务的是特定业务规则，不属于通用客服能力。库存类型收窄为仅兑换码。既有数据库的 `trial_claims` 表保持原样不删除，兑换码发货与库存隔离不受影响。
+
 ### 修复
 
-- `蒸馏/` 目录下的本地开发图片虽已在 `.gitignore` 中声明，但因先于规则入库仍被跟踪，现已脱离版本控制。
+- `蒸馏/` 目录下的本地开发图片虽已在忽略规则中声明，但因先于规则入库仍被跟踪，现已脱离版本控制。
 
 容器镜像构建与启动尚未纳入自动化门禁，首次部署需自行验证。当前仓库仍以内部构建方式维护，未承诺公共 Release 节奏。
 
@@ -42,12 +50,12 @@
 - 增加五种 provider 适配格式：OpenAI Chat Completions、OpenAI Responses、Anthropic Messages、Google Gemini 和 Ollama Chat。
 - 增加 AI 草稿来源、精确配置版本、规则/设置指纹和发送前再次复核。
 - 增加商品客服内容、兑换码/网盘资源配置和经过订单证明的受控履约流程。
-- 增加 nginx、systemd、Docker、日志轮转和新 Ubuntu 开发部署模板。
+- 增加 nginx、systemd、日志轮转和开发部署文档模板。
 - 增加 GitHub CI、Dependabot、CODEOWNERS、Issue/PR 模板、贡献指南和许可证边界文档。
 
 ### 安全
 
-- 浏览器不接收或保存闲鱼 Cookie、平台 Token 和模型密钥。
+- 浏览器不接收或保存闲鱼 Cookie、平台 Token；模型 Key 仅在用户主动测试或保存连接时短暂提交，已保存值不回显，应用不写入浏览器存储。
 - 控制文件缺失或损坏时 fail-closed；只有显式注册或新建店铺初始化可以播种默认文件。
 - AI 只能生成客服文本或人工接管决策，不能授权发货、改订单或读取其他店铺资料。
 - 自动履约必须核验订单号、商品、买家、卖家、状态和数量，不能由买家文字、商品标题或模型输出授权。
@@ -56,7 +64,7 @@
 
 ### 验证范围
 
-- 离线合同覆盖仓库脱敏、API、账号隔离、AI provider、异步任务、Worker 恢复、人工回复、部署配置、扩展资产和桌面/移动 UI。
+- 离线合同覆盖仓库脱敏、API、账号隔离、AI provider、异步任务、Worker 恢复、人工回复、部署配置和桌面/移动 UI。
 - 当前完整门禁使用 `npm test`，并辅以 `python3 tests/repository-contract.py` 和 `git diff --check`。
 - 本地开发实例已验证 API 存活/就绪、未登录鉴权响应、静态资源一致性以及桌面/390px 布局无横向溢出。
 
@@ -69,5 +77,4 @@
 - 真实订单、库存、发货和平台 ACK 的业务验收；
 - nginx/systemd 生产主机加载、域名、TLS、密钥和运行态权限配置。
 
-[未发布]: https://github.com/tswawa/xianyu-saas/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/tswawa/xianyu-saas/releases/tag/v0.1.0
+当前仓库为私有内部构建，未发布 Git 标签或 GitHub Release，因此本文件不提供版本间的比较链接。

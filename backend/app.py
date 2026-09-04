@@ -60,7 +60,6 @@ from bot_manager import (
     terminate_pid as bot_terminate_pid,
     write_secret,
 )
-from connector_handoff import handoffs
 from db import (
     DB,
     DB_PATH,
@@ -477,7 +476,6 @@ async def security_headers(request: Request, call_next):
     if (
         method not in {"GET", "HEAD", "OPTIONS"}
         and request.url.path.startswith("/api/")
-        and request.url.path != "/api/bot/connector/cookies"
         and request.cookies.get(SESSION_COOKIE)
         and os.environ.get("SAAS_TESTING") != "1"
     ):
@@ -947,14 +945,6 @@ class AIReadyIn(BaseModel):
 
 class CookiesIn(BaseModel):
     cookies: str
-
-
-class ConnectorCookiesIn(BaseModel):
-    handoff_token: str
-    cookies: str
-
-    class Config:
-        extra = "forbid"
 
 
 class XianyuLoginCompleteIn(BaseModel):
@@ -1982,23 +1972,6 @@ def _same_saved_cookie(user_id: int, account_key: str, candidate: str) -> bool:
     ).digest()
 
 
-def _handoff_http_error(code: str, status: int) -> HTTPException:
-    messages = {
-        "handoff_invalid": "连接请求已失效，请重新发起连接",
-        "handoff_expired": "连接请求已过期，请重新发起连接",
-        "handoff_busy": "已有连接正在检测，请稍后再试",
-        "handoff_attempts_exceeded": "连接尝试次数过多，请重新发起连接",
-    }
-    return HTTPException(
-        status,
-        detail={
-            "code": code,
-            "message": messages.get(code, "连接请求无效，请重新发起连接"),
-            "retryable": code not in {"handoff_attempts_exceeded"},
-        },
-    )
-
-
 def _xianyu_login_http_error(error: XianyuLoginError) -> HTTPException:
     statuses = {
         "invalid_request": 400,
@@ -2698,9 +2671,6 @@ def logout(
     else:
         # Compatibility with the tiny QR fake used by older contract tests.
         qr_logins.clear_user(user["id"])
-    clear_handoffs = getattr(handoffs, "clear_user", None)
-    if clear_handoffs is not None:
-        clear_handoffs(user["id"])
     db.delete_token(token)
     response.delete_cookie(SESSION_COOKIE, path=COOKIE_PATH, secure=COOKIE_SECURE, samesite="strict")
     _audit(
@@ -4030,75 +4000,6 @@ def cancel_xianyu_login(
         if error.code not in {"login_not_found", "login_expired"}:
             raise _xianyu_login_http_error(error) from None
     return {"ok": True}
-
-
-@app.post("/api/bot/connector/handoff")
-def issue_connector_handoff(
-    user=Depends(Auth.current_user),
-    account=Depends(current_shop_account),
-):
-    """Issue a short-lived bridge credential without exposing the session token."""
-    _require_permission(user, "shop.configure")
-    account_key = str(account["account_key"])
-    handoff_token, expires_at = (
-        handoffs.issue(user["id"])
-        if account_key == "default"
-        else handoffs.issue(user["id"], account_key)
-    )
-    return {
-        "ok": True,
-        "handoff_token": handoff_token,
-        "expires_at": expires_at,
-    }
-
-
-@app.post("/api/bot/connector/cookies")
-def submit_connector_cookies(body: ConnectorCookiesIn):
-    """Accept connector cookies through a scoped, short-lived handoff token.
-
-    The endpoint intentionally has no normal session dependency: the browser
-    extension cannot rely on SameSite HttpOnly cookies from its service
-    worker.  The handoff token is the sole credential and is never persisted.
-    """
-    token = body.handoff_token.strip()
-    if not token or len(token) > 256:
-        raise _handoff_http_error("handoff_invalid", 401)
-    scope_begin = getattr(handoffs, "begin_with_scope", None)
-    if scope_begin is None:
-        claim_code, user_id = handoffs.begin(token)
-        account_key = "default"
-    else:
-        claim_code, user_id, account_key = scope_begin(token)
-    if claim_code != "ok" or user_id is None:
-        status = 409 if claim_code == "handoff_busy" else 401
-        raise _handoff_http_error(claim_code, status)
-
-    try:
-        user = db.get_user_by_id(user_id)
-        if user is None or not has_permission(user, "shop.configure"):
-            raise _handoff_http_error("handoff_invalid", 401)
-        cookies = body.cookies.strip()
-        if not cookies or len(cookies) > 32768:
-            raise _cookie_http_error("cookie_invalid", "登录信息无效，请重新登录闲鱼并连接", 400)
-        if bot_status(user_id, account_key or "default").get("running") and not _same_saved_cookie(
-            user_id, account_key or "default", cookies
-        ):
-            raise _cookie_http_error("bot_running", "请先暂停自动客服，再更新店铺登录", 409)
-        account = db.get_shop_account(user_id, account_key=account_key or "default")
-        if account is None or not account["enabled"]:
-            raise _handoff_http_error("handoff_invalid", 401)
-        result = _shop_sync_payload(
-            _run_shop_sync(user_id, cookies, replace_cookie=True, account=account)
-        )
-    except HTTPException:
-        handoffs.finish(token, success=False)
-        raise
-    except (OSError, RuntimeError, ValueError):
-        handoffs.finish(token, success=False)
-        raise HTTPException(503, "店铺连接失败，请稍后重试") from None
-    else:
-        handoffs.finish(token, success=True)
-        return result
 
 
 @app.put("/api/bot/cookies")

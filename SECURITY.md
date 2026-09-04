@@ -4,10 +4,12 @@
 
 ## 私下报告漏洞
 
-- 优先使用 GitHub Security Advisories 的私下报告入口：<https://github.com/tswawa/xianyu-saas/security/advisories/new>。
-- 如果目标仓库暂未启用该功能，请通过维护者账号 [@tswawa](https://github.com/tswawa) 私下联系，并只提供脱敏后的复现步骤。
+当前仓库为私有内部项目，尚未开放面向外部报告者的入口。协作者发现安全问题时，请直接私下联系维护者，并只提供脱敏后的复现步骤，不要在提交信息、Issue 或 Pull Request 中描述可复用的攻击细节。
+
 - 报告中不要包含 Cookie、Token、API Key、密码、真实订单号、买家信息、库存、数据库或未经脱敏的日志。
 - 维护者会先确认收到报告，再评估影响范围、修复方式和是否需要发布安全公告；不要在公开渠道催促或复制敏感内容。
+
+仓库转为公开后，再按 [`docs/PUBLIC_RELEASE_CHECKLIST.md`](docs/PUBLIC_RELEASE_CHECKLIST.md) 启用 GitHub Security Advisories 等外部报告入口。
 
 ## 不进入仓库的内容
 

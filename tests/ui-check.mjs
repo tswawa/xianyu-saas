@@ -215,8 +215,6 @@ const fixtures = {
   qrSyncFailures: 0,
   qrStageFailures: 0,
   qrStageCancelNotFound: 0,
-  handoffCounter: 0,
-  handoffTokens: new Set(),
   cookieFailureCode: "",
   accountData: {},
   loaderResponseDelayMs: { products: {}, automation: {}, orders: {}, cards: {}, ai: {} },
@@ -632,25 +630,6 @@ function createServer() {
         fixtures.qrCancels += 1;
         return json(res, { ok: true });
       }
-      if (apiPath === "/api/bot/connector/handoff" && req.method === "POST") {
-        const token = `handoff-contract-${++fixtures.handoffCounter}`;
-        fixtures.handoffTokens.add(token);
-        return json(res, { ok: true, handoff_token: token, expires_at: Date.now() / 1000 + 600 });
-      }
-      if (apiPath === "/api/bot/connector/cookies" && req.method === "POST") {
-        if (!fixtures.handoffTokens.has(payload.handoff_token)) return json(res, { detail: { code: "handoff_invalid", message: "连接请求已失效" } }, 401);
-        fixtures.handoffTokens.delete(payload.handoff_token);
-        if (typeof payload.cookies !== "string" || !payload.cookies.includes("unb=") || !payload.cookies.includes("_m_h5_tk=")) {
-          return json(res, { detail: { code: "cookie_incomplete", message: "登录信息不完整" } }, 400);
-        }
-        fixtures.cookieSaves += 1;
-        fixtures.bot.cookies_set = true;
-        fixtures.bot.connected = true;
-        fixtures.bot.sync_status = "verified";
-        fixtures.bot.cookie_status = { code: "verified", label: "已验证", message: "登录状态已验证", action: "可随时重新检测店铺商品" };
-        fixtures.bot.last_sync_at = "2026-08-15T10:01:00+0800";
-        return json(res, { ok: true, connected: true, shop_name: fixtures.bot.shop_name, product_count: fixtures.products.length });
-      }
       if (apiPath === "/api/bot/ai/status" && req.method === "GET") {
         const scoped = scopedAi(req);
         return json(res, structuredClone(scoped.value.status));
@@ -843,7 +822,7 @@ function createServer() {
         const scoped = scopedAi(req);
         const itemId = decodeURIComponent(aiPublishMatch[1]);
         const current = scoped.value.knowledge[itemId];
-        if (!current || payload.confirm !== true) return json(res, { detail: "请先保存草稿并确认发布" }, 409);
+        if (!current || payload.confirm !== true) return json(res, { detail: "请先保存商品补充内容并确认" }, 409);
         current.status = "published";
         current.published = structuredClone(current.draft);
         current.revision += 1;

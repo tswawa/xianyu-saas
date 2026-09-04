@@ -63,3 +63,8 @@ node_modules/
 .vscode/
 *.swp
 *.swo
+
+# AI 协作与内部规划文件（保留在本机，不进入公开树）
+/AGENTS.md
+/handoff/
+/docs/COMPETITOR-ANALYSIS-PLAN.md

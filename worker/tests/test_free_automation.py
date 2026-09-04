@@ -256,7 +256,6 @@ class FreeAutomationTests(unittest.IsolatedAsyncioTestCase):
     ):
         if mode == "rules_ai":
             write_json(self.state / "redeem_codes.json", [])
-            write_json(self.state / "trial_codes.json", [])
         env_patch, bot = self.make_agent(
             mode,
             rules,

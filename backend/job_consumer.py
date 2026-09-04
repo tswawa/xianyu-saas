@@ -297,7 +297,7 @@ class JobConsumer:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="DeepWhale durable job consumer")
+    parser = argparse.ArgumentParser(description="xianyu-saas durable job consumer")
     parser.add_argument("--once", action="store_true", help="consume at most one available job")
     args = parser.parse_args()
     consumer = JobConsumer()

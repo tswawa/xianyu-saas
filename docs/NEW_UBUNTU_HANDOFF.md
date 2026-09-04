@@ -35,8 +35,8 @@ Node.js 请使用受信任的官方发行方式或已有的版本管理器安装
 推荐使用 GitHub SSH Key，不把 PAT 写进命令、remote URL 或聊天：
 
 ```bash
-git clone <PRIVATE_REPOSITORY_SSH_URL> deepwhale-xianyu-service
-cd deepwhale-xianyu-service
+git clone <PRIVATE_REPOSITORY_SSH_URL> xianyu-saas
+cd xianyu-saas
 ```
 
 `<PRIVATE_REPOSITORY_SSH_URL>` 是明确占位符，需替换为负责人提供的真实私有仓库地址。当前服务器本地仓库尚未配置该远端，文档不猜测仓库名称。
@@ -125,9 +125,8 @@ git push -u origin feature/<short-name>
 
 先完整读取：
 
-1. `handoff/AGENTS.md`
-2. `handoff/MEMORY.md`
-3. 本文件
-4. `README.md`
+1. 本文件
+2. `README.md`
+3. `CONTRIBUTING.md`（安全红线、架构边界、产品约束和本地门禁）
 
 如果所用客户端支持项目级指令或长期记忆，可由用户手动把上述内容加入对应位置；不要自动覆盖已有根目录规则，也不要把本机 `.env` 内容加入记忆。

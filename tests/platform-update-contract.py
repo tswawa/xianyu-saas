@@ -106,7 +106,7 @@ def write_source_root() -> None:
     (SOURCE_ROOT / "backend").mkdir(parents=True)
     (SOURCE_ROOT / "frontend").mkdir(parents=True)
     package = {
-        "name": "deepwhale-xianyu-service",
+        "name": "xianyu-saas",
         "version": "0.1.0",
         "dependencies": {"safe": "1.0.0"},
         "devDependencies": {"test": "1.0.0"},
@@ -145,7 +145,7 @@ def write_source_root() -> None:
 
 def candidate_files(version: str, *, dependency="1.0.0") -> dict[str, tuple[bytes, bool]]:
     package = {
-        "name": "deepwhale-xianyu-service",
+        "name": "xianyu-saas",
         "version": version,
         "dependencies": {"safe": dependency},
         "devDependencies": {"test": "1.0.0"},
@@ -574,6 +574,18 @@ def main() -> None:
             raise AssertionError("updater lock must reject concurrent execution")
     finally:
         os.close(lock_descriptor)
+
+    # A second updater must not delete the first process's claimed intent when
+    # it exits after failing to acquire the lock.
+    processing_path = config.intent_file.with_name("intent.processing.json")
+    processing_path.parent.mkdir(parents=True, exist_ok=True)
+    processing_path.write_text("{}", encoding="utf-8")
+    with patch.object(updater.Config, "from_env", return_value=config), patch.object(
+        updater, "acquire_lock", side_effect=updater.UpdaterError("update_already_running")
+    ):
+        assert updater.main() == 1
+    assert processing_path.exists(), "a concurrent updater must preserve the claimed intent"
+    processing_path.unlink()
 
     os.environ["SAAS_GITHUB_READ_TOKEN"] = "must-not-reach-updater-child"
     captured_child = {}

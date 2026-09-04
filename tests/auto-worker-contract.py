@@ -337,21 +337,6 @@ def main() -> None:
         assert fake_qr.finished == [("qr-contract", True, "qr-shop")]
 
 
-        create_account(client, "extension-shop")
-        extension_headers = {"X-Shop-Account": "extension-shop"}
-        handoff = client.post("/api/bot/connector/handoff", headers=extension_headers)
-        assert handoff.status_code == 200, handoff.text
-        extension_cookie = "unb=610004; _m_h5_tk=extension-token_tail; sid=extension"
-        extension = TestClient(app.app).post(
-            "/api/bot/connector/cookies",
-            json={
-                "handoff_token": handoff.json()["handoff_token"],
-                "cookies": extension_cookie,
-            },
-        )
-        assert extension.status_code == 200, extension.text
-        assert starts["extension-shop"] == 1
-
         create_account(client, "sync-shop")
         sync_headers = {"X-Shop-Account": "sync-shop"}
         sync_cookie = "unb=610005; _m_h5_tk=sync-token_tail; sid=sync"

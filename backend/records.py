@@ -184,7 +184,7 @@ def _table_exists(con, table_name: str) -> bool:
 
 def inventory_counts(user_id: int, kind: str, account_key: str = DEFAULT_ACCOUNT_ID):
     """Return worker-authoritative inventory counts when its DB exists."""
-    if kind not in {"redeem", "trial"}:
+    if kind != "redeem":
         raise ValueError("unsupported inventory kind")
     con = _connect(user_id, "delivery_state.db", account_key)
     if con is None:

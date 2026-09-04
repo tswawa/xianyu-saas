@@ -34,6 +34,5 @@ npm run test:analytics
 npm run test:product-batch
 npm run test:templates-cards
 npm run test:deploy
-npm run test:connector
 npm run test:worker
 npm run test:ui

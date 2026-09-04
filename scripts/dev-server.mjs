@@ -92,7 +92,13 @@ async function serveStatic(response, file) {
 }
 
 const server = http.createServer(async (request, response) => {
-  const url = new URL(request.url || "/", "http://127.0.0.1");
+  let url;
+  try {
+    url = new URL(request.url || "/", "http://127.0.0.1");
+  } catch {
+    send(response, 400, "Bad request", { "content-type": "text/plain; charset=utf-8" });
+    return;
+  }
   if (url.pathname === "/xianyu-saas") {
     response.writeHead(308, { location: "/xianyu-saas/" });
     response.end();
@@ -107,7 +113,13 @@ const server = http.createServer(async (request, response) => {
     return;
   }
   if (url.pathname.startsWith("/xianyu-saas/assets/")) {
-    const relative = decodeURIComponent(url.pathname.slice("/xianyu-saas/assets/".length));
+    let relative;
+    try {
+      relative = decodeURIComponent(url.pathname.slice("/xianyu-saas/assets/".length));
+    } catch {
+      send(response, 400, "Bad request", { "content-type": "text/plain; charset=utf-8" });
+      return;
+    }
     const target = path.resolve(assets, relative);
     if (target !== assets && target.startsWith(assets + path.sep)) {
       await serveStatic(response, target);
@@ -119,5 +131,5 @@ const server = http.createServer(async (request, response) => {
 
 server.listen(port, host, () => {
   const display = host === "0.0.0.0" || host === "::" ? "127.0.0.1" : host;
-  process.stdout.write(`DeepWhale 闲鱼客服本地页面: http://${display}:${port}/xianyu-saas/\n`);
+  process.stdout.write(`闲鱼客服本地页面: http://${display}:${port}/xianyu-saas/\n`);
 });

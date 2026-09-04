@@ -921,19 +921,24 @@ def main() -> int:
     config = Config.from_env()
     lock_descriptor = None
     processing = _processing_file(config)
+    claim_started = False
     try:
         validate_layout(config)
         lock_descriptor = acquire_lock(config)
+        claim_started = True
         intent, processing = claim_intent(config)
         process_intent(config, intent)
         return 0
     except (UpdaterError, PlatformUpdateError, OSError, sqlite3.Error):
         return 1
     finally:
-        try:
-            processing.unlink(missing_ok=True)
-        except OSError:
-            pass
+        # Do not remove an active updater's claimed intent when this process
+        # exits before it acquires the updater lock.
+        if claim_started:
+            try:
+                processing.unlink(missing_ok=True)
+            except OSError:
+                pass
         if lock_descriptor is not None:
             os.close(lock_descriptor)
 

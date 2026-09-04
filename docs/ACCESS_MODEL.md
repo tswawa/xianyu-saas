@@ -1,13 +1,12 @@
 # 闲鱼客服 SaaS 权限与服务边界
 
-更新日期：2026-08-31
+更新日期：2026-09-02
 
-## 套餐判定
+## 兼容订阅字段与当前授权
 
-- `member`：`expires_at` 晚于当前时间。
-- `free`：新注册、未激活或会员已到期。
-- 套餐由后端根据订阅时间计算；前端只展示结果，不参与授权决策。
-- 会员只解锁 AI 类能力（当前为 `automation.ai`，后续的 AI 一键操作与定制服务也走会员）；订单、统计、模板、卡密、高级履约等经营功能对免费用户可用。
+- `member`：`expires_at` 晚于当前时间；`free`：新注册、未激活或会员已到期。
+- 后端仍按 `expires_at` 计算 `plan`、`active` 和 `plan_label`，用于兼容旧客户端、管理员维护路径和状态展示；这些字段不构成当前自用工作台的业务授权依据。
+- 当前 `permissions_for()` 对 `free` 与 `member` 返回相同的经营和 AI 权限集合；店铺、履约、记录、统计与 AI 均不按订阅状态拦截。平台管理能力仍由 `admin` 角色单独控制。
 
 ## 权限矩阵
 
@@ -21,9 +20,9 @@
 | `records.read` | 是 | 是 | 查看对话与订单记录 |
 | `runtime.logs` | 是 | 是 | 查看托管机器人运行日志 |
 | `analytics.read` | 是 | 是 | 查看运营统计 |
-| `automation.ai` | 否 | 是 | 启动平台 AI 智能客服 |
+| `automation.ai` | 是 | 是 | 启动平台 AI 智能客服 |
 
-停止机器人是安全操作，所有已登录用户均可执行，避免会员到期后无法关闭进程。
+停止机器人是安全操作，所有已登录用户均可执行；订阅状态变化不会让用户失去停止自己店铺 Worker 的能力。
 
 ## 平台角色与账号生命周期
 
@@ -61,21 +60,17 @@
 
 ## API 边界
 
-- `/api/me` 返回账号、套餐和权限数组。
-- `/api/membership/plans` 返回全部时长卡种（日/周/月/年）；套餐用于开通会员 AI 能力，不是订单、统计或履约功能的门槛。前端只负责展示，不能通过请求参数绕过该限制。
-- `/api/config` 只返回平台 AI 的可用状态和套餐信息，不返回或接收模型地址、模型名、API Key。
+- `/api/me` 返回兼容性的 `plan`、`active`、`plan_label` 字段和当前权限数组；权限数组不随订阅状态变化。
+- `/api/membership/plans`、`/api/activate` 与 `/api/admin/codes` 等旧套餐/兑换码接口已停用并返回 404；`expires_at` 和管理员延长接口只保留兼容维护用途，不参与当前业务授权。
+- `/api/config` 只返回平台 AI 的可用状态和兼容配置，不返回或接收模型地址、模型名、API Key。
 - `POST /api/bot/login/start`、同源二维码和状态接口只暴露随机登录 ID、状态和剩余时间；二维码查询材料、Cookie 和 Token 只存在于短期服务端内存。
 - `GET /api/bot/login/{id}/status` 只确认扫码状态，不执行最长 55 秒的商品同步。确认后由 `POST /api/bot/login/complete` 单独同步；同步失败释放两阶段消费锁供直接重试，成功保存后才销毁登录会话。
-- `POST /api/bot/connector/handoff` 只接受当前 HttpOnly 登录会话并签发短期内存凭证；每个账号最多保留 3 个活动凭证，凭证有过期和尝试次数上限，成功后立即销毁。
-- `POST /api/bot/connector/cookies` 不读取普通 SaaS 会话，只接受上述 handoff。连接助手从绑定的闲鱼官方标签页读取 Cookie 后直接调用该接口，页面只接收 ACK、状态和安全错误码，不接收 Cookie、handoff token 或扩展 session。
 - `PUT /api/bot/cookies` 先校验 Cookie，再保存敏感内容并生成账号绑定的商品快照；校验失败不会替换原连接。
 - `POST /api/bot/shop/sync` 使用已保存 Cookie 只读同步店铺昵称和商品列表。快照必须匹配当前 Cookie 账号指纹，不能混用旧账号缓存或手工商品配置。
-- 免费账号可使用真实商品快照、关键词回复、固定资料发送、卡券/模板、对话订单、运行日志和经营统计；`automation.ai`（AI 智能客服）仍由后端逐接口校验会员权限。
+- 所有登录账号均可使用真实商品快照、关键词回复、固定资料发送、卡券/模板、对话订单、运行日志、经营统计和 AI 客服；服务端仍逐接口校验权限与店铺作用域。
 - Cookie 检测失败返回稳定的 `detail.code` 与中文 `detail.message`；`risk_control` 显示需要安全验证，`cookie_expired` 显示失效并要求重新获取，状态写入租户 `shop_sync_state.json`（不含 Cookie 内容，权限 `0600`）。
-- Chrome 连接助手是折叠的兼容方式，只声明 `cookies` 和 DeepWhale/闲鱼白名单 host 权限，不使用 `chrome.storage`；Cookie 查询固定为闲鱼 MTOP URL 并绑定目标标签页唯一 `cookieStoreId`，提交固定为 DeepWhale connector endpoint 且使用 `credentials: "omit"`。
-- 会员履约配置必须使用数字商品 ID；服务端会拒绝重复/无效 ID 和缺少网盘资源标签的配置。新租户先使用空映射，AI 可运行但不会猜测或自动发货。
+- 履约配置必须使用数字商品 ID；服务端会拒绝重复/无效 ID 和缺少网盘资源标签的配置。新租户先使用空映射，AI 可运行但不会猜测或自动发货。
 - 更换 Cookie 对应的卖家账号时，旧履约映射会被原子清空，避免把上一账号的商品绑定到新账号。
-- `/api/activate`、`/api/admin/codes` 兑换码流程已停用并返回 404；会员有效期仍可由管理员延长，后续支付链接接入后替换管理员流程。
 - `/api/bot/conversations` 返回会话摘要；`/api/bot/messages?chat_id=...` 只返回选中买家的消息。人工回复接口只保存明确绑定会话的草稿，当前不会直接向闲鱼发送。
 - `GET/PUT /api/bot/templates` 与 `DELETE /api/bot/templates/{id}` 管理 redeem/pan 发货模板；只返回模板元数据与商品绑定，不回显 payload 原文。
 - `GET/PUT /api/bot/cards` 管理当前账号兑换码池元数据与统计；批量导入只接受码列表，不回传任何 Cookie/Token。
@@ -85,9 +80,9 @@
 
 ## 平台 AI 边界
 
-- 浏览器和租户配置永远不持有上游模型凭据。
-- 托管机器人启动时只获得进程生命周期内有效的内部随机凭据。
-- 内部 `/internal/v1/chat/completions` 代理验证随机凭据、账号作用域、账号启用状态和实时会员状态，再使用服务器环境中的模型配置转发请求；作用域头不会转发给上游。
+- 浏览器不保存长期上游模型凭据；用户主动测试或保存连接时，模型 Key 只在页面内存中短暂存在并提交，已保存的 Key 不回显，也不写入应用的浏览器存储。
+- 租户目录只保存服务端加密后的上游模型凭据；托管机器人启动时只获得进程生命周期内有效的内部随机凭据。
+- 内部 `/internal/v1/chat/completions` 代理验证随机凭据、账号作用域、账号启用状态和当前 AI 配置，再使用服务器环境中的模型配置转发请求；作用域头不会转发给上游。
 - nginx 不代理 `/internal/`；该路径只允许本机托管机器人访问。
 - 机器人停止、退出或异常回收后立即撤销内部凭据。
 

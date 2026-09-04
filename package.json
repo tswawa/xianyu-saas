@@ -1,5 +1,5 @@
 {
-  "name": "deepwhale-xianyu-service",
+  "name": "xianyu-saas",
   "version": "0.1.0",
   "private": true,
   "description": "按店铺账号隔离的闲鱼客服工作台、服务端与自动客服 worker",
@@ -36,10 +36,9 @@
     "test:templates-cards": "backend/.venv/bin/python tests/templates-cards-contract.py",
     "test:deploy": "backend/.venv/bin/python tests/deploy-contract.py",
     "test:repository": "python3 tests/repository-contract.py",
-    "test:connector": "node tests/connector-extension-contract.mjs",
     "test:ui": "node tests/ui-check.mjs",
     "test:worker": "cd worker && timeout 20m prlimit --as=3221225472 -- .venv/bin/python -m unittest discover -s tests -v",
-    "test:syntax": "python3 -m py_compile backend/*.py tests/*.py worker/*.py worker/utils/*.py worker/scripts/*.py worker/tests/*.py && node --check frontend/assets/app.js && node --check scripts/dev-server.mjs && node --check tests/ui-check.mjs && node --check tests/connector-extension-contract.mjs"
+    "test:syntax": "python3 -m py_compile backend/*.py tests/*.py worker/*.py worker/utils/*.py worker/scripts/*.py worker/tests/*.py && node --check frontend/assets/app.js && node --check scripts/dev-server.mjs && node --check tests/ui-check.mjs"
   },
   "devDependencies": {
     "playwright": "1.55.1"

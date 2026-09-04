@@ -23,11 +23,9 @@ from delivery_store import DeliveryStore  # noqa: E402
 
 STATE_FILES = {
     "redeem_codes.json": list,
-    "trial_codes.json": list,
-    "trial_sent.json": dict,
     "pan_links.json": dict,
 }
-REQUIRED_FILES = {"redeem_codes.json", "trial_codes.json", "pan_links.json"}
+REQUIRED_FILES = {"redeem_codes.json", "pan_links.json"}
 OUTPUT_FILES = set(STATE_FILES) | {"chat_history.db", "delivery_state.db"}
 LEGACY_LEDGER_FILES = ("redeem_sent.json", "pan_sent.json")
 QUARANTINE_LEDGER = "legacy_delivery_ledger.json"
@@ -218,12 +216,6 @@ def migrate(source_dir: str, destination_dir: str) -> dict:
         store = DeliveryStore(
             str(delivery_target),
             redeem_pool_path=str(staging / "redeem_codes.json"),
-            trial_pool_path=str(staging / "trial_codes.json"),
-            trial_sent_path=(
-                str(staging / "trial_sent.json")
-                if (staging / "trial_sent.json").exists()
-                else None
-            ),
         )
 
         _check_sqlite(chat_target)
@@ -239,9 +231,7 @@ def migrate(source_dir: str, destination_dir: str) -> dict:
             if path.name not in OUTPUT_FILES:
                 raise RuntimeError("migration produced an unexpected file")
             outputs.append(path.name)
-        expected_outputs = OUTPUT_FILES - (
-            {"trial_sent.json"} if not (staging / "trial_sent.json").exists() else set()
-        )
+        expected_outputs = set(OUTPUT_FILES)
         if not legacy_ledger_quarantined:
             expected_outputs.discard(QUARANTINE_LEDGER)
         if set(outputs) != expected_outputs:

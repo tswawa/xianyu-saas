@@ -55,7 +55,7 @@ SEMVER_RE = re.compile(
 )
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 ALLOWED_TOP_LEVEL_DIRS = frozenset(
-    {"backend", "frontend", "worker", "scripts", "deploy", "config", "docs", "extension", "tests"}
+    {"backend", "frontend", "worker", "scripts", "deploy", "config", "docs", "tests"}
 )
 ALLOWED_ROOT_FILES = frozenset(
     {

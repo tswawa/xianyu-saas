@@ -209,13 +209,6 @@ class AgentTestCase(unittest.IsolatedAsyncioTestCase):
             ],
         )
         write_json(
-            self.state_dir / "trial_codes.json",
-            [
-                {"code": "TRIAL-A", "used": False},
-                {"code": "TRIAL-B", "used": False},
-            ],
-        )
-        write_json(
             self.state_dir / "pan_links.json",
             {
                 "links": [
@@ -843,7 +836,7 @@ class AgentTestCase(unittest.IsolatedAsyncioTestCase):
             self.agent.delivery_store.inventory_counts()["redeem"]["available"], 3
         )
 
-    async def test_model_magic_tokens_have_no_reply_or_trial_side_effect(self):
+    async def test_model_magic_tokens_have_no_reply_or_delivery_side_effect(self):
         for index, token in enumerate(("-", "[TRIAL]", "[TUTORIAL]")):
             self.agent.bot = FakeBot(token)
             await self.agent._process_chat_message(
@@ -855,7 +848,9 @@ class AgentTestCase(unittest.IsolatedAsyncioTestCase):
                 )
             )
         self.agent.send_text_reliably.assert_not_awaited()
-        self.assertEqual(self.agent.delivery_store.inventory_counts()["trial"]["available"], 2)
+        self.assertEqual(
+            self.agent.delivery_store.inventory_counts()["redeem"]["available"], 3
+        )
         for index in range(3):
             outcomes = [
                 row
@@ -1188,21 +1183,6 @@ class AgentTestCase(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(task, 0.2)
         self.assertEqual(events, ["verify", "send"])
 
-    async def test_trial_failure_retries_same_code(self):
-        self.agent.send_text_reliably = AsyncMock(side_effect=ConnectionError("offline"))
-        self.assertEqual(
-            await self.agent.send_trial_code("chat-1", "buyer-1"), "retry"
-        )
-        first_text = self.agent.send_text_reliably.await_args.args[2]
-
-        self.agent.send_text_reliably = AsyncMock(return_value=None)
-        self.assertEqual(
-            await self.agent.send_trial_code("chat-1", "buyer-1"), "sent"
-        )
-        second_text = self.agent.send_text_reliably.await_args.args[2]
-
-        self.assertIn("TRIAL-A", first_text)
-        self.assertEqual(first_text, second_text)
 
     async def test_manual_mode_does_not_block_verified_delivery(self):
         self.bind()
@@ -1795,7 +1775,6 @@ class StoreTestCase(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             state = Path(directory)
             write_json(state / "redeem_codes.json", [])
-            write_json(state / "trial_codes.json", [])
             write_json(state / "pan_links.json", {"links": []})
             products = state / "products.json"
             write_json(
@@ -2218,7 +2197,6 @@ class ProtocolAckTestCase(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             state = Path(directory)
             write_json(state / "redeem_codes.json", [])
-            write_json(state / "trial_codes.json", [])
             write_json(state / "pan_links.json", {"links": []})
             products = state / "products.json"
             write_json(
@@ -2255,7 +2233,6 @@ class ProtocolAckTestCase(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             state = Path(directory)
             write_json(state / "redeem_codes.json", [])
-            write_json(state / "trial_codes.json", [])
             write_json(state / "pan_links.json", {"links": []})
             products = state / "products.json"
             write_json(

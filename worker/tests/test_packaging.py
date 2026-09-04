@@ -93,7 +93,6 @@ class IgnoreContractTests(unittest.TestCase):
             "XianyuApis.py",
             "context_manager.py",
             "delivery_store.py",
-            "tutorial_text.py",
             "products_config.json",
             "prompts/default_prompt_example.txt",
         )
@@ -125,7 +124,6 @@ class IgnoreContractTests(unittest.TestCase):
         self.assertNotIn("*.json", patterns)
         self.assertNotIn("*.py", patterns)
         self.assertNotIn("products_config.json", patterns)
-        self.assertNotIn("tutorial_text.py", patterns)
 
     def test_base_product_mapping_has_no_material_payload(self):
         payload = json.loads(read_utf8("products_config.json"))
@@ -156,7 +154,6 @@ class DockerContractTests(unittest.TestCase):
             "XianyuApis.py",
             "context_manager.py",
             "delivery_store.py",
-            "tutorial_text.py",
             "products_config.json",
             "scripts/list_manual_reviews.py",
             "scripts/resolve_manual_review.py",

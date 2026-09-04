@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
-"""Static deployment guards for shop login and connector endpoints."""
+"""Static deployment guards for shop login endpoints."""
 
+import os
+import re
+import socket
+import subprocess
+import time
 from pathlib import Path
 
 
@@ -19,7 +24,6 @@ LOGROTATE = (ROOT / "deploy/xianyu-saas-bot-logrotate.conf").read_text(encoding=
 BOOTSTRAP = "location = /xianyu-saas/api/auth/bootstrap {"
 ADMIN_CONFIRM = "location = /xianyu-saas/api/admin/confirm {"
 ADMIN_UPDATES = "location ^~ /xianyu-saas/api/admin/updates/ {"
-EXACT = "location = /xianyu-saas/api/bot/connector/cookies {"
 LOGIN_START = "location = /xianyu-saas/api/bot/login/start {"
 LOGIN_COMPLETE = "location = /xianyu-saas/api/bot/login/complete {"
 LOGIN_SESSION = "location ^~ /xianyu-saas/api/bot/login/ {"
@@ -28,14 +32,12 @@ GENERIC = "location ^~ /xianyu-saas/api/ {"
 assert LOCATIONS.count(BOOTSTRAP) == 1
 assert LOCATIONS.count(ADMIN_CONFIRM) == 1
 assert LOCATIONS.count(ADMIN_UPDATES) == 1
-assert LOCATIONS.count(EXACT) == 1
 assert LOCATIONS.count(LOGIN_START) == 1
 assert LOCATIONS.count(LOGIN_COMPLETE) == 1
 assert LOCATIONS.count(LOGIN_SESSION) == 1
 assert LOCATIONS.index(BOOTSTRAP) < LOCATIONS.index(GENERIC)
 assert LOCATIONS.index(ADMIN_CONFIRM) < LOCATIONS.index(GENERIC)
 assert LOCATIONS.index(ADMIN_UPDATES) < LOCATIONS.index(GENERIC)
-assert LOCATIONS.index(EXACT) < LOCATIONS.index(GENERIC)
 assert LOCATIONS.index(LOGIN_START) < LOCATIONS.index(GENERIC)
 assert LOCATIONS.index(LOGIN_COMPLETE) < LOCATIONS.index(LOGIN_SESSION)
 assert LOCATIONS.index(LOGIN_SESSION) < LOCATIONS.index(GENERIC)
@@ -70,32 +72,24 @@ for directive in (
 ):
     assert directive in admin_updates, directive
 
-connector = LOCATIONS.split(EXACT, 1)[1].split("\n}", 1)[0]
-for directive in (
-    "limit_req zone=xianyu_connector_submit burst=4 nodelay;",
-    "limit_conn xianyu_connector_conn 2;",
-    "limit_conn_status 429;",
-    "limit_except POST { deny all; }",
-    "client_max_body_size 40k;",
-    "client_body_timeout 10s;",
-    "proxy_pass http://127.0.0.1:8096/api/bot/connector/cookies;",
-    'proxy_set_header Cookie "";',
-    'proxy_set_header Authorization "";',
-):
-    assert directive in connector, directive
-
 assert "zone=xianyu_auth_bootstrap:1m rate=3r/m;" in ZONES
 assert "zone=xianyu_admin_confirm:1m rate=6r/m;" in ZONES
 assert "zone=xianyu_platform_update:1m rate=12r/m;" in ZONES
-assert "zone=xianyu_connector_submit:1m rate=12r/m;" in ZONES
-assert "zone=xianyu_connector_conn:1m;" in ZONES
 assert "zone=xianyu_login_poll:1m rate=60r/m;" in ZONES
 assert "zone=xianyu_login_complete:1m rate=6r/m;" in ZONES
 assert "zone=xianyu_login_conn:1m;" in ZONES
 
+# 每个被引用的限流 zone 都必须在仓库内定义，否则自建者的 nginx 会因
+# unknown limit_req zone 启动失败。
+referenced_zones = set(re.findall(r"limit_req zone=([a-z_]+)", LOCATIONS))
+referenced_zones |= set(re.findall(r"limit_conn ([a-z_]+) ", LOCATIONS))
+defined_zones = set(re.findall(r"zone=([a-z_]+):", ZONES))
+missing_zones = referenced_zones - defined_zones
+assert not missing_zones, f"locations.conf 引用了未定义的 zone: {sorted(missing_zones)}"
+
 login_start = LOCATIONS.split(LOGIN_START, 1)[1].split("\n}", 1)[0]
 for directive in (
-    "limit_req zone=deepwhale_session burst=5 nodelay;",
+    "limit_req zone=xianyu_session burst=5 nodelay;",
     "limit_conn xianyu_login_conn 2;",
     "limit_conn_status 429;",
     "limit_except POST { deny all; }",
@@ -213,4 +207,68 @@ for directive in (
 ):
     assert directive in LOGROTATE, directive
 
-print("deploy contract: proxy trust, limits, private paths and log retention passed")
+
+def _reserve_loopback_port() -> int:
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        return int(listener.getsockname()[1])
+
+
+def _raw_http_get(port: int, target: str) -> bytes:
+    with socket.create_connection(("127.0.0.1", port), timeout=2) as connection:
+        connection.sendall(
+            f"GET {target} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n".encode()
+        )
+        chunks = []
+        while chunk := connection.recv(4096):
+            chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _assert_dev_server_survives_malformed_requests() -> None:
+    port = _reserve_loopback_port()
+    environment = os.environ.copy()
+    environment["SAAS_DEV_WEB_PORT"] = str(port)
+    process = subprocess.Popen(
+        ["node", str(ROOT / "scripts/dev-server.mjs")],
+        cwd=ROOT,
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        for _ in range(100):
+            if process.poll() is not None:
+                stdout, stderr = process.communicate()
+                raise AssertionError(f"dev server exited during startup: {stdout}{stderr}")
+            with socket.socket() as probe:
+                if probe.connect_ex(("127.0.0.1", port)) == 0:
+                    break
+            time.sleep(0.02)
+        else:
+            raise AssertionError("dev server did not start")
+
+        invalid_target = _raw_http_get(port, "http://[")
+        assert invalid_target.startswith(b"HTTP/1.1 400 "), invalid_target[:80]
+        assert process.poll() is None, "invalid request targets must not terminate the dev server"
+
+        malformed_asset = _raw_http_get(port, "/xianyu-saas/assets/%E0%A4%A")
+        assert malformed_asset.startswith(b"HTTP/1.1 400 "), malformed_asset[:80]
+        assert process.poll() is None, "malformed asset paths must not terminate the dev server"
+
+        healthy = _raw_http_get(port, "/xianyu-saas/")
+        assert healthy.startswith(b"HTTP/1.1 200 "), healthy[:80]
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=2)
+
+
+_assert_dev_server_survives_malformed_requests()
+
+print("deploy contract: proxy trust, limits, private paths, static serving and log retention passed")

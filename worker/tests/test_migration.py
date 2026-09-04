@@ -25,10 +25,6 @@ class MigrationTests(unittest.TestCase):
             ],
         )
         write_json(
-            source / "trial_codes.json",
-            [{"code": "TRIAL-CODE", "used": False}],
-        )
-        write_json(
             source / "pan_links.json",
             {"links": [{"url": "https://example.invalid", "code": "ABCD"}]},
         )
@@ -65,7 +61,6 @@ class MigrationTests(unittest.TestCase):
             self.assertEqual(os.stat(destination).st_mode & 0o777, 0o700)
             for name in (
                 "redeem_codes.json",
-                "trial_codes.json",
                 "pan_links.json",
                 "chat_history.db",
                 "delivery_state.db",

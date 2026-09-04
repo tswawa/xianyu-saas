@@ -108,7 +108,6 @@ class DeliveryStore:
             "cancelled_during_send",
             "cancelled_after_send_attempt",
             "manual_takeover_before_send",
-            "trial_state_commit_failed",
             "ack_timeout",
             "untrusted_order",
             "duplicate_replay",
@@ -134,8 +133,6 @@ class DeliveryStore:
         self,
         db_path: str,
         redeem_pool_path: Optional[str] = None,
-        trial_pool_path: Optional[str] = None,
-        trial_sent_path: Optional[str] = None,
         now_fn=time.time,
     ):
         self.db_path = os.path.abspath(db_path)
@@ -147,10 +144,6 @@ class DeliveryStore:
         self._init_db()
         if redeem_pool_path:
             self.import_inventory(redeem_pool_path, "redeem")
-        if trial_pool_path:
-            self.import_inventory(trial_pool_path, "trial")
-        if trial_sent_path:
-            self.import_trial_claims(trial_sent_path)
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path, timeout=10)
@@ -252,17 +245,6 @@ class DeliveryStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_llm_usage_window
                     ON llm_usage(window_start);
-
-                CREATE TABLE IF NOT EXISTS trial_claims (
-                    buyer_id TEXT PRIMARY KEY,
-                    inventory_id INTEGER NOT NULL,
-                    status TEXT NOT NULL,
-                    last_error TEXT,
-                    created_at REAL NOT NULL,
-                    updated_at REAL NOT NULL,
-                    delivered_at REAL,
-                    FOREIGN KEY(inventory_id) REFERENCES inventory(id)
-                );
 
                 CREATE TABLE IF NOT EXISTS manual_modes (
                     chat_id TEXT PRIMARY KEY,
@@ -375,9 +357,6 @@ class DeliveryStore:
             # A process may have stopped after sending but before recording the ACK.
             # Reusing the deterministic message UUID makes the retry idempotent upstream.
             conn.execute(
-                "UPDATE trial_claims SET status = 'retry' WHERE status = 'sending'"
-            )
-            conn.execute(
                 """
                 UPDATE inbound_events
                 SET status = 'pending', next_attempt_at = 0
@@ -412,7 +391,7 @@ class DeliveryStore:
             raise DeliveryStoreError(f"invalid state file: {Path(path).name}") from exc
 
     def import_inventory(self, path: str, kind: str) -> int:
-        if kind not in {"redeem", "trial"}:
+        if kind != "redeem":
             raise ValueError("unsupported inventory kind")
         payload = self._load_json(path)
         if payload is None:
@@ -473,9 +452,6 @@ class DeliveryStore:
                         """,
                         (replacement, now, current["id"]),
                     )
-                    self._quarantine_trial_claim(
-                        conn, current["id"], "inventory_marked_used", now
-                    )
                     quarantined_inventory[current["id"]] = "inventory_marked_used"
 
             incoming = {secret for secret, _status in rows}
@@ -493,25 +469,9 @@ class DeliveryStore:
                     """,
                     (now, current["id"]),
                 )
-                self._quarantine_trial_claim(
-                    conn, current["id"], "inventory_removed_from_manifest", now
-                )
                 quarantined_inventory[current["id"]] = "inventory_removed_from_manifest"
             self._quarantine_delivery_claims(conn, quarantined_inventory, now)
         return len(rows)
-
-    @staticmethod
-    def _quarantine_trial_claim(
-        conn: sqlite3.Connection, inventory_id: int, reason: str, now: float
-    ) -> None:
-        conn.execute(
-            """
-            UPDATE trial_claims
-            SET status = 'manual_review', last_error = ?, updated_at = ?
-            WHERE inventory_id = ? AND status IN ('reserved', 'retry', 'sending')
-            """,
-            (reason, now, inventory_id),
-        )
 
     def _quarantine_delivery_claims(
         self,
@@ -558,77 +518,6 @@ class DeliveryStore:
                     (now, *order_inventory_ids, row["order_key"]),
                 )
             self._upsert_manual_review(conn, row["order_key"], reason, now)
-
-    def import_trial_claims(self, path: str) -> int:
-        payload = self._load_json(path)
-        if payload is None:
-            return 0
-        if not isinstance(payload, dict):
-            raise DeliveryStoreError(f"trial claims file must contain an object: {Path(path).name}")
-
-        imported = 0
-        claimed_inventory = set()
-        now = self.now_fn()
-        with self._transaction() as conn:
-            for buyer_id, record in payload.items():
-                if not str(buyer_id).strip() or not isinstance(record, dict):
-                    raise DeliveryStoreError(f"trial claim is invalid: {Path(path).name}")
-                if not isinstance(record.get("code"), str) or not record["code"].strip():
-                    raise DeliveryStoreError(f"trial claim code is invalid: {Path(path).name}")
-                inventory = conn.execute(
-                    "SELECT id FROM inventory WHERE kind = 'trial' AND secret = ?",
-                    (record["code"].strip(),),
-                ).fetchone()
-                if inventory is None:
-                    raise DeliveryStoreError(f"trial claim references unknown inventory: {Path(path).name}")
-                if inventory["id"] in claimed_inventory:
-                    raise DeliveryStoreError(f"trial inventory has multiple claimants: {Path(path).name}")
-                claimed_inventory.add(inventory["id"])
-                existing_claim = conn.execute(
-                    "SELECT inventory_id FROM trial_claims WHERE buyer_id = ?",
-                    (str(buyer_id),),
-                ).fetchone()
-                if (
-                    existing_claim is not None
-                    and existing_claim["inventory_id"] != inventory["id"]
-                ):
-                    raise DeliveryStoreError(
-                        f"trial buyer references different inventory: {Path(path).name}"
-                    )
-                other_claim = conn.execute(
-                    """
-                    SELECT buyer_id FROM trial_claims
-                    WHERE inventory_id = ? AND buyer_id != ?
-                    LIMIT 1
-                    """,
-                    (inventory["id"], str(buyer_id)),
-                ).fetchone()
-                if other_claim is not None:
-                    raise DeliveryStoreError(
-                        f"trial inventory has multiple claimants: {Path(path).name}"
-                    )
-                conn.execute(
-                    """
-                    UPDATE inventory
-                    SET status = 'delivered', buyer_id = ?, updated_at = ?
-                    WHERE id = ?
-                    """,
-                    (str(buyer_id), now, inventory["id"]),
-                )
-                conn.execute(
-                    """
-                    INSERT INTO trial_claims(
-                        buyer_id, inventory_id, status, created_at, updated_at, delivered_at
-                    ) VALUES (?, ?, 'delivered', ?, ?, ?)
-                    ON CONFLICT(buyer_id) DO UPDATE SET
-                        status = 'delivered', last_error = NULL,
-                        updated_at = excluded.updated_at,
-                        delivered_at = excluded.delivered_at
-                    """,
-                    (str(buyer_id), inventory["id"], now, now, now),
-                )
-                imported += 1
-        return imported
 
     def inventory_counts(self) -> dict[str, dict[str, int]]:
         conn = self._connect()
@@ -1892,172 +1781,6 @@ class DeliveryStore:
                 WHERE order_key = ?
                 """,
                 (now, now, order_key),
-            )
-
-    def prepare_trial(self, buyer_id: str) -> DeliveryReservation:
-        buyer_id = str(buyer_id)
-        now = self.now_fn()
-        with self._transaction() as conn:
-            claim = conn.execute(
-                "SELECT * FROM trial_claims WHERE buyer_id = ?", (buyer_id,)
-            ).fetchone()
-            if claim is None:
-                inventory = conn.execute(
-                    """
-                    SELECT id FROM inventory
-                    WHERE kind = 'trial' AND status = 'available'
-                    ORDER BY id LIMIT 1
-                    """
-                ).fetchone()
-                if inventory is None:
-                    return DeliveryReservation(
-                        key=f"trial:{buyer_id}",
-                        status="manual_review",
-                        delivery_type="trial",
-                        chat_id="",
-                        buyer_id=buyer_id,
-                        item_id="",
-                resources=(),
-                payload=None,
-                reason="inventory_empty",
-                    )
-                conn.execute(
-                    """
-                    UPDATE inventory
-                    SET status = 'reserved', reservation_key = ?, buyer_id = ?, updated_at = ?
-                    WHERE id = ? AND status = 'available'
-                    """,
-                    (f"trial:{buyer_id}", buyer_id, now, inventory["id"]),
-                )
-                conn.execute(
-                    """
-                    INSERT INTO trial_claims(buyer_id, inventory_id, status, created_at, updated_at)
-                    VALUES (?, ?, 'reserved', ?, ?)
-                    """,
-                    (buyer_id, inventory["id"], now, now),
-                )
-                claim = conn.execute(
-                    "SELECT * FROM trial_claims WHERE buyer_id = ?", (buyer_id,)
-                ).fetchone()
-            resource = conn.execute(
-                "SELECT secret FROM inventory WHERE id = ?", (claim["inventory_id"],)
-            ).fetchone()
-            return DeliveryReservation(
-                key=f"trial:{buyer_id}",
-                status=claim["status"],
-                delivery_type="trial",
-                chat_id="",
-                buyer_id=buyer_id,
-                item_id="",
-                resources=(resource["secret"],) if resource else (),
-                payload=None,
-                reason=claim["last_error"],
-            )
-
-    def claim_trial_for_send(self, buyer_id: str) -> Optional[DeliveryReservation]:
-        buyer_id = str(buyer_id)
-        now = self.now_fn()
-        with self._transaction() as conn:
-            cursor = conn.execute(
-                """
-                UPDATE trial_claims
-                SET status = 'sending', updated_at = ?
-                WHERE buyer_id = ? AND status IN ('reserved', 'retry')
-                """,
-                (now, buyer_id),
-            )
-            if cursor.rowcount != 1:
-                return None
-            claim = conn.execute(
-                "SELECT * FROM trial_claims WHERE buyer_id = ?", (buyer_id,)
-            ).fetchone()
-            resource = conn.execute(
-                "SELECT secret FROM inventory WHERE id = ?", (claim["inventory_id"],)
-            ).fetchone()
-            return DeliveryReservation(
-                key=f"trial:{buyer_id}",
-                status=claim["status"],
-                delivery_type="trial",
-                chat_id="",
-                buyer_id=buyer_id,
-                item_id="",
-                resources=(resource["secret"],) if resource else (),
-                payload=None,
-                reason=claim["last_error"],
-            )
-
-    def mark_trial_retry(self, buyer_id: str, error: str) -> None:
-        now = self.now_fn()
-        with self._transaction() as conn:
-            conn.execute(
-                """
-                UPDATE trial_claims
-                SET status = 'retry', last_error = ?, updated_at = ?
-                WHERE buyer_id = ? AND status = 'sending'
-                """,
-                (self._clean_error(error), now, str(buyer_id)),
-            )
-
-    def mark_trial_manual_review(self, buyer_id: str, reason: str) -> None:
-        now = self.now_fn()
-        with self._transaction() as conn:
-            claim = conn.execute(
-                """
-                SELECT inventory_id, status FROM trial_claims
-                WHERE buyer_id = ?
-                """,
-                (str(buyer_id),),
-            ).fetchone()
-            if claim is None or claim["status"] in {"delivered", "manual_review"}:
-                return
-            if claim["status"] not in {"reserved", "retry", "sending"}:
-                raise DeliveryStoreError("trial claim has an invalid state")
-            conn.execute(
-                """
-                UPDATE inventory
-                SET status = 'quarantined', updated_at = ?
-                WHERE id = ? AND status = 'reserved'
-                """,
-                (now, claim["inventory_id"]),
-            )
-            conn.execute(
-                """
-                UPDATE trial_claims
-                SET status = 'manual_review', last_error = ?, updated_at = ?
-                WHERE buyer_id = ?
-                """,
-                (self._clean_error(reason), now, str(buyer_id)),
-            )
-
-    def mark_trial_delivered(self, buyer_id: str) -> None:
-        now = self.now_fn()
-        with self._transaction() as conn:
-            claim = conn.execute(
-                "SELECT inventory_id, status FROM trial_claims WHERE buyer_id = ?",
-                (str(buyer_id),),
-            ).fetchone()
-            if claim is None:
-                raise DeliveryStoreError("unknown trial claim")
-            if claim["status"] == "delivered":
-                return
-            if claim["status"] != "sending":
-                raise DeliveryStoreError("trial claim is not owned by a sender")
-            cursor = conn.execute(
-                """
-                UPDATE inventory SET status = 'delivered', updated_at = ?
-                WHERE id = ? AND status = 'reserved' AND reservation_key = ?
-                """,
-                (now, claim["inventory_id"], f"trial:{buyer_id}"),
-            )
-            if cursor.rowcount != 1:
-                raise DeliveryStoreError("reserved trial inventory state is inconsistent")
-            conn.execute(
-                """
-                UPDATE trial_claims
-                SET status = 'delivered', last_error = NULL, updated_at = ?, delivered_at = ?
-                WHERE buyer_id = ?
-                """,
-                (now, now, str(buyer_id)),
             )
 
     def mark_automation_reply_sent(self, chat_id: str, sent_at: Optional[float] = None) -> float:

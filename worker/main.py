@@ -618,12 +618,6 @@ class XianyuLive:
             redeem_pool_path=(
                 self._state_input_path("redeem_codes.json") if paid_automation else None
             ),
-            trial_pool_path=(
-                self._state_input_path("trial_codes.json") if paid_automation else None
-            ),
-            trial_sent_path=(
-                self._state_input_path("trial_sent.json") if paid_automation else None
-            ),
         )
         quarantined = self.delivery_store.quarantine_automatic_orders(
             "platform_order_identity_unavailable"
@@ -758,11 +752,9 @@ class XianyuLive:
         self.inbound_chat_tasks = {}
         self.delivery_tasks = set()
         self.chat_locks = {}
-        self.trial_locks = {}
         self.item_locks = {}
         self.order_locks = {}
         self.chat_lock_users = {}
-        self.trial_lock_users = {}
         self.item_lock_users = {}
         self.order_lock_users = {}
 
@@ -1803,21 +1795,16 @@ class XianyuLive:
         if reservation.delivery_type == "redeem":
             if len(reservation.resources) != reservation.quantity:
                 raise RuntimeError("reserved redeem inventory is unavailable")
+            # The configured template message wins; the fallback stays generic so a
+            # self-hosted shop never ships another operator's product wording.
+            intro = (reservation.payload or "").strip() or "付款已经核验，这是你的兑换码："
             if reservation.quantity == 1:
-                code_text = reservation.resources[0]
-                return (
-                    f"付款已经核验，这是你的 DeepSeek 正式版兑换码：{code_text}\n"
-                    "打开 https://deepwhale.chat/sub2api/ 注册登录后，在兑换码入口完成兑换。"
-                )
+                return f"{intro}\n{reservation.resources[0]}"
             codes = "\n".join(
                 f"{index}. {code}"
                 for index, code in enumerate(reservation.resources, start=1)
             )
-            return (
-                f"付款已经核验，这是你的 {reservation.quantity} 个 DeepSeek 正式版兑换码，"
-                f"每个都可以独立兑换：\n{codes}\n"
-                "打开 https://deepwhale.chat/sub2api/ 注册登录后，在兑换码入口逐个完成兑换。"
-            )
+            return f"{intro}\n{codes}"
         if (
             reservation.delivery_type == "material"
             and reservation.quantity == 1
@@ -1959,75 +1946,6 @@ class XianyuLive:
         logger.info("平台发货完成 event={}", stable_ref(order_key))
         return "shipped"
 
-    async def send_trial_code(self, chat_id, toid, before_attempt=None):
-        async with self._keyed_lock(
-            self.trial_locks, self.trial_lock_users, toid
-        ):
-            if self.is_manual_mode(chat_id):
-                return "manual"
-            reservation = self.delivery_store.prepare_trial(toid)
-            if reservation.status == "delivered":
-                logger.info("试用资格已领取 buyer={}", stable_ref(toid))
-                return "already_delivered"
-            if reservation.status == "manual_review":
-                logger.warning("试用资格需人工审核 buyer={}", stable_ref(toid))
-                return "unavailable"
-            if not reservation.resources:
-                logger.error("试用码库存不足")
-                return "unavailable"
-            reservation = self.delivery_store.claim_trial_for_send(toid)
-            if reservation is None:
-                return "busy"
-            text = (
-                f"这是你的 0.1 元免费试用码：{reservation.resources[0]}\n"
-                "打开 https://deepwhale.chat/sub2api/ 注册登录 → 找\"兑换码\"入口输入兑换\n"
-                "试完觉得好用再拍 5 元档，随时找我～"
-            )
-            try:
-                await self.send_text_reliably(
-                    chat_id,
-                    toid,
-                    text,
-                    message_key=reservation.key,
-                    before_attempt=before_attempt,
-                )
-            except ManualTakeoverError:
-                self.delivery_store.mark_trial_manual_review(
-                    toid, "manual_takeover_before_send"
-                )
-                logger.warning("人工接管取消试用码自动发送 buyer={}", stable_ref(toid))
-                return "manual"
-            except AutomationReplySuppressed as exc:
-                self.delivery_store.mark_trial_retry(
-                    toid, f"automation_{exc.reason}"
-                )
-                logger.warning(
-                    "自动回复策略取消试用码发送 buyer={} reason={}",
-                    stable_ref(toid),
-                    exc.reason,
-                )
-                return "suppressed"
-            except Exception as exc:
-                self.delivery_store.mark_trial_retry(toid, type(exc).__name__)
-                logger.error("试用码发送失败 buyer={} error={}", stable_ref(toid), type(exc).__name__)
-                return "retry"
-            try:
-                self.delivery_store.mark_trial_delivered(toid)
-            except Exception as exc:
-                try:
-                    self.delivery_store.mark_trial_retry(
-                        toid, "trial_state_commit_failed"
-                    )
-                except Exception:
-                    pass
-                logger.error(
-                    "试用状态提交失败 buyer={} error={}",
-                    stable_ref(toid),
-                    type(exc).__name__,
-                )
-                return "retry"
-            logger.info("试用码发送完成 buyer={}", stable_ref(toid))
-            return "sent"
 
     async def human_reply_delay(self, user_msg, bot_reply, chat_id):
         """Return the account-configured base delay plus bounded random jitter."""

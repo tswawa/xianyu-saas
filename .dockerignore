@@ -17,7 +17,6 @@ docs
 handoff
 tests
 deploy
-connector-extension
 蒸馏
 # 文档不进镜像，但保留许可与署名文件以满足 GPL 分发要求。
 *.md

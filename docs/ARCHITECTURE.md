@@ -32,7 +32,7 @@ flowchart LR
 
 ### `frontend/`
 
-纯静态工作台，不保存 Cookie、Token 或模型密钥。账号切换、商品切换和异步请求使用 generation/scope 保护迟到响应，但后端仍是最终权限边界。
+纯静态工作台，不保存 Cookie、Token 或长期模型密钥；用户主动测试或保存模型连接时，Key 只短暂存在页面内存并提交给服务端，应用不写入浏览器存储。账号切换、商品切换和异步请求使用 generation/scope 保护迟到响应，但后端仍是最终权限边界。
 
 ### `backend/`
 

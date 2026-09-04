@@ -47,7 +47,6 @@ from fastapi.testclient import TestClient  # noqa: E402
 import app  # noqa: E402
 import bot_manager  # noqa: E402
 import shop_sync  # noqa: E402
-from connector_handoff import HANDOFF_TTL_SECONDS, HandoffStore  # noqa: E402
 from platform_ai import identify_scope, issue_token, revoke_token  # noqa: E402
 
 
@@ -389,26 +388,8 @@ def assert_bot_manager_access_contract():
 
 
 def main():
-    clock = [1000.0]
-    handoff_store = HandoffStore(clock=lambda: clock[0])
-    unit_token, _ = handoff_store.issue(7)
-    assert handoff_store.begin(unit_token) == ("ok", 7)
-    assert handoff_store.begin(unit_token) == ("handoff_busy", None)
-    handoff_store.finish(unit_token, success=False)
-    assert handoff_store.begin(unit_token) == ("ok", 7)
-    handoff_store.finish(unit_token, success=True)
-    assert handoff_store.begin(unit_token) == ("handoff_invalid", None)
-
-    expired_token, _ = handoff_store.issue(7)
-    clock[0] += HANDOFF_TTL_SECONDS + 1
-    assert handoff_store.begin(expired_token) == ("handoff_expired", None)
-    active_tokens = [handoff_store.issue(8)[0] for _ in range(4)]
-    assert handoff_store.begin(active_tokens[0]) == ("handoff_invalid", None)
-    assert handoff_store.begin(active_tokens[-1]) == ("ok", 8)
-
     app.ai_service.requester = mock_upstream_request
     client = TestClient(app.app)
-    app.handoffs.clear()
     fake_qr_logins = FakeQrLogins()
     app.qr_logins = fake_qr_logins
     app.sync_shop = fake_shop_sync
@@ -614,33 +595,6 @@ def main():
     assert client.post(f"/api/bot/login/{cancelled}/cancel").status_code == 200
     assert client.post(f"/api/bot/login/{cancelled}/cancel").status_code == 200
 
-    # The browser connector receives a short-lived handoff credential from
-    # the normal session, then submits directly through the bridge endpoint;
-    # the bridge itself must not require the HttpOnly session cookie.
-    handoff = client.post("/api/bot/connector/handoff")
-    assert handoff.status_code == 200
-    handoff_payload = handoff.json()
-    assert handoff_payload["ok"] is True
-    handoff_token = handoff_payload["handoff_token"]
-    assert isinstance(handoff_token, str) and 32 <= len(handoff_token) <= 128
-    bridge_client = TestClient(app.app)
-    bridge_response = bridge_client.post(
-        "/api/bot/connector/cookies",
-        json={
-            "handoff_token": handoff_token,
-            "cookies": "unb=123456; _m_h5_tk=contract-token_abc; sid=contract",
-        },
-    )
-    assert bridge_response.status_code == 200
-    assert bridge_response.json()["connected"] is True
-    assert bridge_response.json()["shop_name"] == "合同店铺"
-    replay = bridge_client.post(
-        "/api/bot/connector/cookies",
-        json={"handoff_token": handoff_token, "cookies": "unb=123456; _m_h5_tk=replay"},
-    )
-    assert replay.status_code == 401
-    assert replay.json()["detail"]["code"] == "handoff_invalid"
-
     # Free tier keeps only shop connection and simplified product cards.
     browser_write_headers = {
         "X-SaaS-Browser-Intent": "browser-write",
@@ -676,6 +630,14 @@ def main():
     assert cookie_response.status_code == 200
     assert cookie_response.json()["shop_name"] == "合同店铺"
     assert cookie_response.json()["product_count"] == 2
+    # The block above deliberately runs with ``SAAS_TESTING=0`` to exercise the
+    # browser-write guard, so that sync left a real 60s egress cooldown behind.
+    # Later checks expect their own error classifier rather than that leftover
+    # cooldown, so clear it for the sync leases only.
+    app.db.con.execute(
+        "UPDATE control_leases SET cooldown_until = 0 WHERE resource_key LIKE 'shop-sync:%'"
+    )
+    app.db.con.commit()
     verified_status = client.get("/api/bot/status").json()
     assert verified_status["sync_status"] == "verified"
     assert verified_status["shop_name"] == "合同店铺"

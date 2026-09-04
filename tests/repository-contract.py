@@ -36,8 +36,6 @@ REQUIRED = (
     "tests/auth-security-contract.py",
     "tests/platform-admin-contract.py",
     "tests/platform-update-contract.py",
-    "handoff/AGENTS.md",
-    "handoff/MEMORY.md",
     "worker/LICENSE",
     "worker/NOTICE.md",
     "worker/main.py",
@@ -187,5 +185,18 @@ assert 'GITHUB_API_HOST = "api.github.com"' in update_source
 assert "allow_redirects=False" in update_source
 assert "git pull" not in update_source.lower()
 assert "/api/admin/updates" not in update_source, "update verifier must not depend on browser routes"
+
+# AI 协作记忆与内部规划稿属于维护者本机文件，不进入公开树。
+PRIVATE_PATHS = (
+    "AGENTS.md",
+    "handoff/AGENTS.md",
+    "handoff/MEMORY.md",
+    "handoff/MEMORY_OPERATIONS.md",
+    "docs/COMPETITOR-ANALYSIS-PLAN.md",
+)
+for relative in PRIVATE_PATHS:
+    assert relative not in {
+        str(path) for path in relative_files
+    }, f"private collaboration file must stay untracked: {relative}"
 
 print("repository contract: portable layout, provenance and secret exclusions passed")
