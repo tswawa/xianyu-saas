@@ -108,11 +108,11 @@ npm run dev
 
 - **Docker 部署环境**：
   ```bash
-  docker compose exec xianyu-saas backend/.venv/bin/python -c "from db import DB; db = DB('/data/saas.db'); db.create_user('admin', 'Admin12345678!', role='admin'); print('管理员创建成功！')"
+  docker compose exec xianyu-saas backend/.venv/bin/python -c "from db import DB; from bot_manager import ensure_dir; db = DB('/data/saas.db'); db.create_user('admin', 'Admin12345678!', role='admin', initializer=lambda uid: ensure_dir(uid, 'default', initialize=True)); print('管理员创建成功！')"
   ```
 - **Linux 源码环境**：
   ```bash
-  PYTHONPATH=backend python3 -c "from db import DB; db = DB('data/saas.db'); db.create_user('admin', 'Admin12345678!', role='admin'); print('管理员创建成功！')"
+  PYTHONPATH=backend python3 -c "from db import DB; from bot_manager import ensure_dir; db = DB('data/saas.db'); db.create_user('admin', 'Admin12345678!', role='admin', initializer=lambda uid: ensure_dir(uid, 'default', initialize=True)); print('管理员创建成功！')"
   ```
 
 > 💡 **提示**：默认账号为 `admin`，密码为 `Admin12345678!`（系统安全策略要求密码长度**不少于 12 位**）。创建完成后即可在登录页输入登录，登录后可在后台随时修改密码。
