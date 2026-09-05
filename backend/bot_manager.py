@@ -494,6 +494,54 @@ def ensure_dir(
         raise OSError("cannot initialize account storage" if initialize else "cannot prepare account storage") from error
 
 
+def initialize_unused_account_storage(user_id: int) -> bool:
+    """Complete a legacy empty default account, never repair operational data.
+
+    The caller holds the control DB write transaction and checks the account's
+    initialization marker, connection history, jobs and runtime first.
+    Filesystem contents are an independent guard: unexpected files, nonempty
+    knowledge, edited defaults and malformed JSON all forbid automatic writes.
+    """
+    if is_running(user_id, DEFAULT_ACCOUNT_ID):
+        return False
+    storage = _storage()
+    path = storage.ensure_account_dir(user_id, DEFAULT_ACCOUNT_ID)
+    missing = set(INITIAL_ACCOUNT_FILES)
+    for child in path.iterdir():
+        info = os.lstat(child)
+        if stat.S_ISLNK(info.st_mode):
+            raise AccountStorageError("initialization path must not be a symlink")
+        if child.name == "ai_knowledge":
+            if not stat.S_ISDIR(info.st_mode):
+                raise AccountStorageError("knowledge path is not a directory")
+            if any(child.iterdir()):
+                return False
+            continue
+        if child.name not in INITIAL_ACCOUNT_FILES:
+            return False
+        if not stat.S_ISREG(info.st_mode) or info.st_size > 256 * 1024:
+            return False
+        try:
+            actual = json.loads(storage.read_text(user_id, DEFAULT_ACCOUNT_ID, child.name))
+        except (UnicodeError, json.JSONDecodeError):
+            return False
+        expected = json.loads(INITIAL_ACCOUNT_FILES[child.name])
+        if json.dumps(actual, sort_keys=True) != json.dumps(expected, sort_keys=True):
+            return False
+        missing.discard(child.name)
+    # Only write after all existing contents have passed the default-only guard.
+    for name in INITIAL_ACCOUNT_FILES:
+        if name in missing:
+            storage.create_text(user_id, DEFAULT_ACCOUNT_ID, name, INITIAL_ACCOUNT_FILES[name])
+    knowledge = path / "ai_knowledge"
+    knowledge.mkdir(mode=0o700, exist_ok=True)
+    info = os.lstat(knowledge)
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise AccountStorageError("unsafe knowledge directory")
+    os.chmod(knowledge, 0o700)
+    return True
+
+
 def _limit():
     import resource
 

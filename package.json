@@ -18,6 +18,7 @@
     "test": "bash scripts/test-all.sh",
     "test:api": "backend/.venv/bin/python tests/api-contract.py && backend/.venv/bin/python tests/shop-sync-contract.py && backend/.venv/bin/python tests/xianyu-login-contract.py",
     "test:auth": "backend/.venv/bin/python tests/auth-roles-contract.py && backend/.venv/bin/python tests/auth-security-contract.py && backend/.venv/bin/python tests/platform-admin-contract.py",
+    "test:first-registration": "backend/.venv/bin/python -B tests/first-registration-contract.py",
     "test:update": "backend/.venv/bin/python tests/platform-update-contract.py",
     "test:p0": "backend/.venv/bin/python tests/control-plane-contract.py",
     "test:ai": "backend/.venv/bin/python tests/ai-provider-adapters-contract.py && backend/.venv/bin/python tests/ai-customer-service-contract.py",

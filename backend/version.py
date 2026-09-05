@@ -10,7 +10,7 @@ import os
 VERSION = "0.1.0"
 BUILD_COMMIT = os.environ.get("SAAS_BUILD_COMMIT", "development").strip()[:40] or "development"
 BUILD_TIME = os.environ.get("SAAS_BUILD_TIME", "development").strip()[:80] or "development"
-ASSET_VERSION = "20260904-01"
+ASSET_VERSION = "20260905-01"
 
 
 def version_payload(channel: str) -> dict:

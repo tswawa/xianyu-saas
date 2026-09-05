@@ -4,12 +4,14 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import sqlite3
 import sys
 import tempfile
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
@@ -41,6 +43,9 @@ sys.path.insert(0, str(ROOT / "backend"))
 from fastapi.testclient import TestClient  # noqa: E402
 
 import app  # noqa: E402
+import bot_manager  # noqa: E402
+import shop_sync  # noqa: E402
+from account_storage import AccountStorage  # noqa: E402
 from db import (  # noqa: E402
     BootstrapUnavailableError,
     DB,
@@ -50,6 +55,133 @@ from db import (  # noqa: E402
 
 
 PASSWORD = "Contract-Pass-123!"
+
+
+@contextmanager
+def isolated_registration(name):
+    root = RUN_DIR / name
+    root.mkdir()
+    database = DB(str(root / "saas.db"))
+    tenants = root / "tenants"
+    storage = AccountStorage(tenants)
+    try:
+        with (
+            patch.object(app, "db", database),
+            patch.object(bot_manager, "TENANTS_ROOT", str(tenants)),
+            patch.object(shop_sync, "TENANTS_ROOT", str(tenants)),
+            patch.object(app.ai_service, "storage", storage),
+            patch.dict(os.environ, {
+                "SAAS_TENANTS_DIR": str(tenants), "SAAS_ALLOW_REGISTRATION": "0",
+                "SAAS_BOOTSTRAP_ENABLED": "0", "SAAS_TESTING": "0",
+            }),
+            TestClient(app.app, headers={
+                "Origin": "http://testserver", "X-SaaS-Browser-Intent": "browser-write",
+            }) as client,
+        ):
+            yield database, storage, client
+    finally:
+        database.con.close()
+
+
+def assert_first_registration_http() -> None:
+    with isolated_registration("first-registration") as (database, storage, client):
+        capabilities = client.get("/api/auth/capabilities").json()
+        assert capabilities["first_registration_available"] is True
+        assert capabilities["registration_enabled"] is True
+        assert capabilities["bootstrap_available"] is False
+        rejected = client.post("/api/auth/register", headers={"Origin": "https://other.example"},
+                               json={"username": "first-web-admin", "password": PASSWORD})
+        assert rejected.status_code == 403
+        assert database.user_count() == 0
+        weak = client.post("/api/auth/register", json={"username": "first-web-admin", "password": "short"})
+        assert weak.status_code == 400
+        created = client.post("/api/auth/register", json={"username": "first-web-admin", "password": PASSWORD})
+        assert created.status_code == 200, created.text
+        assert created.json() == {"ok": True, "role": "admin"}
+        user = database.get_user("first-web-admin")
+        account = database.get_shop_account(user["id"])
+        assert account["storage_initialized_at"] is not None
+        for name, expected in bot_manager.INITIAL_ACCOUNT_FILES.items():
+            assert json.loads(storage.read_text(user["id"], "default", name)) == json.loads(expected)
+        assert (storage.account_dir(user["id"]) / "ai_knowledge").is_dir()
+        login = client.post("/api/auth/login", json={"username": "first-web-admin", "password": PASSWORD})
+        assert login.status_code == 200, login.text
+        client.cookies.set(app.SESSION_COOKIE, login.cookies[app.SESSION_COOKIE], path="/")
+        assert client.get("/api/me").json()["role"] == "admin"
+        assert client.get("/api/config").status_code == 200
+        assert client.get("/api/automation").status_code == 200
+        capabilities = client.get("/api/auth/capabilities").json()
+        assert capabilities["first_registration_available"] is False
+        assert capabilities["registration_enabled"] is False
+        again = client.post("/api/auth/register", json={"username": "second-admin", "password": PASSWORD})
+        assert again.status_code == 403
+        assert database.user_count() == 1
+        with patch.dict(os.environ, {"SAAS_ALLOW_REGISTRATION": "1"}):
+            database.set_platform_setting("registration_open", "1", user["id"])
+            owner = client.post("/api/auth/register", json={"username": "later-owner", "password": PASSWORD})
+            assert owner.status_code == 200 and owner.json()["role"] == "owner"
+
+
+def assert_first_registration_storage_failure() -> None:
+    with isolated_registration("first-registration-failure") as (database, storage, client):
+        original = AccountStorage.atomic_write_path
+
+        def fail_midway(instance, path, data, **kwargs):
+            if Path(path).name == "automation_settings.json":
+                raise OSError("synthetic write failure")
+            return original(instance, path, data, **kwargs)
+
+        with patch.object(AccountStorage, "atomic_write_path", fail_midway):
+            failed = client.post("/api/auth/register", json={"username": "retry-admin", "password": PASSWORD})
+        assert failed.status_code == 503
+        assert failed.json()["detail"]["code"] == "account_initialization_failed"
+        assert database.user_count() == 0 and database.first_registration_available()
+        assert not storage.account_dir(1).exists()
+        # A directory left by an operator must not be removed by compensation.
+        existing = storage.write_text(1, "default", "reply_rules.json", '{"version":1,"rules":[]}')
+        preserved = existing.read_bytes()
+        failed = client.post("/api/auth/register", json={"username": "retry-admin", "password": PASSWORD})
+        assert failed.status_code == 503
+        assert existing.read_bytes() == preserved
+        assert database.user_count() == 0 and database.first_registration_available()
+        existing.unlink()
+        existing.parent.rmdir()
+        retried = client.post("/api/auth/register", json={"username": "retry-admin", "password": PASSWORD})
+        assert retried.status_code == 200 and database.count_enabled_admins() == 1
+
+
+def assert_legacy_login_initialization() -> None:
+    with isolated_registration("legacy-login") as (database, storage, client):
+        database.create_user("padding-admin", PASSWORD, role="admin")
+        uid = database.create_user("legacy-owner", PASSWORD, role="owner")
+        assert uid != 1
+        original = storage.write_text(uid, "default", "reply_rules.json", '{ "rules": [], "version": 1 }')
+        original_bytes = original.read_bytes()
+        wrong = client.post("/api/auth/login", json={"username": "legacy-owner", "password": "incorrect-password"})
+        assert wrong.status_code == 401
+        assert not (original.parent / "automation_settings.json").exists()
+        login = client.post("/api/auth/login", json={"username": "legacy-owner", "password": PASSWORD})
+        assert login.status_code == 200, login.text
+        assert original.read_bytes() == original_bytes
+        assert database.get_shop_account(uid)["storage_initialized_at"] is not None
+        client.cookies.set(app.SESSION_COOKIE, login.cookies[app.SESSION_COOKIE], path="/")
+        assert client.get("/api/config").status_code == 200
+        assert client.get("/api/automation").status_code == 200
+        original.unlink()
+        login = client.post("/api/auth/login", json={"username": "legacy-owner", "password": PASSWORD})
+        assert login.status_code == 200
+        assert not original.exists(), "an initialized account must never be reseeded on login"
+        assert client.get("/api/config").status_code == 503
+
+    with isolated_registration("legacy-permission") as (database, storage, client):
+        uid = database.create_user("legacy-permission", PASSWORD)
+        with patch.object(bot_manager, "initialize_unused_account_storage", side_effect=PermissionError("synthetic")):
+            failed = client.post("/api/auth/login", json={"username": "legacy-permission", "password": PASSWORD})
+        assert failed.status_code == 503
+        assert failed.json()["detail"]["code"] == "account_initialization_failed"
+        assert not failed.cookies.get(app.SESSION_COOKIE)
+        assert database.get_shop_account(uid)["storage_initialized_at"] is None
+        assert database.con.execute("SELECT COUNT(*) FROM tokens").fetchone()[0] == 0
 
 
 def assert_bootstrap_concurrency() -> None:
@@ -170,13 +302,20 @@ def assert_legacy_migration() -> None:
 
 
 def main() -> None:
+    assert_first_registration_http()
+    assert_first_registration_storage_failure()
+    assert_legacy_login_initialization()
     client = TestClient(app.app)
     capabilities = client.get("/api/auth/capabilities").json()
     assert capabilities == {
-        "registration_enabled": False,
+        "registration_enabled": True,
+        "first_registration_available": True,
         "bootstrap_available": False,
         "password_min_length": 12,
     }
+    # Explicit token bootstrap must not be bypassed by ordinary registration.
+    os.environ["SAAS_BOOTSTRAP_ENABLED"] = "1"
+    assert client.get("/api/auth/capabilities").json()["first_registration_available"] is False
     first_public = client.post(
         "/api/auth/register",
         json={"username": "public-first", "password": PASSWORD},

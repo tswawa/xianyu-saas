@@ -4,7 +4,7 @@
 
   const API_PREFIX = "/xianyu-saas";
   const QR_LOGIN_POLL_MS = 1500;
-  const ASSET_VERSION = "20260904-01";
+  const ASSET_VERSION = "20260905-01";
   const AI_TEXT_PLACEHOLDERS = new Set(["无", "暂无", "没有", "未填写", "待填写", "待补充", "占位", "n/a", "na", "none", "null", "todo", "tbd"]);
   const ICONS = API_PREFIX + "/assets/icons.svg?v=" + ASSET_VERSION + "#";
   // 旧版视图 key → 新版视图 key（历史会话/书签兜底）。
@@ -31,6 +31,7 @@
   const state = {
     authMode: "login",
     registrationAllowed: false,
+    firstRegistrationAvailable: false,
     bootstrapAvailable: false,
     passwordMinLength: 12,
     view: "home",
@@ -2373,62 +2374,83 @@
     }
   }
 
-  async function loadAuthCapabilities() {
+  async function loadAuthCapabilities({ preferFirstRegistration = false } = {}) {
+    let loadError = null;
     try {
       const capabilities = await api("/api/auth/capabilities");
       state.registrationAllowed = capabilities?.registration_enabled === true;
+      state.firstRegistrationAvailable = capabilities?.first_registration_available === true;
       state.bootstrapAvailable = capabilities?.bootstrap_available === true;
-      state.passwordMinLength = Math.max(12, Number(capabilities?.password_min_length || 12));
-    } catch (_error) {
+      const passwordMinLength = Number(capabilities?.password_min_length || 12);
+      state.passwordMinLength = Number.isFinite(passwordMinLength) ? Math.max(12, passwordMinLength) : 12;
+    } catch (error) {
+      // Fail closed, but never disguise database initialization errors as a
+      // normal registration-disabled state or lower the last known password rule.
       state.registrationAllowed = false;
+      state.firstRegistrationAvailable = false;
       state.bootstrapAvailable = false;
-      state.passwordMinLength = 12;
+      loadError = error;
     }
     const registerTab = $("#registerTab");
     const bootstrapTab = $("#bootstrapTab");
     if (registerTab) registerTab.hidden = !state.registrationAllowed;
     if (bootstrapTab) bootstrapTab.hidden = !state.bootstrapAvailable;
+    text("#registerTab", state.firstRegistrationAvailable ? "创建管理员" : "注册");
     $("#authPassword")?.setAttribute("minlength", String(state.passwordMinLength));
     $("#newPasswordInput")?.setAttribute("minlength", String(state.passwordMinLength));
-    if (
-      (state.authMode === "register" && !state.registrationAllowed)
-      || (state.authMode === "bootstrap" && !state.bootstrapAvailable)
-    ) setAuthMode("login");
+    setAuthMode(
+      preferFirstRegistration && state.firstRegistrationAvailable ? "register" : state.authMode,
+      { clearMessage: false },
+    );
+    if (loadError) throw loadError;
   }
 
-  function setAuthMode(mode) {
+  function setAuthMode(mode, { clearMessage = true } = {}) {
     const register = mode === "register" && state.registrationAllowed;
-    const firstAdmin = mode === "bootstrap" && state.bootstrapAvailable;
-    state.authMode = register ? "register" : firstAdmin ? "bootstrap" : "login";
+    const legacyBootstrap = mode === "bootstrap" && state.bootstrapAvailable;
+    const firstRegistration = register && state.firstRegistrationAvailable;
+    state.authMode = register ? "register" : legacyBootstrap ? "bootstrap" : "login";
     $("#loginTab").setAttribute("aria-selected", String(state.authMode === "login"));
     $("#registerTab").setAttribute("aria-selected", String(state.authMode === "register"));
     $("#bootstrapTab").setAttribute("aria-selected", String(state.authMode === "bootstrap"));
     const tokenField = $("#bootstrapTokenField");
-    if (tokenField) tokenField.hidden = state.authMode !== "bootstrap";
+    if (tokenField) tokenField.hidden = !legacyBootstrap;
     const tokenInput = $("#bootstrapToken");
     if (tokenInput) {
-      tokenInput.required = state.authMode === "bootstrap";
-      if (state.authMode !== "bootstrap") tokenInput.value = "";
+      tokenInput.required = legacyBootstrap;
+      tokenInput.disabled = !legacyBootstrap;
+      if (!legacyBootstrap) tokenInput.value = "";
     }
     text(
       "#authTitle",
-      state.authMode === "bootstrap" ? "创建首个管理员账号" : register ? "创建工作台账号" : "登录工作台",
+      firstRegistration || legacyBootstrap ? "创建首个管理员账号" : register ? "创建工作台账号" : "登录工作台",
     );
     text(
       "#authDescription",
-      state.authMode === "bootstrap"
-        ? "仅限受信任初始化入口；令牌成功使用后立即失效。"
-        : register ? "注册后连接你的闲鱼店铺。" : "连接店铺后，商品会自动整理。",
+      firstRegistration
+        ? "首次使用，设置账号和密码即可创建管理员。创建后默认关闭后续注册。"
+        : legacyBootstrap ? "仅限受信任初始化入口；令牌成功使用后立即失效。"
+          : register ? "注册后连接你的闲鱼店铺。" : "连接店铺后，商品会自动整理。",
     );
-    text("#authSubmit span", state.authMode === "bootstrap" ? "完成初始化" : register ? "创建账号" : "登录");
+    text("#authSubmit span", firstRegistration ? "创建管理员并进入工作台" : legacyBootstrap ? "完成初始化" : register ? "创建账号" : "登录");
     $("#authPassword").setAttribute("autocomplete", state.authMode === "login" ? "current-password" : "new-password");
-    formMessage("#authError", "");
+    if (clearMessage) formMessage("#authError", "");
+  }
+
+  async function loginAndEnterWorkspace(username, password) {
+    await api("/api/auth/login", { method: "POST", body: JSON.stringify({ username, password }) });
+    $("#authPassword").value = "";
+    await bootstrap();
   }
 
   async function submitAuth(event) {
     event.preventDefault();
+    const button = $("#authSubmit");
+    if (button.disabled) return;
+    const mode = state.authMode;
+    const wasFirstRegistration = mode === "register" && state.firstRegistrationAvailable;
     const username = $("#authUsername").value.trim();
-    const password = $("#authPassword").value;
+    let password = $("#authPassword").value;
     if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{2,31}$/.test(username)) {
       formMessage("#authError", "账号需为 3 至 32 位字母、数字、点、下划线或短横线");
       return;
@@ -2437,15 +2459,24 @@
       formMessage("#authError", "密码长度需要在 " + state.passwordMinLength + " 至 1024 位之间");
       return;
     }
-    const button = $("#authSubmit");
+    let createdRole = "";
     setBusy(button, true);
+    ["#loginTab", "#registerTab", "#bootstrapTab"].forEach((selector) => { $(selector).disabled = true; });
+    formMessage("#authError", "");
     try {
-      if (state.authMode === "register") {
-        await api("/api/auth/register", { method: "POST", body: JSON.stringify({ username, password }) });
-        setAuthMode("login");
+      if (mode === "register") {
+        const result = await api("/api/auth/register", { method: "POST", body: JSON.stringify({ username, password }) });
+        createdRole = result?.role === "admin" ? "admin" : "owner";
         $("#authPassword").value = "";
-        formMessage("#authError", "注册成功，请登录", true);
-      } else if (state.authMode === "bootstrap") {
+        await loadAuthCapabilities();
+        setAuthMode("login");
+        if (createdRole === "admin") {
+          state.view = "home";
+          await loginAndEnterWorkspace(username, password);
+        } else {
+          formMessage("#authError", "注册成功，请登录", true);
+        }
+      } else if (mode === "bootstrap") {
         const bootstrapToken = $("#bootstrapToken").value.trim();
         if (bootstrapToken.length < 32 || bootstrapToken.length > 256) {
           formMessage("#authError", "一次性初始化令牌无效");
@@ -2456,19 +2487,40 @@
           headers: { "X-Bootstrap-Token": bootstrapToken },
           body: JSON.stringify({ username, password }),
         });
+        createdRole = "admin";
         $("#bootstrapToken").value = "";
         $("#authPassword").value = "";
         await loadAuthCapabilities();
         setAuthMode("login");
         formMessage("#authError", "管理员账号已创建，请登录", true);
       } else {
-        await api("/api/auth/login", { method: "POST", body: JSON.stringify({ username, password }) });
-        await bootstrap();
+        await loginAndEnterWorkspace(username, password);
       }
     } catch (error) {
-      formMessage("#authError", error.message || "操作失败，请稍后重试");
+      let message = error.message || "操作失败，请稍后重试";
+      if (createdRole) {
+        setAuthMode("login");
+        $("#authUsername").value = username;
+        $("#authPassword").value = "";
+        message = (createdRole === "admin" ? "管理员账号" : "账号") + "已创建，但后续操作未完成：" + message + "。请稍后登录。";
+      } else if (mode === "register" || mode === "bootstrap") {
+        try {
+          await loadAuthCapabilities();
+          if (wasFirstRegistration && !state.firstRegistrationAvailable && [403, 409].includes(error.status)) {
+            setAuthMode("login");
+            $("#authPassword").value = "";
+            message = "首次管理员注册已结束" + (state.registrationAllowed ? "，当前仅开放店主注册。" : "，后续注册已关闭。")
+              + message + "；请使用已有账号登录或联系管理员。";
+          }
+        } catch (capabilitiesError) {
+          message += "；注册状态刷新失败：" + (capabilitiesError.message || "请刷新页面后重试");
+        }
+      }
+      formMessage("#authError", message);
     } finally {
+      password = "";
       setBusy(button, false);
+      ["#loginTab", "#registerTab", "#bootstrapTab"].forEach((selector) => { $(selector).disabled = false; });
     }
   }
 
@@ -6346,11 +6398,12 @@
     bindEvents();
     syncSidebarAccessibility();
     installProductImageFallback();
-    await loadAuthCapabilities();
     try {
+      await loadAuthCapabilities({ preferFirstRegistration: true });
       await bootstrap();
     } catch (error) {
       clearSession(false);
+      if (error.status !== 401) formMessage("#authError", error.message || "服务暂时不可用，请刷新页面后重试");
     }
   }
 

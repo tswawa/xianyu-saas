@@ -80,7 +80,7 @@ cp config/saas.env.docker.example config/saas.env
 docker compose up -d --build
 ```
 
-- **管理后台**：`http://localhost:4173/xianyu-saas/`
+- **管理后台**：`http://127.0.0.1:4173/xianyu-saas/`
 - **数据持久化**：数据库与各店铺配置文件默认保存在本地 `./data` 目录。
 
 查看日志或停止：
@@ -102,26 +102,24 @@ npx playwright install --with-deps chromium
 npm run dev
 ```
 
-### 首次登录：创建管理员账号
+### 首次使用：网页注册管理员
 
-为了防止公网被他人随意扫描并抢先注册，系统默认**关闭了公开网页注册**。服务首次启动后，请在服务器终端执行对应命令创建首位管理员（Admin）账号：
+默认配置（`SAAS_BOOTSTRAP_ENABLED=0`）下，全新数据库允许直接在登录页创建首位管理员，**无需终端命令或令牌**，也不受 `SAAS_ALLOW_REGISTRATION=0` 对后续注册的限制。
 
-- **Docker 部署环境**：
-  ```bash
-  docker compose exec xianyu-saas backend/.venv/bin/python -c "from db import DB; from bot_manager import ensure_dir; db = DB('/data/saas.db'); db.create_user('admin', 'Admin12345678!', role='admin', initializer=lambda uid: ensure_dir(uid, 'default', initialize=True)); print('管理员创建成功！')"
-  ```
-- **Linux 源码环境**：
-  ```bash
-  PYTHONPATH=backend python3 -c "from db import DB; from bot_manager import ensure_dir; db = DB('data/saas.db'); db.create_user('admin', 'Admin12345678!', role='admin', initializer=lambda uid: ensure_dir(uid, 'default', initialize=True)); print('管理员创建成功！')"
-  ```
+1. 打开 `http://127.0.0.1:4173/xianyu-saas/`，在「创建首个管理员账号」页面自行设置账号和不少于 12 位的强密码；系统没有通用管理员账号或密码。
+2. 提交后，服务原子创建首位管理员与默认店铺，初始化 5 个 JSON 配置文件和 `ai_knowledge` 目录；成功后自动登录工作台。并发首次注册只会产生一位初始管理员。
 
-> 💡 **提示**：默认账号为 `admin`，密码为 `Admin12345678!`（系统安全策略要求密码长度**不少于 12 位**）。创建完成后即可在登录页输入登录，登录后可在后台随时修改密码。
+后续网页注册只能创建普通店主（`owner`），且必须同时启用 `SAAS_ALLOW_REGISTRATION=1` 和后台 `registration_open`。私有自用可保持环境变量为 `0`。
+
+> **安全提示**：空站任何能访问者可抢先注册管理员，部署者应先注册再公开分享。`SAAS_ALLOW_REGISTRATION=0` 不会阻止默认空站的首次注册。
+
+已显式启用 `SAAS_BOOTSTRAP_ENABLED=1` 的运维部署仍使用原令牌 bootstrap，不开放无令牌首次注册；这不是默认上手步骤。旧 CLI 账号的受限初始化补缺与兼容边界见 [`docs/ACCESS_MODEL.md`](docs/ACCESS_MODEL.md)。
 
 ---
 
 ## 4 步日常使用流程
 
-1. **登录与绑定店铺**：首次启动先通过上述命令创建管理员账号登录后台；进入「店铺管理」，添加店铺并通过闲鱼 App 扫码登录；
+1. **登录与绑定店铺**：首次使用通过登录页注册管理员并自动进入后台；进入「店铺管理」，添加店铺并通过闲鱼 App 扫码登录；
 2. **配置智能客服**：进入「智能客服中心」，选择合适的人格风格或自定义客服，填入你的大模型 API Key，在沙盘模拟测试效果；
 3. **设置高频规则**：添加商品专属或全店通用的问答规则（优先走规则秒回，省 Token 且零延迟）；
 4. **绑定自动发货**：在「自动化发货」中导入卡密池或填入网盘链接，绑定对应商品，买家付款后全自动秒发。
@@ -138,7 +136,7 @@ npm run dev
 | `SAAS_COOKIE_SECURE` | Cookie 是否强制 HTTPS | 本地设 `0`，线上生产环境设 `1` |
 | `SAAS_AI_MASTER_KEY` | 加密模型 API Key 的主密钥 | 生产环境务必填写强随机字符串 |
 | `SAAS_MAX_BOTS` | 允许同时运行的最大店铺 Worker 数 | 根据服务器性能调整（默认 10） |
-| `SAAS_ALLOW_REGISTRATION` | 是否允许公开注册账号 | 私有自用建议设为 `0` |
+| `SAAS_ALLOW_REGISTRATION` | 后续网页注册上限，仍需后台 `registration_open` 打开；不限制默认空站首次注册 | 私有自用建议设为 `0` |
 
 完整模板见 [`config/saas.env.example`](config/saas.env.example) 和 [`config/saas.env.docker.example`](config/saas.env.docker.example)。
 

@@ -421,6 +421,7 @@ def main():
     assert unavailable.json()["detail"]["code"] == "database_unavailable"
     assert client.get("/api/auth/capabilities").json() == {
         "registration_enabled": True,
+        "first_registration_available": False,
         "bootstrap_available": False,
         "password_min_length": 12,
     }
@@ -450,15 +451,15 @@ def main():
 
     failed_registration_path = {"value": None}
 
-    def fail_registration_init(user_id, account_key="default", initialize=False):
-        assert account_key == "default" and initialize is True
-        path = Path(TENANTS_PATH) / str(user_id)
-        path.mkdir(parents=True, exist_ok=False)
-        (path / "reply_rules.json").write_text('{"version":1,"rules":[]}', encoding="utf-8")
-        failed_registration_path["value"] = path
-        raise OSError("synthetic account initialization failure")
+    original_write = app.AccountStorage.atomic_write_path
 
-    with patch.object(bot_manager, "ensure_dir", side_effect=fail_registration_init):
+    def fail_registration_write(storage, path, data, **kwargs):
+        if Path(path).name == "automation_settings.json":
+            failed_registration_path["value"] = Path(path).parent
+            raise OSError("synthetic account initialization failure")
+        return original_write(storage, path, data, **kwargs)
+
+    with patch.object(app.AccountStorage, "atomic_write_path", fail_registration_write):
         failed_registration = client.post(
             "/api/auth/register",
             json={"username": "failed-registration", "password": "password-123"},

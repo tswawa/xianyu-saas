@@ -240,8 +240,9 @@ class AccountStorage:
         data: str | _BytesLike,
         *,
         encoding: str = "utf-8",
+        replace_existing: bool = True,
     ) -> Path:
-        """Atomically write an already-resolved path below this tenants root."""
+        """Publish a complete file; initialization can refuse an existing target."""
         try:
             target = Path(path)
         except (TypeError, ValueError):
@@ -269,7 +270,13 @@ class AccountStorage:
                 stream.write(payload)
                 stream.flush()
                 os.fsync(stream.fileno())
-            os.replace(temporary, target)
+            if replace_existing:
+                os.replace(temporary, target)
+            else:
+                # A same-directory hard link publishes the fsynced contents
+                # atomically without replacing a file created by another writer.
+                os.link(temporary, target)
+                temporary.unlink()
             # ``mkstemp`` and fchmod already provide this mode; chmod after the
             # rename also covers unusual filesystems with a permissive umask.
             try:
@@ -310,6 +317,12 @@ class AccountStorage:
         if not isinstance(text, str):
             raise AccountStorageError("file content must be text")
         return self.write_file(user_id, account_id, name, text, encoding=encoding)
+
+    def create_text(self, user_id, account_id, name, text: str) -> Path:
+        """Create an initialization file without ever overwriting existing data."""
+        return self.atomic_write_path(
+            self._file_path(user_id, account_id, name), text, replace_existing=False
+        )
 
     def read_bytes(self, user_id, account_id, name) -> bytes:
         path = self._file_path(user_id, account_id, name)

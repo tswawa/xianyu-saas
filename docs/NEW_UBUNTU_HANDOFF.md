@@ -52,6 +52,16 @@ npm run dev
 - **管理后台**：`http://127.0.0.1:4173/xianyu-saas/`
 - **控制面 API**：`http://127.0.0.1:8096`
 
+本地开发模板按默认 Node 服务设置 `SAAS_PUBLIC_ORIGIN=http://127.0.0.1:4173`，`SAAS_TRUSTED_HOSTS=127.0.0.1:4173,127.0.0.1:8096`。若已有 `config/saas.env` 仍使用示例域名，请同步修改；浏览器写请求的来源必须匹配，不要通过放宽 CSRF 检查解决地址不一致。
+
+### 首次使用
+
+默认 `SAAS_BOOTSTRAP_ENABLED=0` 时，全新数据库可直接在登录页创建首位管理员，无需命令或令牌；`SAAS_ALLOW_REGISTRATION=0` 不限制这次注册。服务原子创建管理员、默认店铺的 5 个 JSON 文件及 `ai_knowledge` 目录，成功后自动登录。后续注册只能创建 `owner`，且必须同时打开 `SAAS_ALLOW_REGISTRATION` 与后台 `registration_open`。
+
+> **安全提示**：空站任何能访问者可抢先注册管理员，部署者应先注册再公开分享。
+
+显式启用 `SAAS_BOOTSTRAP_ENABLED=1` 的运维部署保留令牌 bootstrap，不开放无令牌首次注册；历史 CLI 账号仅在默认店铺未使用且已有文件为空默认配置时受限补缺，不覆盖业务或损坏文件。详见 [`ACCESS_MODEL.md`](ACCESS_MODEL.md)。
+
 ### 运行自动化测试
 ```bash
 npm test                      # 运行全套本地测试

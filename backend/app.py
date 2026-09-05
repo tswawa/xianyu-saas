@@ -551,6 +551,10 @@ def public_version():
     }
 
 
+def _first_registration_available() -> bool:
+    return not _env_true("SAAS_BOOTSTRAP_ENABLED", "0") and db.first_registration_available()
+
+
 @app.get("/api/auth/capabilities")
 def auth_capabilities(request: Request):
     env_allowed = _registration_env_allowed()
@@ -561,8 +565,10 @@ def auth_capabilities(request: Request):
     bootstrap_available = bool(
         bootstrap_digest and db.bootstrap_available(bootstrap_digest)
     )
+    first_registration = _first_registration_available()
     return {
-        "registration_enabled": bool(env_allowed and registration_open and users_exist),
+        "registration_enabled": first_registration or bool(env_allowed and registration_open and users_exist),
+        "first_registration_available": first_registration,
         "bootstrap_available": bootstrap_available,
         "password_min_length": PASSWORD_MIN_LENGTH,
     }
@@ -2473,8 +2479,11 @@ def _new_user_initializer(holder: dict):
     def initialize(user_id: int) -> None:
         from bot_manager import ensure_dir as ensure_bot_dir
 
-        holder["user_id"] = int(user_id)
         ensure_bot_dir(user_id, DEFAULT_ACCOUNT_ID, initialize=True)
+        # Failed initialization cleans its own newly created directory. Only a
+        # successfully created directory belongs to this request's compensation;
+        # never delete a pre-existing directory after ensure_dir refuses it.
+        holder["user_id"] = int(user_id)
 
     return initialize
 
@@ -2572,7 +2581,8 @@ def bootstrap_admin(
 @app.post("/api/auth/register")
 def register(body: RegisterIn, request: Request):
     _require_public_write_origin(request)
-    if not _registration_env_allowed():
+    registration_allowed = _registration_env_allowed()
+    if not registration_allowed and not _first_registration_available():
         raise _registration_disabled()
     username = _validate_new_credentials(body.username, body.password)
     holder: dict[str, int] = {}
@@ -2581,6 +2591,8 @@ def register(body: RegisterIn, request: Request):
             username,
             body.password,
             initializer=_new_user_initializer(holder),
+            allow_first_admin=not _env_true("SAAS_BOOTSTRAP_ENABLED", "0"),
+            registration_allowed=registration_allowed,
         )
     except RegistrationClosedError as exc:
         raise _registration_disabled() from exc
@@ -2598,15 +2610,16 @@ def register(body: RegisterIn, request: Request):
             503,
             detail={"code": "account_initialization_failed", "message": "账号初始化失败，请稍后重试"},
         ) from exc
+    role = str(db.get_user_by_id(user_id)["role"])
     _audit(
         "auth.registration_succeeded",
         request,
         actor_user_id=user_id,
         target_type="user",
         target_id=user_id,
-        metadata={"role": "owner"},
+        metadata={"role": role},
     )
-    return {"ok": True}
+    return {"ok": True, "role": role}
 
 
 @app.post("/api/auth/login")
@@ -2642,6 +2655,22 @@ def login(body: LoginIn, request: Request, response: Response):
                 headers={"Retry-After": str(max(rate["retry_after"], retry_after, 1))},
             )
         raise HTTPException(401, detail=detail)
+    try:
+        from bot_manager import initialize_unused_account_storage
+
+        db.initialize_unused_default_storage(user["id"], initialize_unused_account_storage)
+    except (OSError, AccountStorageError, sqlite3.Error) as exc:
+        _audit(
+            "auth.login_failed", request, target_type="user", target_id=user["id"],
+            outcome="failed", metadata={"code": "account_initialization_failed"},
+        )
+        raise HTTPException(
+            503,
+            detail={
+                "code": "account_initialization_failed",
+                "message": "账号配置初始化失败，请检查服务数据目录权限后重试；账号密码无需修改",
+            },
+        ) from exc
     db.clear_login_failures(username_digest, client_digest)
     if needs_upgrade:
         db.upgrade_password_hash(user["id"], stored_hash, password)
@@ -2966,6 +2995,7 @@ def create_shop_account(body: ShopAccountIn, user=Depends(Auth.current_user)):
         # suffix also avoids revealing account names in URLs or directories.
         key = "shop-" + uuid.uuid4().hex[:16]
     row = None
+    storage_created = False
     try:
         normalize_account_key(key)
         row = db.create_shop_account(user["id"], key, name)
@@ -2974,6 +3004,7 @@ def create_shop_account(body: ShopAccountIn, user=Depends(Auth.current_user)):
         from bot_manager import ensure_dir as ensure_bot_dir
 
         ensure_bot_dir(user["id"], key, initialize=True)
+        storage_created = True
         runtime = db.persist_worker_runtime(
             user["id"],
             row["id"],
@@ -2990,10 +3021,11 @@ def create_shop_account(body: ShopAccountIn, user=Depends(Auth.current_user)):
         )
         if runtime is None:
             raise RuntimeError("initial worker runtime generation changed")
+        db.mark_shop_storage_initialized(user["id"], row["id"])
     except sqlite3.IntegrityError as exc:
         if row is not None:
             removed = db.remove_unconfigured_shop_account(user["id"], row["id"])
-            if removed:
+            if removed and storage_created:
                 _discard_new_account_storage(user["id"], key)
             raise HTTPException(400, "店铺账号创建失败") from exc
         raise HTTPException(409, "店铺账号标识已存在，请重试") from exc
@@ -3003,7 +3035,7 @@ def create_shop_account(body: ShopAccountIn, user=Depends(Auth.current_user)):
         # GET /accounts cannot expose a broken ghost account.
         if row is not None:
             removed = db.remove_unconfigured_shop_account(user["id"], row["id"])
-            if removed:
+            if removed and storage_created:
                 _discard_new_account_storage(user["id"], key)
         raise HTTPException(400, "店铺账号创建失败") from exc
     return {"ok": True, "account": _shop_account_payload(row, user["id"])}

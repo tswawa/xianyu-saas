@@ -64,7 +64,17 @@ const defaultAiStoreConfig = {
   handoff_rules: "",
 };
 const fixtures = {
-  authCapabilities: { registration_enabled: true, bootstrap_available: false, password_min_length: 12 },
+  authCapabilities: { registration_enabled: true, first_registration_available: true, bootstrap_available: false, password_min_length: 12 },
+  authCapabilitiesRequests: 0,
+  authCapabilitiesError: null,
+  authCapabilitiesErrorAfterRegistration: null,
+  registrationError: null,
+  loginError: null,
+  registeredUsers: new Map(),
+  registrationRequests: [],
+  authLoginRequests: [],
+  authSequence: [],
+  bootstrapToken: "bootstrap-ui-contract-token-0123456789abcdef",
   bootstrapRequests: [],
   passwordRequests: [],
   authLogoutRequests: 0,
@@ -406,7 +416,8 @@ function advanceManualReply(parent, mode, polls) {
 }
 
 function createServer() {
-  let loggedIn = false;
+  const sessions = new Map();
+  let sessionSequence = 0;
   return http.createServer((req, res) => {
     const url = new URL(req.url, "http://127.0.0.1");
     if (url.pathname === "/xianyu-saas" || url.pathname === "/xianyu-saas/") {
@@ -432,8 +443,20 @@ function createServer() {
     req.on("end", () => {
       const contentType = String(req.headers["content-type"] || "").toLowerCase();
       const payload = contentType.includes("application/json") && rawBody ? JSON.parse(rawBody) : {};
+      const sessionId = String(req.headers.cookie || "").split(";").map((part) => part.trim()).find((part) => part.startsWith("xianyu_saas_session="))?.slice("xianyu_saas_session=".length) || "";
+      const me = sessions.get(sessionId);
       if (apiPath === "/api/auth/capabilities" && req.method === "GET") {
+        fixtures.authCapabilitiesRequests += 1;
+        fixtures.authSequence.push("capabilities");
+        if (fixtures.authCapabilitiesError) return json(res, { detail: fixtures.authCapabilitiesError.detail }, fixtures.authCapabilitiesError.status);
         return json(res, fixtures.authCapabilities);
+      }
+      if (["/api/auth/register", "/api/auth/bootstrap", "/api/auth/login"].includes(apiPath) && req.method === "POST") {
+        if (req.headers["x-saas-browser-intent"] !== "browser-write") return json(res, { detail: { code: "browser_intent_required", message: "缺少浏览器写入标记" } }, 403);
+        if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{2,31}$/.test(payload.username || "") || typeof payload.password !== "string"
+          || payload.password.length < fixtures.authCapabilities.password_min_length || payload.password.length > 1024) {
+          return json(res, { detail: "账号或密码格式无效" }, 422);
+        }
       }
       if (apiPath === "/api/auth/bootstrap" && req.method === "POST") {
         fixtures.bootstrapRequests.push({
@@ -442,29 +465,70 @@ function createServer() {
           browserIntent: String(req.headers["x-saas-browser-intent"] || ""),
           url: req.url,
         });
-        fixtures.authCapabilities = { ...fixtures.authCapabilities, bootstrap_available: false };
+        if (!fixtures.authCapabilities.bootstrap_available) {
+          return json(res, { detail: { code: "bootstrap_consumed", message: "初始化已完成" } }, 409);
+        }
+        if (req.headers["x-bootstrap-token"] !== fixtures.bootstrapToken) {
+          return json(res, { detail: { code: "bootstrap_denied", message: "无法完成初始化" } }, 403);
+        }
+        fixtures.registeredUsers.set(payload.username, { password: payload.password, role: "admin" });
+        fixtures.authCapabilities = { ...fixtures.authCapabilities, registration_enabled: false, first_registration_available: false, bootstrap_available: false };
         return json(res, { ok: true });
       }
-      if (apiPath === "/api/auth/login" && req.method === "POST") {
-        loggedIn = true;
-        return json(res, { ok: true }, 200, { "set-cookie": "xianyu_saas_session=mock-session; Path=/xianyu-saas/; HttpOnly; SameSite=Strict" });
+      if (apiPath === "/api/auth/register" && req.method === "POST") {
+        fixtures.authSequence.push("register");
+        fixtures.registrationRequests.push({
+          payload,
+          token: String(req.headers["x-bootstrap-token"] || ""),
+          browserIntent: String(req.headers["x-saas-browser-intent"] || ""),
+          url: req.url,
+        });
+        if (fixtures.registrationError) return json(res, { detail: fixtures.registrationError.detail }, fixtures.registrationError.status);
+        if (!fixtures.authCapabilities.registration_enabled || fixtures.authCapabilities.bootstrap_available) {
+          return json(res, { detail: { code: "registration_disabled", message: "注册当前未开放" } }, 403);
+        }
+        if (fixtures.registeredUsers.has(payload.username)) return json(res, { detail: { code: "username_unavailable", message: "账号名称不可用" } }, 409);
+        const role = fixtures.authCapabilities.first_registration_available ? "admin" : "owner";
+        fixtures.registeredUsers.set(payload.username, { password: payload.password, role });
+        if (role === "admin") {
+          fixtures.authCapabilities = { ...fixtures.authCapabilities, registration_enabled: false, first_registration_available: false, bootstrap_available: false };
+        }
+        if (fixtures.authCapabilitiesErrorAfterRegistration) fixtures.authCapabilitiesError = fixtures.authCapabilitiesErrorAfterRegistration;
+        // Registration never creates a session: the browser must explicitly log in.
+        return json(res, { ok: true, role });
       }
-      if (apiPath === "/api/auth/register" && req.method === "POST") return json(res, { ok: true });
+      if (apiPath === "/api/auth/login" && req.method === "POST") {
+        fixtures.authSequence.push("login");
+        fixtures.authLoginRequests.push({ payload, browserIntent: String(req.headers["x-saas-browser-intent"] || "") });
+        if (fixtures.loginError) return json(res, { detail: fixtures.loginError.detail }, fixtures.loginError.status);
+        const registered = fixtures.registeredUsers.get(payload.username);
+        if ((registered && registered.password !== payload.password) || (!registered && payload.username !== fixtures.me.username)) {
+          return json(res, { detail: "账号或密码错误" }, 401);
+        }
+        const role = registered?.role || fixtures.me.role;
+        const nextSessionId = "mock-session-" + (++sessionSequence);
+        sessions.set(nextSessionId, {
+          ...fixtures.me, username: payload.username, role, role_label: role === "admin" ? "管理员" : "店主", is_admin: role === "admin",
+          platform_permissions: role === "admin" ? ["platform.audit.read", "platform.settings.manage", "platform.updates.manage", "platform.users.manage"] : [],
+        });
+        return json(res, { ok: true }, 200, { "set-cookie": `xianyu_saas_session=${nextSessionId}; Path=/xianyu-saas/; HttpOnly; SameSite=Strict` });
+      }
       if (apiPath === "/api/auth/logout" && req.method === "POST") {
         fixtures.authLogoutRequests += 1;
         fixtures.requestSequence.push("auth-logout");
-        loggedIn = false;
+        sessions.delete(sessionId);
         return json(res, { ok: true }, 200, { "set-cookie": "xianyu_saas_session=; Path=/xianyu-saas/; Max-Age=0; HttpOnly" });
       }
-      if (!loggedIn) return json(res, { detail: "未登录" }, 401);
+      if (apiPath === "/api/me") fixtures.authSequence.push("me");
+      if (!me) return json(res, { detail: "未登录" }, 401);
       if (req.headers["x-shop-account"]) fixtures.shopAccountHeaders.push(String(req.headers["x-shop-account"]));
-      if (apiPath === "/api/me") return json(res, fixtures.me);
+      if (apiPath === "/api/me") return json(res, me);
       if (apiPath === "/api/auth/password" && req.method === "POST") {
         fixtures.passwordRequests.push(payload);
         return json(res, { ok: true, other_sessions_revoked: true });
       }
       if (apiPath === "/api/version" && req.method === "GET") return json(res, fixtures.version);
-      if (apiPath.startsWith("/api/admin/") && fixtures.me?.is_admin !== true) {
+      if (apiPath.startsWith("/api/admin/") && me.is_admin !== true) {
         return json(res, { detail: { code: "admin_required", message: "需要管理员权限" } }, 403);
       }
       if (apiPath === "/api/admin/settings" && req.method === "GET") return json(res, fixtures.adminSettings);
@@ -509,8 +573,8 @@ function createServer() {
         const user = fixtures.adminUsers.find((item) => String(item.id) === adminSessionsMatch[1]);
         if (!user) return json(res, { detail: { code: "user_not_found", message: "账号不存在" } }, 404);
         fixtures.adminUserRequests.push({ action: "revoke", userId: user.id });
-        const revoked = Math.max(Number(user.session_count || 0) - (user.username === fixtures.me.username ? 1 : 0), 0);
-        user.session_count = user.username === fixtures.me.username ? 1 : 0;
+        const revoked = Math.max(Number(user.session_count || 0) - (user.username === me.username ? 1 : 0), 0);
+        user.session_count = user.username === me.username ? 1 : 0;
         return json(res, { ok: true, sessions_revoked: revoked });
       }
       if (apiPath === "/api/admin/audit" && req.method === "GET") {
@@ -1523,6 +1587,188 @@ async function dispatchManualReplyImageEvent(page, type, file) {
   }, { type, ...file });
 }
 
+async function checkFirstRegistration(browser, baseUrl) {
+  const pages = [];
+  const errors = [];
+  const failedResponses = [];
+  const emptyCapabilities = { registration_enabled: true, first_registration_available: true, bootstrap_available: false, password_min_length: 12 };
+  const databaseError = { status: 503, detail: { code: "database_unavailable", message: "控制面数据库不可用" } };
+  const initializationError = { status: 503, detail: { code: "account_initialization_failed", message: "账号初始化失败，请稍后重试" } };
+  const resetEmptyInstance = () => {
+    fixtures.authCapabilities = { ...emptyCapabilities };
+    fixtures.authCapabilitiesError = null;
+    fixtures.authCapabilitiesErrorAfterRegistration = null;
+    fixtures.registrationError = null;
+    fixtures.loginError = null;
+    fixtures.registeredUsers.clear();
+  };
+  const openPage = async (expectedFailures = []) => {
+    const page = await browser.newPage({ viewport: { width: 1440, height: 900 }, deviceScaleFactor: 1 });
+    pages.push(page);
+    await page.route("https://cdn.example/**", (route) => route.fulfill({
+      status: 200,
+      contentType: "image/png",
+      body: Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", "base64"),
+    }));
+    const allowedFailures = new Set(["401 /api/me", ...expectedFailures]);
+    page.on("pageerror", (error) => errors.push(error.message));
+    page.on("console", (message) => {
+      if (message.type() === "error" && !Array.from(allowedFailures).some((item) => message.text().includes("status of " + item.split(" ")[0]))) {
+        errors.push(message.text());
+      }
+    });
+    page.on("response", (response) => {
+      const key = response.status() + " " + new URL(response.url()).pathname.replace("/xianyu-saas", "");
+      if (response.status() >= 400 && !allowedFailures.has(key)) failedResponses.push(key);
+    });
+    await page.goto(baseUrl, { waitUntil: "networkidle" });
+    return page;
+  };
+  try {
+    resetEmptyInstance();
+    const firstPage = await openPage();
+    const competingPage = await openPage(["403 /api/auth/register"]);
+    assert.equal(await firstPage.locator("#authScreen").isVisible(), true);
+    assert.equal(await firstPage.locator("#authTitle").textContent(), "创建首个管理员账号", "empty instances must default to first registration, not login or token bootstrap");
+    assert.equal(await firstPage.locator("#registerTab").getAttribute("aria-selected"), "true");
+    assert.equal(await firstPage.locator("#registerTab").textContent(), "创建管理员");
+    assert.equal(await firstPage.locator("#bootstrapTab").isVisible(), false);
+    assert.equal(await firstPage.locator("#bootstrapTokenField").isVisible(), false);
+    assert.equal(await firstPage.locator("#bootstrapToken").isDisabled(), true);
+    assert.equal(await firstPage.locator("#bootstrapToken").getAttribute("required"), null);
+    assert.deepEqual(await firstPage.locator("#authForm input:enabled:visible").evaluateAll((nodes) => nodes.map((node) => node.name)), ["username", "password"], "first registration must ask only for username and password");
+    assert.equal(await firstPage.locator("#authPassword").getAttribute("autocomplete"), "new-password");
+    assert.equal(await firstPage.locator("#authPassword").getAttribute("minlength"), "12");
+    assert.equal(await firstPage.locator("#authPassword").getAttribute("maxlength"), "1024");
+    await assertNoOverflow(firstPage, "first administrator registration desktop");
+    await firstPage.setViewportSize({ width: 390, height: 844 });
+    await assertNoOverflow(firstPage, "first administrator registration mobile");
+    await firstPage.setViewportSize({ width: 1440, height: 900 });
+
+    const registrationCount = fixtures.registrationRequests.length;
+    await firstPage.fill("#authUsername", "invalid user");
+    await firstPage.fill("#authPassword", "First-Admin-Pass-123!");
+    await firstPage.click("#authSubmit");
+    assert.match(await firstPage.locator("#authError").textContent(), /账号需为/);
+    await firstPage.fill("#authUsername", "first-admin-demo");
+    await firstPage.fill("#authPassword", "short-pass");
+    await firstPage.click("#authSubmit");
+    assert.match(await firstPage.locator("#authError").textContent(), /12 至 1024/);
+    assert.equal(fixtures.registrationRequests.length, registrationCount, "first registration must retain username and password validation");
+
+    const password = "First-Admin-Pass-123!";
+    const loginCount = fixtures.authLoginRequests.length;
+    const bootstrapCount = fixtures.bootstrapRequests.length;
+    const capabilitiesCount = fixtures.authCapabilitiesRequests;
+    const sequenceStart = fixtures.authSequence.length;
+    await firstPage.fill("#authPassword", password);
+    const registeredResponse = firstPage.waitForResponse((response) => response.url().endsWith("/api/auth/register") && response.request().method() === "POST");
+    const loginResponse = firstPage.waitForResponse((response) => response.url().endsWith("/api/auth/login") && response.request().method() === "POST");
+    const meResponse = firstPage.waitForResponse((response) => response.url().endsWith("/api/me") && response.status() === 200);
+    await firstPage.click("#authSubmit");
+    const registered = await registeredResponse;
+    assert.deepEqual(await registered.json(), { ok: true, role: "admin" });
+    assert.equal(registered.headers()["set-cookie"], undefined, "registration itself must not create a session");
+    assert.equal((await loginResponse).status(), 200);
+    assert.equal((await (await meResponse).json()).role, "admin", "workspace identity must come from the login session, not client-side role elevation");
+    await firstPage.waitForSelector("#workspace:not([hidden])");
+    await firstPage.waitForSelector('[data-panel="home"]:not([hidden])');
+    assert.equal(fixtures.registrationRequests.length, registrationCount + 1);
+    assert.deepEqual(fixtures.registrationRequests.at(-1).payload, { username: "first-admin-demo", password });
+    assert.equal(fixtures.registrationRequests.at(-1).token, "", "first registration must never send a bootstrap token");
+    assert.equal(fixtures.registrationRequests.at(-1).browserIntent, "browser-write");
+    assert.equal(fixtures.registrationRequests.at(-1).url.includes(password), false);
+    assert.equal(fixtures.bootstrapRequests.length, bootstrapCount, "first registration must not call the legacy bootstrap endpoint");
+    assert.equal(fixtures.authLoginRequests.length, loginCount + 1);
+    assert.deepEqual(fixtures.authLoginRequests.at(-1), { payload: { username: "first-admin-demo", password }, browserIntent: "browser-write" });
+    assert.equal(fixtures.authCapabilitiesRequests, capabilitiesCount + 1, "successful first registration must refresh capabilities");
+    assert.deepEqual(fixtures.authSequence.slice(sequenceStart, sequenceStart + 4), ["register", "capabilities", "login", "me"]);
+    assert.deepEqual(fixtures.authCapabilities, { ...emptyCapabilities, registration_enabled: false, first_registration_available: false });
+    assert.equal(await firstPage.inputValue("#authPassword"), "", "automatic login must erase the password input");
+    assert.equal(await firstPage.inputValue("#bootstrapToken"), "");
+    assert.equal(await firstPage.evaluate((secret) => [localStorage, sessionStorage].some((storage) => Object.keys(storage).some((key) => String(storage.getItem(key)).includes(secret))), password), false, "first registration credentials must never reach browser storage");
+
+    // This second page read capabilities before the first request won. Its
+    // stale form must not silently create another administrator or log in.
+    await competingPage.fill("#authUsername", "competing-admin-demo");
+    await competingPage.fill("#authPassword", "Competing-Admin-Pass-123!");
+    const closedCapabilitiesCount = fixtures.authCapabilitiesRequests;
+    const closedResponse = competingPage.waitForResponse((response) => response.url().endsWith("/api/auth/register") && response.status() === 403);
+    await competingPage.click("#authSubmit");
+    await closedResponse;
+    await competingPage.waitForFunction(() => document.querySelector("#authError")?.textContent.includes("后续注册已关闭"));
+    assert.equal(fixtures.authCapabilitiesRequests, closedCapabilitiesCount + 1);
+    assert.equal(fixtures.authLoginRequests.length, loginCount + 1, "losing first registration must not attempt login");
+    assert.equal(await competingPage.locator("#authTitle").textContent(), "登录工作台");
+    assert.equal(await competingPage.locator("#registerTab").isVisible(), false);
+    assert.equal(await competingPage.locator("#bootstrapTab").isVisible(), false);
+    assert.equal(await competingPage.locator("#workspace").isVisible(), false);
+    assert.match(await competingPage.locator("#authError").textContent(), /首次管理员注册已结束.*注册当前未开放.*已有账号登录/);
+    assert.equal(await competingPage.inputValue("#authUsername"), "competing-admin-demo");
+    assert.equal(await competingPage.inputValue("#authPassword"), "");
+    assert.equal(fixtures.registeredUsers.has("competing-admin-demo"), false);
+    await firstPage.close();
+    await competingPage.close();
+
+    // Database failures are different from a closed registration gate. Both
+    // startup errors and refresh failures must remain visible and retryable.
+    resetEmptyInstance();
+    fixtures.authCapabilitiesError = databaseError;
+    const startupPage = await openPage(["503 /api/auth/capabilities"]);
+    assert.equal(await startupPage.locator("#authScreen").isVisible(), true);
+    assert.match(await startupPage.locator("#authError").textContent(), /控制面数据库不可用/);
+    assert.equal(await startupPage.locator("#registerTab").isVisible(), false);
+    assert.doesNotMatch(await startupPage.locator("#authError").textContent(), /注册已关闭/);
+    await startupPage.close();
+
+    for (const scenario of ["registration-unavailable", "refresh-unavailable", "created-refresh-unavailable", "created-login-unavailable"]) {
+      resetEmptyInstance();
+      fixtures.authCapabilities.password_min_length = 16;
+      const errorPage = await openPage(["503 /api/auth/capabilities", "503 /api/auth/register", "503 /api/auth/login"]);
+      const beforeCapabilities = fixtures.authCapabilitiesRequests;
+      const beforeLogin = fixtures.authLoginRequests.length;
+      const beforeRegistration = fixtures.registrationRequests.length;
+      await errorPage.fill("#authUsername", "error-admin-demo");
+      await errorPage.fill("#authPassword", "password-123");
+      await errorPage.click("#authSubmit");
+      assert.match(await errorPage.locator("#authError").textContent(), /16 至 1024/);
+      assert.equal(fixtures.registrationRequests.length, beforeRegistration, "the server's stricter password minimum must be retained");
+      if (scenario.startsWith("created-")) {
+        if (scenario === "created-refresh-unavailable") fixtures.authCapabilitiesErrorAfterRegistration = databaseError;
+        else fixtures.loginError = initializationError;
+      } else {
+        fixtures.registrationError = initializationError;
+        if (scenario === "refresh-unavailable") fixtures.authCapabilitiesError = databaseError;
+      }
+      await errorPage.fill("#authPassword", "Error-Admin-Pass-123!");
+      await errorPage.click("#authSubmit");
+      await errorPage.waitForFunction(() => document.querySelector("#authSubmit")?.disabled === false && /账号初始化失败|控制面数据库不可用/.test(document.querySelector("#authError")?.textContent || ""));
+      assert.equal(fixtures.authCapabilitiesRequests, beforeCapabilities + 1, `${scenario}: registration outcomes must refresh capabilities once`);
+      assert.doesNotMatch(await errorPage.locator("#authError").textContent(), /首次管理员注册已结束|后续注册已关闭/);
+      assert.equal(await errorPage.locator("#authPassword").getAttribute("minlength"), "16", "capabilities errors must not lower a known password minimum");
+      assert.equal(await errorPage.locator("#workspace").isVisible(), false);
+      assert.equal(fixtures.authLoginRequests.length, beforeLogin + (scenario === "created-login-unavailable" ? 1 : 0));
+      if (scenario.startsWith("created-")) {
+        assert.match(await errorPage.locator("#authError").textContent(), /管理员账号已创建.*请稍后登录/);
+        assert.equal(await errorPage.locator("#authTitle").textContent(), "登录工作台");
+        assert.equal(await errorPage.inputValue("#authPassword"), "");
+        assert.equal(await errorPage.inputValue("#authUsername"), "error-admin-demo");
+      } else if (scenario === "refresh-unavailable") {
+        assert.match(await errorPage.locator("#authError").textContent(), /账号初始化失败.*注册状态刷新失败.*控制面数据库不可用/);
+        assert.equal(await errorPage.locator("#registerTab").isVisible(), false);
+      } else {
+        assert.equal(await errorPage.locator("#registerTab").getAttribute("aria-selected"), "true", "a transient register error with an open gate must retain the retryable form");
+      }
+      await errorPage.close();
+    }
+    assert.deepEqual(errors, [], "first-registration pages must have no runtime or unexpected console errors");
+    assert.deepEqual(failedResponses, [], "first-registration pages must have only explicitly simulated error responses");
+  } finally {
+    for (const page of pages) if (!page.isClosed()) await page.close();
+    resetEmptyInstance();
+  }
+}
+
 async function run() {
   const server = createServer();
   const port = await listen(server);
@@ -1544,16 +1790,26 @@ async function run() {
   let expectedManualReplyNotFoundConsole = 0;
   let expectedManualReplyNotFoundResponses = 0;
   try {
-    const bootstrapToken = "bootstrap-ui-contract-token-0123456789abcdef";
-    fixtures.authCapabilities = { registration_enabled: false, bootstrap_available: true, password_min_length: 12 };
+    await checkFirstRegistration(browser, `http://127.0.0.1:${port}/xianyu-saas/`);
+    const bootstrapToken = fixtures.bootstrapToken;
+    fixtures.authCapabilities = { registration_enabled: false, first_registration_available: false, bootstrap_available: true, password_min_length: 12 };
     const bootstrapPage = await browser.newPage({ viewport: { width: 1440, height: 900 }, deviceScaleFactor: 1 });
     await bootstrapPage.goto(`http://127.0.0.1:${port}/xianyu-saas/`, { waitUntil: "networkidle" });
     assert.equal(await bootstrapPage.locator("#bootstrapTab").isVisible(), true, "trusted first-admin state must expose bootstrap only");
     assert.equal(await bootstrapPage.locator("#registerTab").isVisible(), false, "bootstrap must not imply public registration");
+    assert.equal(await bootstrapPage.locator("#loginTab").getAttribute("aria-selected"), "true", "explicit legacy bootstrap must not enable token-free first registration");
     await bootstrapPage.click("#bootstrapTab");
     assert.match(await bootstrapPage.locator("#authTitle").textContent(), /首个管理员/);
+    assert.equal(await bootstrapPage.locator("#bootstrapTokenField").isVisible(), true);
+    assert.equal(await bootstrapPage.locator("#bootstrapToken").isDisabled(), false);
+    assert.equal(await bootstrapPage.locator("#bootstrapToken").getAttribute("required"), "");
     await bootstrapPage.fill("#authUsername", "bootstrap-admin");
     await bootstrapPage.fill("#authPassword", "Bootstrap-Pass-123!");
+    await bootstrapPage.click("#authSubmit");
+    assert.match(await bootstrapPage.locator("#authError").textContent(), /一次性初始化令牌无效/);
+    assert.equal(fixtures.bootstrapRequests.length, 0, "legacy bootstrap must still require a token");
+    const legacyLoginCount = fixtures.authLoginRequests.length;
+    const legacyCapabilitiesCount = fixtures.authCapabilitiesRequests;
     await bootstrapPage.fill("#bootstrapToken", bootstrapToken);
     await bootstrapPage.click("#authSubmit");
     await bootstrapPage.waitForFunction(() => document.querySelector("#authTitle")?.textContent === "登录工作台");
@@ -1564,8 +1820,16 @@ async function run() {
     assert.equal(fixtures.bootstrapRequests[0].url.includes(bootstrapToken), false, "bootstrap token must never enter the URL");
     assert.equal(JSON.stringify(fixtures.bootstrapRequests[0].payload).includes(bootstrapToken), false, "bootstrap token must never enter JSON");
     assert.equal((await bootstrapPage.locator("body").innerHTML()).includes(bootstrapToken), false, "bootstrap token must be cleared from rendered DOM");
+    assert.equal(await bootstrapPage.inputValue("#bootstrapToken"), "", "legacy bootstrap must erase the live token input");
+    assert.equal(await bootstrapPage.inputValue("#authPassword"), "");
+    assert.equal(await bootstrapPage.locator("#bootstrapToken").isDisabled(), true);
+    assert.equal(await bootstrapPage.locator("#bootstrapTab").isVisible(), false);
+    assert.equal(await bootstrapPage.locator("#registerTab").isVisible(), false);
+    assert.equal(fixtures.authCapabilitiesRequests, legacyCapabilitiesCount + 1);
+    assert.equal(fixtures.authLoginRequests.length, legacyLoginCount, "legacy bootstrap must retain its explicit login experience");
+    assert.match(await bootstrapPage.locator("#authError").textContent(), /管理员账号已创建，请登录/);
     await bootstrapPage.close();
-    fixtures.authCapabilities = { registration_enabled: true, bootstrap_available: false, password_min_length: 12 };
+    fixtures.authCapabilities = { registration_enabled: true, first_registration_available: false, bootstrap_available: false, password_min_length: 12 };
 
     const page = await browser.newPage({ viewport: { width: 1440, height: 900 }, deviceScaleFactor: 1 });
     await page.route("https://cdn.example/**", (route) => route.fulfill({
@@ -1637,9 +1901,25 @@ async function run() {
     assert.equal(await page.locator("#introCurtain").count(), 0, "startup curtain must be removed from the first-load DOM");
     assert.equal(await page.locator("#enterWorkspaceButton").count(), 0, "startup entry button must be removed");
     assert.equal(await page.locator("#authScreen").isVisible(), true, "login screen should be visible without a startup curtain");
+    assert.equal(await page.locator("#loginTab").getAttribute("aria-selected"), "true", "open owner registration must not be mistaken for first-admin setup");
     await page.click("#registerTab");
-    assert.match(await page.locator("#authTitle").textContent(), /创建/, "register tab must switch the auth title");
-    await page.click("#loginTab");
+    assert.equal(await page.locator("#authTitle").textContent(), "创建工作台账号", "subsequent registration must remain an owner signup");
+    assert.equal(await page.locator("#bootstrapTokenField").isVisible(), false);
+    const ownerLoginCount = fixtures.authLoginRequests.length;
+    const ownerCapabilitiesCount = fixtures.authCapabilitiesRequests;
+    await page.fill("#authUsername", "owner-demo");
+    await page.fill("#authPassword", "password-123");
+    const ownerRegistrationResponse = page.waitForResponse((response) => response.url().endsWith("/api/auth/register") && response.request().method() === "POST");
+    await page.click("#authSubmit");
+    assert.deepEqual(await (await ownerRegistrationResponse).json(), { ok: true, role: "owner" });
+    await page.waitForFunction(() => document.querySelector("#authError")?.textContent === "注册成功，请登录");
+    assert.equal(fixtures.authLoginRequests.length, ownerLoginCount, "owner registration must not automatically log in");
+    assert.equal(fixtures.authCapabilitiesRequests, ownerCapabilitiesCount + 1);
+    assert.equal(await page.inputValue("#authUsername"), "owner-demo");
+    assert.equal(await page.inputValue("#authPassword"), "");
+    assert.equal(await page.locator("#workspace").isVisible(), false);
+    assert.equal(await page.locator("#registerTab").isVisible(), true, "open owner registration must remain available");
+    assert.equal(await page.locator("#authTitle").textContent(), "登录工作台");
     await assertNoOverflow(page, "desktop login");
     await page.fill("#authUsername", "owner-demo");
     await page.fill("#authPassword", "password-123");

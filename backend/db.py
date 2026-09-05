@@ -170,6 +170,7 @@ class DB:
                     last_error_code TEXT NOT NULL DEFAULT '',
                     last_verified_at REAL,
                     last_sync_at REAL,
+                    storage_initialized_at REAL,
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL,
                     UNIQUE(user_id, account_key)
@@ -392,20 +393,22 @@ class DB:
         )
 
     def _migrate_shop_accounts_locked(self):
-        """Add account fencing metadata to databases created before it existed."""
+        """Add fencing and explicit storage-initialization metadata once."""
         columns = {
             str(row["name"])
             for row in self.con.execute("PRAGMA table_info(shop_accounts)").fetchall()
         }
-        if "generation" not in columns:
+        additions = {
+            "generation": "ALTER TABLE shop_accounts ADD COLUMN generation INTEGER NOT NULL DEFAULT 0",
+            "storage_initialized_at": "ALTER TABLE shop_accounts ADD COLUMN storage_initialized_at REAL",
+        }
+        for name, statement in additions.items():
+            if name in columns:
+                continue
             try:
-                self.con.execute(
-                    "ALTER TABLE shop_accounts ADD COLUMN generation INTEGER NOT NULL DEFAULT 0"
-                )
+                self.con.execute(statement)
             except sqlite3.OperationalError as error:
-                # API and consumer can initialize against the same legacy DB
-                # at once.  One process may win the ALTER between our PRAGMA
-                # read and statement; accept only that benign duplicate race.
+                # API and consumer may race the same additive migration.
                 if "duplicate column name" not in str(error).lower():
                     raise
 
@@ -1654,8 +1657,7 @@ class DB:
                 if not stored or len(digest) != 64 or not secrets.compare_digest(stored, digest):
                     raise BootstrapTokenError("bootstrap token mismatch")
                 user_id = self._insert_user_account_locked(username, password, "admin", now)
-                if initializer is not None:
-                    initializer(user_id)
+                self._initialize_user_storage_locked(user_id, initializer, now)
                 consumed = self.con.execute(
                     """
                     UPDATE bootstrap_state
@@ -1673,26 +1675,62 @@ class DB:
                     self.con.rollback()
                 raise
 
+    def first_registration_available(self):
+        """A consumed or token-bound installation can never be claimed again."""
+        with self._lock:
+            row = self.con.execute(
+                """SELECT state, token_digest, (SELECT COUNT(*) FROM users) AS user_count
+                   FROM bootstrap_state WHERE singleton_id = 1"""
+            ).fetchone()
+            return bool(
+                row and row["state"] == "pending" and not row["token_digest"]
+                and int(row["user_count"]) == 0
+            )
+
+    def _initialize_user_storage_locked(self, user_id, initializer, now):
+        if initializer is not None:
+            initializer(user_id)
+            self.con.execute(
+                """UPDATE shop_accounts SET storage_initialized_at = ?
+                   WHERE user_id = ? AND account_key = 'default'""",
+                (now, user_id),
+            )
+
     def register_user(
         self,
         username,
         password,
         initializer: Callable[[int], None] | None = None,
+        *,
+        allow_first_admin: bool = False,
+        registration_allowed: bool = True,
     ):
-        """Create an owner only while the durable switch is open and users exist."""
+        """Choose the role and initialize storage inside the same write transaction."""
         now = time.time()
         with self._lock:
             try:
                 self.con.execute("BEGIN IMMEDIATE")
                 users = int(self.con.execute("SELECT COUNT(*) FROM users").fetchone()[0])
-                setting = self.con.execute(
-                    "SELECT setting_value FROM platform_settings WHERE setting_key = 'registration_open'"
-                ).fetchone()
-                if users <= 0 or setting is None or str(setting["setting_value"]) != "1":
-                    raise RegistrationClosedError("registration closed")
-                user_id = self._insert_user_account_locked(username, password, "owner", now)
-                if initializer is not None:
-                    initializer(user_id)
+                if users == 0:
+                    if not allow_first_admin or not self.first_registration_available():
+                        raise RegistrationClosedError("first registration unavailable")
+                    role = "admin"
+                else:
+                    setting = self.con.execute(
+                        "SELECT setting_value FROM platform_settings WHERE setting_key = 'registration_open'"
+                    ).fetchone()
+                    if not registration_allowed or setting is None or str(setting["setting_value"]) != "1":
+                        raise RegistrationClosedError("registration closed")
+                    role = "owner"
+                user_id = self._insert_user_account_locked(username, password, role, now)
+                self._initialize_user_storage_locked(user_id, initializer, now)
+                if role == "admin":
+                    self.con.execute(
+                        """UPDATE bootstrap_state
+                           SET state = 'consumed', token_digest = '', consumed_at = ?, created_user_id = ?
+                           WHERE singleton_id = 1""",
+                        (now, user_id),
+                    )
                 self.con.commit()
                 return user_id
             except BaseException:
@@ -1717,8 +1755,7 @@ class DB:
                 user_id = self._insert_user_account_locked(
                     username, password, effective_role, now
                 )
-                if initializer is not None:
-                    initializer(user_id)
+                self._initialize_user_storage_locked(user_id, initializer, now)
                 if users == 0:
                     self.con.execute(
                         """
@@ -1730,6 +1767,84 @@ class DB:
                     )
                 self.con.commit()
                 return user_id
+            except BaseException:
+                if self.con.in_transaction:
+                    self.con.rollback()
+                raise
+
+    def mark_shop_storage_initialized(self, user_id, account_id):
+        """Called only after the trusted new-shop initializer has completed."""
+        with self._lock:
+            self.con.execute(
+                """UPDATE shop_accounts SET storage_initialized_at = COALESCE(storage_initialized_at, ?)
+                   WHERE user_id = ? AND id = ?""",
+                (time.time(), int(user_id), int(account_id)),
+            )
+            self.con.commit()
+
+    def initialize_unused_default_storage(self, user_id, initializer: Callable[[int], bool]):
+        """Repair only a never-used legacy default shop, serialized with DB writers.
+
+        The callback independently verifies the filesystem is empty/default-only.
+        An initialization marker deliberately prevents later data loss from being
+        mistaken for a new account, even when it has not connected a shop yet.
+        """
+        user_id = int(user_id)
+        with self._lock:
+            try:
+                self.con.execute("BEGIN IMMEDIATE")
+                user = self.con.execute(
+                    "SELECT disabled_at FROM users WHERE id = ?", (user_id,)
+                ).fetchone()
+                account = self.con.execute(
+                    "SELECT * FROM shop_accounts WHERE user_id = ? AND account_key = 'default'",
+                    (user_id,),
+                ).fetchone()
+                eligible = bool(
+                    user is not None and user["disabled_at"] is None
+                    and account is not None and account["storage_initialized_at"] is None
+                    and account["enabled"] and account["status"] == "unconfigured"
+                    and int(account["generation"]) == 0 and not account["account_ref"]
+                    and account["last_verified_at"] is None and account["last_sync_at"] is None
+                )
+                if not eligible:
+                    self.con.rollback()
+                    return False
+                runtime = self.con.execute(
+                    "SELECT * FROM worker_runtimes WHERE user_id = ? AND account_id = ?",
+                    (user_id, account["id"]),
+                ).fetchone()
+                if runtime is not None and (
+                    runtime["pid"] or runtime["started_at"] is not None
+                    or int(runtime["generation"]) != 0
+                    or runtime["state"] not in {"waiting_login", "stopped", "degraded"}
+                ):
+                    self.con.rollback()
+                    return False
+                jobs = self.con.execute(
+                    "SELECT 1 FROM jobs WHERE user_id = ? AND account_id IN (0, ?) LIMIT 1",
+                    (user_id, account["id"]),
+                ).fetchone()
+                lease = self.con.execute(
+                    "SELECT 1 FROM control_leases WHERE resource_key LIKE ? AND lease_until > ? LIMIT 1",
+                    (f"%:{user_id}:{int(account['id'])}", time.time()),
+                ).fetchone()
+                config = self.con.execute(
+                    "SELECT * FROM tenant_configs WHERE user_id = ?", (user_id,)
+                ).fetchone()
+                legacy_config_used = bool(config and (
+                    config["bot_running"] or config["llm_api_key"] or config["llm_base_url"]
+                    or config["llm_model"] or str(config["keywords_json"]).strip() not in {"", "{}"}
+                ))
+                if jobs or lease or legacy_config_used or not initializer(user_id):
+                    self.con.rollback()
+                    return False
+                self.con.execute(
+                    "UPDATE shop_accounts SET storage_initialized_at = ? WHERE id = ?",
+                    (time.time(), account["id"]),
+                )
+                self.con.commit()
+                return True
             except BaseException:
                 if self.con.in_transaction:
                     self.con.rollback()
