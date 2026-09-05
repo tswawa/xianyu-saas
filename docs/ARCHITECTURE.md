@@ -1,91 +1,69 @@
-# 架构概览
+# 系统架构概览
 
-xianyu-saas 是一个单仓库、分进程、按用户和店铺账号隔离的客服工作台。前端保持静态轻量，FastAPI 控制面负责身份、权限和状态，Worker 负责平台消息与履约。
+xianyu-saas 是一个单仓库、多进程、按用户与店铺进行物理隔离的闲鱼多店铺运营工作台。
 
-## 数据流
+前端保持轻量静态交互，FastAPI 控制面负责鉴权与业务调度，独立 Worker 进程负责各店铺的消息接入与自动发货。
+
+## 整体数据流
 
 ```mermaid
 flowchart LR
-    Browser[浏览器工作台\n静态 HTML/CSS/JS]
-    API[FastAPI 控制面\n鉴权 / 权限 / 状态]
+    Browser[浏览器管理后台
+静态 HTML/CSS/JS]
+    API[FastAPI 控制面
+用户鉴权 / 店铺调度 / 知识库]
     DB[(SQLite 控制面数据库)]
-    Store[账号私有运行目录\n连接状态 / 快照 / 配置]
-    Consumer[任务消费者\n异步同步]
-    Worker[店铺 Worker\n消息 / 规则 / 履约]
-    Platform[闲鱼平台]
-    AI[可选 AI provider]
+    Store[店铺私有目录
+登录态 / 商品快照 / 问答规则]
+    Consumer[任务消费者
+异步商品同步]
+    Worker[单店铺独立 Worker
+WebSocket 接入 / 规则引擎 / 自动发货]
+    Platform[闲鱼开放协议]
+    AI[大模型生态
+OpenAI / Gemini / Claude / Ollama]
 
-    Browser -->|同源 API| API
+    Browser -->|REST API| API
     API --> DB
     API --> Store
-    API -->|持久任务| Consumer
+    API -->|异步作业| Consumer
     Consumer --> Store
     Consumer --> Platform
-    API -->|生命周期控制| Worker
+    API -->|进程管理| Worker
     Worker --> Store
     Worker --> Platform
-    Worker -->|本机账号作用域请求| API
+    Worker -->|本地请求| API
     API --> AI
 ```
 
-## 组件边界
+## 核心组件划分
 
-### `frontend/`
+### 1. `frontend/`（管理工作台前端）
+- 轻量纯原生单页应用（HTML5 + 原生 CSS + 现代 ES 模块），无冗余打包体积；
+- 提供运营概览、店铺管理、多店铺切换、客服会话工作台、AI 知识库与沙盘配置、卡密库存池、订单及发货记录；
+- 前端不接触大模型长期密钥与闲鱼 Cookie，保障密钥安全。
 
-静态工作台，负责页面展示、表单和请求作用域提示。浏览器不保存平台 Cookie、Token 或长期模型密钥；后端仍是最终鉴权和账号边界。
+### 2. `backend/`（FastAPI 控制面）
+- 用户身份鉴权、角色权限控制与店铺多租户隔离；
+- 店铺官方扫码连接驱动与商品周期性同步调度；
+- AI 统一上下文组装、模板管理与 5 种大模型协议适配；
+- 持久化人工回复 Outbox，支持图文按序发送；
+- 平台系统更新器与健康检查（`/health`、`/api/ready`）。
 
-### `backend/`
+### 3. `worker/`（单店铺独立 Worker 进程）
+- 每个绑定的闲鱼店铺由一个专属 Python Worker 进程常驻驱动；
+- **WebSocket 长连接入站**：接收买家即时聊天消息与平台订单付款事件；
+- **入站去重与幂等处理**：防重复消费、防重发；
+- **客服回复引擎**：执行商品专属与店铺通用规则匹配；未命中时请求控制面 AI 决策；
+- **自动发货状态机**：监听付款事件 -> 调用官方双接口验单 -> 事务锁定卡密库存 -> 自动私信下发卡密或网盘资源。
 
-FastAPI 控制面负责：
+### 4. `deploy/` & 容器编排
+- 根目录 `Dockerfile` 与 `docker-compose.yml`：提供开箱即用的一键容器化运行能力，数据外挂在本地 `./data` 目录；
+- `deploy/`：针对 Linux 生产环境提供基于 systemd 的守护进程配置、Nginx 反向代理模板与 Ed25519 签名更新器。
 
-- 登录、会话、角色和账号/店铺作用域；
-- 官方二维码连接、商品同步和状态转换；
-- SQLite 数据、持久任务、租约、审计摘要和 Worker 生命周期；
-- 私有配置初始化、校验和敏感字段过滤；
-- AI 统一回复引擎与 provider 连接；
-- 人工回复 outbox、版本更新和管理接口。
+## 关键设计准则
 
-### `backend/job_consumer.py`
-
-独立消费异步店铺同步任务。任务载荷不保存平台 Cookie 原文，使用账号作用域、租约、有限重试和死信状态。
-
-### `worker/`
-
-每个店铺账号一个受控进程，负责 WebSocket 入站、入站幂等、固定规则、AI 候选、人工回复和订单证明后的履约。人工回复可以包含最多 8 张图片和文字，按图片顺序发送并逐部分确认。
-
-### `deploy/`
-
-提供 Nginx、systemd、日志轮转和签名版本更新模板。路径、域名、用户和密钥由部署环境配置，不应把真实运行态复制到仓库。
-
-### 根目录容器化
-
-`Dockerfile`、`docker-compose.yml` 和 `docker/entrypoint.sh` 提供整站容器运行方式。backend 与 worker 在同一镜像中，以便控制面派生 Worker；容器方式与 `deploy/` 的 systemd 版本化切换互斥。
-
-## 一致性与安全规则
-
-1. 可写数据绑定用户和店铺账号；客户端不能自行声明目录或跨店铺标识。
-2. 配置缺失或损坏时安全关闭自动化；显式初始化才会播种默认配置。
-3. AI 回复实际发送前复核自动化状态、AI 状态、配置版本、人工接管和幂等状态。
-4. 人工 outbox 采用发送期租约、稳定消息标识和有限重试；失败只重试未确认的部分。
-5. 自动履约必须有完整订单证明和事务库存预留；AI、买家文字和商品标题不能授权发货。
-6. 平台协议 ACK 只表示协议层接收，不等于买家已读或最终送达。
-7. 真实平台、真实模型、真实订单和生产发布需要单独受控验收。
-
-## 平台依赖
-
-控制面使用 Linux 进程和文件系统能力限制 Worker、校验进程身份并保证单实例控制面。Windows 和 macOS 建议通过 Docker 运行；源码方式主要面向 Linux。
-
-## 代码导航
-
-| 目标 | 入口 |
-| --- | --- |
-| API 路由与控制面 | `backend/app.py` |
-| 数据库与任务 | `backend/db.py` |
-| Worker 生命周期 | `backend/bot_manager.py` |
-| 异步同步 | `backend/job_consumer.py` |
-| AI 内容与 provider | `backend/ai_customer_service.py`、`backend/ai_provider_adapters.py` |
-| 消息与履约 | `worker/main.py`、`worker/context_manager.py`、`worker/delivery_store.py` |
-| 前端状态 | `frontend/assets/app.js` |
-| 容器运行 | `Dockerfile`、`docker-compose.yml`、`docker/entrypoint.sh` |
-| systemd 发布 | `deploy/systemd/`、`deploy/updater/` |
-| 离线合同 | `tests/`、`worker/tests/` |
+1. **店铺强隔离**：各店铺的配置、快照、订单数据保存在独立的物理目录，Worker 独立运行，互不干扰；
+2. **发货与 AI 彻底解耦**：大模型仅做客服聊天，发货完全交由双接口验单和原子库存扣减，杜绝模型幻觉导致误发；
+3. **真人仿真打字**：支持配置随机 0~60 秒的拟人回复延迟，大幅降低平台风控几率；
+4. **人工接管优先**：人工在工作台介入后触发静默冷却，防止机器人与客服争抢插话。
