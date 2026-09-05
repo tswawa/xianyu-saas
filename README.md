@@ -102,11 +102,26 @@ npx playwright install --with-deps chromium
 npm run dev
 ```
 
+### 首次登录：创建管理员账号
+
+为了防止公网被他人随意扫描并抢先注册，系统默认**关闭了公开网页注册**。服务首次启动后，请在服务器终端执行对应命令创建首位管理员（Admin）账号：
+
+- **Docker 部署环境**：
+  ```bash
+  docker compose exec xianyu-saas backend/.venv/bin/python -c "from db import DB; db = DB('/data/saas.db'); db.create_user('admin', 'Admin12345678!', role='admin'); print('管理员创建成功！')"
+  ```
+- **Linux 源码环境**：
+  ```bash
+  PYTHONPATH=backend python3 -c "from db import DB; db = DB('data/saas.db'); db.create_user('admin', 'Admin12345678!', role='admin'); print('管理员创建成功！')"
+  ```
+
+> 💡 **提示**：默认账号为 `admin`，密码为 `Admin12345678!`（系统安全策略要求密码长度**不少于 12 位**）。创建完成后即可在登录页输入登录，登录后可在后台随时修改密码。
+
 ---
 
 ## 4 步日常使用流程
 
-1. **扫码绑定**：进入「店铺管理」，添加店铺并通过闲鱼 App 扫码登录；
+1. **登录与绑定店铺**：首次启动先通过上述命令创建管理员账号登录后台；进入「店铺管理」，添加店铺并通过闲鱼 App 扫码登录；
 2. **配置智能客服**：进入「智能客服中心」，选择合适的人格风格或自定义客服，填入你的大模型 API Key，在沙盘模拟测试效果；
 3. **设置高频规则**：添加商品专属或全店通用的问答规则（优先走规则秒回，省 Token 且零延迟）；
 4. **绑定自动发货**：在「自动化发货」中导入卡密池或填入网盘链接，绑定对应商品，买家付款后全自动秒发。
