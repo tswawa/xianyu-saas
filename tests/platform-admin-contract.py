@@ -248,6 +248,52 @@ def main() -> None:
     ids = {int(row["id"]) for row in rows}
     assert old_id not in ids
     assert recent_id in ids
+    # Check results are durable and must never replace installation records.
+    channel = app.db.get_platform_setting("update_channel", "stable")
+    payload = {"status": "available", "available": True, "version": "0.2.0",
+               "current_version": "0.1.0", "channel": channel, "release_notes": "candidate"}
+    app.db.upsert_platform_update("0.2.0", channel, "staged", candidate_path="/isolated/candidate",
+                                  manifest_sha256="a" * 64, release_notes="verified")
+    before = dict(app.db.get_platform_update("0.2.0", channel))
+    with patch.object(app, "inspect_releases", return_value=(payload, None)):
+        for _ in range(2):
+            checked = promoted_client.post("/api/admin/updates/check")
+            assert checked.status_code == 200, checked.text
+            assert checked.json()["status"] == "available" and checked.json()["checked_at"] > 0
+    assert dict(app.db.get_platform_update("0.2.0", channel)) == before
+    for status in ("no_release", "current", "incomplete"):
+        result = {**payload, "status": status, "available": status == "incomplete"}
+        with patch.object(app, "inspect_releases", return_value=(result, None)):
+            assert promoted_client.post("/api/admin/updates/check").json()["status"] == status
+        assert promoted_client.get("/api/admin/updates").json()["update_check"]["status"] == status
+    with patch.object(app, "inspect_releases", side_effect=app.PlatformUpdateError("update_source_failed")):
+        assert promoted_client.post("/api/admin/updates/check").status_code == 502
+    assert app.db.get_platform_update_check(channel)["status"] == "error"
+    assert dict(app.db.get_platform_update("0.2.0", channel)) == before
+    other_channel = "stable" if channel == "beta" else "beta"
+    assert app.db.get_platform_update_check(other_channel)["status"] == "unchecked"
+    with patch("platform_update.deployment_kind", return_value="docker"), patch.object(app, "write_update_intent") as intent:
+        for action in ("download", "apply", "rollback"):
+            data = {"version": "0.2.0"}
+            if action != "download":
+                data["confirmation_token"] = "unused-confirmation-token"
+            unsupported = promoted_client.post("/api/admin/updates/" + action, json=data)
+            assert unsupported.status_code == 503, unsupported.text
+            assert unsupported.json()["detail"]["code"] == "update_installation_unsupported"
+        intent.assert_not_called()
+    with patch.object(app, "update_capabilities", return_value={
+        "check": True, "download": True, "apply": True, "rollback": True, "reason": "",
+    }), patch.object(app, "validate_candidate"), patch.object(app, "write_update_intent", return_value={"queued": True}):
+        confirmation = promoted_client.post("/api/admin/confirm", json={"password": OWNER_PASSWORD, "action": "update.apply"})
+        applied = promoted_client.post("/api/admin/updates/apply", json={
+            "version": "0.2.0", "confirmation_token": confirmation.json()["confirmation_token"],
+        })
+        assert applied.status_code == 202, applied.text
+        assert app.db.get_platform_update("0.2.0", channel)["status"] == "apply_requested"
+        with patch.object(app, "inspect_releases", return_value=(payload, None)):
+            assert promoted_client.post("/api/admin/updates/check").status_code == 200
+        assert app.db.get_platform_update("0.2.0", channel)["status"] == "apply_requested"
+        assert promoted_client.post("/api/admin/updates/download", json={"version": "0.3.0"}).status_code == 409
     print("platform admin contract: ok")
 
 

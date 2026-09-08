@@ -25,7 +25,8 @@ from urllib.parse import urlsplit
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from fastapi.exceptions import RequestValidationError
+from pydantic import BaseModel, Field
 
 from access import account_payload, has_permission, is_platform_admin, plan_for
 from account_storage import AccountStorage, AccountStorageError, DEFAULT_ACCOUNT_ID, normalize_account_key
@@ -81,8 +82,10 @@ from platform_ai import (
 from platform_update import (
     PlatformUpdateError,
     available_rollback_versions,
+    SemVer,
     fetch_release,
-    release_payload,
+    inspect_releases,
+    update_capabilities,
     stage_release,
     validate_candidate,
     write_update_intent,
@@ -99,7 +102,9 @@ from shop_sync import (
     sync_status_payload,
 )
 from shop_sync_service import ShopSyncPersistenceError, run_shop_sync_inner
-from version import version_payload
+from version import local_release_notes, version_payload
+from user_ai_connection import UserAIConnections
+from operations import OperationsService, OperationsError
 from xianyu_login import XianyuLoginError, qr_logins
 
 
@@ -136,6 +141,15 @@ AUDIT_EVENT_TYPES = frozenset(
         "platform.update_downloaded",
         "platform.update_requested",
         "platform.rollback_requested",
+        "ai.connection_changed",
+        "operations.proposed",
+        "operations.executing",
+        "operations.succeeded",
+        "operations.partial_failed",
+        "operations.failed",
+        "operations.cancelled",
+        "operations.expired",
+        "operations.needs_review",
     }
 )
 AUDIT_METADATA_KEYS = frozenset(
@@ -193,7 +207,21 @@ def _acquire_api_process_lock():
 
 _api_process_lock = _acquire_api_process_lock()
 db = DB()
+user_ai_connections = UserAIConnections(db, ai_service)
+ai_service.user_connections = user_ai_connections
+operations_service = OperationsService(db, ai_service)
 app = FastAPI(title="xianyu-saas-api", docs_url=None, redoc_url=None)
+
+
+@app.exception_handler(RequestValidationError)
+async def request_validation_without_payload(request: Request, error: RequestValidationError):
+    # Pydantic's default 'input' can contain an entire submitted credential body.
+    # Keep useful field/type errors, never echo input values or exception context.
+    return JSONResponse(status_code=422, content={"detail": [
+        {"loc": list(item.get("loc", ())), "type": item.get("type", "validation_error"),
+         "msg": item.get("msg", "请求格式无效")}
+        for item in error.errors()
+    ]})
 
 
 def _assert_not_testing_in_production() -> None:
@@ -521,12 +549,14 @@ def ready():
 
 
 def _local_release_notes() -> str:
-    try:
-        return (Path(__file__).resolve().parents[1] / "CHANGELOG.md").read_text(
-            encoding="utf-8"
-        )[:16_000]
-    except (OSError, UnicodeError):
-        return ""
+    return local_release_notes()
+
+
+def _update_check_payload(channel: str) -> dict:
+    result = db.get_platform_update_check(channel)
+    if result.get("current_version") and result["current_version"] != version_payload(channel)["version"]:
+        return {"channel": channel, "status": "unchecked", "available": False, "checked_at": None}
+    return result
 
 
 def _platform_update_payload(row) -> dict | None:
@@ -608,6 +638,8 @@ def get_version(user=Depends(Auth.current_user)):
         **version_payload(channel),
         "release_notes": _local_release_notes(),
         "latest_update": _platform_update_payload(db.latest_platform_update(channel)),
+        "update_check": _update_check_payload(channel),
+        "capabilities": update_capabilities(),
     }
 
 
@@ -859,11 +891,53 @@ class AIConnectionSaveIn(AIConnectionTestIn):
 
 
 class AIConnectionDeleteIn(BaseModel):
-    confirm: bool
+    confirm: bool = Field(strict=True)
     expected_revision: int
 
     class Config:
         extra = "forbid"
+
+
+class UserAIConnectionTestIn(AIConnectionTestIn):
+    source_account_key: str = Field(default="", max_length=80)
+    source_revision: int | None = Field(default=None, ge=0)
+
+
+class UserAIConnectionSaveIn(UserAIConnectionTestIn):
+    verification_token: str = Field(max_length=8192)
+    confirm: bool = Field(default=False, strict=True)
+
+
+class OpsHistoryIn(BaseModel):
+    role: str = Field(max_length=16)
+    content: str = Field(max_length=4000)
+
+    class Config:
+        extra = "forbid"
+
+
+class OpsChatIn(BaseModel):
+    message: str = Field(min_length=1, max_length=2000)
+    history: list[OpsHistoryIn] = Field(default_factory=list, max_length=10)
+    selected_item_ids: list[str] = Field(default_factory=list, max_length=20)
+    selected_rule_ids: list[str] = Field(default_factory=list, max_length=20)
+    request_id: str = Field(min_length=8, max_length=120)
+
+    class Config:
+        extra = "forbid"
+
+
+class OpsPlanActionIn(BaseModel):
+    revision: int = Field(ge=1)
+    digest: str = Field(min_length=64, max_length=64)
+
+    class Config:
+        extra = "forbid"
+
+
+class OpsConfirmIn(OpsPlanActionIn):
+    confirm: bool = Field(default=False, strict=True)
+    request_id: str = Field(min_length=8, max_length=120)
 
 
 class AIConfigIn(BaseModel):
@@ -1154,7 +1228,7 @@ def _raise_ai_error(error: AIServiceError):
 
 def _require_ai_reply_ready(user, account) -> None:
     scope = _ai_scope(user, account)
-    connection = ai_service.get_connection(*scope)
+    connection = ai_service.effective_connection(*scope)
     if connection.get("connection_status") != "verified" or not ai_service.is_configured(*scope):
         raise HTTPException(
             409,
@@ -2779,11 +2853,16 @@ def save_config(
         except (TypeError, ValueError, AutomationValidationError) as exc:
             raise HTTPException(400, "回复规则格式无效") from exc
         encoded = json.dumps(document, ensure_ascii=False, separators=(",", ":"))
-        # Keep the old user-level column as a compatibility mirror only for
-        # the legacy default account. Other accounts are fully file-scoped.
-        if account_key == "default":
-            db.save_config(user["id"], {"keywords_json": encoded})
-        write_secret(user["id"], "reply_rules.json", encoded, account_key)
+        # Share the same lock as /api/automation and confirmed ops plans.
+        lease, owner = _acquire_account_lease("automation-save", user, account, lease_seconds=45,
+            busy_message="回复规则正在修改，请稍后重试", unavailable_message="回复规则暂时不可用")
+        try:
+            _ensure_account_lease(lease)
+            write_secret(user["id"], "reply_rules.json", encoded, account_key)
+            if account_key == "default":
+                db.save_config(user["id"], {"keywords_json": encoded})
+        finally:
+            _release_account_lease(lease, owner)
     return {"ok": True, "config": _config_payload(user, account)}
 
 
@@ -3400,6 +3479,169 @@ def get_products(
     }
 
 
+def _shared_connection_guard(user):
+    if user_ai_connections.initialized(int(user["id"])):
+        raise HTTPException(409, detail={"code": "connection_managed_in_settings", "message": "已启用统一模型连接，请前往设置修改"})
+
+
+@app.get("/api/settings/ai/connection")
+def get_user_ai_connection(user=Depends(Auth.current_user)):
+    _require_permission(user, "automation.ai")
+    try:
+        return {**user_ai_connections.read(int(user["id"])), "providers": provider_catalog()}
+    except AIServiceError as error:
+        _raise_ai_error(error)
+
+
+@app.get("/api/settings/ai/connection/legacy-sources")
+def get_legacy_ai_connections(user=Depends(Auth.current_user)):
+    _require_permission(user, "automation.ai")
+    try:
+        return {"sources": user_ai_connections.legacy_sources(int(user["id"]))}
+    except AIServiceError as error:
+        _raise_ai_error(error)
+
+
+@app.post("/api/settings/ai/connection/test")
+def test_user_ai_connection(body: UserAIConnectionTestIn, user=Depends(Auth.current_user)):
+    _require_permission(user, "automation.ai")
+    try:
+        return user_ai_connections.test(int(user["id"]), **body.model_dump())
+    except AIServiceError as error:
+        _raise_ai_error(error)
+
+
+@app.put("/api/settings/ai/connection")
+def save_user_ai_connection(body: UserAIConnectionSaveIn, request: Request, user=Depends(Auth.current_user)):
+    _require_permission(user, "automation.ai")
+    lease = owner = None
+    try:
+        if body.source_account_key:
+            account = db.get_shop_account(user["id"], account_key=body.source_account_key)
+            if account is None or not account["enabled"]:
+                raise HTTPException(404, "迁移来源店铺不存在或已停用")
+            lease, owner = _acquire_account_lease("ai-config", user, account, lease_seconds=45,
+                busy_message="来源连接正在更新，请稍后重试", unavailable_message="来源连接暂时不可用")
+            _ensure_account_lease(lease)
+        saved = user_ai_connections.save(int(user["id"]), **body.model_dump())
+        _audit("ai.connection_changed", request, actor_user_id=user["id"], target_type="user", target_id=str(user["id"]),
+               metadata={"status": "shared", "version": str(saved["revision"])})
+        return {"ok": True, "connection": saved}
+    except AIServiceError as error:
+        _raise_ai_error(error)
+    finally:
+        if lease is not None:
+            _release_account_lease(lease, owner)
+
+
+@app.delete("/api/settings/ai/connection")
+def delete_user_ai_connection(body: AIConnectionDeleteIn, request: Request, user=Depends(Auth.current_user)):
+    _require_permission(user, "automation.ai")
+    try:
+        saved = user_ai_connections.delete(int(user["id"]), **body.model_dump())
+        _audit("ai.connection_changed", request, actor_user_id=user["id"], target_type="user", target_id=str(user["id"]),
+               metadata={"status": "cleared", "version": str(saved["revision"])})
+        return {"ok": True, "connection": saved}
+    except AIServiceError as error:
+        _raise_ai_error(error)
+
+
+def _ops_request_id(request: Request, request_id: str) -> str:
+    supplied = request.headers.get("Idempotency-Key", "")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{7,79}", request_id) or (supplied and supplied != request_id):
+        raise HTTPException(400, detail={"code": "invalid_request_id", "message": "请求标识无效或不一致"})
+    return request_id
+
+
+def _ops_backend_failure(error):
+    if isinstance(error, AIServiceError):
+        _raise_ai_error(error)
+    raise HTTPException(503, detail={"code": "operations_unavailable", "message": "运维服务暂时不可用，请稍后重试"}) from error
+
+
+@app.get("/api/ops/context")
+def get_ops_context(user=Depends(Auth.current_user), account=Depends(current_shop_account)):
+    _require_permission(user, "automation.ai")
+    try:
+        result = operations_service.context(*_ai_scope(user, account))
+        runtime = db.get_worker_runtime(user["id"], account["id"])
+        diagnostics = dict(result.get("diagnostics") or {})
+        diagnostics.update(runtime_state=str(runtime["state"]) if runtime else "not_started",
+                           desired_state=str(runtime["desired_state"]) if runtime else "stopped")
+        return {**result, "diagnostics": diagnostics, "connection": user_ai_connections.read(int(user["id"]))}
+    except (AIServiceError, OSError, sqlite3.Error) as error:
+        _ops_backend_failure(error)
+
+
+@app.post("/api/ops/chat")
+def ops_chat(body: OpsChatIn, request: Request, user=Depends(Auth.current_user), account=Depends(current_shop_account)):
+    _require_permission(user, "automation.ai")
+    request_id = _ops_request_id(request, body.request_id)
+    lease = owner = None
+    try:
+        if not user_ai_connections.initialized(int(user["id"])):
+            raise AIServiceError("connection_unconfigured", 409, "请先在设置中测试并保存统一模型连接")
+        user_ai_connections.runtime(int(user["id"]))
+        lease, owner = _acquire_account_lease("ops-chat", user, account, lease_seconds=180,
+            busy_message="此店铺已有运维请求正在生成，请稍后重试", unavailable_message="运维生成服务暂时不可用")
+        return operations_service.chat(*_ai_scope(user, account), message=body.message,
+            history=[item.model_dump() for item in body.history], selected_item_ids=body.selected_item_ids,
+            selected_rule_ids=body.selected_rule_ids, request_id=request_id)
+    except (AIServiceError, OSError, sqlite3.Error) as error:
+        _ops_backend_failure(error)
+    finally:
+        if lease is not None:
+            _release_account_lease(lease, owner)
+
+
+@app.get("/api/ops/plans/{plan_id}")
+def get_ops_plan(plan_id: str, user=Depends(Auth.current_user), account=Depends(current_shop_account)):
+    _require_permission(user, "automation.ai")
+    try:
+        return operations_service.get_plan(*_ai_scope(user, account), plan_id)
+    except (AIServiceError, OSError, sqlite3.Error) as error:
+        _ops_backend_failure(error)
+
+
+@app.post("/api/ops/plans/{plan_id}/confirm")
+def confirm_ops_plan(plan_id: str, body: OpsConfirmIn, request: Request,
+                     user=Depends(Auth.current_user), account=Depends(current_shop_account)):
+    _require_permission(user, "automation.ai")
+    _require_permission(user, "automation.rules")
+    request_id = _ops_request_id(request, body.request_id)
+    leases = []
+    try:
+        for resource in ("automation-save", "ai-config"):
+            leases.append(_acquire_account_lease(resource, user, account, lease_seconds=120,
+                busy_message="店铺资料正在修改，请稍后确认", unavailable_message="资料写入服务暂时不可用"))
+        def ensure_owned():
+            for lease, _ in leases:
+                _ensure_account_lease(lease)
+            current_user = db.get_user_by_id(user["id"])
+            current_account = db.get_shop_account(user["id"], account_id=account["id"])
+            if current_user is None or current_user["disabled_at"] is not None or current_account is None or not current_account["enabled"]:
+                raise OperationsError("scope_invalid", 409)
+        ensure_owned()
+        return operations_service.confirm(*_ai_scope(user, account), plan_id,
+            revision=body.revision, digest=body.digest, confirm=body.confirm,
+            request_id=request_id, ensure_lease=ensure_owned)
+    except (AIServiceError, OSError, sqlite3.Error) as error:
+        _ops_backend_failure(error)
+    finally:
+        for lease, owner in reversed(leases):
+            _release_account_lease(lease, owner)
+
+
+@app.post("/api/ops/plans/{plan_id}/cancel")
+def cancel_ops_plan(plan_id: str, body: OpsPlanActionIn,
+                    user=Depends(Auth.current_user), account=Depends(current_shop_account)):
+    _require_permission(user, "automation.ai")
+    try:
+        return operations_service.cancel(*_ai_scope(user, account), plan_id, revision=body.revision, digest=body.digest)
+    except (AIServiceError, OSError, sqlite3.Error) as error:
+        _ops_backend_failure(error)
+
+
 @app.get("/api/bot/ai/status")
 def get_ai_status(
     user=Depends(Auth.current_user),
@@ -3407,7 +3649,7 @@ def get_ai_status(
 ):
     _require_permission(user, "automation.ai")
     scope = _ai_scope(user, account)
-    connection = ai_service.get_connection(*scope)
+    connection = ai_service.effective_connection(*scope)
     try:
         config = ai_service.get_config(*scope)
     except AIServiceError as error:
@@ -3448,7 +3690,7 @@ def get_ai_connection(
     account=Depends(current_shop_account),
 ):
     _require_permission(user, "automation.ai")
-    return {**ai_service.get_connection(*_ai_scope(user, account)), "providers": provider_catalog()}
+    return {**ai_service.effective_connection(*_ai_scope(user, account)), "providers": provider_catalog()}
 
 
 @app.post("/api/bot/ai/connection/test")
@@ -3458,6 +3700,7 @@ def test_ai_connection(
     account=Depends(current_shop_account),
 ):
     _require_permission(user, "automation.ai")
+    _shared_connection_guard(user)
     try:
         return ai_service.test_connection(
             *_ai_scope(user, account),
@@ -3478,6 +3721,7 @@ def save_ai_connection(
     account=Depends(current_shop_account),
 ):
     _require_permission(user, "automation.ai")
+    _shared_connection_guard(user)
     lease, owner = _acquire_account_lease(
         "ai-config", user, account, lease_seconds=45,
         busy_message="AI 配置正在更新，请稍后重试",
@@ -3485,6 +3729,7 @@ def save_ai_connection(
     )
     try:
         _ensure_account_lease(lease)
+        _shared_connection_guard(user)
         saved = ai_service.save_connection(
             *_ai_scope(user, account),
             provider=body.provider,
@@ -3509,6 +3754,7 @@ def delete_ai_connection_key(
     account=Depends(current_shop_account),
 ):
     _require_permission(user, "automation.ai")
+    _shared_connection_guard(user)
     if body.confirm is not True:
         raise HTTPException(400, detail={"code": "confirmation_required", "message": "请确认删除当前店铺 AI 密钥"})
     lease, owner = _acquire_account_lease(
@@ -3518,6 +3764,7 @@ def delete_ai_connection_key(
     )
     try:
         _ensure_account_lease(lease)
+        _shared_connection_guard(user)
         saved = ai_service.delete_key(
             *_ai_scope(user, account), expected_revision=body.expected_revision
         )
@@ -4987,13 +5234,30 @@ def get_orders(
     user=Depends(Auth.current_user),
     account=Depends(current_shop_account),
     limit: int = 50,
+    page: str | None = None,
+    page_size: str | None = None,
+    status: str = "all",
+    search_field: str = "all",
+    q: str = "",
+    created_from: str = "",
+    created_to: str = "",
 ):
     _require_permission(user, "records.read")
-    return {
-        "orders": records.orders(
-            user["id"], max(1, min(int(limit), 200)), str(account["account_key"])
-        )
-    }
+    key = str(account["account_key"])
+    try:
+        paginated = page is not None or page_size is not None or status != "all" or search_field != "all" or bool(q or created_from or created_to)
+        if not paginated:
+            return {"orders": records.orders(user["id"], max(1, min(int(limit), 200)), key)}
+        page_value, size_value = page if page is not None else "1", page_size if page_size is not None else "15"
+        if not re.fullmatch(r"[0-9]{1,7}", page_value) or not re.fullmatch(r"[0-9]{1,2}", size_value):
+            raise ValueError("页码或每页条数格式无效")
+        return records.order_page(user["id"], key, page=int(page_value), page_size=int(size_value),
+                                  status=status, search_field=search_field, q=q,
+                                  created_from=created_from, created_to=created_to)
+    except records.OrdersUnavailableError as exc:
+        raise HTTPException(503, detail={"code": "orders_unavailable", "message": "订单记录暂时无法读取，请稍后重试"}) from exc
+    except ValueError as exc:
+        raise HTTPException(400, detail={"code": "invalid_order_query", "message": str(exc)}) from exc
 
 
 @app.get("/api/bot/summary")
@@ -5492,7 +5756,21 @@ _UPDATE_ERROR_MESSAGES = {
     "update_archive_hash_mismatch": "发布文件完整性校验失败",
     "update_intent_pending": "已有更新操作等待执行",
     "update_candidate_invalid": "候选版本已失效，请重新下载",
-    "update_release_not_found": "没有找到可用发布版本",
+    "update_release_not_found": "无法访问发布仓库，请检查仓库权限或稍后重试",
+    "update_source_auth_failed": "发布查询被拒绝，请检查 GitHub 访问权限或请求限额",
+    "update_source_rate_limited": "发布查询次数已达上限，请稍后重试",
+    "update_source_failed": "无法连接发布来源，请检查网络后重试",
+    "update_source_invalid": "发布来源返回了无法识别的数据",
+    "update_redirect_rejected": "发布来源返回了不受信任的重定向",
+    "release_assets_missing": "发现新版本，但缺少签名安装制品；当前不能网页安装",
+    "release_assets_invalid": "发布制品信息不完整，请等待维护者修复",
+    "update_public_key_missing": "尚未配置更新签名公钥，请联系维护者",
+    "update_public_key_invalid": "更新签名公钥不可用，请检查部署配置",
+    "update_installation_unsupported": "此部署方式不支持网页安装，请按部署说明更新",
+    "update_installation_unavailable": "签名发布目录或权限未就绪，请联系维护者",
+    "update_service_unavailable": "独立更新服务未就绪，请联系维护者",
+    "update_already_staged": "该版本已经下载校验，无需重复下载",
+    "update_busy": "已有安装或回滚操作正在进行，请先查看执行状态",
 }
 
 
@@ -5503,6 +5781,8 @@ def _raise_update_error(error: PlatformUpdateError):
         "update_intent_pending",
         "update_release_exists",
         "update_version_already_current",
+        "update_already_staged",
+        "update_busy",
     }:
         status = 409
     elif code.startswith("release_") or code.startswith("update_archive_") or code in {
@@ -5548,13 +5828,25 @@ def _begin_platform_update_lease(seconds: float = 600) -> tuple[_AccountLease, s
     return _AccountLease("platform-update", owner, max(float(seconds), 30.0)), owner
 
 
+def _require_update_operation(operation: str) -> None:
+    capabilities = update_capabilities()
+    if capabilities.get(operation) is not True:
+        _raise_update_error(PlatformUpdateError(capabilities["reason"] or "update_installation_unsupported"))
+    if db.active_platform_update() is not None:
+        _raise_update_error(PlatformUpdateError("update_busy"))
+
+
 def _admin_update_status_payload() -> dict:
     channel = db.get_platform_setting("update_channel", "stable")
     current = version_payload(channel)
+    capabilities = update_capabilities()
+    active = db.active_platform_update()
     return {
         "current": current,
-        "latest_update": _platform_update_payload(db.latest_platform_update(channel)),
-        "rollback_versions": available_rollback_versions(current["version"]),
+        "latest_update": _platform_update_payload(active or db.latest_platform_update(channel)),
+        "update_check": _update_check_payload(channel),
+        "capabilities": capabilities,
+        "rollback_versions": available_rollback_versions(current["version"]) if capabilities["rollback"] else [],
     }
 
 
@@ -5572,31 +5864,23 @@ def admin_check_update(
     current = version_payload(channel)
     lease, owner = _begin_platform_update_lease(120)
     try:
-        release = fetch_release(channel, current["version"])
-        payload = release_payload(release, channel, current["version"])
-        if release is not None:
-            db.upsert_platform_update(
-                release.version,
-                channel,
-                "available",
-                release_id=release.release_id,
-                release_notes=release.notes,
-                requested_by=admin["id"],
-            )
+        payload, _ = inspect_releases(channel, current["version"])
+        payload = db.save_platform_update_check(channel, payload)
         _audit(
-            "platform.update_checked",
-            request,
-            actor_user_id=admin["id"],
-            target_type="version",
-            target_id=release.version if release is not None else current["version"],
-            metadata={
-                "version": release.version if release is not None else current["version"],
-                "channel": channel,
-                "status": "available" if release is not None else "current",
-            },
+            "platform.update_checked", request, actor_user_id=admin["id"],
+            target_type="version", target_id=payload.get("version") or current["version"],
+            metadata={"version": payload.get("version") or current["version"],
+                      "channel": channel, "status": payload["status"]},
         )
         return payload
     except PlatformUpdateError as exc:
+        db.save_platform_update_check(channel, {
+            "status": "error", "available": False, "current_version": current["version"],
+            "error_code": exc.code,
+        })
+        _audit("platform.update_checked", request, actor_user_id=admin["id"],
+               target_type="version", target_id=current["version"], outcome="failure",
+               metadata={"channel": channel, "code": exc.code})
         _raise_update_error(exc)
     finally:
         _release_account_lease(lease, owner)
@@ -5608,15 +5892,26 @@ def admin_download_update(
     request: Request,
     admin=Depends(require_platform_admin),
 ):
+    _require_update_operation("download")
     channel = db.get_platform_setting("update_channel", "stable")
     current = version_payload(channel)
     lease, owner = _begin_platform_update_lease(900)
     try:
+        _require_update_operation("download")
         release = fetch_release(channel, current["version"])
+        if release is not None:
+            existing = db.get_platform_update(release.version, channel)
+            if existing is not None and existing["status"] == "staged":
+                try:
+                    validate_candidate(existing["candidate_path"], release.version, existing["manifest_sha256"])
+                except PlatformUpdateError:
+                    pass  # A lost or damaged candidate may be downloaded again.
+                else:
+                    raise PlatformUpdateError("update_already_staged")
         if release is None:
             raise HTTPException(
                 409,
-                detail={"code": "update_not_available", "message": "当前已是最新版本"},
+                detail={"code": "update_not_available", "message": "未发现可安装的新版本，请先检查发布信息"},
             )
         requested_version = str(body.version or "").strip()
         if requested_version and requested_version != release.version:
@@ -5655,105 +5950,56 @@ def admin_download_update(
         _release_account_lease(lease, owner)
 
 
-@app.post("/api/admin/updates/apply", status_code=202)
-def admin_apply_update(
-    body: PlatformUpdateApplyIn,
-    request: Request,
-    admin=Depends(require_platform_admin),
-):
-    channel = db.get_platform_setting("update_channel", "stable")
-    row = db.get_platform_update(body.version, channel)
-    if row is None or str(row["status"]) != "staged":
-        raise HTTPException(
-            409,
-            detail={"code": "update_not_staged", "message": "请先下载并校验该版本"},
-        )
-    if not db.consume_admin_confirmation(
-        body.confirmation_token, admin["id"], "update.apply"
-    ):
-        raise HTTPException(
-            403,
-            detail={"code": "confirmation_invalid", "message": "二次确认已失效，请重新确认"},
-        )
+def _request_platform_install(action: str, body, request: Request, admin):
+    _require_update_operation(action)
+    lease, owner = _begin_platform_update_lease(300)
     try:
-        validate_candidate(
-            str(row["candidate_path"]), body.version, str(row["manifest_sha256"])
-        )
-        queued = write_update_intent(
-            "apply",
-            body.version,
-            channel=channel,
-            requested_by=admin["id"],
-            candidate_path=str(row["candidate_path"]),
-            manifest_sha256=str(row["manifest_sha256"]),
-        )
+        _require_update_operation(action)
+        channel = db.get_platform_setting("update_channel", "stable")
+        current = version_payload(channel)
+        row = db.get_platform_update(body.version, channel)
+        fields = {}
+        if action == "apply":
+            if row is None or row["status"] != "staged":
+                raise HTTPException(409, detail={"code": "update_not_staged", "message": "请先下载并校验该版本"})
+            if SemVer.parse(body.version).compare(SemVer.parse(current["version"])) <= 0:
+                raise PlatformUpdateError("update_downgrade_rejected")
+            fields = {key: str(row[key]) for key in ("release_id", "candidate_path", "manifest_sha256", "release_notes")}
+            validate_candidate(fields["candidate_path"], body.version, fields["manifest_sha256"])
+        elif body.version not in available_rollback_versions(current["version"]):
+            raise HTTPException(404, detail={"code": "rollback_version_unavailable", "message": "该回滚版本不可用"})
+        if not db.consume_admin_confirmation(body.confirmation_token, admin["id"], "update." + action):
+            raise HTTPException(403, detail={"code": "confirmation_invalid", "message": "二次确认已失效，请重新确认"})
+        # Persist the request BEFORE notifying the independent updater, so a fast
+        # updater cannot have its progress overwritten by a late API write.
+        db.upsert_platform_update(body.version, channel, action + "_requested", requested_by=admin["id"], **fields)
+        try:
+            queued = write_update_intent(
+                action, body.version, channel=channel, requested_by=admin["id"],
+                candidate_path=fields.get("candidate_path", ""), manifest_sha256=fields.get("manifest_sha256", ""),
+            )
+        except PlatformUpdateError as exc:
+            db.upsert_platform_update(body.version, channel, "staged" if action == "apply" else "failed",
+                                      error_code=exc.code, requested_by=admin["id"], **fields)
+            raise
+        _audit("platform.update_requested" if action == "apply" else "platform.rollback_requested",
+               request, actor_user_id=admin["id"], target_type="version", target_id=body.version,
+               metadata={"version": body.version, "channel": channel, "status": "queued"})
+        return queued
     except PlatformUpdateError as exc:
         _raise_update_error(exc)
-    db.upsert_platform_update(
-        body.version,
-        channel,
-        "apply_requested",
-        release_id=str(row["release_id"]),
-        manifest_sha256=str(row["manifest_sha256"]),
-        candidate_path=str(row["candidate_path"]),
-        release_notes=str(row["release_notes"]),
-        requested_by=admin["id"],
-    )
-    _audit(
-        "platform.update_requested",
-        request,
-        actor_user_id=admin["id"],
-        target_type="version",
-        target_id=body.version,
-        metadata={"version": body.version, "channel": channel, "status": "queued"},
-    )
-    return queued
+    finally:
+        _release_account_lease(lease, owner)
+
+
+@app.post("/api/admin/updates/apply", status_code=202)
+def admin_apply_update(body: PlatformUpdateApplyIn, request: Request, admin=Depends(require_platform_admin)):
+    return _request_platform_install("apply", body, request, admin)
 
 
 @app.post("/api/admin/updates/rollback", status_code=202)
-def admin_rollback_update(
-    body: PlatformUpdateApplyIn,
-    request: Request,
-    admin=Depends(require_platform_admin),
-):
-    channel = db.get_platform_setting("update_channel", "stable")
-    current = version_payload(channel)
-    if body.version not in available_rollback_versions(current["version"]):
-        raise HTTPException(
-            404,
-            detail={"code": "rollback_version_unavailable", "message": "该回滚版本不可用"},
-        )
-    if not db.consume_admin_confirmation(
-        body.confirmation_token, admin["id"], "update.rollback"
-    ):
-        raise HTTPException(
-            403,
-            detail={"code": "confirmation_invalid", "message": "二次确认已失效，请重新确认"},
-        )
-    try:
-        queued = write_update_intent(
-            "rollback",
-            body.version,
-            channel=channel,
-            requested_by=admin["id"],
-        )
-    except PlatformUpdateError as exc:
-        _raise_update_error(exc)
-    db.upsert_platform_update(
-        body.version,
-        channel,
-        "rollback_requested",
-        requested_by=admin["id"],
-    )
-    _audit(
-        "platform.rollback_requested",
-        request,
-        actor_user_id=admin["id"],
-        target_type="version",
-        target_id=body.version,
-        metadata={"version": body.version, "channel": channel, "status": "queued"},
-    )
-    return queued
+def admin_rollback_update(body: PlatformUpdateApplyIn, request: Request, admin=Depends(require_platform_admin)):
+    return _request_platform_install("rollback", body, request, admin)
 
 
 def _runtime_value(runtime, name: str, default=None):

@@ -240,6 +240,12 @@ def build_request(provider: Any, base_url: str, model: str, api_key: str, payloa
                 upstream[key] = value
         if isinstance(payload.get("reasoning_effort"), str) and payload["reasoning_effort"] in {"low", "medium", "high"}:
             upstream["reasoning_effort"] = payload["reasoning_effort"]
+        # DeepSeek V4 defaults to thinking. A tiny connection probe must not
+        # exhaust its output budget before producing the actual reply.
+        if clean_model.lower() in {"deepseek-v4-flash", "deepseek-v4-pro"}:
+            thinking = payload.get("thinking")
+            if isinstance(thinking, dict) and thinking.get("type") in {"enabled", "disabled"}:
+                upstream["thinking"] = {"type": thinking["type"]}
     elif spec.endpoint == "responses":
         upstream = {
             "model": clean_model,

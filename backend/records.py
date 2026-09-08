@@ -8,7 +8,10 @@ import sqlite3
 import stat
 import time
 import uuid
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
+from pathlib import Path
+from urllib.parse import urlsplit
 
 from account_storage import AccountStorage, AccountStorageError, DEFAULT_ACCOUNT_ID
 from shop_sync import load_verified_snapshot
@@ -1953,32 +1956,298 @@ def set_conversation_takeover(
     return next((row for row in selected_rows if row["chat_id"] == selected), None)
 
 
-def orders(user_id: int, limit: int = 50, account_key: str = DEFAULT_ACCOUNT_ID):
-    con = _connect(user_id, "delivery_state.db", account_key)
-    if con is None:
-        return []
+ORDER_STATUS_OPTIONS = (
+    ("all", "全部"), ("processing", "处理中"), ("sent", "已发送"),
+    ("manual", "待人工"), ("retry", "待重试"), ("ended", "已结束"),
+    ("exception", "其他异常"),
+)
+_ORDER_STATUS_LABELS = {
+    "awaiting_binding": "待核验", "verified": "已核验", "reserved": "待发送",
+    "sending": "发送中", "queued": "处理中", "delivered": "已发送",
+    "manual_review": "待人工", "retry": "待重试", "cancelled": "已取消处理",
+    "expired": "记录已过期", "failed": "发送失败",
+}
+_ORDER_REASONS = {
+    "inventory_empty": "库存不足，请核对后处理",
+    "inventory_marked_used": "关联库存已使用", "inventory_removed_from_manifest": "关联库存已移除",
+    "inventory_state_changed": "库存状态已变化", "ack_timeout": "平台确认超时，请先核对发送结果",
+    "manual_takeover_before_send": "会话已由人工接管", "platform_order_identity_unavailable": "平台订单号尚未确认",
+    "chat_binding_unavailable": "会话关联尚未确认", "order_not_awaiting_shipment": "核验时订单不处于待发货状态",
+    "order_reverification_failed": "订单再次核验未通过", "order_identity_mismatch": "订单号核对不一致",
+    "order_item_mismatch": "商品核对不一致", "order_buyer_mismatch": "买家核对不一致",
+    "seller_identity_mismatch": "卖家核对不一致", "unsupported_quantity": "数量不符合自动处理条件",
+    "unsupported_item": "商品未配置自动处理", "pan_resource_unavailable": "网盘资料不可用",
+    "material_payload_unavailable": "发货资料不可用", "cancelled_after_send_attempt": "发送尝试后中断，需人工核对",
+    "cancelled_during_send": "发送中断，需人工核对", "interrupted_send": "发送进程中断，需人工核对",
+    "order_detail_invalid": "平台订单信息暂不可用", "untrusted_order": "订单未通过可信核验",
+    "expired_message": "通知已过期", "operator_cancelled": "已由维护者取消处理",
+}
+_ORDER_RESOLUTIONS = {
+    "fulfilled_manually": "已人工处理发货", "closed_on_platform": "已在平台关闭",
+    "duplicate_notice": "重复通知已处理", "not_actionable": "无需进一步处理",
+    "auto_revived_fulfill": "已恢复核验流程",
+}
+_ORDER_FIELDS = (
+    "order_key", "status", "item_id", "quantity", "platform_order_id", "buyer_id", "chat_id",
+    "paid_amount", "created_at", "updated_at", "verified_at", "delivered_at",
+    "platform_shipped_at", "platform_status", "delivery_type", "last_error",
+)
+
+
+class OrdersUnavailableError(RuntimeError):
+    """Account-local records cannot be read; never expose raw database errors."""
+
+
+def _orders_file(user_id, account_key, name):
+    storage = AccountStorage(TENANTS_ROOT)
+    path = storage.account_dir(user_id, account_key) / name
+    current = storage.root
+    for part in path.relative_to(storage.root).parts:
+        current = current / part
+        try:
+            info = current.lstat()
+        except FileNotFoundError:
+            return None
+        if stat.S_ISLNK(info.st_mode) or (current != path and not stat.S_ISDIR(info.st_mode)):
+            raise OrdersUnavailableError()
+        if current == path and not stat.S_ISREG(info.st_mode):
+            raise OrdersUnavailableError()
+    return path
+
+
+def _orders_connection(user_id, account_key, name="delivery_state.db"):
+    path = _orders_file(user_id, account_key, name)
+    if path is None:
+        return None
+    # Check sidecars as well: SQLite may consult these even in read-only mode.
+    for suffix in ("-wal", "-shm", "-journal"):
+        _orders_file(user_id, account_key, name + suffix)
+    con = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=3)
     try:
-        rows = con.execute(
-            """SELECT order_key, status, item_id, quantity, platform_status,
-                      paid_amount, delivered_at, created_at
-               FROM delivery_events ORDER BY created_at DESC LIMIT ?""",
-            (min(max(limit, 1), 200),),
-        ).fetchall()
-        out = []
-        for r in rows:
-            out.append({
-                "order_key": r["order_key"][:14],
-                "status": r["status"],
-                "item_id": r["item_id"],
-                "quantity": r["quantity"],
-                "platform_status": r["platform_status"],
-                "paid_amount": r["paid_amount"],
-                "delivered_at": _fmt(r["delivered_at"]),
-                "created_at": _fmt(r["created_at"]),
-            })
-        return out
-    finally:
+        con.row_factory = sqlite3.Row
+        con.execute("PRAGMA query_only = ON")
+        deadline = time.monotonic() + 5
+        con.set_progress_handler(lambda: int(time.monotonic() > deadline), 10_000)
+        return con
+    except sqlite3.Error:
         con.close()
+        raise
+
+
+def _order_date_bound(value):
+    if value in (None, ""):
+        return None
+    if not isinstance(value, str) or len(value) > 64:
+        raise ValueError("记录时间格式无效")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            raise ValueError()
+        return parsed.timestamp()
+    except (ValueError, OverflowError, OSError):
+        raise ValueError("记录时间须为带时区的 ISO 时间") from None
+
+
+def _order_timestamp(value):
+    if value in (None, ""):
+        return ""
+    try:
+        number = float(value)
+        if not math.isfinite(number):
+            return ""
+        return datetime.fromtimestamp(number, timezone.utc).isoformat(timespec="seconds")
+    except (TypeError, ValueError, OverflowError, OSError):
+        return ""
+
+
+def _order_amount(value):
+    if value in (None, "") or isinstance(value, bool):
+        return None
+    text = str(value).strip()
+    if len(text) > 64 or not re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", text):
+        return None
+    try:
+        return text if Decimal(text).is_finite() and Decimal(text) >= 0 else None
+    except InvalidOperation:
+        return None
+
+
+def _order_source_sql(con):
+    exists = con.execute("SELECT type FROM sqlite_master WHERE name = 'delivery_events'").fetchone()
+    if exists is None:
+        return None
+    if exists["type"] != "table":
+        raise OrdersUnavailableError()
+    columns = {row["name"] for row in con.execute("PRAGMA table_info(delivery_events)")}
+    if not {"order_key", "status", "created_at"}.issubset(columns):
+        raise OrdersUnavailableError()
+    selected = [f'events."{field}" AS "{field}"' if field in columns else f'NULL AS "{field}"' for field in _ORDER_FIELDS]
+    review_columns = {row["name"] for row in con.execute("PRAGMA table_info(manual_reviews)")}
+    resolved = "0"
+    resolution = "NULL"
+    if {"order_key", "status"}.issubset(review_columns):
+        resolved = "EXISTS(SELECT 1 FROM manual_reviews r WHERE r.order_key=events.order_key AND r.status='resolved')"
+        if "resolution" in review_columns:
+            resolution = "(SELECT r.resolution FROM manual_reviews r WHERE r.order_key=events.order_key AND r.status='resolved' LIMIT 1)"
+    selected += [
+        f"CASE WHEN events.status='manual_review' THEN CASE WHEN {resolved} THEN 'resolved' ELSE 'open' END ELSE '' END AS review_status",
+        f"{resolution} AS review_resolution",
+        f"""CASE
+          WHEN events.status IN ('awaiting_binding','verified','reserved','sending','queued') THEN 'processing'
+          WHEN events.status='delivered' THEN 'sent'
+          WHEN events.status='manual_review' AND NOT ({resolved}) THEN 'manual'
+          WHEN events.status='retry' THEN 'retry'
+          WHEN events.status IN ('cancelled','expired') OR (events.status='manual_review' AND ({resolved})) THEN 'ended'
+          ELSE 'exception' END AS status_group""",
+    ]
+    return "WITH orders_source AS (SELECT " + ", ".join(selected) + " FROM delivery_events events) "
+
+
+def _order_enrichment(user_id, account_key, rows):
+    product_map, chat_ids = {}, set()
+    if not rows:
+        return product_map, chat_ids
+    try:
+        # Only validated, same-account snapshot data may decorate an order.
+        if (_orders_file(user_id, account_key, "shop_snapshot.json") is not None
+                and _orders_file(user_id, account_key, "cookies.txt") is not None):
+            snapshot = load_verified_snapshot(user_id, account_key)
+            wanted = {str(row["item_id"] or "") for row in rows}
+            if snapshot:
+                for item in snapshot.get("products", []):
+                    if isinstance(item, dict) and str(item.get("id", "")) in wanted:
+                        product_map[str(item["id"])] = item
+    except (OSError, ValueError, OrdersUnavailableError):
+        pass
+    con = None
+    try:
+        wanted = {str(row["chat_id"]) for row in rows if row["chat_id"]}
+        if wanted:
+            con = _orders_connection(user_id, account_key, "chat_history.db")
+            if con is not None:
+                columns = {row["name"] for row in con.execute("PRAGMA table_info(messages)")}
+                if "chat_id" in columns:
+                    placeholders = ",".join("?" for _ in wanted)
+                    chat_ids = {str(row[0]) for row in con.execute(
+                        f"SELECT DISTINCT chat_id FROM messages WHERE chat_id IN ({placeholders})", tuple(wanted)
+                    )}
+    except (OSError, ValueError, sqlite3.Error, OrdersUnavailableError):
+        pass
+    finally:
+        if con is not None:
+            con.close()
+    return product_map, chat_ids
+
+
+def _order_payload(row, product_map, chat_ids):
+    status = str(row["status"] or "")
+    resolved = row["review_status"] == "resolved"
+    raw_reason = str(row["last_error"] or "")
+    reason = raw_reason if raw_reason in _ORDER_REASONS else ""
+    if raw_reason and not reason:
+        reason = "platform_ship_failed" if raw_reason.startswith("platform_ship:") else "unknown"
+    labels = {"platform_ship_failed": "平台发货标记尚未确认，请核对", "unknown": "处理异常，请核对订单记录"}
+    product = product_map.get(str(row["item_id"] or ""), {})
+    image = str(product.get("image_url", ""))
+    try:
+        parsed_image = urlsplit(image)
+        if len(image) > 2048 or parsed_image.scheme != "https" or not parsed_image.hostname or parsed_image.username or parsed_image.password:
+            image = ""
+    except ValueError:
+        image = ""
+    platform_status = str(row["platform_status"] or "")
+    platform_label = {"2": "核验时待发货", "shipped": "历史记录为已发货"}.get(platform_status, "未获取" if not platform_status else "核验状态暂无法识别")
+    resolution_label = _ORDER_RESOLUTIONS.get(str(row["review_resolution"] or ""), "已人工处理" if resolved else "")
+    payload = {
+        "order_key": str(row["order_key"] or ""), "platform_order_id": str(row["platform_order_id"] or ""),
+        "item_id": str(row["item_id"] or ""), "item_title": str(product.get("title") or "")[:400],
+        "item_image_url": image, "buyer_id": str(row["buyer_id"] or ""), "chat_id": str(row["chat_id"] or ""),
+        "conversation_available": str(row["chat_id"] or "") in chat_ids,
+        "quantity": row["quantity"] if isinstance(row["quantity"], int) and row["quantity"] >= 0 else None,
+        "paid_amount": _order_amount(row["paid_amount"]),
+        "status": status if status in _ORDER_STATUS_LABELS else "unknown", "status_group": row["status_group"],
+        "status_label": "已人工处理" if resolved else _ORDER_STATUS_LABELS.get(status, "未知状态，待核对"),
+        "reason_code": reason, "reason_label": _ORDER_REASONS.get(reason, labels.get(reason, "")),
+        "platform_status": platform_status if platform_status in {"2", "shipped"} else "",
+        "platform_status_label": platform_label,
+        "delivery_type": row["delivery_type"] if row["delivery_type"] in {"redeem", "pan", "material"} else "",
+        "delivery_type_label": {"redeem": "卡密", "pan": "网盘资料", "material": "文本资料"}.get(row["delivery_type"], "未获取"),
+        "review_status": row["review_status"], "review_resolution_label": resolution_label,
+    }
+    for field in ("created_at", "updated_at", "verified_at", "delivered_at", "platform_shipped_at"):
+        payload[field] = _order_timestamp(row[field])
+    return payload
+
+
+def order_page(user_id: int, account_key: str = DEFAULT_ACCOUNT_ID, *, page=1, page_size=15,
+               status="all", search_field="all", q="", created_from="", created_to="", _legacy_limit=None):
+    options = dict(ORDER_STATUS_OPTIONS)
+    if isinstance(page, bool) or not isinstance(page, int) or not 1 <= page <= 1_000_000:
+        raise ValueError("页码须在 1 至 1000000 之间")
+    if _legacy_limit is None and page_size not in {15, 30, 50}:
+        raise ValueError("每页条数仅支持 15、30 或 50")
+    if status not in options or search_field not in {"all", "order_id", "item_id", "buyer_id"}:
+        raise ValueError("订单筛选条件无效")
+    if not isinstance(q, str) or len(q) > 128 or re.search(r"[\x00-\x1f\x7f]", q):
+        raise ValueError("关键词不能超过 128 字或包含控制字符")
+    start, end = _order_date_bound(created_from), _order_date_bound(created_to)
+    if start is not None and end is not None and start >= end:
+        raise ValueError("开始时间须早于结束时间")
+    size = min(max(int(_legacy_limit), 1), 200) if _legacy_limit is not None else page_size
+    result = {"account_key": account_key, "orders": [], "page": 1, "page_size": size,
+              "total": 0, "total_pages": 0, "status_counts": {key: 0 for key in options},
+              "status_options": [{"value": key, "label": label} for key, label in ORDER_STATUS_OPTIONS]}
+    con = None
+    try:
+        con = _orders_connection(user_id, account_key)
+        if con is None:
+            return result
+        con.execute("BEGIN")
+        source = _order_source_sql(con)
+        if source is None:
+            return result
+        conditions, values = [], []
+        keyword = q.strip()
+        if keyword:
+            escaped = keyword.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            fields = {"all": ("order_key", "platform_order_id", "item_id", "buyer_id"),
+                      "order_id": ("order_key", "platform_order_id"), "item_id": ("item_id",), "buyer_id": ("buyer_id",)}[search_field]
+            conditions.append("(" + " OR ".join(f"COALESCE({field}, '') LIKE ? ESCAPE '\\'" for field in fields) + ")")
+            values.extend(["%" + escaped + "%"] * len(fields))
+        if start is not None:
+            conditions.append("created_at >= ?")
+            values.append(start)
+        if end is not None:
+            conditions.append("created_at < ?")
+            values.append(end)
+        where = " WHERE " + " AND ".join(conditions) if conditions else ""
+        for group in con.execute(source + "SELECT status_group, COUNT(*) AS total FROM orders_source" + where + " GROUP BY status_group", values):
+            result["status_counts"][group["status_group"]] = int(group["total"])
+        result["status_counts"]["all"] = sum(value for key, value in result["status_counts"].items() if key != "all")
+        result["total"] = result["status_counts"][status]
+        result["total_pages"] = (result["total"] + size - 1) // size
+        result["page"] = min(page, max(result["total_pages"], 1))
+        if status != "all":
+            conditions.append("status_group = ?")
+            values.append(status)
+        where = " WHERE " + " AND ".join(conditions) if conditions else ""
+        projection = ", ".join((*_ORDER_FIELDS, "review_status", "review_resolution", "status_group"))
+        rows = con.execute(source + "SELECT " + projection + " FROM orders_source" + where + " ORDER BY created_at DESC, order_key DESC LIMIT ? OFFSET ?",
+                           [*values, size, (result["page"] - 1) * size]).fetchall()
+        con.commit()
+        products_by_id, chat_ids = _order_enrichment(user_id, account_key, rows)
+        result["orders"] = [_order_payload(row, products_by_id, chat_ids) for row in rows]
+        return result
+    except (OSError, ValueError, sqlite3.Error, OrdersUnavailableError) as exc:
+        raise OrdersUnavailableError("订单记录暂时无法读取，请稍后重试") from exc
+    finally:
+        if con is not None:
+            con.close()
+
+
+def orders(user_id: int, limit: int = 50, account_key: str = DEFAULT_ACCOUNT_ID):
+    """Compatibility reader for the independent home-page recent-order preview."""
+    return order_page(user_id, account_key, _legacy_limit=limit)["orders"]
 
 
 def summary(user_id: int, account_key: str = DEFAULT_ACCOUNT_ID):

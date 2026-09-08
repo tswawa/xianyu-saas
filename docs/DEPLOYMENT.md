@@ -48,21 +48,39 @@ docker compose down
 
 ### 1. 系统依赖
 - 操作系统：Ubuntu 22.04+ 或 Debian 12
-- Python 3.10+、Node.js 20+、npm 10+、Git 2.40+
+- Python 3.10+（包含 `python3-venv`）、Git 2.40+、Nginx
+- 前端由 Nginx 直接提供静态文件；生产部署无需 Node.js/npm、Playwright 或 Chromium。
 
 ### 2. 初始化环境
 ```bash
 git clone https://github.com/tswawa/xianyu-saas.git
 cd xianyu-saas
 
-./scripts/bootstrap-dev.sh
-npx playwright install --with-deps chromium
+python3 -m venv backend/.venv
+backend/.venv/bin/python -m pip install -r backend/requirements.txt
+python3 -m venv worker/.venv
+worker/.venv/bin/python -m pip install -r worker/requirements.txt
 ```
 
+生产环境只安装上述运行依赖，不执行 `scripts/bootstrap-dev.sh`、`npm test` 等开发测试命令。已有部署沿用当前服务的虚拟环境和数据目录。
+
 ### 3. 配置服务
-参考 `deploy/systemd/` 中的服务模板配置控制面与任务消费者守护进程。
+参考 `deploy/systemd/` 和 `deploy/nginx/` 中的模板配置控制面、任务消费者与静态页面服务；模板内路径须与实际安装位置一致。
 
 ---
+
+## 版本信息与更新方式
+
+- 网页显示的是已安装代码的版本、构建信息和最近一次发布检查结果。尚无 Release、未发现更高版本、制品缺失与网络失败会分别显示；CHANGELOG 中其他版本的条目不代表当前已安装版本。
+- **Docker 源码构建**：网页只检查发布信息，不控制宿主机 Docker。先备份实际数据挂载、取得并核对目标源码，再使用原 Compose 文件及本地覆盖配置执行 `up -d --build --wait`。例如有 `.local/docker-compose.local.yml` 时，必须继续使用 `docker compose -f docker-compose.yml -f .local/docker-compose.local.yml up -d --build --wait`，不要丢弃原端口或数据卷配置，也不要执行 `down -v`。当前源码构建方式不依赖公共预构建镜像，不能用 `docker compose pull` 代替源码更新。
+- **构建信息**：Docker 构建时写入时间并校验 `package.json` 与后端版本一致。可通过构建环境变量 `SAAS_BUILD_COMMIT` 和 `SAAS_BUILD_DIRTY=true/false` 提供真实提交号与本地修改状态；未提供时明确显示未知，不在运行时读取 Git。
+- **systemd 签名部署**：API/消费者模板标记 `SAAS_DEPLOYMENT_MODE=systemd`，但这本身不代表已启用在线更新。必须配置可信的版本目录与 `current` 链接、签名公钥、可写的 staging/intent 目录，以及已加载的 `xianyu-saas-updater.service` 和活动的 `xianyu-saas-updater.path`；监听路径须与 `SAAS_UPDATE_INTENT_FILE` 一致。页面仅在这些条件可核验时开放安装，并仍要求签名校验和管理员二次确认。普通源码部署不应伪装成签名发布安装。
+
+## 统一模型连接与本地网络
+
+- 模型连接统一在「设置」管理，按登录用户隔离。服务端加密存储与主密钥、SQLite 数据库应一起备份。旧店铺连接不会自动迁移，需用户明确选择并测试确认；共享连接删除后不会回退旧密钥。
+- 若连接测试提示 `dns_fake_ip`，说明本地代理返回了 `198.18.0.0/15` Fake-IP。应在代理 DNS 配置中排除对应模型域名，或仅在本地 Compose 覆盖文件中使用经核实的域名解析；不要关闭私网地址保护、TLS 验证或改成任意目标代理。固定解析随服务 IP 变化需要重新核实。
+- 智能运维仅对所选店铺的客服资料和规则生成修改方案，确认后逐项执行。页面会区分待确认、成功、部分失败和需复核；不会执行系统命令、真实发货或库存扣减。
 
 ## 首次使用与账号初始化
 

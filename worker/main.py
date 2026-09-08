@@ -338,8 +338,18 @@ def load_reply_rules(path):
     payload = load_private_json_file(
         path, dict, maximum_bytes=MAX_REPLY_RULE_FILE_BYTES
     )
-    if set(payload) - {"version", "rules"}:
+    if set(payload) - {"version", "rules", "_ops_receipt"}:
         raise RuntimeError('回复规则包含未知顶层字段')
+    if "_ops_receipt" in payload:
+        receipt = payload["_ops_receipt"]
+        if (not isinstance(receipt, dict) or set(receipt) != {"plan_id", "item_id", "digest", "after_hash"}
+                or any(not isinstance(receipt[key], str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,79}", receipt[key]) for key in ("plan_id", "item_id"))
+                or any(not isinstance(receipt[key], str) or not re.fullmatch(r"[0-9a-f]{64}", receipt[key]) for key in ("digest", "after_hash"))):
+            raise RuntimeError('运维规则收据无效')
+        document = {key: value for key, value in payload.items() if key != "_ops_receipt"}
+        digest = hashlib.sha256(json.dumps(document, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")).hexdigest()
+        if digest != receipt["after_hash"]:
+            raise RuntimeError('运维规则收据与内容不一致')
     if payload.get('version') != 1:
         raise RuntimeError('回复规则必须使用 version=1')
     raw_rules = payload.get('rules')
@@ -452,7 +462,7 @@ def read_number_env(name, default, minimum, maximum, *, integer=False):
 from utils.xianyu_utils import generate_mid, generate_uuid, trans_cookies, generate_device_id, decrypt
 from XianyuAgent import XianyuReplyBot
 from context_manager import ChatContextManager, normalize_manual_reply_media, normalize_media
-from delivery_store import DeliveryStore
+from delivery_store import DeliveryStore, DeliveryStoreError
 
 
 class ManualTakeoverError(ConnectionError):
@@ -599,6 +609,8 @@ class XianyuLive:
         self.pan_resources = []
         self._products_signature = None
         self._pan_resources_signature = None
+        self._redeem_pool_signature = None
+        self.redeem_inventory_available = False
         self.context_manager = context_manager or ChatContextManager(db_path=self.chat_db_file)
         self._init_assistant_draft_provenance()
         if reply_bot is not None:
@@ -614,13 +626,9 @@ class XianyuLive:
                 logger.error("内部 AI 客户端不可用，固定规则仍可工作 error={}", type(exc).__name__)
         else:
             self.bot = None
-        paid_automation = self.automation_mode == "rules_ai"
-        self.delivery_store = delivery_store or DeliveryStore(
-            self.delivery_db_file,
-            redeem_pool_path=(
-                self._state_input_path("redeem_codes.json") if paid_automation else None
-            ),
-        )
+        # Fulfillment is independent of AI. Import inventory only after its
+        # enabled product mappings have been validated by the runtime loader.
+        self.delivery_store = delivery_store or DeliveryStore(self.delivery_db_file)
         quarantined = self.delivery_store.quarantine_automatic_orders(
             "platform_order_identity_unavailable"
         )
@@ -1019,9 +1027,9 @@ class XianyuLive:
             )
 
     def _state_input_path(self, filename):
-        state_path = os.path.join(self.state_dir, filename)
-        legacy_path = os.path.join(BASE_DIR, filename)
-        return state_path if os.path.exists(state_path) else legacy_path
+        # Missing account inventory must never fall back to another account's
+        # legacy files in the application directory.
+        return os.path.join(self.state_dir, filename)
 
     def _read_auth_status(self):
         state = self.auth_state_store.read()
@@ -1136,7 +1144,7 @@ class XianyuLive:
         if not force and signature == previous_signature:
             return
         try:
-            products = self._load_products()
+            products = self._load_products() if config_signature is not None else {}
             pan_resources = self._load_pan_resources(products)
         except RuntimeError as exc:
             if force:
@@ -1154,10 +1162,28 @@ class XianyuLive:
         self._products_signature = config_signature
         self._pan_resources_signature = pan_signature
 
+    def _refresh_redeem_inventory(self, force=False):
+        needed = any(config.get("delivery") == "redeem" for config in self.products.values())
+        path = self._state_input_path("redeem_codes.json")
+        file_signature = _reply_rules_file_signature(path) if needed else None
+        signature = (needed, file_signature)
+        if not force and signature == self._redeem_pool_signature:
+            return
+        self.redeem_inventory_available = False
+        if needed and file_signature is not None:
+            try:
+                self.delivery_store.import_inventory(path, "redeem")
+            except DeliveryStoreError as exc:
+                logger.error("卡密库存配置无效，已暂停卡密发货 error={}", type(exc).__name__)
+            else:
+                self.redeem_inventory_available = True
+        self._redeem_pool_signature = signature
+
     def _refresh_runtime_config(self, force=False):
         self._refresh_automation_settings(force=force)
         self._refresh_reply_rules(force=force)
         self._refresh_products(force=force)
+        self._refresh_redeem_inventory(force=force)
 
     def _loaded_automation_revision(self):
         """Hash the exact validated rules/settings snapshot used for one reply."""
@@ -1217,11 +1243,6 @@ class XianyuLive:
         if not isinstance(configs, list):
             raise RuntimeError("products_config.json 缺少 types 列表")
         by_item = {}
-        allowed_deliveries = (
-            {"material"}
-            if self.automation_mode == "rules"
-            else {"redeem", "pan", "material"}
-        )
         for config in configs:
             if not isinstance(config, dict) or config.get("delivery") not in {
                 "redeem",
@@ -1235,12 +1256,6 @@ class XianyuLive:
             if not enabled:
                 # Disabled entries remain in the SaaS document for editing,
                 # but must not authorize either replies or delivery.
-                continue
-            # The deterministic/free worker may share a config file with the
-            # paid worker.  Never let a downgrade inherit redeem or pan
-            # inventory mappings; those entries are intentionally invisible to
-            # this process, while material delivery remains available.
-            if config["delivery"] not in allowed_deliveries:
                 continue
             config = dict(config)
             if config["delivery"] == "material":
@@ -1293,7 +1308,10 @@ class XianyuLive:
         configured_products = self.products if products is None else products
         if not any(config.get("delivery") == "pan" for config in configured_products.values()):
             return []
-        payload = load_json_file(self._state_input_path("pan_links.json"), dict)
+        path = self._state_input_path("pan_links.json")
+        if _reply_rules_file_signature(path) is None:
+            return []
+        payload = load_json_file(path, dict)
         links = payload.get("links")
         if not isinstance(links, list):
             raise RuntimeError("pan_links.json 缺少 links 列表")
@@ -1335,8 +1353,6 @@ class XianyuLive:
                     "host": parsed.hostname.lower(),
                 }
             )
-        if not resources:
-            raise RuntimeError("pan_links.json 没有可用资源")
         return resources
 
     def _pan_payload_for(self, item_config):
@@ -1828,7 +1844,23 @@ class XianyuLive:
                 raise RuntimeError("verified order disappeared")
             if current.status in {"delivered", "manual_review", "cancelled", "expired"}:
                 return current.status
+            self._refresh_products()
+            self._refresh_redeem_inventory()
+            binding = None
+            if not current.buyer_id or not current.item_id:
+                binding = self.delivery_store.get_chat_binding(current.chat_id)
+                if binding is None:
+                    self.delivery_store.mark_order_manual_review(
+                        order_key, "chat_binding_unavailable"
+                    )
+                    return "manual_review"
+            if self.classify_item(current.item_id or binding["item_id"]) != item_config:
+                self.delivery_store.mark_order_manual_review(order_key, "unsupported_item")
+                return "manual_review"
             delivery_type = item_config.get("delivery")
+            if delivery_type == "redeem" and not self.redeem_inventory_available:
+                self.delivery_store.mark_order_manual_review(order_key, "inventory_state_changed")
+                return "manual_review"
             if delivery_type == "material" and current.quantity not in (None, 1):
                 self.delivery_store.mark_order_manual_review(
                     order_key, "unsupported_quantity"
@@ -1856,14 +1888,6 @@ class XianyuLive:
                     )
                     return "manual_review"
                 delivery_payload = delivery_payload.strip()
-            binding = None
-            if not current.buyer_id or not current.item_id:
-                binding = self.delivery_store.get_chat_binding(current.chat_id)
-                if binding is None:
-                    self.delivery_store.mark_order_manual_review(
-                        order_key, "chat_binding_unavailable"
-                    )
-                    return "manual_review"
             reservation = self.delivery_store.prepare_order(
                 order_key,
                 current.chat_id,
@@ -1883,9 +1907,27 @@ class XianyuLive:
             text = self._delivery_text(reservation)
 
             async def verify_before_attempt():
+                await self._reverify_order(reservation)
+                # Recheck local authorization after the platform API await and
+                # on every reconnect attempt, before any payload is sent.
+                self._refresh_products()
+                self._refresh_redeem_inventory()
+                latest_config = self.classify_item(reservation.item_id)
+                if latest_config is None or latest_config.get("delivery") != reservation.delivery_type:
+                    raise OrderVerificationRejected("unsupported_item")
+                if reservation.delivery_type == "pan":
+                    try:
+                        latest_payload = self._pan_payload_for(latest_config)
+                    except RuntimeError:
+                        raise OrderVerificationRejected("pan_resource_unavailable") from None
+                    if latest_payload != reservation.payload:
+                        raise OrderVerificationRejected("pan_resource_unavailable")
                 if (
                     reservation.delivery_type == "redeem"
-                    and not self.delivery_store.order_inventory_is_sendable(order_key)
+                    and (
+                        not self.redeem_inventory_available
+                        or not self.delivery_store.order_inventory_is_sendable(order_key)
+                    )
                 ):
                     latest = self.delivery_store.get_order(order_key)
                     reason = (
@@ -1898,7 +1940,6 @@ class XianyuLive:
                         else "inventory_state_changed"
                     )
                     raise OrderVerificationRejected(reason)
-                await self._reverify_order(reservation)
 
             try:
                 await self.send_text_reliably(

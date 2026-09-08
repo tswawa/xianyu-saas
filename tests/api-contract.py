@@ -496,7 +496,7 @@ def main():
     assert version_payload["update_channel"] == "stable"
     assert set(version_payload) == {
         "version", "commit", "build_time", "asset_version", "update_channel",
-        "release_notes", "latest_update",
+        "release_notes", "latest_update", "build_dirty", "deployment", "update_check", "capabilities",
     }
     assert ".git" not in json.dumps(version_payload, ensure_ascii=False)
     user_id = int(app.db.get_user("free-user")["id"])

@@ -307,6 +307,11 @@ class DB:
                 );
                 CREATE INDEX IF NOT EXISTS idx_platform_updates_status
                     ON platform_updates(status, updated_at DESC, id DESC);
+                CREATE TABLE IF NOT EXISTS platform_update_checks (
+                    channel TEXT PRIMARY KEY,
+                    payload_json TEXT NOT NULL,
+                    checked_at REAL NOT NULL
+                );
                 """
             )
             self._migrate_auth_platform_locked()
@@ -2351,6 +2356,40 @@ class DB:
                 raise
 
     # ---- platform update status ----
+    def save_platform_update_check(self, channel, payload):
+        if channel not in VALID_UPDATE_CHANNELS:
+            raise ValueError("invalid update channel")
+        fields = ("status", "available", "current_version", "version", "published_at", "release_notes", "error_code")
+        result = {key: payload[key] for key in fields if key in payload}
+        result.update(channel=channel, checked_at=time.time())
+        with self._lock:
+            self.con.execute(
+                """INSERT INTO platform_update_checks(channel, payload_json, checked_at)
+                   VALUES (?, ?, ?) ON CONFLICT(channel) DO UPDATE SET
+                   payload_json = excluded.payload_json, checked_at = excluded.checked_at""",
+                (channel, json.dumps(result, ensure_ascii=True), result["checked_at"]),
+            )
+            self.con.commit()
+        return result
+
+    def get_platform_update_check(self, channel):
+        with self._lock:
+            row = self.con.execute(
+                "SELECT payload_json FROM platform_update_checks WHERE channel = ?", (channel,)
+            ).fetchone()
+        return json.loads(row["payload_json"]) if row else {
+            "channel": channel, "status": "unchecked", "available": False, "checked_at": None,
+        }
+
+    def active_platform_update(self):
+        with self._lock:
+            return self.con.execute(
+                """SELECT * FROM platform_updates WHERE status IN (
+                    'apply_requested', 'rollback_requested', 'preparing', 'stopping',
+                    'migrating', 'switching', 'verifying', 'rolling_back'
+                ) ORDER BY updated_at DESC LIMIT 1"""
+            ).fetchone()
+
     def upsert_platform_update(
         self,
         version,

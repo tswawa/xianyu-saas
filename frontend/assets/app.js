@@ -4,7 +4,7 @@
 
   const API_PREFIX = "/xianyu-saas";
   const QR_LOGIN_POLL_MS = 1500;
-  const ASSET_VERSION = "20260905-01";
+  const ASSET_VERSION = "20260908-01";
   const AI_TEXT_PLACEHOLDERS = new Set(["无", "暂无", "没有", "未填写", "待填写", "待补充", "占位", "n/a", "na", "none", "null", "todo", "tbd"]);
   const ICONS = API_PREFIX + "/assets/icons.svg?v=" + ASSET_VERSION + "#";
   // 旧版视图 key → 新版视图 key（历史会话/书签兜底）。
@@ -18,6 +18,7 @@
     vip: "home",
     chats: "chat",
     ai: "ai-config",
+    docs: "settings",
   };
   const ACTIVE_ACCOUNT_STORAGE_PREFIX = "xianyu-saas.active-account:";
   const INBOX_STORAGE_PREFIX = "xianyu-saas.inbox:";
@@ -45,6 +46,18 @@
     refreshOwner: null,
     config: null,
     bot: null,
+    version: null,
+    versionUpdate: null,
+    versionLoadedPublic: false,
+    settingsAi: {
+      connection: null,
+      verificationToken: "",
+      testedFingerprint: "",
+      legacySources: [],
+      selectedLegacySource: null,
+      draft: null,
+    },
+    ops: newOpsState(),
     automation: { rules: [], deliveries: [], running: false, strategy: "standard", enabled: true },
     automationEditor: { type: "", index: -1 },
     ai: {
@@ -126,6 +139,7 @@
       takeover: {},
     },
     orders: [],
+    ordersPage: createInitialOrdersPageState(),
     templates: [],
     cards: null,
     cardsAccountKey: "",
@@ -134,17 +148,7 @@
     templateEditor: { editingId: "", productIds: [] },
     cardsEditor: { editingId: "", mode: "import" },
     confirmAction: null,
-    docs: {
-      tab: "guide",
-      version: null,
-      update: null,
-      settings: null,
-      users: [],
-      audit: [],
-      availableVersion: "",
-      stagedVersion: "",
-      loading: false,
-    },
+    docs: newDocsState(),
     qrLogin: {
       loginId: "",
       accountKey: "",
@@ -202,6 +206,8 @@
     const normalized = normalizeView(view);
     if (["chat", "ai-config", "auto-reply"].includes(normalized)) return "chat";
     if (["goods", "templates", "cards"].includes(normalized)) return "goods";
+    if (normalized === "settings" || normalized === "docs") return "settings";
+    if (normalized === "ops") return "ops";
     return normalized;
   }
 
@@ -654,8 +660,6 @@
     next.extractionGeneration = Number(state.ai?.extractionGeneration || 0) + 1;
     next.previewGeneration = Number(state.ai?.previewGeneration || 0) + 1;
     state.ai = next;
-    const keyInput = $("#aiApiKey");
-    if (keyInput) keyInput.value = "";
     clearAiProductTransientUi();
   }
 
@@ -831,17 +835,16 @@
 
   function syncAiDirtyFlags() {
     if (!state.ai) return false;
-    const candidate = aiConnectionCandidate();
-    state.ai.dirty.connection = JSON.stringify({ provider: candidate.provider, base_url: candidate.base_url, model: candidate.model }) !== state.ai.baseline.connection || Boolean(candidate.api_key);
+    state.ai.dirty.connection = false;
     if ($("#aiStoreForm")) state.ai.dirty.config = aiStoreBaselineValue() !== state.ai.baseline.config;
     const knowledge = $("#aiKnowledgeContent");
     if (knowledge && state.ai.selectedItemId) state.ai.dirty.knowledge = knowledge.value !== state.ai.baseline.knowledge;
-    return Object.values(state.ai.dirty).some(Boolean);
+    return Boolean(state.ai.dirty.config || state.ai.dirty.knowledge);
   }
 
   function confirmDiscardAiChanges(reason = "切换") {
     if (!syncAiDirtyFlags()) return true;
-    const accepted = window.confirm("当前 AI 配置有未保存修改。确认" + reason + "并丢弃这些修改吗？");
+    const accepted = window.confirm("当前店铺 AI 客服配置有未保存修改。确认" + reason + "并丢弃这些修改吗？");
     if (accepted) state.ai.dirty = { connection: false, config: false, knowledge: false };
     return accepted;
   }
@@ -1136,38 +1139,16 @@
     const connection = state.ai?.connection || {};
     const statusCode = connectionStatusCode(connection, state.ai?.status);
     const statusInfo = connectionStatusInfo(statusCode);
-    const badge = $("#aiConnectionBadge");
-    if (badge) {
-      badge.textContent = statusInfo[0];
-      badge.className = "badge " + statusInfo[1];
-    }
     const overall = $("#aiOverallStatus");
     const aiRunning = Boolean(state.bot?.running && state.bot?.automation_mode === "rules_ai");
     if (overall) {
       overall.textContent = aiRunning ? "AI 运行中" : statusCode === "verified" ? "AI 已暂停" : statusInfo[0];
       overall.className = "badge " + (aiRunning ? "badge-green" : statusCode === "verified" ? "badge-amber" : statusInfo[1]);
     }
-    const selectedProvider = aiProviderCode();
-    const keyConfigured = aiProviderHasReusableKey(selectedProvider);
-    const keyState = $("#aiKeyState");
-    if (keyState) {
-      const optionalKey = selectedProvider === "ollama_chat" && !keyConfigured;
-      keyState.textContent = keyConfigured ? "已安全保存" : optionalKey ? "可选" : aiProviderCode(connection.provider) !== selectedProvider ? "需重新填写" : "未配置";
-      keyState.className = "ai-key-state" + (keyConfigured ? " is-saved" : "");
-    }
+    renderAiConfigSummary();
     if (!preserveEditors) {
-      const provider = aiProviderCode(connection.provider);
-      const baseUrl = String(connection.base_url || "");
-      const model = String(connection.model || "");
-      if ($("#aiProvider")) $("#aiProvider").value = provider;
-      if ($("#aiBaseUrl")) $("#aiBaseUrl").value = baseUrl;
-      if ($("#aiModel")) $("#aiModel").value = model;
-      if ($("#aiApiKey")) $("#aiApiKey").value = "";
-      state.ai.baseline.connection = JSON.stringify({ provider, base_url: baseUrl, model });
-      state.ai.dirty.connection = false;
       writeAiStoreForm(aiConfigDraft(state.ai.config));
     }
-    renderAiProviderFields();
     const configStatus = String(state.ai?.config?.content_status || state.ai?.config?.status || (aiStoreHasContent() ? "saved" : "unconfigured"));
     const personaInfo = aiStoreHasContent() ? aiKnowledgeStatusInfo(configStatus) : ["未填写", "badge-muted"];
     const personaBadge = $("#aiPersonaStatus");
@@ -1175,12 +1156,58 @@
       personaBadge.textContent = personaInfo[0];
       personaBadge.className = "badge " + personaInfo[1];
     }
-    setAiInlineStatus(statusInfo[2], statusInfo[1] === "badge-red" ? "error" : statusInfo[1] === "badge-green" ? "success" : "warning");
     const search = $("#aiProductSearch");
     if (search && search.value !== state.ai.productSearch) search.value = state.ai.productSearch;
     renderAiTemplates();
     renderAiKnowledgeEditor({ preserveText: preserveEditors });
     renderAiStatus();
+  }
+
+  function renderAiConfigSummary() {
+    const globalConn = state.settingsAi?.connection;
+    const shopConn = state.ai?.connection;
+    const badge = $("#aiConnectionBadge");
+    const title = $("#aiConnectionSummaryTitle");
+    const desc = $("#aiConnectionSummaryText");
+
+    if (globalConn?.verified || globalConn?.provider) {
+      if (badge) {
+        badge.textContent = "全局已生效";
+        badge.className = "badge badge-green";
+      }
+      if (title) {
+        title.textContent = "统一模型: " + (globalConn.model || "") + " (" + (AI_PROVIDER_COPY[globalConn.provider]?.label || globalConn.provider || "") + ")";
+      }
+      if (desc) {
+        let txt = "当前账号已统一配置大模型，供智能客服与智能运维等功能调用。";
+        if (shopConn?.model) {
+          txt += "（检测到该店铺曾有独立配置，当前已优先使用账号全局统一连接）";
+        }
+        desc.textContent = txt;
+      }
+    } else if (shopConn?.verified || shopConn?.provider) {
+      if (badge) {
+        badge.textContent = "店铺独立生效";
+        badge.className = "badge badge-amber";
+      }
+      if (title) {
+        title.textContent = "店铺独立模型: " + (shopConn.model || "") + " (" + (AI_PROVIDER_COPY[shopConn.provider]?.label || shopConn.provider || "") + ")";
+      }
+      if (desc) {
+        desc.textContent = "当前正在使用该店铺的历史独立配置。建议前往系统设置将其升级保存为全局统一连接。";
+      }
+    } else {
+      if (badge) {
+        badge.textContent = "未配置";
+        badge.className = "badge badge-muted";
+      }
+      if (title) {
+        title.textContent = "尚未配置模型连接";
+      }
+      if (desc) {
+        desc.textContent = "当前账号尚未统一配置 AI 模型连接，智能客服与智能运维暂不可用。点击右侧按钮前往配置。";
+      }
+    }
   }
 
   async function loadAiKnowledge(itemId, context = captureAccountContext()) {
@@ -1233,129 +1260,236 @@
     return accountContextMatches(context) && generation === state.ai.loadGeneration;
   }
 
+  function settingsAiConnectionFingerprint(candidate) {
+    return JSON.stringify([
+      candidate.provider,
+      candidate.base_url,
+      candidate.model,
+      candidate.api_key || "",
+      Number(state.settingsAi?.connection?.revision || 0),
+      state.settingsAi?.selectedLegacySource?.account_key || "",
+      state.settingsAi?.selectedLegacySource?.revision ?? null,
+    ]);
+  }
+
   function invalidateAiConnectionTest() {
     state.ai.verificationToken = "";
     state.ai.testedFingerprint = "";
-    state.ai.dirty.connection = true;
+    state.ai.dirty.connection = false;
+    if (state.settingsAi) {
+      state.settingsAi.verificationToken = "";
+      state.settingsAi.testedFingerprint = "";
+      state.settingsAi.draft = {
+        provider: $("#aiProvider")?.value || "",
+        base_url: $("#aiBaseUrl")?.value || "",
+        model: $("#aiModel")?.value || "",
+        api_key: $("#aiApiKey")?.value || "",
+      };
+      if (state.settingsAi.selectedLegacySource) {
+        const src = state.settingsAi.selectedLegacySource;
+        if (state.settingsAi.draft.model !== src.model || state.settingsAi.draft.base_url !== src.base_url || state.settingsAi.draft.provider !== src.provider) {
+          state.settingsAi.selectedLegacySource = null;
+        }
+      }
+    }
+    if ($("#aiSaveConnection")) $("#aiSaveConnection").disabled = true;
     const connection = state.ai.connection || {};
     state.ai.connection = Object.assign({}, connection, { status: "pending", verified: false });
     renderAiConfig({ preserveEditors: true });
   }
 
   function validateAiConnectionCandidate(candidate, { requireKey = false } = {}) {
-    if (!AI_PROVIDER_COPY[candidate.provider]) throw new ApiError("请选择支持的接口格式");
+    if (!candidate.provider) throw new ApiError("请选择支持的接口格式");
     if (!candidate.base_url) throw new ApiError("请填写服务地址");
     if (!candidate.model) throw new ApiError("请填写模型名");
-    if (requireKey && aiProviderRequiresKey(candidate.provider) && !candidate.api_key && !aiProviderHasReusableKey(candidate.provider)) throw new ApiError("首次配置或切换接口格式后请输入对应的 API Key");
+    if (requireKey && candidate.provider !== "ollama" && candidate.provider !== "ollama_chat" && !candidate.api_key) {
+      throw new ApiError("请输入当前接口的 API Key");
+    }
   }
 
-  async function testAiConnection() {
-    const candidate = aiConnectionCandidate();
+  async function testUnifiedAiConnection() {
+    const settings = state.settingsAi;
+    if (!state.me || settings.operation) return;
+    const candidate = {
+      provider: $("#aiProvider")?.value || "",
+      base_url: String($("#aiBaseUrl")?.value || "").trim(),
+      model: String($("#aiModel")?.value || "").trim(),
+      api_key: String($("#aiApiKey")?.value || "").trim(),
+    };
     try {
-      validateAiConnectionCandidate(candidate, { requireKey: true });
+      const hasConfiguredKey = Boolean(
+        candidate.api_key ||
+        state.settingsAi?.selectedLegacySource?.api_key_configured ||
+        (state.settingsAi?.connection?.api_key_configured && state.settingsAi?.connection?.provider === candidate.provider)
+      );
+      validateAiConnectionCandidate(candidate, { requireKey: !hasConfiguredKey });
     } catch (error) {
-      setAiInlineStatus(error.message, "error");
+      formMessage("#aiConnectionMessage", error.message);
       return;
     }
     const button = $("#aiTestConnection");
-    const context = captureAccountContext();
-    const fingerprint = aiConnectionFingerprint(candidate);
+    const fingerprint = settingsAiConnectionFingerprint(candidate);
+    settings.operation = "test";
     setBusy(button, true);
-    setAiInlineStatus("正在测试连接，不会启动客服或发送闲鱼消息", "warning");
+    formMessage("#aiConnectionMessage", "正在测试统一模型连接…");
     try {
-      const result = await accountScopedApi(context, "/api/bot/ai/connection/test", {
+      const payload = {
+        provider: candidate.provider,
+        base_url: candidate.base_url,
+        model: candidate.model,
+        expected_revision: Number(state.settingsAi?.connection?.revision || 0),
+      };
+      if (candidate.api_key) payload.api_key = candidate.api_key;
+      if (state.settingsAi?.selectedLegacySource) {
+        payload.source_account_key = state.settingsAi.selectedLegacySource.account_key;
+        payload.source_revision = state.settingsAi.selectedLegacySource.revision;
+      }
+      const result = await api("/api/settings/ai/connection/test", {
         method: "POST",
-        body: JSON.stringify(Object.assign({}, candidate, {
-          expected_revision: Number(state.ai.connection?.revision || 0),
-        })),
+        body: JSON.stringify(payload),
       });
-      if (!accountContextMatches(context)) return;
-      state.ai.verificationToken = String(result?.verification_token || "");
-      state.ai.testedFingerprint = fingerprint;
-      state.ai.connection = Object.assign({}, state.ai.connection || {}, {
-        status: String(result?.status || "success"),
-        verified: true,
-        last_tested_at: result?.tested_at || result?.last_tested_at || null,
-      });
-      renderAiConfig({ preserveEditors: true });
-      setAiInlineStatus("连接测试成功，可以保存当前候选配置", "success");
+      if (state.settingsAi !== settings || !state.me || fingerprint !== settingsAiConnectionFingerprint(aiConnectionCandidate())) return;
+      if (result?.ok !== true || result?.status !== "verified" || !result.verification_token) throw new ApiError("连接测试未返回有效凭证");
+      settings.verificationToken = result.verification_token;
+      settings.testedFingerprint = fingerprint;
+      if ($("#aiSaveConnection")) $("#aiSaveConnection").disabled = false;
+      renderSettingsAiPanel();
+      renderAiConfigSummary();
+      updateOpsConnectionBadge();
+      formMessage("#aiConnectionMessage", "连接测试成功，请点击“保存统一连接”以生效", true);
       showToast("模型连接测试成功");
     } catch (error) {
-      if (!accountContextMatches(context)) return;
-      state.ai.verificationToken = "";
-      state.ai.testedFingerprint = "";
-      const code = String(error?.code || "unavailable");
-      state.ai.connection = Object.assign({}, state.ai.connection || {}, { status: code, verified: false });
-      renderAiConfig({ preserveEditors: true });
-      setAiInlineStatus(connectionStatusInfo(code)[2] || error.message, "error");
-      showToast(connectionStatusInfo(code)[0], "error");
+      if (state.settingsAi !== settings || !state.me) return;
+      settings.verificationToken = "";
+      settings.testedFingerprint = "";
+      if ($("#aiSaveConnection")) $("#aiSaveConnection").disabled = true;
+      formMessage("#aiConnectionMessage", error.message || "模型连接测试失败，请核对配置");
     } finally {
-      if (accountContextMatches(context)) setBusy(button, false);
+      if (state.settingsAi === settings) { settings.operation = ""; setBusy(button, false); renderSettingsAiPanel(); }
     }
   }
 
-  async function saveAiConnection(event) {
-    event.preventDefault();
-    const candidate = aiConnectionCandidate();
+  async function saveUnifiedAiConnection(event) {
+    if (event) event.preventDefault();
+    const settings = state.settingsAi;
+    if (!state.me || settings.operation) return;
+    const candidate = {
+      provider: $("#aiProvider")?.value || "",
+      base_url: String($("#aiBaseUrl")?.value || "").trim(),
+      model: String($("#aiModel")?.value || "").trim(),
+      api_key: String($("#aiApiKey")?.value || "").trim(),
+    };
     try {
-      validateAiConnectionCandidate(candidate, { requireKey: true });
-      if (!state.ai.verificationToken || state.ai.testedFingerprint !== aiConnectionFingerprint(candidate)) throw new ApiError("请先测试当前接口格式、服务地址、模型和密钥");
+      const hasConfiguredKey = Boolean(
+        candidate.api_key ||
+        state.settingsAi?.selectedLegacySource?.api_key_configured ||
+        (state.settingsAi?.connection?.api_key_configured && state.settingsAi?.connection?.provider === candidate.provider)
+      );
+      validateAiConnectionCandidate(candidate, { requireKey: !hasConfiguredKey });
+      if (!state.settingsAi.verificationToken || state.settingsAi.testedFingerprint !== settingsAiConnectionFingerprint(candidate)) {
+        throw new ApiError("请先点击“测试连接”并测试通过后再保存");
+      }
     } catch (error) {
-      setAiInlineStatus(error.message, "error");
+      formMessage("#aiConnectionMessage", error.message);
       return;
     }
-    const button = event.submitter || $("#aiSaveConnection");
-    const context = captureAccountContext();
+    const button = $("#aiSaveConnection") || event?.submitter;
+    settings.operation = "save";
+    const submittedFingerprint = settingsAiConnectionFingerprint(candidate);
     setBusy(button, true);
     try {
       const payload = {
         provider: candidate.provider,
         base_url: candidate.base_url,
         model: candidate.model,
-        verification_token: state.ai.verificationToken,
-        expected_revision: Number(state.ai.connection?.revision || 0),
+        verification_token: state.settingsAi.verificationToken,
+        expected_revision: Number(state.settingsAi?.connection?.revision || 0),
+        confirm: true,
       };
       if (candidate.api_key) payload.api_key = candidate.api_key;
-      const result = await accountScopedApi(context, "/api/bot/ai/connection", { method: "PUT", body: JSON.stringify(payload) });
-      if (!accountContextMatches(context)) return;
-      state.ai.connection = result?.connection || result || state.ai.connection;
-      state.ai.verificationToken = "";
-      state.ai.testedFingerprint = "";
-      if ($("#aiApiKey")) $("#aiApiKey").value = "";
-      renderAiConfig();
-      setAiInlineStatus("连接已安全保存；API Key 不会回显", "success");
-      showToast("模型连接已保存");
+      if (state.settingsAi?.selectedLegacySource) {
+        payload.source_account_key = state.settingsAi.selectedLegacySource.account_key;
+        payload.source_revision = state.settingsAi.selectedLegacySource.revision;
+      }
+      const result = await api("/api/settings/ai/connection", {
+        method: "PUT",
+        body: JSON.stringify(payload),
+      });
+      if (state.settingsAi !== settings || !state.me) return;
+      if (!result?.connection || result.ok !== true) throw new ApiError("连接保存结果无效，请刷新确认");
+      const unchanged = submittedFingerprint === settingsAiConnectionFingerprint(aiConnectionCandidate());
+      settings.connection = result.connection;
+      settings.verificationToken = "";
+      settings.testedFingerprint = "";
+      if (unchanged) {
+        settings.selectedLegacySource = null;
+        settings.draft = null;
+        if ($("#aiApiKey")) $("#aiApiKey").value = "";
+      }
+      renderSettingsAiPanel();
+      renderAiConfigSummary();
+      updateOpsConnectionBadge();
+      formMessage("#aiConnectionMessage", unchanged ? "统一模型连接已保存，供本人各功能使用" : "已保存提交的连接；编辑区仍有未保存修改", true);
     } catch (error) {
-      if (accountContextMatches(context)) setAiInlineStatus(error.message || "连接保存失败", "error");
+      if (state.settingsAi === settings && state.me) {
+        settings.verificationToken = "";
+        settings.testedFingerprint = "";
+        formMessage("#aiConnectionMessage", error.message || "连接保存失败");
+      }
     } finally {
-      if (accountContextMatches(context)) setBusy(button, false);
+      if (state.settingsAi === settings) {
+        settings.operation = "";
+        setBusy(button, false);
+        renderSettingsAiPanel();
+        button.disabled = !settings.verificationToken;
+      }
+    }
+  }
+
+  async function deleteUnifiedAiConnection() {
+    const button = $("#aiDeleteKey");
+    const settings = state.settingsAi;
+    if (!state.me || settings.operation || !button || button.disabled) return;
+    settings.operation = "delete";
+    setBusy(button, true);
+    try {
+      const result = await api("/api/settings/ai/connection", {
+        method: "DELETE",
+        body: JSON.stringify({ confirm: true, expected_revision: Number(settings.connection?.revision || 0) }),
+      });
+      if (state.settingsAi !== settings || !state.me) return;
+      if (result?.ok !== true || !result.connection) throw new ApiError("删除结果未确认，请刷新设置");
+      settings.connection = result.connection;
+      settings.verificationToken = "";
+      settings.testedFingerprint = "";
+      settings.selectedLegacySource = null;
+      settings.draft = null;
+      $("#aiApiKey").value = "";
+      $("#aiSaveConnection").disabled = true;
+      renderSettingsAiPanel();
+      renderAiConfigSummary();
+      updateOpsConnectionBadge();
+      formMessage("#aiConnectionMessage", "统一模型密钥与连接已删除", true);
+    } catch (error) {
+      if (state.settingsAi === settings && state.me) formMessage("#aiConnectionMessage", error.message || "删除失败，请重试");
+    } finally {
+      if (state.settingsAi === settings) { settings.operation = ""; setBusy(button, false); renderSettingsAiPanel(); }
     }
   }
 
   function confirmDeleteAiKey() {
-    const context = captureAccountContext();
-    text("#confirmTitle", "删除当前店铺 API Key");
-    text("#confirmMessage", "删除后当前店铺 AI 客服会关闭，固定规则与人工回复不受影响。是否继续？");
+    text("#confirmTitle", "删除全局统一大模型 API Key");
+    text("#confirmMessage", "删除后当前账号的统一 AI 连接将被清除，智能客服与智能运维将无法调用大模型。是否继续？");
     text("#confirmAction", "确认删除 Key");
     state.confirmAction = async () => {
-      if (!accountContextMatches(context)) return;
-      await accountScopedApi(context, "/api/bot/ai/connection/key", {
-        method: "DELETE",
-        body: JSON.stringify({ confirm: true, expected_revision: Number(state.ai.connection?.revision || 0) }),
-      });
-      if (!accountContextMatches(context)) return;
-      if ($("#aiApiKey")) $("#aiApiKey").value = "";
-      state.ai.connection = Object.assign({}, state.ai.connection || {}, { api_key_configured: false, status: "unconfigured", verified: false });
-      state.ai.status = Object.assign({}, state.ai.status || {}, { enabled: false, connection_verified: false });
-      state.ai.verificationToken = "";
-      state.ai.testedFingerprint = "";
-      renderAiConfig();
-      showToast("当前店铺 API Key 已删除");
+      await deleteUnifiedAiConnection();
+      closeDialog("confirmDialog");
     };
-    const dialog = $("#confirmDialog");
-    if (typeof dialog?.showModal === "function") dialog.showModal();
-    else dialog?.setAttribute("open", "");
+    openDialog("confirmDialog");
   }
+
+  const testAiConnection = testUnifiedAiConnection;
+  const saveAiConnection = saveUnifiedAiConnection;
 
   async function saveAiPersona() {
     const config = aiStoreFormValue();
@@ -2527,7 +2661,8 @@
   function clearSession(showMessage = true) {
     resetQrLogin();
     stopMerchantPolling();
-    ["xianyuLoginDialog", "quickRepliesDialog", "batchDeliveryDialog", "templateEditorDialog", "cardsEditorDialog", "confirmDialog"].forEach(closeDialog);
+    ["xianyuLoginDialog", "quickRepliesDialog", "batchDeliveryDialog", "templateEditorDialog", "cardsEditorDialog", "confirmDialog", "docsHelpModal", "opsDiffModal"].forEach(closeDialog);
+    closeVersionBadgePopover();
     state.confirmAction = null;
     resetManualReplyContext();
     state.view = "home";
@@ -2543,6 +2678,12 @@
     state.bot = null;
     state.automation = { rules: [], deliveries: [], running: false, strategy: "standard", enabled: true };
     resetAiState();
+    resetOpsState();
+    state.settingsAi = { connection: null, verificationToken: "", testedFingerprint: "", legacySources: [], selectedLegacySource: null, draft: null };
+    if ($("#aiApiKey")) $("#aiApiKey").value = "";
+    if ($("#aiModel")) $("#aiModel").value = "";
+    if ($("#aiBaseUrl")) $("#aiBaseUrl").value = "";
+    if ($("#aiSaveConnection")) $("#aiSaveConnection").disabled = true;
     resetReplyRuleForm();
     resetAutomationMutations();
     state.attention = [];
@@ -2558,6 +2699,7 @@
     state.catalogStatus = null;
     state.batchDelivery = { enabled: true, previewToken: "", preview: null, generation: Number(state.batchDelivery?.generation || 0) + 1 };
     resetAccountInboxState();
+    resetOrdersPageState();
     state.orders = [];
     state.templates = [];
     state.cards = null;
@@ -2566,28 +2708,38 @@
     state.templateEditorOpenGeneration += 1;
     state.templateEditor = { editingId: "", productIds: [] };
     state.cardsEditor = { editingId: "", mode: "import" };
-    state.docs = {
-      tab: "guide", version: null, update: null, settings: null, users: [], audit: [],
-      availableVersion: "", stagedVersion: "", loading: false,
-    };
-    ["templateEditorForm", "cardsEditorForm", "cardsCreateForm", "batchDeliveryForm", "passwordChangeForm", "platformSettingsForm"].forEach((id) => $("#" + id)?.reset());
+    stopDocsPolling();
+    state.docs = newDocsState();
+    state.version = state.publicVersion || null;
+    state.versionUpdate = null;
+    closeVersionBadgePopover();
+    renderVersionBadge();
+    ["templateEditorForm", "cardsEditorForm", "cardsCreateForm", "batchDeliveryForm", "passwordChangeForm", "platformSettingsForm", "ordersFilterForm", "aiConnectionForm", "opsPromptForm"].forEach((id) => $("#" + id)?.reset());
     [
       "homeStatCards", "homeProductGrid", "homeOrderList", "attentionList", "shopAccountsPanelList",
-      "productGrid", "conversationItems", "chatMessages", "orderList", "replyRuleList",
+      "productGrid", "conversationItems", "chatMessages", "orderList", "ordersStatusTabs", "replyRuleList",
       "templateGrid", "cardsStats", "cardsList", "analyticsCards", "analyticsChart",
     ].forEach((id) => {
       const node = $("#" + id);
       if (node) node.innerHTML = "";
     });
-    ["automationFirstReply", "automationFallbackReply", "batchDeliveryMaterial", "manualReplyInput"].forEach((id) => {
+    const ordersMsg = $("#ordersMessage");
+    if (ordersMsg) {
+      ordersMsg.hidden = true;
+      ordersMsg.textContent = "";
+    }
+    ["automationFirstReply", "automationFallbackReply", "batchDeliveryMaterial", "manualReplyInput", "opsPromptInput"].forEach((id) => {
       const node = $("#" + id);
       if (node) node.value = "";
     });
     $("#authUsername").value = "";
     $("#authPassword").value = "";
     if ($("#bootstrapToken")) $("#bootstrapToken").value = "";
+    if ($("#updateAdminPassword")) $("#updateAdminPassword").value = "";
+    ["#updateActionMessage", "#passwordChangeMessage", "#versionLoadMessage", "#aiConnectionMessage", "#opsPromptMessage", "#opsPlanMessage"].forEach((selector) => text(selector, ""));
     $("#workspace").hidden = true;
     $("#authScreen").hidden = false;
+    void loadPublicVersionOnce();
     if (showMessage) showToast("已退出登录");
   }
 
@@ -2641,9 +2793,19 @@
       return;
     }
     if (!confirmDiscardAiChanges("店铺")) return;
+    if ($("#aiModel")?.value || $("#aiBaseUrl")?.value || $("#aiApiKey")?.value) {
+      if (!state.settingsAi) state.settingsAi = {};
+      state.settingsAi.draft = {
+        provider: $("#aiProvider")?.value || "",
+        base_url: $("#aiBaseUrl")?.value || "",
+        model: $("#aiModel")?.value || "",
+        api_key: $("#aiApiKey")?.value || "",
+      };
+    }
     resetManualReplyContext();
     state.activeAccountKey = key;
     state.accountEpoch += 1;
+    resetOpsState();
     const context = captureAccountContext();
     state.messageLoadGeneration += 1;
     state.messageSelectionInFlight = false;
@@ -2670,6 +2832,9 @@
     state.catalogStatus = null;
     state.batchDelivery = { enabled: true, previewToken: "", preview: null, generation: Number(state.batchDelivery?.generation || 0) + 1 };
     resetAccountInboxState({ restorePreferences: true });
+    resetOrdersPageState();
+    $("#ordersFilterForm")?.reset();
+    if ($("#ordersSearchField")) $("#ordersSearchField").value = "all";
     state.orders = [];
     state.templates = [];
     state.cards = null;
@@ -2678,7 +2843,8 @@
     state.templateEditorOpenGeneration += 1;
     state.templateEditor = { editingId: "", productIds: [] };
     state.cardsEditor = { editingId: "", mode: "import" };
-    const returnView = state.view === "shops" ? "shops" : "home";
+    const preserveViews = new Set(["shops", "orders", "settings", "ops", "goods", "templates", "cards", "auto-reply", "chat", "ai-config"]);
+    const returnView = preserveViews.has(state.view) ? state.view : "home";
     renderAccountSwitcher();
     renderOverview();
     renderChat();
@@ -2836,6 +3002,7 @@
           state.productsTruncatedAccountKey = "";
           state.catalogStatus = null;
           resetAccountInboxState({ restorePreferences: true });
+          resetOrdersPageState();
           state.orders = [];
           state.templates = [];
           state.cards = null;
@@ -2864,6 +3031,7 @@
       { view: "chat", label: "智能客服", icon: "message-square-text" },
       { view: "goods", label: "履约中心", icon: "box" },
       { view: "orders", label: "订单管理", icon: "package-check" },
+      { view: "ops", label: "智能运维", icon: "sparkles" },
     ];
     $("#sideNav").innerHTML = items.map((item) => (
       '<button type="button" class="side-nav-item" data-view="' + item.view + '" aria-label="' + item.label + '" title="' + item.label + '">' +
@@ -4389,7 +4557,7 @@
 
   function orderRowMarkup(order) {
     const status = String(order.status || "queued");
-    const labels = { delivered: "已完成", manual_review: "待人工", retry: "待重试", failed: "发送失败", queued: "处理中" };
+    const labels = { delivered: "已发送", manual_review: "待人工", retry: "待重试", failed: "发送失败", queued: "处理中" };
     const badges = { delivered: "badge-green", manual_review: "badge-amber", retry: "badge-blue", failed: "badge-red", queued: "badge-muted" };
     const icons = { delivered: "package-check", manual_review: "clock", retry: "refresh-cw", failed: "circle-alert", queued: "clock" };
     const itemSummary = (order.item_id || "未命名商品") + (order.paid_amount ? " · 已支付 ¥" + order.paid_amount : "");
@@ -4402,21 +4570,476 @@
       "</div>";
   }
 
-  function renderOrders() {
-    const list = $("#orderList");
-    if (!state.orders.length) {
-      list.innerHTML = "";
-      $("#ordersEmpty").hidden = false;
-    } else {
-      $("#ordersEmpty").hidden = true;
-      list.innerHTML = state.orders.map(orderRowMarkup).join("");
-    }
+  function renderHomeOrders() {
     const homePanel = $("#homeOrdersPanel");
     const homeList = $("#homeOrderList");
     if (homePanel && homeList) {
       const visible = state.orders.length > 0;
       homePanel.hidden = !visible;
       if (visible) homeList.innerHTML = state.orders.slice(0, 4).map(orderRowMarkup).join("");
+    }
+  }
+
+  const DEFAULT_STATUS_OPTIONS = [
+    { value: "all", label: "全部" },
+    { value: "processing", label: "处理中" },
+    { value: "sent", label: "已发送" },
+    { value: "manual", label: "待人工" },
+    { value: "retry", label: "待重试" },
+    { value: "ended", label: "已结束" },
+    { value: "exception", label: "其他异常" },
+  ];
+
+  function createInitialOrdersPageState() {
+    return {
+      generation: 0,
+      activeRequest: null,
+      loading: false,
+      error: null,
+      items: [],
+      page: 1,
+      pageSize: 15,
+      total: 0,
+      totalPages: 0,
+      status: "all",
+      searchField: "all",
+      q: "",
+      dateFrom: "",
+      dateTo: "",
+      statusCounts: {},
+      statusOptions: [],
+      expandedKeys: new Set(),
+    };
+  }
+
+  function resetOrdersPageState() {
+    state.ordersPage = createInitialOrdersPageState();
+  }
+
+  function parseDateRangeToIso(dateFromStr, dateToStr) {
+    let fromIso = "";
+    let toIso = "";
+    if (dateFromStr && /^\d{4}-\d{2}-\d{2}$/.test(dateFromStr)) {
+      const parts = dateFromStr.split("-").map(Number);
+      const dt = new Date(parts[0], parts[1] - 1, parts[2]);
+      if (!Number.isNaN(dt.getTime())) {
+        fromIso = dt.toISOString();
+      }
+    }
+    if (dateToStr && /^\d{4}-\d{2}-\d{2}$/.test(dateToStr)) {
+      const parts = dateToStr.split("-").map(Number);
+      // next day local midnight: left-closed, right-open
+      const dt = new Date(parts[0], parts[1] - 1, parts[2] + 1);
+      if (!Number.isNaN(dt.getTime())) {
+        toIso = dt.toISOString();
+      }
+    }
+    return { fromIso, toIso };
+  }
+
+  function formatPaidAmount(value) {
+    if (value === null || value === undefined || value === "") return "未获取";
+    let str = String(value).trim();
+    if (!str) return "未获取";
+    str = str.replace(/^[¥￥$]\s*/, "");
+    if (!/^[-+]?\d+(\.\d+)?$/.test(str)) {
+      return str ? "¥" + str : "未获取";
+    }
+    const isNeg = str.startsWith("-");
+    if (isNeg || str.startsWith("+")) str = str.slice(1);
+    const parts = str.split(".");
+    const intPart = parts[0] || "0";
+    let decPart = parts[1] || "";
+    if (decPart.length === 0) decPart = "00";
+    else if (decPart.length === 1) decPart += "0";
+    return (isNeg ? "-¥" : "¥") + intPart + "." + decPart;
+  }
+
+  function formatDetailDateTime(value) {
+    if (!value) return "--";
+    const num = Number(value);
+    const date = Number.isFinite(num) && num > 1000000000 ? new Date(num * 1000) : new Date(value);
+    if (Number.isNaN(date.getTime())) return String(value);
+    return new Intl.DateTimeFormat("zh-CN", {
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: false,
+    }).format(date);
+  }
+
+  function orderStatusBadgeClass(statusGroup, status) {
+    switch (statusGroup || status) {
+      case "sent":
+      case "delivered":
+        return "badge-green";
+      case "processing":
+      case "queued":
+        return "badge-blue";
+      case "manual":
+      case "manual_review":
+        return "badge-amber";
+      case "retry":
+        return "badge-purple";
+      case "ended":
+        return "badge-muted";
+      case "exception":
+      case "failed":
+        return "badge-red";
+      default:
+        return "badge-muted";
+    }
+  }
+
+  function orderProductThumb(order) {
+    const fakeProduct = {
+      image_url: order.item_image_url,
+      title: order.item_title || order.item_id || "闲",
+    };
+    const title = String(fakeProduct.title).trim();
+    const image = productImageUrl(fakeProduct);
+    if (image) {
+      return '<span class="orders-product-thumb product-thumb"><img src="' + esc(image) + '" alt="" loading="lazy" referrerpolicy="no-referrer"></span>';
+    }
+    if (title) {
+      return '<span class="orders-product-thumb product-thumb"><span class="product-monogram" aria-hidden="true">' + esc(title.slice(0, 1)) + '</span></span>';
+    }
+    return '<span class="orders-product-thumb product-thumb"><svg class="icon"><use href="' + ICONS + 'box"></use></svg></span>';
+  }
+
+  async function copyOrderText(textToCopy) {
+    const value = String(textToCopy || "").trim();
+    if (!value) return;
+    let copied = false;
+    if (navigator?.clipboard?.writeText) {
+      try {
+        await navigator.clipboard.writeText(value);
+        copied = true;
+      } catch {
+        copied = false;
+      }
+    }
+    if (!copied) {
+      try {
+        const input = document.createElement("input");
+        input.value = value;
+        input.style.position = "fixed";
+        input.style.left = "-9999px";
+        input.style.top = "-9999px";
+        input.style.opacity = "0";
+        document.body.appendChild(input);
+        input.focus();
+        input.select();
+        copied = document.execCommand("copy");
+        document.body.removeChild(input);
+      } catch {
+        copied = false;
+      }
+    }
+    if (copied) {
+      showToast("已复制编号: " + value);
+    } else {
+      window.prompt("请手动复制编号：", value);
+    }
+  }
+
+  async function handleOrderChat(chatId) {
+    const targetChatId = String(chatId || "").trim();
+    if (!targetChatId) {
+      showToast("该订单暂无关联的买家会话", "warning");
+      return;
+    }
+    const context = captureAccountContext();
+    showView("chat");
+    if (!accountContextMatches(context)) return;
+    try {
+      await selectConversation(targetChatId);
+      if (!accountContextMatches(context)) return;
+      if (!state.selectedChatId || state.selectedChatId !== targetChatId) {
+        showToast("未找到该订单关联的买家会话记录", "warning");
+      }
+    } catch (error) {
+      if (accountContextMatches(context)) {
+        showToast(error.message || "买家会话记录读取失败", "error");
+      }
+    }
+  }
+
+  function orderDetailCardMarkup(order) {
+    const fields = [
+      { label: "平台订单号", value: order.platform_order_id || "--" },
+      { label: "内部记录号", value: order.order_key || "--" },
+      { label: "商品ID", value: order.item_id || "--" },
+      { label: "商品标题", value: order.item_title || "--" },
+      { label: "买家ID", value: order.buyer_id || "--" },
+      { label: "会话ID", value: order.chat_id || "--" },
+      { label: "履约方式", value: order.delivery_type_label || order.delivery_type || "--" },
+      { label: "平台状态", value: order.platform_status_label || (order.platform_status ? "状态码 " + order.platform_status : "--") },
+      { label: "履约状态", value: order.status_label || order.status || "--" },
+      { label: "异常原因", value: order.reason_label || (order.reason_code ? "原因码 " + order.reason_code : "--") },
+      { label: "人工复核", value: order.review_resolution_label || (order.review_status ? (order.review_status === "open" ? "待复核" : order.review_status) : "--") },
+      { label: "实付金额", value: formatPaidAmount(order.paid_amount) },
+      { label: "购买数量", value: order.quantity != null ? String(order.quantity) : "--" },
+      { label: "记录创建时间", value: formatDetailDateTime(order.created_at) },
+      { label: "最近更新时间", value: formatDetailDateTime(order.updated_at) },
+      { label: "消息发送时间", value: formatDetailDateTime(order.delivered_at) },
+      { label: "平台发货标记时间", value: formatDetailDateTime(order.platform_shipped_at) },
+    ];
+    return '<div class="orders-detail-card">' +
+      fields.map((field) => '<div class="orders-detail-item"><strong>' + esc(field.label) + '</strong><span>' + esc(field.value) + '</span></div>').join("") +
+      '</div>';
+  }
+
+  function orderTableRowMarkup(order) {
+    const key = String(order.order_key || "");
+    const expanded = state.ordersPage.expandedKeys.has(key);
+    const platformId = order.platform_order_id ? String(order.platform_order_id).trim() : "";
+    const orderKey = key || "--";
+    const primaryId = platformId || orderKey;
+    const subId = platformId && orderKey !== platformId ? orderKey : "";
+    const copyId = platformId || orderKey;
+    const productTitle = order.item_title || order.item_id || "未命名商品";
+    const badgeClass = orderStatusBadgeClass(order.status_group, order.status);
+    const statusLabel = order.status_label || order.status || "--";
+    const reasonText = order.reason_label || "--";
+    const hasChat = Boolean(order.conversation_available && order.chat_id);
+
+    let html = '<tr class="order-table-row' + (expanded ? " is-expanded" : "") + '" data-order-key="' + esc(key) + '">' +
+      '<td class="col-expand">' +
+        '<button type="button" class="orders-toggle-btn' + (expanded ? " is-expanded" : "") + '" data-order-toggle="' + esc(key) + '" aria-expanded="' + String(expanded) + '" aria-label="' + (expanded ? "收起详情" : "展开详情") + '">' +
+          '<svg class="icon"><use href="' + ICONS + 'chevron-down"></use></svg>' +
+        '</button>' +
+      '</td>' +
+      '<td class="col-main">' +
+        '<div class="orders-id-cell">' +
+          '<strong class="orders-id-text" title="' + esc(primaryId) + '">' + esc(primaryId) + '</strong>' +
+          (subId ? '<small class="orders-id-sub" title="内部记录号: ' + esc(subId) + '">内部: ' + esc(subId) + '</small>' : "") +
+        '</div>' +
+      '</td>' +
+      '<td class="col-product">' +
+        '<div class="orders-product-cell">' +
+          orderProductThumb(order) +
+          '<div class="orders-product-info">' +
+            '<span class="orders-product-title" title="' + esc(productTitle) + '">' + esc(productTitle) + '</span>' +
+            (order.item_id ? '<small class="orders-product-id">ID: ' + esc(order.item_id) + '</small>' : "") +
+          '</div>' +
+        '</div>' +
+      '</td>' +
+      '<td class="col-buyer">' +
+        '<span class="orders-buyer-text" title="' + esc(order.buyer_id || "--") + '">' + esc(order.buyer_id || "--") + '</span>' +
+      '</td>' +
+      '<td class="col-amount">' +
+        '<span>' + esc(formatPaidAmount(order.paid_amount)) + '</span>' +
+      '</td>' +
+      '<td class="col-quantity">' +
+        '<span>' + esc(order.quantity != null ? String(order.quantity) : "--") + '</span>' +
+      '</td>' +
+      '<td class="col-status">' +
+        '<span class="badge ' + badgeClass + '">' + esc(statusLabel) + '</span>' +
+      '</td>' +
+      '<td class="col-time">' +
+        '<time title="' + esc(order.created_at || "") + '">' + esc(formatDate(order.created_at)) + '</time>' +
+      '</td>' +
+      '<td class="col-reason">' +
+        '<span class="orders-reason-text" title="' + esc(reasonText) + '">' + esc(reasonText) + '</span>' +
+      '</td>' +
+      '<td class="col-actions">' +
+        '<div class="orders-table-actions">' +
+          '<button type="button" class="button button-secondary button-compact orders-action-btn" data-order-copy="' + esc(copyId) + '" title="复制编号: ' + esc(copyId) + '" aria-label="复制编号">' +
+            '<svg class="icon"><use href="' + ICONS + 'copy"></use></svg><span>复制</span>' +
+          '</button>' +
+          '<button type="button" class="button button-secondary button-compact orders-action-btn" data-order-chat="' + esc(order.chat_id || "") + '" ' + (hasChat ? "" : "disabled ") + 'title="' + (hasChat ? "查看会话" : "暂无可用会话") + '" aria-label="查看会话">' +
+            '<svg class="icon"><use href="' + ICONS + 'message-square-text"></use></svg><span>会话</span>' +
+          '</button>' +
+          '<button type="button" class="button button-secondary button-compact orders-action-btn" data-order-toggle="' + esc(key) + '" aria-expanded="' + String(expanded) + '">' +
+            '<span>' + (expanded ? "收起" : "详情") + '</span>' +
+          '</button>' +
+        '</div>' +
+      '</td>' +
+    '</tr>';
+
+    if (expanded) {
+      html += '<tr class="order-detail-row" data-detail-key="' + esc(key) + '"><td colspan="10">' + orderDetailCardMarkup(order) + '</td></tr>';
+    }
+    return html;
+  }
+
+  function syncOrdersShopSelect() {
+    const shopSelect = $("#ordersShopSelect");
+    if (!shopSelect) return;
+    const enabledAccounts = (Array.isArray(state.accounts) ? state.accounts : []).filter((item) => item && item.enabled !== false);
+    const currentKey = state.activeAccountKey || "";
+    if (!enabledAccounts.length) {
+      shopSelect.innerHTML = '<option value="' + esc(currentKey || "default") + '">' + esc(currentKey ? "当前店铺 (" + currentKey + ")" : "默认店铺") + '</option>';
+      shopSelect.value = currentKey || "default";
+      return;
+    }
+    shopSelect.innerHTML = enabledAccounts.map((account) => {
+      const selected = account.key === currentKey ? " selected" : "";
+      return '<option value="' + esc(account.key) + '"' + selected + '>' + esc(accountLabel(account)) + '</option>';
+    }).join("");
+    shopSelect.value = currentKey;
+  }
+
+  function renderOrderPage() {
+    syncOrdersShopSelect();
+    const statusContainer = $("#ordersStatusTabs");
+    if (statusContainer) {
+      const options = state.ordersPage.statusOptions.length ? state.ordersPage.statusOptions : DEFAULT_STATUS_OPTIONS;
+      const counts = state.ordersPage.statusCounts || {};
+      statusContainer.innerHTML = options.map((option) => {
+        const active = state.ordersPage.status === option.value;
+        const count = counts[option.value];
+        const countMarkup = count != null ? '<span class="orders-status-count">' + Number(count) + '</span>' : "";
+        return '<button type="button" class="orders-status-tab' + (active ? " is-active" : "") + '" data-order-status="' + esc(option.value) + '" role="tab" aria-selected="' + String(active) + '">' +
+          '<span class="orders-status-label">' + esc(option.label) + '</span>' + countMarkup +
+        '</button>';
+      }).join("");
+    }
+
+    const messageNode = $("#ordersMessage");
+    if (messageNode) {
+      if (state.ordersPage.error) {
+        const err = state.ordersPage.error;
+        const msg = err?.detail?.message || err?.message || "订单记录暂时无法读取，请稍后重试";
+        messageNode.hidden = false;
+        messageNode.className = "orders-message is-error";
+        messageNode.textContent = msg;
+      } else {
+        messageNode.hidden = true;
+        messageNode.className = "orders-message";
+        messageNode.textContent = "";
+      }
+    }
+
+    const list = $("#orderList");
+    const emptyPanel = $("#ordersEmpty");
+    const pagination = $("#ordersPagination");
+    if (!list) return;
+
+    if (state.ordersPage.loading) {
+      if (emptyPanel) emptyPanel.hidden = true;
+      if (pagination) pagination.hidden = true;
+      list.innerHTML = '<tr><td colspan="10" class="orders-table-status"><div class="orders-loading"><svg class="icon is-spinning"><use href="' + ICONS + 'refresh-cw"></use></svg><span>正在读取订单记录...</span></div></td></tr>';
+      return;
+    }
+
+    if (state.ordersPage.error) {
+      if (emptyPanel) emptyPanel.hidden = true;
+      if (pagination) pagination.hidden = true;
+      const err = state.ordersPage.error;
+      const msg = err?.detail?.message || err?.message || "订单记录暂时无法读取，请稍后重试";
+      list.innerHTML = '<tr><td colspan="10" class="orders-table-status is-error"><div class="orders-error-box"><svg class="icon"><use href="' + ICONS + 'circle-alert"></use></svg><span>' + esc(msg) + '</span><button type="button" class="button button-secondary button-compact" id="ordersRetryBtn">重试</button></div></td></tr>';
+      return;
+    }
+
+    if (!state.ordersPage.items.length) {
+      const hasFilter = Boolean(
+        state.ordersPage.q ||
+        state.ordersPage.dateFrom ||
+        state.ordersPage.dateTo ||
+        (state.ordersPage.status && state.ordersPage.status !== "all") ||
+        (state.ordersPage.searchField && state.ordersPage.searchField !== "all")
+      );
+      if (hasFilter) {
+        if (emptyPanel) emptyPanel.hidden = true;
+        list.innerHTML = '<tr><td colspan="10" class="orders-table-status"><div class="orders-empty-filter"><svg class="icon"><use href="' + ICONS + 'search"></use></svg><p>未找到匹配条件的订单记录</p><button type="button" class="button button-secondary button-compact" id="ordersClearFilterBtn">清空筛选条件</button></div></td></tr>';
+        if (pagination) pagination.hidden = false;
+      } else {
+        list.innerHTML = "";
+        if (emptyPanel) {
+          emptyPanel.hidden = false;
+          text("#ordersEmptyTitle", "还没有订单");
+          text("#ordersEmptyDesc", "支付订单出现后会自动显示在这里。");
+        }
+        if (pagination) pagination.hidden = true;
+      }
+    } else {
+      if (emptyPanel) emptyPanel.hidden = true;
+      list.innerHTML = state.ordersPage.items.map(orderTableRowMarkup).join("");
+      if (pagination) pagination.hidden = false;
+    }
+
+    if (pagination && !pagination.hidden) {
+      const total = state.ordersPage.total;
+      const totalPages = Math.max(0, state.ordersPage.totalPages);
+      const page = state.ordersPage.page;
+      text("#ordersTotal", "共 " + total + " 条记录，第 " + page + " / " + Math.max(1, totalPages) + " 页");
+      text("#ordersPageCurrent", page + " / " + Math.max(1, totalPages));
+      const prevBtn = $("#ordersPrev");
+      if (prevBtn) prevBtn.disabled = page <= 1;
+      const nextBtn = $("#ordersNext");
+      if (nextBtn) nextBtn.disabled = page >= totalPages || totalPages === 0;
+      const pageInput = $("#ordersPageInput");
+      if (pageInput) {
+        pageInput.value = page;
+        pageInput.max = Math.max(1, totalPages);
+      }
+      const pageSizeSelect = $("#ordersPageSize");
+      if (pageSizeSelect) pageSizeSelect.value = String(state.ordersPage.pageSize);
+    }
+  }
+
+  function renderOrders() {
+    renderHomeOrders();
+    renderOrderPage();
+  }
+
+  async function loadOrderPage() {
+    if (!state.me || !state.activeAccountKey) return;
+    const context = captureAccountContext();
+    const generation = ++state.ordersPage.generation;
+    const requestToken = {};
+    state.ordersPage.activeRequest = requestToken;
+    state.ordersPage.loading = true;
+    state.ordersPage.error = null;
+    const refreshBtn = $("#refreshOrders");
+    if (refreshBtn) refreshBtn.disabled = true;
+    renderOrderPage();
+
+    const params = new URLSearchParams();
+    params.set("page", String(Math.max(1, state.ordersPage.page || 1)));
+    params.set("page_size", String([15, 30, 50].includes(Number(state.ordersPage.pageSize)) ? Number(state.ordersPage.pageSize) : 15));
+    params.set("status", state.ordersPage.status || "all");
+    params.set("search_field", state.ordersPage.searchField || "all");
+    if (state.ordersPage.q) params.set("q", state.ordersPage.q.slice(0, 128));
+
+    const { fromIso, toIso } = parseDateRangeToIso(state.ordersPage.dateFrom, state.ordersPage.dateTo);
+    if (fromIso) params.set("created_from", fromIso);
+    if (toIso) params.set("created_to", toIso);
+
+    try {
+      const data = await accountScopedApi(context, "/api/bot/orders?" + params.toString());
+      if (!accountContextMatches(context) || generation !== state.ordersPage.generation || state.ordersPage.activeRequest !== requestToken) {
+        return;
+      }
+      state.ordersPage.loading = false;
+      state.ordersPage.error = null;
+      state.ordersPage.items = Array.isArray(data.orders) ? data.orders : [];
+      state.ordersPage.page = Math.max(1, Number(data.page || 1));
+      state.ordersPage.pageSize = Number(data.page_size || state.ordersPage.pageSize || 15);
+      state.ordersPage.total = Math.max(0, Number(data.total || 0));
+      state.ordersPage.totalPages = Math.max(0, Number(data.total_pages || 0));
+      state.ordersPage.statusCounts = data.status_counts && typeof data.status_counts === "object" ? data.status_counts : {};
+      if (Array.isArray(data.status_options) && data.status_options.length) {
+        state.ordersPage.statusOptions = data.status_options;
+      }
+      renderOrderPage();
+    } catch (error) {
+      if (!accountContextMatches(context) || generation !== state.ordersPage.generation || state.ordersPage.activeRequest !== requestToken) {
+        return;
+      }
+      state.ordersPage.loading = false;
+      state.ordersPage.error = error;
+      renderOrderPage();
+      throw error;
+    } finally {
+      if (state.ordersPage.activeRequest === requestToken) {
+        if (refreshBtn) refreshBtn.disabled = false;
+      }
     }
   }
 
@@ -4739,11 +5362,25 @@
   }
 
   async function loadOrders() {
+    if (!state.me) return;
     const context = captureAccountContext();
-    const data = await api("/api/bot/orders?limit=200");
-    if (!accountContextMatches(context)) return;
-    state.orders = data.orders || [];
-    renderOrders();
+    if (state.view === "orders") {
+      await loadAccounts();
+      if (!accountContextMatches(context)) return;
+      syncOrdersShopSelect();
+    }
+    try {
+      const data = await accountScopedApi(context, "/api/bot/orders?limit=50");
+      if (accountContextMatches(context)) {
+        state.orders = Array.isArray(data?.orders) ? data.orders : [];
+        renderHomeOrders();
+      }
+    } catch {
+      // Home order preview error does not block orders workbench
+    }
+    if (accountContextMatches(context) && state.view === "orders") {
+      await loadOrderPage();
+    }
   }
 
   async function loadOverviewSignals(epoch = state.accountEpoch) {
@@ -4767,75 +5404,166 @@
     return state.me?.is_admin === true || String(state.me?.role || "") === "admin";
   }
 
-  function setDocsTab(tab) {
+  function newDocsState() {
+    return {
+      tab: "ai", version: null, update: null, settings: null, users: [], audit: [],
+      availableVersion: "", stagedVersion: "", loading: {}, loaded: {}, errors: {}, requests: {},
+      operation: "", pollTimer: 0, pollAttempts: 0,
+    };
+  }
+
+  function stopDocsPolling() {
+    window.clearTimeout(state.docs.pollTimer);
+    state.docs.pollTimer = 0;
+  }
+
+  function setSettingsTab(tab, { load = true } = {}) {
     const admin = isPlatformAdmin();
-    const allowed = new Set(["guide", "version", ...(admin ? ["accounts", "audit"] : [])]);
-    state.docs.tab = allowed.has(tab) ? tab : "guide";
-    $$('[data-docs-tab]').forEach((button) => {
-      const selected = button.dataset.docsTab === state.docs.tab;
+    const allowed = new Set(["ai", "security", "version", ...(admin ? ["accounts", "audit"] : [])]);
+    const selectedTab = allowed.has(tab) ? tab : "ai";
+    if (state.docs.tab !== selectedTab) {
+      stopDocsPolling();
+      state.docs.pollAttempts = 0;
+      if (state.docs.tab === "version" && $("#updateAdminPassword")) $("#updateAdminPassword").value = "";
+      if (state.docs.tab === "security") $("#passwordChangeForm")?.reset();
+    }
+    state.docs.tab = selectedTab;
+    $$('[data-settings-tab], [data-docs-tab]').forEach((button) => {
+      const target = button.dataset.settingsTab || button.dataset.docsTab;
+      const selected = target === selectedTab;
       button.classList.toggle("is-active", selected);
       button.setAttribute("aria-selected", String(selected));
     });
-    $$('[data-docs-panel]').forEach((panel) => {
-      const adminOnly = panel.hasAttribute("data-admin-only");
-      panel.hidden = panel.dataset.docsPanel !== state.docs.tab || (adminOnly && !admin);
+    $$('[data-settings-panel], [data-docs-panel]').forEach((panel) => {
+      const target = panel.dataset.settingsPanel || panel.dataset.docsPanel;
+      panel.hidden = target !== selectedTab || (panel.hasAttribute("data-admin-only") && !admin);
     });
-    if (state.docs.tab !== "guide") void loadDocsData();
+    text("#securityUsernameValue", state.me?.username || "--");
+    text("#securityRoleValue", admin ? "管理员" : "店主");
+    if (selectedTab === "ai") {
+      renderSettingsAiPanel();
+      if (load) void loadUnifiedAiConnection();
+    } else if (load) {
+      void loadSettingsData();
+    }
+  }
+
+  const setDocsTab = setSettingsTab;
+
+  const UPDATE_ACTIVE_STATES = new Set(["apply_requested", "rollback_requested", "preparing", "stopping", "migrating", "switching", "verifying", "rolling_back"]);
+  const UPDATE_INSTALL_LABELS = {
+    available: "旧检查记录，请重新检查发布信息", staged: "已下载并校验，尚未应用",
+    apply_requested: "已提交应用请求，等待更新服务", rollback_requested: "已提交回滚请求，等待更新服务",
+    preparing: "正在准备安装", stopping: "正在停止服务", migrating: "正在迁移数据",
+    switching: "正在切换代码版本", verifying: "正在验证服务", rolling_back: "正在回滚",
+    applied: "更新已完成", succeeded: "更新已完成", rolled_back: "已回滚", failed: "执行失败，请联系维护者查看记录",
+  };
+  const UPDATE_REASON_LABELS = {
+    update_installation_unsupported: "当前部署不支持网页安装。",
+    update_installation_unavailable: "签名发布目录或权限未就绪。",
+    update_public_key_missing: "尚未配置更新签名公钥。",
+    update_public_key_invalid: "更新签名公钥不可用。",
+    update_service_unavailable: "独立更新服务未就绪。",
+    update_source_auth_failed: "发布查询被拒绝，请检查权限或请求限额。",
+    update_source_rate_limited: "发布查询次数已达上限，请稍后重试。",
+    update_source_failed: "无法连接发布来源，请检查网络后重试。",
+    update_source_invalid: "发布来源返回了无法识别的数据。",
+    update_release_not_found: "无法访问发布仓库，请检查权限。",
+    update_redirect_rejected: "发布来源返回了不受信任的重定向。",
+    release_assets_missing: "发布缺少签名安装制品。",
+    release_assets_invalid: "发布安装制品不完整。",
+  };
+
+  function scheduleDocsPolling() {
+    stopDocsPolling();
+    const docs = state.docs;
+    const caps = docs.update?.capabilities || docs.version?.capabilities || {};
+    if (!state.me || (state.view !== "docs" && state.view !== "settings") || docs.tab !== "version" || !isPlatformAdmin()
+      || !(caps.apply || caps.rollback) || !UPDATE_ACTIVE_STATES.has(docs.update?.latest_update?.status)) return;
+    if (docs.pollAttempts >= 30) {
+      formMessage("#versionLoadMessage", "自动刷新已暂停，可点击刷新状态继续查看；请求已提交不代表安装成功。");
+      return;
+    }
+    docs.pollTimer = window.setTimeout(() => {
+      if (state.docs !== docs || (state.view !== "docs" && state.view !== "settings") || docs.tab !== "version") return;
+      docs.pollAttempts += 1;
+      void loadSettingsData({ force: true });
+    }, 4000);
   }
 
   function renderVersionPanel() {
-    const version = state.docs.version || {};
-    const update = state.docs.update || {};
+    const docs = state.docs;
+    const version = docs.version || {};
+    const update = docs.update || {};
+    const caps = update.capabilities || version.capabilities || {};
+    const check = update.update_check || version.update_check || {};
     const latest = update.latest_update || version.latest_update || null;
+    const active = UPDATE_ACTIVE_STATES.has(latest?.status);
+    const busy = !!docs.operation || !!docs.loading.version || !!docs.errors.version;
     text("#currentVersionValue", version.version ? "v" + version.version : "--");
-    const buildParts = [];
-    if (version.commit) buildParts.push(String(version.commit));
-    if (version.build_time) buildParts.push(String(version.build_time));
-    text("#currentBuildValue", buildParts.join(" · ") || "开发构建");
+    const buildParts = [version.commit && version.commit !== "development" ? "提交 " + String(version.commit).slice(0, 12) : "本地构建 · 提交号未提供"];
+    const buildDate = new Date(version.build_time || "");
+    if (Number.isFinite(buildDate.getTime())) buildParts.push(buildDate.toLocaleString("zh-CN", { hour12: false }));
+    else buildParts.push("构建时间未提供");
+    buildParts.push(version.build_dirty === true ? "包含未提交改动" : version.build_dirty === false ? "构建时工作区干净" : "本地修改状态未知");
+    text("#currentBuildValue", docs.version ? buildParts.join(" · ") : "未获取");
+    text("#currentDeploymentValue", { docker: "Docker 容器", systemd: "systemd 服务", source: "源码部署" }[version.deployment] || "未获取");
     text("#currentAssetVersionValue", version.asset_version || "--");
-    text("#currentUpdateChannelValue", version.update_channel === "beta" ? "测试版" : version.update_channel === "stable" ? "稳定版" : "--");
-    text("#currentUpdateStatusValue", latest?.status ? "更新状态：" + latest.status : "尚未检查");
-    const notes = latest?.release_notes || version.release_notes || "暂无本地更新说明";
-    text("#versionReleaseNotes", notes);
-
-    const availableVersion = state.docs.availableVersion
-      || (latest?.status === "available" ? String(latest.version || "") : "");
-    const stagedVersion = state.docs.stagedVersion
-      || (["staged", "apply_requested", "preparing", "stopping", "migrating", "switching", "verifying"].includes(String(latest?.status || ""))
-        ? String(latest.version || "") : "");
-    state.docs.availableVersion = availableVersion;
-    state.docs.stagedVersion = stagedVersion;
-    const download = $("#downloadUpdateButton");
-    const apply = $("#applyUpdateButton");
-    if (download) {
-      download.disabled = !availableVersion;
-      text(download, availableVersion ? "下载并校验 v" + availableVersion : "下载并校验");
+    text("#currentUpdateChannelValue", { beta: "测试版", stable: "稳定版" }[version.update_channel] || "--");
+    const checkLabels = {
+      unchecked: "尚未检查", no_release: "此通道尚无发布版本", current: "未发现更高版本",
+      available: "发现新版本 v" + (check.version || ""),
+      incomplete: "发现 v" + (check.version || "") + "，但安装制品不完整",
+      error: UPDATE_REASON_LABELS[check.error_code] || "更新查询失败，请稍后重试",
+    };
+    text("#currentUpdateStatusValue", docs.operation === "check" ? "正在检查发布信息…" : checkLabels[check.status] || "尚未检查");
+    text("#lastUpdateCheckValue", check.checked_at ? formatDate(check.checked_at) : "尚未检查");
+    text("#updateInstallStatusValue", latest ? (latest.version ? "v" + latest.version + " · " : "")
+      + (UPDATE_INSTALL_LABELS[latest.status] || "未知状态，请刷新后联系维护者") : "尚无安装操作");
+    text("#localReleaseNotes", version.release_notes || "当前构建未提供对应版本说明。");
+    text("#versionReleaseNotes", ["available", "incomplete"].includes(check.status)
+      ? check.release_notes || "该候选版本未提供说明。" : "检查发现新版本后将在此显示说明。");
+    text("#manualUpdateGuideText", caps.instruction
+      ? (UPDATE_REASON_LABELS[caps.reason] || "") + caps.instruction : "正在读取部署信息，暂不提供安装操作。");
+    const checkMatches = check.channel === version.update_channel && check.current_version === version.version;
+    const available = !busy && !active && checkMatches && check.status === "available" ? String(check.version || "") : "";
+    const staged = available && latest?.status === "staged" && latest.channel === version.update_channel
+      && latest.version === available ? available : "";
+    docs.availableVersion = caps.download === true ? available : "";
+    docs.stagedVersion = caps.apply === true ? staged : "";
+    const admin = isPlatformAdmin();
+    $("#adminUpdateControls").hidden = !admin || !(caps.download || caps.apply || caps.rollback);
+    if ($("#checkUpdateButton")) {
+      $("#checkUpdateButton").disabled = !admin || caps.check !== true || busy;
+      text("#checkUpdateButton", docs.operation === "check" ? "正在检查…" : "检查更新");
     }
-    if (apply) {
-      apply.disabled = !stagedVersion;
-      text(apply, stagedVersion ? "应用 v" + stagedVersion : "应用已校验版本");
+    if ($("#versionBadgeRefresh")) {
+      $("#versionBadgeRefresh").disabled = !admin || caps.check !== true || busy;
+      text("#versionBadgeRefresh", docs.operation === "check" ? "正在检查…" : "检查更新");
     }
+    $("#downloadUpdateButton").disabled = !admin || !docs.availableVersion || !!staged;
+    text("#downloadUpdateButton", docs.operation === "download" ? "正在下载校验…" : available ? "下载并校验 v" + available : "下载并校验");
+    $("#applyUpdateButton").disabled = !admin || !docs.stagedVersion;
+    text("#applyUpdateButton", docs.operation === "apply" ? "正在提交…" : staged ? "应用 v" + staged : "应用已校验版本");
     const rollbackSelect = $("#rollbackVersionSelect");
-    if (rollbackSelect) {
-      const selected = rollbackSelect.value;
-      rollbackSelect.replaceChildren();
-      const versions = Array.isArray(update.rollback_versions) ? update.rollback_versions : [];
-      if (!versions.length) {
-        const option = document.createElement("option");
-        option.value = "";
-        option.textContent = "没有可用版本";
-        rollbackSelect.append(option);
-      } else {
-        versions.forEach((item) => {
-          const option = document.createElement("option");
-          option.value = String(item);
-          option.textContent = "v" + String(item);
-          rollbackSelect.append(option);
-        });
-        if (versions.includes(selected)) rollbackSelect.value = selected;
-      }
-      $("#rollbackUpdateButton").disabled = !rollbackSelect.value;
+    const selected = rollbackSelect.value;
+    const versions = caps.rollback === true && !active && Array.isArray(update.rollback_versions) ? update.rollback_versions : [];
+    rollbackSelect.replaceChildren();
+    for (const item of versions.length ? versions : [""]) {
+      const option = document.createElement("option");
+      option.value = String(item);
+      option.textContent = item ? "v" + String(item) : "没有可用版本";
+      rollbackSelect.append(option);
     }
+    if (versions.includes(selected)) rollbackSelect.value = selected;
+    rollbackSelect.disabled = busy || !admin || !versions.length;
+    $("#rollbackUpdateButton").disabled = busy || !admin || !rollbackSelect.value || caps.rollback !== true;
+    $("#updateAdminPassword").disabled = busy || active || !admin || !(caps.apply || caps.rollback);
+    $("#refreshVersionButton").disabled = !!docs.loading.version || !!docs.operation;
+    formMessage("#versionLoadMessage", docs.errors.version || (docs.loading.version ? "正在读取版本信息…" : ""));
+    state.version = docs.version;
+    state.versionUpdate = docs.update;
+    renderVersionBadge();
   }
 
   function renderPlatformSettings() {
@@ -4900,6 +5628,14 @@
     "platform.update_downloaded": "更新已下载并校验",
     "platform.update_requested": "已请求应用更新",
     "platform.rollback_requested": "已请求回滚版本",
+    "operations.proposed": "运维方案已生成",
+    "operations.executing": "运维方案执行中",
+    "operations.succeeded": "运维方案执行成功",
+    "operations.partial_failed": "运维方案部分失败",
+    "operations.failed": "运维方案执行失败",
+    "operations.cancelled": "运维方案已取消",
+    "operations.expired": "运维方案已过期",
+    "operations.needs_review": "运维方案待人工审核",
   };
 
   function renderAuditEvents() {
@@ -4933,13 +5669,14 @@
     });
   }
 
-  function renderDocs() {
+  function renderSettings() {
     const admin = isPlatformAdmin();
     $$('[data-admin-only]').forEach((node) => {
-      if (!node.hasAttribute("data-docs-panel")) node.hidden = !admin;
+      if (!node.hasAttribute("data-settings-panel") && !node.hasAttribute("data-docs-panel")) node.hidden = !admin;
     });
-    if (!admin && ["accounts", "audit"].includes(state.docs.tab)) state.docs.tab = "guide";
-    setDocsTab(state.docs.tab || "guide");
+    if (!admin && ["accounts", "audit"].includes(state.docs.tab)) state.docs.tab = "ai";
+    setSettingsTab(state.docs.tab || "ai", { load: false });
+    renderSettingsAiPanel();
     renderVersionPanel();
     if (admin) {
       renderPlatformSettings();
@@ -4948,34 +5685,68 @@
     }
   }
 
-  async function loadDocsData({ force = false } = {}) {
-    if (!state.me || (state.docs.loading && !force)) return;
-    state.docs.loading = true;
+  const renderDocs = renderSettings;
+
+  async function loadSettingsData({ force = false } = {}) {
+    if (!state.me) return;
+    const docs = state.docs;
+    const tab = docs.tab;
+    if (["guide", "security"].includes(tab)) { renderSettings(); return; }
+    if (tab === "ai") { renderSettings(); void loadUnifiedAiConnection(); return; }
+    if (!force && (docs.loading[tab] || docs.loaded[tab])) { renderSettings(); scheduleDocsPolling(); return; }
+    const id = (docs.requests[tab] || 0) + 1;
+    docs.requests[tab] = id;
+    const username = state.me.username;
+    const admin = isPlatformAdmin();
+    const valid = () => state.docs === docs && state.me?.username === username && isPlatformAdmin() === admin && docs.requests[tab] === id;
+    docs.loading[tab] = true;
+    docs.errors[tab] = "";
+    renderSettings();
     try {
-      state.docs.version = await api("/api/version");
-      if (isPlatformAdmin()) {
-        const [update, settings, users, audit] = await Promise.all([
-          api("/api/admin/updates"),
-          api("/api/admin/settings"),
-          api("/api/admin/users?limit=100"),
-          api("/api/admin/audit?limit=100"),
+      if (tab === "version") {
+        const [version, update] = await Promise.all([
+          api("/api/version"), isPlatformAdmin() ? api("/api/admin/updates") : Promise.resolve(null),
         ]);
-        state.docs.update = update;
-        state.docs.settings = settings;
-        state.docs.users = users.users || [];
-        state.docs.audit = audit.events || [];
+        if (!valid()) return;
+        // Responses straddling a channel change cannot be combined.
+        if (update && update.current?.update_channel !== version.update_channel) throw new Error("更新通道已变化，请刷新状态");
+        docs.version = version;
+        docs.update = update;
+        state.version = version;
+        state.versionUpdate = update;
+        renderVersionBadge();
+      } else if (tab === "accounts" && isPlatformAdmin()) {
+        const [settings, users] = await Promise.all([api("/api/admin/settings"), api("/api/admin/users?limit=100")]);
+        if (!valid()) return;
+        docs.settings = settings;
+        docs.users = users.users || [];
+      } else if (tab === "audit" && isPlatformAdmin()) {
+        const audit = await api("/api/admin/audit?limit=100");
+        if (!valid()) return;
+        docs.audit = audit.events || [];
       }
-      renderDocs();
+      docs.loaded[tab] = true;
     } catch (error) {
-      showToast(error.message || "项目信息读取失败", "error");
+      if (!valid()) return;
+      docs.loaded[tab] = false;
+      docs.errors[tab] = error.message || "信息读取失败，请重试";
+      if (tab !== "version") showToast(docs.errors[tab], "error");
     } finally {
-      state.docs.loading = false;
+      if (valid()) {
+        docs.loading[tab] = false;
+        renderSettings();
+        scheduleDocsPolling();
+      }
     }
   }
+
+  const loadDocsData = loadSettingsData;
 
   async function changeCurrentPassword(event) {
     event.preventDefault();
     const form = event.currentTarget;
+    const docs = state.docs;
+    if (!state.me || form.querySelector('button[type="submit"]').disabled) return;
     const currentPassword = $("#currentPasswordInput").value;
     const newPassword = $("#newPasswordInput").value;
     if (newPassword.length < state.passwordMinLength || newPassword.length > 1024) {
@@ -4989,10 +5760,11 @@
         method: "POST",
         body: JSON.stringify({ current_password: currentPassword, new_password: newPassword }),
       });
+      if (state.docs !== docs || !state.me) return;
       form.reset();
       formMessage("#passwordChangeMessage", "密码已更新，其他会话已撤销", true);
     } catch (error) {
-      formMessage("#passwordChangeMessage", error.message || "密码更新失败");
+      if (state.docs === docs && state.me) formMessage("#passwordChangeMessage", error.message || "密码更新失败");
     } finally {
       setBusy(button, false);
     }
@@ -5003,13 +5775,24 @@
     const button = event.currentTarget.querySelector('button[type="submit"]');
     setBusy(button, true);
     try {
-      state.docs.settings = await api("/api/admin/settings", {
+      const docs = state.docs;
+      const settings = await api("/api/admin/settings", {
         method: "PUT",
         body: JSON.stringify({
           registration_open: $("#registrationOpenToggle").checked,
           update_channel: $("#updateChannelSelect").value,
         }),
       });
+      if (state.docs !== docs || !isPlatformAdmin()) return;
+      docs.settings = settings;
+      docs.requests.version = (docs.requests.version || 0) + 1;
+      docs.loading.version = false;
+      docs.loaded.version = false;
+      docs.version = null;
+      docs.update = null;
+      docs.availableVersion = "";
+      docs.stagedVersion = "";
+      stopDocsPolling();
       formMessage("#platformSettingsMessage", "平台设置已保存", true);
       await loadDocsData({ force: true });
     } catch (error) {
@@ -5019,70 +5802,88 @@
     }
   }
 
-  async function checkPlatformUpdate() {
-    const button = $("#checkUpdateButton");
-    setBusy(button, true);
-    formMessage("#updateActionMessage", "正在检查固定 Release 来源");
+  async function runUpdateAction(action, perform, successMessage) {
+    const docs = state.docs;
+    const caps = docs.update?.capabilities || docs.version?.capabilities || {};
+    if (docs.operation || docs.loading.version || docs.errors.version || !isPlatformAdmin() || (action !== "check" && caps[action] !== true)) return;
+    const username = state.me.username;
+    const channel = docs.version?.update_channel;
+    const valid = () => state.docs === docs && state.me?.username === username && isPlatformAdmin()
+      && (!docs.version || docs.version.update_channel === channel);
+    docs.operation = action;
+    docs.requests.version = (docs.requests.version || 0) + 1;
+    stopDocsPolling();
+    renderVersionPanel();
+    formMessage("#updateActionMessage", action === "check" ? "正在查询项目发布信息…" : "正在处理，请勿重复提交…");
     try {
-      const result = await api("/api/admin/updates/check", { method: "POST" });
-      state.docs.availableVersion = result.available ? String(result.version || "") : "";
-      formMessage(
-        "#updateActionMessage",
-        result.available ? "发现新版本 v" + result.version : "当前已是最新版本",
-        true,
-      );
-      await loadDocsData({ force: true });
+      const result = await perform(valid);
+      if (!valid()) return;
+      if (result?.channel && channel && result.channel !== channel) throw new Error("更新通道已变化，请重新刷新状态");
+      if (action === "check") {
+        if (docs.version) docs.version.update_check = result;
+        if (docs.update) docs.update.update_check = result;
+        state.versionUpdate = { update_check: result };
+        renderVersionBadge();
+      }
+      formMessage("#updateActionMessage", successMessage, true);
     } catch (error) {
-      formMessage("#updateActionMessage", error.message || "更新检查失败");
+      if (!valid()) return;
+      if (action === "check") {
+        const failed = { status: "error", available: false, channel, current_version: docs.version?.version, checked_at: Date.now() / 1000 };
+        if (docs.version) docs.version.update_check = failed;
+        if (docs.update) docs.update.update_check = failed;
+        state.versionUpdate = { update_check: failed };
+        renderVersionBadge();
+      }
+      formMessage("#updateActionMessage", error.message || "操作失败，请重试");
     } finally {
-      setBusy(button, false);
+      if (state.docs === docs) {
+        docs.operation = "";
+        docs.loaded.version = false;
+        if (action === "apply" || action === "rollback") $("#updateAdminPassword").value = "";
+        if (valid()) {
+          docs.pollAttempts = 0;
+          renderVersionPanel();
+          renderVersionBadge();
+          if (docs.tab === "version" && state.view === "settings") await loadDocsData({ force: true });
+        }
+      }
+    }
+  }
+
+  async function checkPlatformUpdate() {
+    const refreshBtn = $("#versionBadgeRefresh");
+    if (refreshBtn) setBusy(refreshBtn, true);
+    try {
+      await runUpdateAction("check", () => api("/api/admin/updates/check", { method: "POST" }), "检查完成，结果见上方发布状态。");
+    } finally {
+      if (refreshBtn) setBusy(refreshBtn, false);
+      renderVersionBadge();
     }
   }
 
   async function downloadPlatformUpdate() {
     const version = state.docs.availableVersion;
-    if (!version) return;
-    const button = $("#downloadUpdateButton");
-    setBusy(button, true);
-    formMessage("#updateActionMessage", "正在下载并校验签名、清单和文件哈希");
-    try {
-      const result = await api("/api/admin/updates/download", {
-        method: "POST",
-        body: JSON.stringify({ version }),
-      });
-      state.docs.stagedVersion = String(result.version || version);
-      formMessage("#updateActionMessage", "v" + state.docs.stagedVersion + " 已校验，可申请应用", true);
-      await loadDocsData({ force: true });
-    } catch (error) {
-      formMessage("#updateActionMessage", error.message || "更新下载失败");
-    } finally {
-      setBusy(button, false);
-    }
+    if (!version || $("#downloadUpdateButton").disabled) return;
+    await runUpdateAction("download", () => api("/api/admin/updates/download", {
+      method: "POST", body: JSON.stringify({ version }),
+    }), "v" + version + " 已下载并校验，尚未安装。");
   }
 
   async function confirmAdminUpdate(action, version) {
+    const button = $(action === "apply" ? "#applyUpdateButton" : "#rollbackUpdateButton");
+    if (button.disabled || !["apply", "rollback"].includes(action)) return;
     const password = $("#updateAdminPassword").value;
-    if (!password) {
-      formMessage("#updateActionMessage", "请先输入当前管理员密码");
-      return;
-    }
-    const actionName = action === "apply" ? "update.apply" : "update.rollback";
-    const confirmation = await api("/api/admin/confirm", {
-      method: "POST",
-      body: JSON.stringify({ password, action: actionName }),
-    });
-    const endpoint = action === "apply" ? "/api/admin/updates/apply" : "/api/admin/updates/rollback";
-    await api(endpoint, {
-      method: "POST",
-      body: JSON.stringify({ version, confirmation_token: confirmation.confirmation_token }),
-    });
-    $("#updateAdminPassword").value = "";
-    formMessage(
-      "#updateActionMessage",
-      action === "apply" ? "更新请求已提交，独立 updater 将安全切换版本" : "回滚请求已提交",
-      true,
-    );
-    await loadDocsData({ force: true });
+    if (!password) { formMessage("#updateActionMessage", "请先输入当前管理员密码"); return; }
+    await runUpdateAction(action, async (valid) => {
+      const confirmation = await api("/api/admin/confirm", {
+        method: "POST", body: JSON.stringify({ password, action: "update." + action }),
+      });
+      if (!valid()) return null;
+      return api("/api/admin/updates/" + action, {
+        method: "POST", body: JSON.stringify({ version, confirmation_token: confirmation.confirmation_token }),
+      });
+    }, "请求已提交，请查看安装进度；提交成功不代表升级或回滚已经完成。");
   }
 
   async function handleAdminUserAction(button) {
@@ -5116,6 +5917,766 @@
     }
   }
 
+  function openDocsHelpModal() {
+    openDialog("docsHelpModal");
+  }
+
+  async function loadPublicVersionOnce() {
+    if (state.versionLoadedPublic) return;
+    if (state.publicVersionRequest) return state.publicVersionRequest;
+    state.publicVersionRequest = (async () => {
+      try {
+        const version = await api("/api/version/public");
+        if (!version?.version) return;
+        state.publicVersion = version;
+        state.versionLoadedPublic = true;
+        if (!state.me) state.version = version;
+        renderVersionBadge();
+      } catch (_) {
+        // An optional metadata failure must not call an authenticated fallback.
+      } finally { state.publicVersionRequest = null; }
+    })();
+    return state.publicVersionRequest;
+  }
+
+  async function loadVersionInfo({ force = false } = {}) {
+    if (!state.me) { await loadPublicVersionOnce(); return; }
+    const docs = state.docs;
+    if (docs.badgeLoading || (!force && docs.badgeLoaded)) return;
+    const username = state.me.username;
+    const admin = isPlatformAdmin();
+    const valid = () => state.docs === docs && state.me?.username === username && isPlatformAdmin() === admin;
+    docs.badgeLoading = true;
+    try {
+      const [version, update] = await Promise.all([
+        api("/api/version"), admin ? api("/api/admin/updates") : Promise.resolve(null),
+      ]);
+      if (!valid()) return;
+      if (update && update.current?.update_channel !== version.update_channel) throw new ApiError("更新通道已变化，请刷新");
+      docs.version = state.version = version;
+      docs.update = state.versionUpdate = update;
+      docs.badgeLoaded = true;
+      renderVersionBadge();
+      renderVersionPanel();
+    } catch (error) {
+      if (valid()) formMessage("#versionLoadMessage", error.message || "版本信息读取失败");
+    } finally { if (valid()) docs.badgeLoading = false; }
+  }
+
+  function renderVersionBadge() {
+    const versionObj = state.version || state.docs?.version || {};
+    const updateObj = state.versionUpdate || state.docs?.update || {};
+    const check = updateObj.update_check || versionObj.update_check || {};
+    const curVer = versionObj.version ? "v" + versionObj.version : "v--";
+    text("#versionBadgeValue", curVer);
+    text("#versionBadgeCurrent", versionObj.version ? "v" + versionObj.version : "--");
+
+    const hasUpdate = Boolean(state.me && check.available === true && ["available", "incomplete"].includes(check.status));
+    const btn = $("#versionBadgeButton");
+    const dot = $("#versionBadgeDot");
+    if (btn) {
+      btn.classList.toggle("has-update", hasUpdate);
+      btn.classList.toggle("is-warning", hasUpdate);
+      btn.classList.toggle("update-available", hasUpdate);
+    }
+    if (dot) dot.hidden = !hasUpdate;
+
+    let statusText = "尚未检查";
+    if (check.status === "available") {
+      statusText = "可更新至更高版本 v" + (check.version || "");
+    } else if (check.status === "incomplete") {
+      statusText = "发现更高版本（安装包不完整）";
+    } else if (check.status === "current") {
+      statusText = "未发现更高版本，无需更新";
+    } else if (check.status === "no_release") {
+      statusText = "尚无发布";
+    } else if (check.status === "error") {
+      statusText = "更新检查失败";
+    }
+    text("#versionBadgeStatus", statusText);
+
+    const refreshBtn = $("#versionBadgeRefresh");
+    if (refreshBtn) {
+      const admin = isPlatformAdmin();
+      refreshBtn.hidden = !admin;
+    }
+    const relLink = $("#versionBadgeReleaseLink");
+    if (relLink) {
+      relLink.hidden = false;
+      relLink.href = "https://github.com/tswawa/xianyu-saas/releases";
+    }
+  }
+
+  function toggleVersionBadgePopover(force) {
+    const popover = $("#versionBadgePopover");
+    const button = $("#versionBadgeButton");
+    if (!popover) return;
+    const shouldOpen = typeof force === "boolean" ? force : popover.hidden;
+    popover.hidden = !shouldOpen;
+    button?.setAttribute("aria-expanded", String(shouldOpen));
+  }
+
+  function closeVersionBadgePopover() {
+    const popover = $("#versionBadgePopover");
+    const button = $("#versionBadgeButton");
+    if (popover) popover.hidden = true;
+    button?.setAttribute("aria-expanded", "false");
+  }
+
+  async function loadUnifiedAiConnection() {
+    if (!state.me) return;
+    const settings = state.settingsAi;
+    if (settings.loading) return settings.loading;
+    const username = state.me.username;
+    const revision = settings.connection?.revision;
+    const valid = () => state.settingsAi === settings && state.me?.username === username;
+    settings.loading = (async () => {
+      try {
+        const [res, legacyRes] = await Promise.all([
+          api("/api/settings/ai/connection"),
+          api("/api/settings/ai/connection/legacy-sources"),
+        ]);
+        if (!valid() || settings.operation || settings.connection?.revision !== revision) return;
+        if (res?.scope !== "user" || !Number.isInteger(res.revision)) throw new ApiError("连接信息格式无效");
+        if (revision !== undefined && res.revision !== revision) {
+          settings.verificationToken = "";
+          settings.testedFingerprint = "";
+        }
+        settings.connection = res;
+        settings.legacySources = Array.isArray(legacyRes?.sources) ? legacyRes.sources : [];
+        settings.error = "";
+        if (Array.isArray(res.providers)) populateAiProviders(res.providers);
+      } catch (error) {
+        if (valid()) {
+          settings.error = error.message || "连接信息读取失败，请重试";
+          formMessage("#aiConnectionMessage", settings.error);
+        }
+      } finally {
+        if (valid()) {
+          settings.loading = null;
+          renderSettingsAiPanel();
+          renderAiConfigSummary();
+          updateOpsConnectionBadge();
+        }
+      }
+    })();
+    return settings.loading;
+  }
+
+  const loadSettingsAiConnection = loadUnifiedAiConnection;
+
+  function populateAiProviders(providers) {
+    const select = $("#aiProvider");
+    if (!select || !Array.isArray(providers) || !providers.length) return;
+    const cur = select.value;
+    select.replaceChildren();
+    providers.forEach((p) => {
+      const opt = document.createElement("option");
+      opt.value = p.code;
+      opt.textContent = p.label || p.code;
+      select.append(opt);
+    });
+    if (cur && Array.from(select.options).some((o) => o.value === cur)) {
+      select.value = cur;
+    }
+  }
+
+  function renderSettingsAiPanel() {
+    const panel = $("#settingsAiPanel");
+    if (!panel) return;
+    const conn = state.settingsAi?.connection;
+    const badge = $("#settingsAiConnectionBadge");
+    const verified = conn?.initialized === true && conn?.connection_status === "verified";
+    if (badge) {
+      if (verified) {
+        badge.textContent = "已连接 (" + (conn.model || "") + ")";
+        badge.className = "badge badge-green";
+      } else if (conn?.initialized && (conn?.base_url || conn?.model)) {
+        badge.textContent = "已配置 (未验证)";
+        badge.className = "badge badge-amber";
+      } else {
+        badge.textContent = "未连接";
+        badge.className = "badge badge-muted";
+      }
+    }
+    const delBtn = $("#aiDeleteKey");
+    if (delBtn) {
+      delBtn.hidden = !conn?.initialized || (!conn?.api_key_configured && conn?.connection_status !== "verified");
+      delBtn.disabled = Boolean(state.settingsAi.operation);
+    }
+    $("#aiSaveConnection").disabled = Boolean(state.settingsAi.operation) || !state.settingsAi.verificationToken;
+    if (state.settingsAi?.draft) {
+      if ($("#aiProvider") && state.settingsAi.draft.provider) $("#aiProvider").value = state.settingsAi.draft.provider;
+      if ($("#aiBaseUrl") && typeof state.settingsAi.draft.base_url === "string") $("#aiBaseUrl").value = state.settingsAi.draft.base_url;
+      if ($("#aiModel") && typeof state.settingsAi.draft.model === "string") $("#aiModel").value = state.settingsAi.draft.model;
+      if ($("#aiApiKey") && typeof state.settingsAi.draft.api_key === "string") $("#aiApiKey").value = state.settingsAi.draft.api_key;
+    } else if (conn && !state.settingsAi?.testedFingerprint) {
+      if ($("#aiProvider") && conn.provider) $("#aiProvider").value = conn.provider;
+      if ($("#aiBaseUrl")) $("#aiBaseUrl").value = conn.base_url || "";
+      if ($("#aiModel")) $("#aiModel").value = conn.model || "";
+    }
+    populateSettingsAiLegacySelect();
+    renderAiProviderFields();
+  }
+
+  function populateSettingsAiLegacySelect() {
+    const select = $("#settingsAiLegacySelect") || $("#settingsLegacySource");
+    if (!select) return;
+    const cur = select.value;
+    select.replaceChildren();
+    const optDefault = document.createElement("option");
+    optDefault.value = "";
+    optDefault.textContent = "-- 选择已有店铺连接迁移 --";
+    select.append(optDefault);
+    const sources = Array.isArray(state.settingsAi?.legacySources) ? state.settingsAi.legacySources : [];
+    sources.forEach((src) => {
+      const opt = document.createElement("option");
+      opt.value = src.account_key;
+      opt.textContent = (src.name || src.account_key) + " (" + (src.model || src.provider || "") + ")";
+      select.append(opt);
+    });
+    if (cur) select.value = cur;
+  }
+
+  function handleLegacySourceImport() {
+    const select = $("#settingsAiLegacySelect") || $("#settingsLegacySource");
+    const accountKey = select?.value;
+    if (!accountKey) return;
+    const sources = Array.isArray(state.settingsAi?.legacySources) ? state.settingsAi.legacySources : [];
+    const source = sources.find((s) => s.account_key === accountKey);
+    if (!source) return;
+    state.settingsAi.selectedLegacySource = source;
+    if ($("#aiProvider") && source.provider) $("#aiProvider").value = source.provider;
+    if ($("#aiBaseUrl")) $("#aiBaseUrl").value = String(source.base_url || "");
+    if ($("#aiModel")) $("#aiModel").value = String(source.model || "");
+    if ($("#aiApiKey")) $("#aiApiKey").value = "";
+    state.settingsAi.verificationToken = "";
+    state.settingsAi.testedFingerprint = "";
+    state.settingsAi.draft = {
+      provider: $("#aiProvider")?.value || "",
+      base_url: $("#aiBaseUrl")?.value || "",
+      model: $("#aiModel")?.value || "",
+      api_key: "",
+    };
+    if ($("#aiSaveConnection")) $("#aiSaveConnection").disabled = true;
+    formMessage("#aiConnectionMessage", "已从旧连接【" + (source.name || source.account_key) + "】导入参数。请点击“测试连接”并在测试通过后保存升级为全局配置。", true);
+  }
+
+  const handleLegacySourceSelect = handleLegacySourceImport;
+
+  function newOpsState() {
+    return { selectedItemIds: [], selectedRuleIds: [], chatHistory: [], currentPlan: null,
+      connection: null, diagnostics: null, contextLoaded: false, loading: false, loadGeneration: 0,
+      inFlight: false, confirming: false, cancelling: false, refreshing: false,
+      pendingChat: null, confirmRequests: {}, contextError: "" };
+  }
+
+  function resetOpsState() {
+    state.ops = newOpsState();
+    closeDialog("opsDiffModal");
+    $("#opsPromptForm")?.reset();
+    $("#opsShopSelect")?.replaceChildren();
+    for (const id of ["opsPromptMessage", "opsPlanMessage", "opsDiffMessage", "opsDiffMeta", "opsDiffTable", "opsPlanDiffList"]) text("#" + id, "");
+    text("#opsPromptCount", "0 / 2000");
+    renderOpsProductList([]);
+    renderOpsRuleList([]);
+    updateOpsConnectionBadge({});
+    renderOpsChatMessages();
+    renderOpsPlan();
+  }
+
+  function opsContextMatches(ops, context) {
+    return state.ops === ops && Boolean(state.me) && accountContextMatches(context);
+  }
+
+  function opsPlanStatus(plan) {
+    return plan?.status === "proposed" && Number(plan.expires_at) * 1000 <= Date.now() ? "expired" : plan?.status;
+  }
+
+  const OPS_TOOLS = { "knowledge.save": "更新客服资料", "knowledge.disable": "停用客服资料", "rules.replace": "修改回复规则" };
+  const OPS_STATUSES = { proposed: "待核对确认", executing: "正在执行", succeeded: "执行完成（成功）",
+    partial_failed: "部分执行失败", failed: "执行失败", cancelled: "方案已取消", expired: "方案已过期", needs_review: "待人工复核" };
+
+  function updateOpsConnectionBadge(overrideConn) {
+    const badge = $("#opsConnectionBadge");
+    if (!badge) return;
+    const conn = overrideConn || state.settingsAi?.connection || state.ops.connection;
+    const verified = conn?.initialized === true && conn?.connection_status === "verified";
+    if (verified) {
+      badge.textContent = "已连接 (" + (conn.model || "") + ")";
+      badge.className = "badge badge-green";
+    } else {
+      badge.textContent = "请先在设置保存统一连接";
+      badge.className = "badge badge-muted";
+    }
+  }
+
+  function getSelectedOpsItemIds() {
+    const select = $("#opsProductSelect");
+    if (select) return Array.from(select.selectedOptions).map((el) => el.value);
+    const checked = document.querySelectorAll('#opsProductList input[type="checkbox"]:checked');
+    if (checked.length) return Array.from(checked).map((el) => el.value).slice(0, 20);
+    return state.ops.selectedItemIds || [];
+  }
+
+  function getSelectedOpsRuleIds() {
+    const select = $("#opsRuleSelect");
+    if (select) return Array.from(select.selectedOptions).map((el) => el.value);
+    const checked = document.querySelectorAll('#opsRuleList input[type="checkbox"]:checked');
+    if (checked.length) return Array.from(checked).map((el) => el.value);
+    return state.ops.selectedRuleIds || [];
+  }
+
+  function renderOpsProductList(products) {
+    const select = $("#opsProductSelect");
+    const list = $("#opsProductList");
+    const items = Array.isArray(products) ? products : [];
+    if (select) {
+      select.replaceChildren();
+      items.forEach((prod) => {
+        const id = String(prod.item_id || prod.id || "");
+        const title = String(prod.title || "商品 " + id);
+        const opt = document.createElement("option");
+        opt.value = id;
+        opt.textContent = title;
+        if (state.ops.selectedItemIds.includes(id)) opt.selected = true;
+        select.append(opt);
+      });
+    }
+    if (list) {
+      list.replaceChildren();
+      if (!items.length) {
+        const empty = document.createElement("span");
+        empty.className = "ops-empty-hint";
+        empty.textContent = "暂无关联商品";
+        list.append(empty);
+      } else {
+        items.forEach((prod) => {
+          const id = String(prod.item_id || prod.id || "");
+          const title = String(prod.title || "商品 " + id);
+          const label = document.createElement("label");
+          label.className = "ops-checkbox-label";
+          const input = document.createElement("input");
+          input.type = "checkbox";
+          input.value = id;
+          if (state.ops.selectedItemIds.includes(id)) input.checked = true;
+          input.addEventListener("change", () => {
+            const selectEl = $("#opsProductSelect");
+            if (selectEl) {
+              Array.from(selectEl.options).forEach((opt) => {
+                if (opt.value === id) opt.selected = input.checked;
+              });
+            }
+            state.ops.selectedItemIds = getSelectedOpsItemIds();
+          });
+          const span = document.createElement("span");
+          span.textContent = title;
+          label.append(input, span);
+          list.append(label);
+        });
+      }
+    }
+  }
+
+  function renderOpsRuleList(rules) {
+    const select = $("#opsRuleSelect");
+    const list = $("#opsRuleList");
+    const items = Array.isArray(rules) ? rules : [];
+    if (select) {
+      select.replaceChildren();
+      items.forEach((rule, idx) => {
+        const id = String(rule.id || "rule-" + (idx + 1));
+        const name = rule.name || (Array.isArray(rule.keywords) ? rule.keywords.slice(0, 3).join(",") : "规则 #" + (idx + 1));
+        const opt = document.createElement("option");
+        opt.value = id;
+        opt.textContent = name;
+        if (state.ops.selectedRuleIds.includes(id)) opt.selected = true;
+        select.append(opt);
+      });
+    }
+    if (list) {
+      list.replaceChildren();
+      if (!items.length) {
+        const empty = document.createElement("span");
+        empty.className = "ops-empty-hint";
+        empty.textContent = "暂无关联规则";
+        list.append(empty);
+      } else {
+        items.forEach((rule, idx) => {
+          const id = String(rule.id || "rule-" + (idx + 1));
+          const name = rule.name || (Array.isArray(rule.keywords) ? rule.keywords.slice(0, 3).join(",") : "规则 #" + (idx + 1));
+          const label = document.createElement("label");
+          label.className = "ops-checkbox-label";
+          const input = document.createElement("input");
+          input.type = "checkbox";
+          input.value = id;
+          if (state.ops.selectedRuleIds.includes(id)) input.checked = true;
+          input.addEventListener("change", () => {
+            const selectEl = $("#opsRuleSelect");
+            if (selectEl) {
+              Array.from(selectEl.options).forEach((opt) => {
+                if (opt.value === id) opt.selected = input.checked;
+              });
+            }
+            state.ops.selectedRuleIds = getSelectedOpsRuleIds();
+          });
+          const span = document.createElement("span");
+          span.textContent = name;
+          label.append(input, span);
+          list.append(label);
+        });
+      }
+    }
+  }
+
+  async function loadOpsContext() {
+    if (!state.me) return;
+    const ops = state.ops;
+    const context = captureAccountContext();
+    if (ops.loading) return;
+    const generation = ++ops.loadGeneration;
+    ops.loading = true;
+    ops.contextError = "";
+    const valid = () => opsContextMatches(ops, context) && ops.loadGeneration === generation;
+    const shopSelect = $("#opsShopSelect");
+    renderOpsPlan();
+    formMessage("#opsPromptMessage", "正在读取当前店铺资料…");
+    try {
+      await loadAccounts();
+      if (!valid()) return;
+      shopSelect.replaceChildren();
+      for (const account of state.accounts.filter((item) => item.enabled !== false)) {
+        const option = document.createElement("option");
+        option.value = account.key;
+        option.textContent = accountLabel(account);
+        shopSelect.append(option);
+      }
+      shopSelect.value = context.accountKey;
+      const result = await accountScopedApi(context, "/api/ops/context");
+      if (!valid()) return;
+      if (!Array.isArray(result.products) || !Array.isArray(result.rules)) throw new ApiError("运维资料响应格式无效");
+      ops.connection = result.connection;
+      ops.diagnostics = result.diagnostics || {};
+      ops.contextLoaded = true;
+      ops.selectedItemIds = ops.selectedItemIds.filter((id) => result.products.some((item) => item.item_id === id));
+      ops.selectedRuleIds = ops.selectedRuleIds.filter((id) => result.rules.some((item) => item.id === id));
+      renderOpsProductList(result.products);
+      renderOpsRuleList(result.rules);
+      updateOpsConnectionBadge(result.connection);
+      formMessage("#opsPromptMessage", result.connection?.initialized && result.connection?.connection_status === "verified" ? "" : "请前往设置测试并保存统一模型连接");
+    } catch (error) {
+      if (!valid()) return;
+      ops.contextLoaded = false;
+      ops.contextError = error.message || "运维资料读取失败，请重试";
+      renderOpsProductList([]);
+      renderOpsRuleList([]);
+      formMessage("#opsPromptMessage", ops.contextError);
+    } finally {
+      if (valid()) {
+        ops.loading = false;
+        renderOpsChatMessages();
+        renderOpsPlan();
+      }
+    }
+  }
+
+  function handleOpsProductSelectChange(event) {
+    const selected = Array.from(event.target.selectedOptions).map((o) => o.value).slice(0, 20);
+    state.ops.selectedItemIds = selected;
+    document.querySelectorAll('#opsProductList input[type="checkbox"]').forEach((box) => {
+      box.checked = selected.includes(box.value);
+    });
+  }
+
+  function handleOpsRuleSelectChange(event) {
+    const selected = Array.from(event.target.selectedOptions).map((o) => o.value);
+    state.ops.selectedRuleIds = selected;
+    document.querySelectorAll('#opsRuleList input[type="checkbox"]').forEach((box) => {
+      box.checked = selected.includes(box.value);
+    });
+  }
+
+  async function handleOpsShopSelectChange(event) {
+    const key = event.target.value;
+    await switchShopAccount(key);
+    if ($("#opsShopSelect")) $("#opsShopSelect").value = state.activeAccountKey;
+  }
+
+  function handleOpsPromptInput(event) {
+    const val = event.target.value || "";
+    text("#opsPromptCount", val.length + " / 2000");
+  }
+
+  function renderOpsChatMessages() {
+    const container = $("#opsChatHistory") || $("#opsChatMessages");
+    if (!container) return;
+    const msgs = Array.isArray(state.ops.chatHistory) ? state.ops.chatHistory : [];
+    if (!msgs.length) {
+      container.innerHTML = '<div class="ops-chat-empty">选择店铺与关联资料后，在下方输入运维需求开始对话。</div>';
+      return;
+    }
+    container.innerHTML = msgs.map((msg) => {
+      const isUser = msg.role === "user";
+      return '<div class="ops-chat-msg ' + (isUser ? "is-user" : "is-assistant") + '">' +
+        '<div class="ops-chat-bubble">' + esc(msg.content) + '</div>' +
+        '</div>';
+    }).join("");
+    container.scrollTop = container.scrollHeight;
+  }
+
+  const renderOpsChat = renderOpsChatMessages;
+
+  function renderOpsPlan() {
+    const busy = state.ops.inFlight || state.ops.confirming || state.ops.cancelling || state.ops.refreshing;
+    const sendButton = $("#opsSendBtn");
+    setBusy(sendButton, state.ops.inFlight);
+    if (sendButton) sendButton.disabled = busy || state.ops.loading;
+    if ($("#opsPromptInput")) $("#opsPromptInput").disabled = busy;
+    const plan = state.ops.currentPlan;
+    const planNode = $("#opsPlanCard") || $("#opsPlan");
+    const emptyNode = $("#opsPlanEmpty");
+    if (!planNode) return;
+    if (!plan) {
+      planNode.hidden = true;
+      if (emptyNode) emptyNode.hidden = false;
+      return;
+    }
+    if (emptyNode) emptyNode.hidden = true;
+    planNode.hidden = false;
+
+    text("#opsPlanTitle", plan.title || "拟执行运维方案 (" + (plan.id || "") + ")");
+    text("#opsPlanSummary", plan.summary || "请核对拟执行操作与差异后确认执行。");
+
+    const badge = $("#opsPlanStatusBadge") || $("#opsPlanRisk");
+    const status = opsPlanStatus(plan);
+    const invalidPlan = !Array.isArray(plan.items) || plan.items.some((item) => !Object.hasOwn(OPS_TOOLS, item.tool));
+
+    if (badge) {
+      if (status === "succeeded") {
+        badge.textContent = "执行完成 (成功)";
+        badge.className = "badge badge-green";
+      } else if (status === "cancelled") {
+        badge.textContent = "方案已取消";
+        badge.className = "badge badge-muted";
+      } else if (status === "partial_failed") {
+        badge.textContent = "部分执行失败";
+        badge.className = "badge badge-red";
+      } else if (status === "needs_review") {
+        badge.textContent = "执行失败 / 待人工复核";
+        badge.className = "badge badge-red";
+      } else if (status === "failed") {
+        badge.textContent = "执行失败";
+        badge.className = "badge badge-red";
+      } else if (status === "expired") {
+        badge.textContent = "方案已过期";
+        badge.className = "badge badge-muted";
+      } else if (status === "executing") {
+        badge.textContent = "正在执行中…";
+        badge.className = "badge badge-amber";
+      } else if (status === "proposed") {
+        badge.textContent = "待核对确认";
+        badge.className = "badge badge-amber";
+      } else {
+        badge.textContent = status;
+        badge.className = "badge badge-muted";
+      }
+    }
+
+    const diffContainer = $("#opsPlanDiffList") || $("#opsPlanActions");
+    if (diffContainer) {
+      diffContainer.replaceChildren();
+      const items = Array.isArray(plan.items) ? plan.items : [];
+      items.forEach((item, idx) => {
+        const itemCard = document.createElement("div");
+        itemCard.className = "ops-plan-diff-item";
+
+        const title = document.createElement("div");
+        title.className = "ops-plan-diff-item-title";
+        const statusText = { succeeded: "已完成", failed: "失败", needs_review: "待复核", executing: "执行中", pending: "待执行" }[item.status] || "未知状态";
+        title.textContent = "#" + (idx + 1) + " " + (OPS_TOOLS[item.tool] || "不支持的操作") + " · " + (item.target || "--") + "【" + statusText + "】";
+        itemCard.append(title);
+
+        if (item.error_code) {
+          const errBox = document.createElement("div");
+          errBox.className = "ops-diff-error-box";
+          errBox.textContent = "错误原因: " + item.error_code + " (内容冲突 / 需人工复核)";
+          itemCard.append(errBox);
+        }
+
+        const grid = document.createElement("div");
+        grid.className = "ops-plan-diff-grid";
+
+        const beforeBox = document.createElement("div");
+        beforeBox.className = "ops-diff-before";
+        const beforeContent = item.before?.content !== undefined ? String(item.before.content) : (typeof item.before === "object" ? JSON.stringify(item.before, null, 2) : String(item.before || "--"));
+        beforeBox.innerHTML = '<strong>原有商品说明 (原值):</strong><pre>' + esc(beforeContent) + '</pre>';
+
+        const afterBox = document.createElement("div");
+        afterBox.className = "ops-diff-after";
+        const afterContent = item.after?.content !== undefined ? String(item.after.content) : (typeof item.after === "object" ? JSON.stringify(item.after, null, 2) : String(item.after || "--"));
+        afterBox.innerHTML = '<strong>仅限所选商品的使用说明 (拟更新):</strong><pre>' + esc(afterContent) + '</pre>';
+
+        grid.append(beforeBox, afterBox);
+        itemCard.append(grid);
+        diffContainer.append(itemCard);
+      });
+    }
+
+    const confirmBtn = $("#opsPlanConfirmBtn") || $("#opsPlanConfirm");
+    const cancelBtn = $("#opsPlanCancelBtn") || $("#opsPlanCancel");
+    const refreshBtn = $("#opsPlanRefreshBtn") || $("#opsPlanRefresh");
+
+    if (confirmBtn) confirmBtn.disabled = busy || invalidPlan || status !== "proposed";
+    if ($("#opsDiffConfirmBtn")) $("#opsDiffConfirmBtn").disabled = busy || invalidPlan || status !== "proposed";
+    if (cancelBtn) cancelBtn.disabled = busy || status !== "proposed";
+    if (refreshBtn) refreshBtn.disabled = busy;
+  }
+
+  function formatDiffVal(val) {
+    if (val === null || val === undefined) return "--";
+    if (typeof val === "object") {
+      if (val.content !== undefined) return String(val.content);
+      try { return JSON.stringify(val, null, 2); } catch (_) { return String(val); }
+    }
+    return String(val);
+  }
+
+  function openOpsDiffModal() {
+    const plan = state.ops.currentPlan;
+    if (!plan) return;
+    openDialog("opsDiffModal");
+    const meta = $("#opsDiffMeta");
+    if (meta) {
+      meta.innerHTML = '<span>方案: <strong>' + esc(plan.title || "运维方案") + '</strong></span> · ' +
+        '<span>状态: <strong>' + esc(OPS_STATUSES[opsPlanStatus(plan)] || "未知") + '</strong></span> · ' +
+        '<span>共 ' + (Array.isArray(plan.items) ? plan.items.length : 0) + ' 项拟变更</span>';
+    }
+    const tableBody = $("#opsDiffTable");
+    if (tableBody) {
+      const items = Array.isArray(plan.items) ? plan.items : [];
+      tableBody.innerHTML = items.map((act) => {
+        return '<tr>' +
+          '<td><strong>' + esc(act.tool || "操作") + '</strong></td>' +
+          '<td>' + esc(act.target || "--") + '</td>' +
+          '<td class="ops-diff-before"><strong>原有商品说明</strong><pre>' + esc(formatDiffVal(act.before)) + '</pre></td>' +
+          '<td class="ops-diff-after"><strong>仅限所选商品的使用说明</strong><pre>' + esc(formatDiffVal(act.after)) + '</pre></td>' +
+          '</tr>';
+      }).join("");
+    }
+    formMessage("#opsDiffMessage", "");
+  }
+
+  async function sendOpsChat(event) {
+    event?.preventDefault();
+    const ops = state.ops;
+    if (!state.me || ops.inFlight || ops.confirming || ops.cancelling || ops.refreshing) return;
+    const context = captureAccountContext();
+    const valid = () => opsContextMatches(ops, context);
+    const input = $("#opsPromptInput");
+    const prompt = input.value.trim();
+    if (!prompt || prompt.length > 2000) { formMessage("#opsPromptMessage", "请输入不超过 2000 字的需求"); return; }
+    const selectedItemIds = getSelectedOpsItemIds();
+    const selectedRuleIds = getSelectedOpsRuleIds();
+    if (selectedItemIds.length + selectedRuleIds.length > 20) {
+      formMessage("#opsPromptMessage", "每次最多选择 20 个商品或规则目标"); return;
+    }
+    if (!ops.contextLoaded || ops.contextError) {
+      formMessage("#opsPromptMessage", ops.contextError || "请等店铺资料加载完成后再发送"); return;
+    }
+    const connection = state.settingsAi.connection || ops.connection;
+    if (connection?.initialized !== true || connection.connection_status !== "verified") {
+      formMessage("#opsPromptMessage", "请先在设置中测试并保存统一模型连接"); return;
+    }
+    const signature = JSON.stringify([prompt, selectedItemIds, selectedRuleIds]);
+    if (!ops.pendingChat || ops.pendingChat.signature !== signature) {
+      const payload = { request_id: newClientRequestId(), message: prompt,
+        selected_item_ids: selectedItemIds, selected_rule_ids: selectedRuleIds,
+        history: ops.chatHistory.slice(-10).map(({ role, content }) => ({ role, content: content.slice(0, 4000) })) };
+      ops.pendingChat = { signature, payload };
+      ops.chatHistory = [...ops.chatHistory, { role: "user", content: prompt }].slice(-10);
+    }
+    const pending = ops.pendingChat;
+    ops.inFlight = true;
+    const button = $("#opsSendBtn");
+    setBusy(button, true);
+    input.disabled = true;
+    formMessage("#opsPromptMessage", "正在分析，尚未修改资料…");
+    renderOpsChatMessages();
+    renderOpsPlan();
+    try {
+      const result = await accountScopedApi(context, "/api/ops/chat", {
+        method: "POST", headers: { "Idempotency-Key": pending.payload.request_id }, body: JSON.stringify(pending.payload),
+      });
+      if (!valid()) return;
+      if (typeof result?.reply !== "string" || !result.reply.trim()) throw new ApiError("运维服务未返回有效回答，请重试");
+      if (result.plan && (!result.plan.id || !Array.isArray(result.plan.items))) throw new ApiError("计划格式无效，未执行修改");
+      ops.chatHistory = [...ops.chatHistory, { role: "assistant", content: result.reply }].slice(-10);
+      ops.currentPlan = result.plan || null;
+      ops.pendingChat = null;
+      input.value = "";
+      text("#opsPromptCount", "0 / 2000");
+      formMessage("#opsPromptMessage", result.plan ? "已生成待确认方案，尚未修改资料" : "分析完成，未修改资料", true);
+      renderOpsChatMessages();
+    } catch (error) {
+      if (valid()) formMessage("#opsPromptMessage", error.message || "运维服务暂时不可用；保留原请求，可重试查询结果");
+    } finally {
+      if (valid()) {
+        ops.inFlight = false;
+        setBusy(button, false);
+        input.disabled = false;
+        renderOpsPlan();
+      }
+    }
+  }
+
+  async function runOpsPlanAction(action) {
+    const ops = state.ops;
+    const plan = ops.currentPlan;
+    if (!state.me || !plan?.id || ops.inFlight || ops.confirming || ops.cancelling || ops.refreshing) return;
+    if (action !== "refresh" && opsPlanStatus(plan) !== "proposed") return;
+    if (!Array.isArray(plan.items) || plan.items.some((item) => !Object.hasOwn(OPS_TOOLS, item.tool))) return;
+    const context = captureAccountContext();
+    const valid = () => opsContextMatches(ops, context) && ops.currentPlan?.id === plan.id;
+    const field = { confirm: "confirming", cancel: "cancelling", refresh: "refreshing" }[action];
+    ops[field] = true;
+    renderOpsPlan();
+    formMessage("#opsPlanMessage", action === "refresh" ? "正在读取执行结果…" : "正在提交，请勿重复操作…");
+    const suffix = action === "refresh" ? "" : "/" + action;
+    const options = { method: action === "refresh" ? "GET" : "POST" };
+    if (action !== "refresh") {
+      const payload = { revision: plan.revision, digest: plan.digest };
+      if (action === "confirm") {
+        const requestId = ops.confirmRequests[plan.id] || newClientRequestId();
+        ops.confirmRequests[plan.id] = requestId;
+        Object.assign(payload, { confirm: true, request_id: requestId });
+        options.headers = { "Idempotency-Key": requestId };
+      }
+      options.body = JSON.stringify(payload);
+    }
+    try {
+      const result = await accountScopedApi(context, "/api/ops/plans/" + encodeURIComponent(plan.id) + suffix, options);
+      if (!valid()) return;
+      if (result?.id !== plan.id || !Object.hasOwn(OPS_STATUSES, result.status) || !Array.isArray(result.items)) throw new ApiError("计划响应无效，请刷新结果核对");
+      ops.currentPlan = result;
+      formMessage("#opsPlanMessage", OPS_STATUSES[opsPlanStatus(result)] || "请核对执行状态", result.status === "succeeded" || result.status === "cancelled");
+      if (result.status === "succeeded") closeDialog("opsDiffModal");
+    } catch (error) {
+      if (valid()) {
+        formMessage("#opsPlanMessage", error.message || "操作结果尚未确认，请刷新查询；不要重复生成相同修改");
+        formMessage("#opsDiffMessage", error.message || "请刷新方案核对结果");
+      }
+    } finally {
+      if (opsContextMatches(ops, context)) {
+        ops[field] = false;
+        renderOpsPlan();
+      }
+    }
+  }
+
+  async function confirmOpsPlan() { return runOpsPlanAction("confirm"); }
+  async function cancelOpsPlan() { return runOpsPlanAction("cancel"); }
+  async function refreshOpsPlan() { return runOpsPlanAction("refresh"); }
+
   async function bootstrap() {
     state.accountEpoch += 1;
     const epoch = state.accountEpoch;
@@ -5141,8 +6702,10 @@
     const catalogStatus = registerCatalogStatus(bot);
     renderNav();
     renderAccount();
-    renderDocs();
+    renderSettings();
     renderOverview();
+    void loadVersionInfo().catch(() => {});
+    void loadUnifiedAiConnection().catch(() => {});
     await Promise.all([loadProducts({ force: true, catalogStatus }), loadAutomation().catch(() => {}), loadAiConfig().catch(() => {}), loadOverviewSignals(epoch)]);
     await Promise.all([loadMessages().catch(() => {}), loadOrders().catch(() => {}), loadQuickReplies().catch(() => {})]);
     $("#authScreen").hidden = true;
@@ -5221,7 +6784,16 @@
       loadMessages().catch((error) => showToast(error.message, "error"));
     }
     if (view === "orders") loadOrders().catch((error) => showToast(error.message, "error"));
-    if (view === "docs") loadDocsData().catch((error) => showToast(error.message || "项目信息读取失败", "error"));
+    if (view === "settings" || view === "docs") {
+      renderSettings();
+      void loadSettingsData();
+      if (requestedView === "docs") openDocsHelpModal();
+    } else {
+      stopDocsPolling();
+    }
+    if (view === "ops") {
+      void loadOpsContext();
+    }
     if (view === "templates") {
       loadTemplates().catch((error) => showToast(error.message, "error"));
       loadCards().catch((error) => showToast(error.message || "卡密池加载失败，请稍后重试", "error"));
@@ -5246,8 +6818,10 @@
     const catalogStatus = registerCatalogStatus(bot);
     renderNav();
     renderAccount();
-    renderDocs();
+    renderSettings();
     renderOverview();
+    void loadVersionInfo().catch(() => {});
+    void loadUnifiedAiConnection().catch(() => {});
     await loadProducts({ force: true, catalogStatus });
     if (!refreshContextMatches(context)) return false;
     await loadAutomation().catch(() => {});
@@ -5265,6 +6839,12 @@
     if (state.view === "orders") {
       await loadOrders();
       if (!refreshContextMatches(context)) return false;
+    }
+    if (state.view === "settings") {
+      renderSettings();
+    }
+    if (state.view === "ops") {
+      void loadOpsContext();
     }
     syncMerchantPolling();
     return true;
@@ -5974,6 +7554,13 @@
     }
   }
 
+  function openDialog(id) {
+    const dialog = $("#" + id);
+    if (!dialog || dialog.open) return;
+    if (typeof dialog.showModal === "function") dialog.showModal();
+    else dialog.setAttribute("open", "");
+  }
+
   function closeDialog(id) {
     const dialog = $("#" + id);
     if (!dialog) return;
@@ -5988,10 +7575,63 @@
     $("#authForm").addEventListener("submit", submitAuth);
     $("#passwordChangeForm").addEventListener("submit", changeCurrentPassword);
     $("#platformSettingsForm").addEventListener("submit", savePlatformSettings);
-    $("#refreshVersionButton").addEventListener("click", () => loadDocsData({ force: true }));
+    $("#refreshVersionButton").addEventListener("click", () => { state.docs.pollAttempts = 0; void loadDocsData({ force: true }); });
     $("#refreshAdminUsers").addEventListener("click", () => loadDocsData({ force: true }));
     $("#refreshAuditButton").addEventListener("click", () => loadDocsData({ force: true }));
-    $("#checkUpdateButton").addEventListener("click", checkPlatformUpdate);
+    $("#checkUpdateButton")?.addEventListener("click", checkPlatformUpdate);
+    $("#versionBadgeButton")?.addEventListener("click", (e) => {
+      e.stopPropagation();
+      toggleVersionBadgePopover();
+    });
+    $("#versionBadgeClose")?.addEventListener("click", (e) => {
+      e.stopPropagation();
+      closeVersionBadgePopover();
+    });
+    $("#versionBadgeRefresh")?.addEventListener("click", (e) => {
+      e.stopPropagation();
+      void checkPlatformUpdate();
+    });
+    $("#versionBadgeDetails")?.addEventListener("click", () => {
+      closeVersionBadgePopover();
+      showView("settings");
+      setSettingsTab("version");
+    });
+    document.addEventListener("click", (event) => {
+      const container = event.target.closest(".version-badge-container");
+      if (!container) closeVersionBadgePopover();
+    });
+    document.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") {
+        closeVersionBadgePopover();
+      }
+    });
+
+    $("#settingsDocsBtn")?.addEventListener("click", openDocsHelpModal);
+    $$('[data-settings-tab]').forEach((button) => button.addEventListener("click", () => setSettingsTab(button.dataset.settingsTab)));
+    $$('[data-settings-go]').forEach((button) => button.addEventListener("click", () => {
+      showView("settings");
+      setSettingsTab(button.dataset.settingsGo);
+    }));
+    $("#settingsAiLegacySelect")?.addEventListener("change", handleLegacySourceSelect);
+    $("#settingsLegacySource")?.addEventListener("change", handleLegacySourceSelect);
+    $("#settingsImportLegacy")?.addEventListener("click", handleLegacySourceImport);
+
+    $("#opsShopSelect")?.addEventListener("change", handleOpsShopSelectChange);
+    $("#opsProductSelect")?.addEventListener("change", handleOpsProductSelectChange);
+    $("#opsRuleSelect")?.addEventListener("change", handleOpsRuleSelectChange);
+    $("#opsPromptInput")?.addEventListener("input", handleOpsPromptInput);
+    $("#opsMessageInput")?.addEventListener("input", handleOpsPromptInput);
+    $("#opsPromptForm")?.addEventListener("submit", sendOpsChat);
+    $("#opsChatForm")?.addEventListener("submit", sendOpsChat);
+    $("#opsPlanViewDiffBtn")?.addEventListener("click", openOpsDiffModal);
+    $("#opsPlanRefreshBtn")?.addEventListener("click", refreshOpsPlan);
+    $("#opsPlanRefresh")?.addEventListener("click", refreshOpsPlan);
+    $("#opsPlanConfirmBtn")?.addEventListener("click", confirmOpsPlan);
+    $("#opsPlanConfirm")?.addEventListener("click", confirmOpsPlan);
+    $("#opsPlanCancelBtn")?.addEventListener("click", cancelOpsPlan);
+    $("#opsPlanCancel")?.addEventListener("click", cancelOpsPlan);
+    $("#opsDiffConfirmBtn")?.addEventListener("click", confirmOpsPlan);
+
     $("#downloadUpdateButton").addEventListener("click", downloadPlatformUpdate);
     $("#applyUpdateButton").addEventListener("click", () => {
       const version = state.docs.stagedVersion;
@@ -6001,10 +7641,11 @@
       const version = $("#rollbackVersionSelect").value;
       if (version) void confirmAdminUpdate("rollback", version).catch((error) => formMessage("#updateActionMessage", error.message || "回滚申请失败"));
     });
-    $("#rollbackVersionSelect").addEventListener("change", (event) => {
-      $("#rollbackUpdateButton").disabled = !event.currentTarget.value;
-    });
+    $("#rollbackVersionSelect").addEventListener("change", () => renderVersionPanel());
     $$('[data-docs-tab]').forEach((button) => button.addEventListener("click", () => setDocsTab(button.dataset.docsTab)));
+    $$('[data-docs-go]').forEach((button) => button.addEventListener("click", () => {
+      if (["home", "chat", "goods", "orders", "shops"].includes(button.dataset.docsGo)) showView(button.dataset.docsGo);
+    }));
     $("#adminUsersBody").addEventListener("click", (event) => {
       const button = event.target.closest("[data-admin-user-action]");
       if (button) void handleAdminUserAction(button);
@@ -6173,7 +7814,142 @@
     $("#toggleChatTakeover").addEventListener("click", () => {
       void toggleConversationTakeover();
     });
-    $("#refreshOrders").addEventListener("click", () => loadOrders().catch((error) => showToast(error.message, "error")));
+    $("#refreshOrders")?.addEventListener("click", () => loadOrders().catch((error) => showToast(error.message, "error")));
+    $("#ordersFilterForm")?.addEventListener("submit", (event) => {
+      event.preventDefault();
+      const searchField = $("#ordersSearchField")?.value || "all";
+      let q = ($("#ordersSearchInput")?.value || "").trim();
+      if (q.length > 128) q = q.slice(0, 128);
+      const dateFrom = $("#ordersDateFrom")?.value || "";
+      const dateTo = $("#ordersDateTo")?.value || "";
+      if (dateFrom && dateTo && dateFrom > dateTo) {
+        showToast("起始日期不能晚于截止日期", "warning");
+        return;
+      }
+      state.ordersPage.searchField = searchField;
+      state.ordersPage.q = q;
+      state.ordersPage.dateFrom = dateFrom;
+      state.ordersPage.dateTo = dateTo;
+      state.ordersPage.page = 1;
+      state.ordersPage.expandedKeys.clear();
+      void loadOrderPage().catch((error) => showToast(error.message, "error"));
+    });
+    $("#ordersReset")?.addEventListener("click", () => {
+      if ($("#ordersSearchField")) $("#ordersSearchField").value = "all";
+      if ($("#ordersSearchInput")) $("#ordersSearchInput").value = "";
+      if ($("#ordersDateFrom")) $("#ordersDateFrom").value = "";
+      if ($("#ordersDateTo")) $("#ordersDateTo").value = "";
+      state.ordersPage.searchField = "all";
+      state.ordersPage.q = "";
+      state.ordersPage.dateFrom = "";
+      state.ordersPage.dateTo = "";
+      state.ordersPage.status = "all";
+      state.ordersPage.page = 1;
+      state.ordersPage.expandedKeys.clear();
+      void loadOrderPage().catch((error) => showToast(error.message, "error"));
+    });
+    $("#ordersShopSelect")?.addEventListener("change", (event) => {
+      const nextKey = event.currentTarget.value;
+      if (nextKey && nextKey !== state.activeAccountKey) {
+        void switchShopAccount(nextKey);
+      }
+    });
+    $("#ordersStatusTabs")?.addEventListener("click", (event) => {
+      const tab = event.target.closest("[data-order-status]");
+      if (!tab) return;
+      const status = tab.dataset.orderStatus;
+      if (status && status !== state.ordersPage.status) {
+        state.ordersPage.status = status;
+        state.ordersPage.page = 1;
+        state.ordersPage.expandedKeys.clear();
+        void loadOrderPage().catch((error) => showToast(error.message, "error"));
+      }
+    });
+    $("#orderList")?.addEventListener("click", (event) => {
+      const toggleBtn = event.target.closest("[data-order-toggle]");
+      if (toggleBtn) {
+        event.preventDefault();
+        const key = toggleBtn.dataset.orderToggle;
+        if (key) {
+          if (state.ordersPage.expandedKeys.has(key)) {
+            state.ordersPage.expandedKeys.delete(key);
+          } else {
+            state.ordersPage.expandedKeys.add(key);
+          }
+          renderOrderPage();
+        }
+        return;
+      }
+      const copyBtn = event.target.closest("[data-order-copy]");
+      if (copyBtn) {
+        event.preventDefault();
+        void copyOrderText(copyBtn.dataset.orderCopy);
+        return;
+      }
+      const chatBtn = event.target.closest("[data-order-chat]");
+      if (chatBtn && !chatBtn.disabled) {
+        event.preventDefault();
+        void handleOrderChat(chatBtn.dataset.orderChat);
+        return;
+      }
+      const retryBtn = event.target.closest("#ordersRetryBtn");
+      if (retryBtn) {
+        event.preventDefault();
+        void loadOrderPage().catch((error) => showToast(error.message, "error"));
+        return;
+      }
+      const clearFilterBtn = event.target.closest("#ordersClearFilterBtn");
+      if (clearFilterBtn) {
+        event.preventDefault();
+        $("#ordersReset")?.click();
+        return;
+      }
+    });
+    $("#ordersPageSize")?.addEventListener("change", (event) => {
+      const nextSize = Number(event.currentTarget.value);
+      if ([15, 30, 50].includes(nextSize)) {
+        state.ordersPage.pageSize = nextSize;
+        state.ordersPage.page = 1;
+        state.ordersPage.expandedKeys.clear();
+        void loadOrderPage().catch((error) => showToast(error.message, "error"));
+      }
+    });
+    $("#ordersPrev")?.addEventListener("click", () => {
+      if (state.ordersPage.page > 1) {
+        state.ordersPage.page -= 1;
+        state.ordersPage.expandedKeys.clear();
+        void loadOrderPage().catch((error) => showToast(error.message, "error"));
+      }
+    });
+    $("#ordersNext")?.addEventListener("click", () => {
+      if (state.ordersPage.page < state.ordersPage.totalPages) {
+        state.ordersPage.page += 1;
+        state.ordersPage.expandedKeys.clear();
+        void loadOrderPage().catch((error) => showToast(error.message, "error"));
+      }
+    });
+    const handleOrdersJump = () => {
+      const input = $("#ordersPageInput");
+      if (!input) return;
+      const val = parseInt(input.value, 10);
+      if (Number.isInteger(val)) {
+        const clamped = Math.max(1, Math.min(state.ordersPage.totalPages || 1, val));
+        if (clamped !== state.ordersPage.page) {
+          state.ordersPage.page = clamped;
+          state.ordersPage.expandedKeys.clear();
+          void loadOrderPage().catch((error) => showToast(error.message, "error"));
+        } else {
+          input.value = clamped;
+        }
+      }
+    };
+    $("#ordersPageJump")?.addEventListener("click", handleOrdersJump);
+    $("#ordersPageInput")?.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        handleOrdersJump();
+      }
+    });
     $("#createTemplateButton").addEventListener("click", () => { void openTemplateEditor(); });
     $("#templatesEmptyAction").addEventListener("click", () => { void openTemplateEditor(); });
     $("#templateEditorForm").addEventListener("submit", saveTemplate);
@@ -6388,6 +8164,7 @@
       const card = host.closest(".home-product-card");
       const title = card?.querySelector(".home-product-name")?.textContent
         || host.closest(".product-cell")?.querySelector(".product-title")?.textContent
+        || host.closest(".orders-product-cell")?.querySelector(".orders-product-title")?.textContent
         || "闲";
       const monogramClass = host.classList.contains("home-product-thumb") ? "home-product-monogram" : "product-monogram";
       host.innerHTML = '<span class="' + monogramClass + '" aria-hidden="true">' + esc(String(title).trim().slice(0, 1) || "闲") + "</span>";
@@ -6398,6 +8175,7 @@
     bindEvents();
     syncSidebarAccessibility();
     installProductImageFallback();
+    void loadPublicVersionOnce();
     try {
       await loadAuthCapabilities({ preferFirstRegistration: true });
       await bootstrap();

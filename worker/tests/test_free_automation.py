@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import os
 import sqlite3
@@ -126,6 +127,19 @@ class FakeBot:
 
 
 class ReplyRuleLoaderTests(unittest.TestCase):
+    def test_operations_receipt_requires_matching_content_and_known_fields(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "rules.json"
+            document = {"version": 1, "rules": [{"id": "rule-1", "keywords": ["hello"], "reply": "您好"}]}
+            digest = hashlib.sha256(json.dumps(document, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+            receipt = {"plan_id": "ops-123", "item_id": "opi-456", "digest": "a" * 64, "after_hash": digest}
+            write_json(path, {**document, "_ops_receipt": receipt})
+            self.assertEqual(load_reply_rules(str(path))[0]["reply"], "您好")
+            for invalid in ({**receipt, "after_hash": "b" * 64}, {**receipt, "command": "forbidden"}, None):
+                write_json(path, {**document, "_ops_receipt": invalid})
+                with self.assertRaises(RuntimeError):
+                    load_reply_rules(str(path))
+
     def test_first_match_and_unicode_casefold(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "rules.json"
@@ -254,8 +268,6 @@ class FreeAutomationTests(unittest.IsolatedAsyncioTestCase):
         seed_rules=True,
         seed_settings=True,
     ):
-        if mode == "rules_ai":
-            write_json(self.state / "redeem_codes.json", [])
         env_patch, bot = self.make_agent(
             mode,
             rules,
@@ -278,6 +290,7 @@ class FreeAutomationTests(unittest.IsolatedAsyncioTestCase):
         return agent, bot
 
     async def test_rules_mode_initializes_without_ai_client_or_paid_inventory(self):
+        (self.state / "pan_links.json").unlink()
         with patch.dict(os.environ, {"AUTOMATION_MODE": "rules"}, clear=True):
             with patch("main.XianyuReplyBot") as bot_constructor:
                 agent = XianyuLive(
@@ -290,6 +303,113 @@ class FreeAutomationTests(unittest.IsolatedAsyncioTestCase):
         bot_constructor.assert_not_called()
         self.assertIsNone(agent.bot)
         self.assertEqual(agent.automation_mode, "rules")
+
+    async def test_material_empty_and_unconfigured_shops_need_no_inventory_files(self):
+        (self.state / "pan_links.json").unlink()
+        material = {
+            "id": "material", "item_ids": [MATERIAL_ITEM],
+            "delivery": "material", "payload": "material payload",
+        }
+        for mode in ("rules", "rules_ai"):
+            for payload in ({"types": [material]}, {"types": []}, None):
+                with self.subTest(mode=mode, payload=payload):
+                    if payload is None:
+                        self.products.unlink()
+                    else:
+                        write_json(self.products, payload)
+                    with patch("main.DeliveryStore.import_inventory") as importer:
+                        agent, _ = self.build_agent(mode=mode)
+                    importer.assert_not_called()
+                    self.assertFalse(agent.redeem_inventory_available)
+                    self.assertEqual(agent.pan_resources, [])
+                    self.assertFalse((self.state / "redeem_codes.json").exists())
+
+    async def test_rules_inventory_import_requires_enabled_valid_mapping(self):
+        pool = self.state / "redeem_codes.json"
+        write_json(pool, [{"code": "TEST-CODE", "used": False}])
+        for payload in (
+            {"types": []},
+            {"types": [{"id": "api", "item_ids": [API_ITEM], "delivery": "redeem", "enabled": False}]},
+            {"types": [{"id": "pan", "item_ids": [PAN_ITEM], "delivery": "pan", "resource_match": ["resource"]}]},
+        ):
+            with self.subTest(payload=payload):
+                write_json(self.products, payload)
+                with patch("main.DeliveryStore.import_inventory") as importer:
+                    agent, _ = self.build_agent()
+                importer.assert_not_called()
+                self.assertEqual(agent.delivery_store.inventory_counts(), {})
+
+        write_json(self.products, {"types": [{"delivery": "redeem", "item_ids": []}]})
+        with patch("main.DeliveryStore.import_inventory") as importer:
+            with self.assertRaises(RuntimeError):
+                self.build_agent()
+        importer.assert_not_called()
+
+    async def test_rules_redeem_inventory_hot_loads_without_ai_or_reimport_loop(self):
+        agent, bot = self.build_agent()
+        self.assertFalse(agent.redeem_inventory_available)
+        pool = self.state / "redeem_codes.json"
+        write_json(pool, [{"code": "TEST-CODE-A", "used": False}])
+        with patch.object(
+            agent.delivery_store, "import_inventory", wraps=agent.delivery_store.import_inventory
+        ) as importer:
+            agent._refresh_runtime_config()
+            agent._refresh_runtime_config()
+        importer.assert_called_once_with(str(pool), "redeem")
+        self.assertTrue(agent.redeem_inventory_available)
+        self.assertEqual(agent.delivery_store.inventory_counts()["redeem"], {"available": 1})
+        write_json(pool, [
+            {"code": "TEST-CODE-A", "used": True},
+            {"code": "TEST-CODE-B", "used": False},
+        ])
+        agent._refresh_runtime_config()
+        self.assertEqual(agent.delivery_store.inventory_counts()["redeem"], {
+            "legacy_used": 1, "available": 1,
+        })
+        pool.unlink()
+        agent._refresh_runtime_config()
+        self.assertFalse(agent.redeem_inventory_available)
+        self.assertEqual(bot.calls, 0)
+
+    async def test_hot_enabled_redeem_mapping_imports_existing_inventory(self):
+        write_json(self.products, {"types": []})
+        write_json(self.state / "redeem_codes.json", [{"code": "TEST-HOT", "used": False}])
+        agent, _ = self.build_agent()
+        self.assertEqual(agent.delivery_store.inventory_counts(), {})
+        write_json(self.products, {
+            "types": [{"id": "api", "item_ids": [API_ITEM], "delivery": "redeem"}],
+        })
+        agent._refresh_runtime_config()
+        self.assertEqual(agent.classify_item(API_ITEM)["delivery"], "redeem")
+        self.assertEqual(agent.delivery_store.inventory_counts()["redeem"], {"available": 1})
+        write_json(self.products, {"types": []})
+        agent._refresh_runtime_config()
+        self.assertFalse(agent.redeem_inventory_available)
+        self.assertIsNone(agent.classify_item(API_ITEM))
+
+    async def test_missing_account_inventory_never_uses_legacy_application_files(self):
+        (self.state / "pan_links.json").unlink()
+        with tempfile.TemporaryDirectory() as legacy:
+            write_json(Path(legacy) / "redeem_codes.json", [{"code": "OTHER-ACCOUNT", "used": False}])
+            write_json(Path(legacy) / "pan_links.json", {"links": "must not load"})
+            with patch("main.BASE_DIR", legacy):
+                agent, _ = self.build_agent()
+        self.assertEqual(agent.delivery_store.inventory_counts(), {})
+        self.assertEqual(agent.pan_resources, [])
+        self.assertFalse(agent.redeem_inventory_available)
+
+    async def test_invalid_redeem_inventory_does_not_block_rules_or_material(self):
+        write_json(self.state / "redeem_codes.json", [{"code": "TEST-CODE", "used": "yes"}])
+        agent, bot = self.build_agent(rules={
+            "version": 1,
+            "rules": [{"id": "ready", "keywords": ["hello"], "reply": "规则正常"}],
+        })
+        self.assertFalse(agent.redeem_inventory_available)
+        self.assertEqual(agent.delivery_store.inventory_counts(), {})
+        await agent._process_buyer_chat(CHAT_ID, BUYER_ID, MATERIAL_ITEM, "hello", "invalid-stock")
+        self.assertEqual(agent.send_text_reliably.await_args.args[2], "规则正常")
+        self.assertEqual(agent.classify_item(MATERIAL_ITEM)["delivery"], "material")
+        self.assertEqual(bot.calls, 0)
 
     def test_rules_ai_runtime_validation_keeps_fixed_rules_available_without_ai_token(self):
         with patch.dict(
@@ -1339,10 +1459,10 @@ class FreeAutomationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(schedule_calls, 2)
         sleep.assert_awaited_once_with(agent.inbound_retry_interval)
 
-    async def test_rules_mode_filters_paid_delivery_types(self):
+    async def test_rules_mode_keeps_configured_delivery_types(self):
         agent, _bot = self.build_agent(mode="rules")
-        self.assertIsNone(agent.classify_item(API_ITEM))
-        self.assertIsNone(agent.classify_item(PAN_ITEM))
+        self.assertEqual(agent.classify_item(API_ITEM)["delivery"], "redeem")
+        self.assertEqual(agent.classify_item(PAN_ITEM)["delivery"], "pan")
         self.assertEqual(agent.classify_item(MATERIAL_ITEM)["delivery"], "material")
 
     async def test_rules_ai_keeps_paid_delivery_types(self):

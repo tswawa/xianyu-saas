@@ -7,6 +7,7 @@ order, inventory or buyer data is used.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sqlite3
@@ -120,6 +121,144 @@ def seed_records(storage: AccountStorage, user_id: int, account_key: str, chat_i
             "INSERT INTO delivery_events VALUES (?,?,?,?,?,?,?,?)",
             (order_key, "delivered", "100001", 1, "shipped", 1.0, 1000.0, 1000.0),
         )
+
+
+def assert_order_queries(client, user_id, storage):
+    key = "orders-page"
+    created = client.post("/api/bot/accounts", json={"key": key, "name": "订单分页测试"})
+    assert created.status_code == 200, created.text
+    headers = {"X-Shop-Account": key}
+    root = storage.account_dir(user_id, key)
+    path = root / "delivery_state.db"
+    empty = client.get("/api/bot/orders?page=1&page_size=15", headers=headers).json()
+    assert empty["total"] == 0 and empty["total_pages"] == 0 and not path.exists()
+    statuses = ["awaiting_binding", "verified", "reserved", "sending", "delivered", "manual_review",
+                "retry", "cancelled", "expired", "failed", "future_state", "manual_review"]
+    base = 1788602400
+    with sqlite3.connect(path) as con:
+        con.executescript("""
+            CREATE TABLE delivery_events (
+                order_key TEXT PRIMARY KEY, status TEXT, created_at REAL, updated_at REAL,
+                platform_order_id TEXT, item_id TEXT, buyer_id TEXT, chat_id TEXT,
+                quantity INTEGER, paid_amount TEXT, platform_status TEXT, verified_at REAL,
+                delivered_at REAL, platform_shipped_at REAL, delivery_type TEXT,
+                last_error TEXT, delivery_payload TEXT, inventory_ids TEXT
+            );
+            CREATE TABLE manual_reviews (order_key TEXT PRIMARY KEY, status TEXT, resolution TEXT);
+        """)
+        for index in range(240):
+            record_key = f"same-first-14--{index:05}"
+            con.execute("INSERT INTO delivery_events VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
+                record_key, statuses[index % len(statuses)], base + index // 3, base + index // 3,
+                str(429175119103700000 + index), "100001", "buyer-%_\\literal" if index == 2 else "buyer-001",
+                "order-chat", 1, "0.00" if index == 0 else None if index == 1 else "0.18", "2", base,
+                base + 30 if index % 12 == 4 else None, None, "redeem",
+                "inventory_empty" if index % 12 == 5 else "private-error-SECRET" if index % 12 == 10 else None,
+                "private-delivery-SECRET", "private-inventory-SECRET",
+            ))
+            if index % 12 == 11:
+                con.execute("INSERT INTO manual_reviews VALUES (?, 'resolved', 'fulfilled_manually')", (record_key,))
+    with sqlite3.connect(root / "chat_history.db") as con:
+        con.execute("CREATE TABLE messages (chat_id TEXT)")
+        con.execute("INSERT INTO messages VALUES ('order-chat')")
+    cookie = "unb=810001; _m_h5_tk=fixture-signature_demo"
+    storage.write_text(user_id, key, "cookies.txt", cookie)
+    snapshot = fake_shop_sync(cookie)
+    snapshot["products"][0].update(price="9999.00", image_url="https://user:secret@bad.example/item.png")
+    shop_sync.save_snapshot(user_id, snapshot, key)
+    path_before = path.read_bytes()
+    page = client.get("/api/bot/orders?page=1&page_size=15", headers=headers)
+    assert page.status_code == 200, page.text
+    data = page.json()
+    assert data["account_key"] == key and data["total"] == 240 and data["total_pages"] == 16
+    assert data["status_counts"] == {"all": 240, "processing": 80, "sent": 20, "manual": 20, "retry": 20, "ended": 60, "exception": 40}
+    assert data["orders"][0]["order_key"] == "same-first-14--00239"
+    assert data["orders"][0]["status_label"] == "已人工处理"
+    assert data["orders"][0]["conversation_available"] is True
+    assert len(client.get("/api/bot/orders?limit=200", headers=headers).json()["orders"]) == 200
+    keys = []
+    for number in range(1, 17):
+        part = client.get(f"/api/bot/orders?page={number}&page_size=15", headers=headers).json()
+        keys.extend(row["order_key"] for row in part["orders"])
+    assert len(keys) == len(set(keys)) == 240 and keys == sorted(keys, reverse=True)
+    for size in (15, 30, 50):
+        last = client.get(f"/api/bot/orders?page=1000000&page_size={size}", headers=headers).json()
+        assert last["page"] == (240 + size - 1) // size and last["orders"][-1]["order_key"] == "same-first-14--00000"
+    manual = client.get("/api/bot/orders?page=1&status=manual", headers=headers).json()
+    assert manual["total"] == 20 and manual["status_counts"]["all"] == 240
+    assert all(row["review_status"] == "open" and row["reason_label"] for row in manual["orders"])
+    for status, count in data["status_counts"].items():
+        filtered = client.get("/api/bot/orders", params={"page": 1, "status": status}, headers=headers).json()
+        assert filtered["total"] == count
+    for keyword, field, expected in (("same-first-14--00000", "order_id", 1), ("429175119103700002", "order_id", 1),
+                                     ("%_\\literal", "buyer_id", 1), ("' OR 1=1 --", "all", 0), ("100001", "item_id", 240)):
+        search = client.get("/api/bot/orders", params={"page": 1, "q": keyword, "search_field": field}, headers=headers).json()
+        assert search["total"] == expected, search
+        assert search["status_counts"]["all"] == expected
+    first = client.get("/api/bot/orders", params={"page": 1, "q": "same-first-14--00000"}, headers=headers).json()["orders"][0]
+    assert first["paid_amount"] == "0.00" and first["platform_order_id"] == "429175119103700000"
+    assert first["item_title"] == "商品-810001" and first["item_image_url"] == ""
+    assert first["paid_amount"] != snapshot["products"][0]["price"], "never substitute a product price for the paid amount"
+    assert len(first["order_key"]) > 14 and first["created_at"].endswith("+00:00")
+    second = client.get("/api/bot/orders", params={"page": 1, "q": "same-first-14--00001"}, headers=headers).json()["orders"][0]
+    assert second["paid_amount"] is None
+    from datetime import datetime, timezone
+    bounds = {"page": 1, "created_from": datetime.fromtimestamp(base, timezone.utc).isoformat(),
+              "created_to": datetime.fromtimestamp(base + 1, timezone.utc).isoformat()}
+    assert client.get("/api/bot/orders", params=bounds, headers=headers).json()["total"] == 3
+    for params in ({"page": "bad"}, {"page": 0}, {"page": 1000001}, {"page_size": 200}, {"page_size": 0},
+                   {"status": "refund"}, {"search_field": "delivery_payload"}, {"q": "x" * 129}, {"q": "\x00"},
+                   {"created_from": "2026-09-05"}, {**bounds, "created_to": bounds["created_from"]}):
+        bad = client.get("/api/bot/orders", params=params, headers=headers)
+        assert bad.status_code == 400 and bad.json()["detail"]["code"] == "invalid_order_query", bad.text
+    serialized = json.dumps(data, ensure_ascii=False)
+    assert all(secret not in serialized for secret in ("SECRET", "inventory_ids", "delivery_payload", "last_error"))
+    legacy = client.get("/api/bot/orders?page=1", headers={"X-Shop-Account": "second"}).json()
+    assert legacy["total"] == 1 and legacy["orders"][0]["buyer_id"] == "" and legacy["orders"][0]["status_label"] == "已发送"
+    assert client.get("/api/bot/orders", params={"page": 1, "q": "same-first-14"}).json()["total"] == 0
+    assert client.get("/api/bot/orders?page=1", headers={"X-Shop-Account": "../orders-page"}).status_code == 404
+    assert path.read_bytes() == path_before, "GET order queries must never mutate the delivery database"
+    other_id = app.db.create_user("other-orders-owner", "Other-Orders-Pass-123!", role="owner", initializer=app._new_user_initializer({}))
+    other = TestClient(app.app)
+    login_response = other.post("/api/auth/login", json={"username": "other-orders-owner", "password": "Other-Orders-Pass-123!"})
+    assert login_response.status_code == 200
+    other.cookies.set("xianyu_saas_session", login_response.cookies.get("xianyu_saas_session"), path="/")
+    assert other.get("/api/bot/orders?page=1", headers=headers).status_code == 404
+    assert other.get("/api/bot/orders?page=1").json()["total"] == 0
+    assert not (storage.account_dir(other_id) / "delivery_state.db").exists()
+    assert other.post("/api/bot/accounts", json={"key": key, "name": "同键不同用户"}).status_code == 200
+    seed_records(storage, other_id, key, "other-private-chat", "same-first-14--00000")
+    other_orders = other.get("/api/bot/orders?page=1", headers=headers).json()
+    assert other_orders["total"] == 1 and other_orders["orders"][0]["platform_order_id"] == ""
+    assert client.get("/api/bot/orders?page=1", headers=headers).json()["total"] == 240
+    assert TestClient(app.app).get("/api/bot/orders?page=1", headers=headers).status_code == 401
+    with patch.object(records, "_orders_connection", side_effect=PermissionError("private path")):
+        unavailable = client.get("/api/bot/orders?page=1", headers=headers)
+        assert unavailable.status_code == 503 and "private path" not in unavailable.text
+    path.write_bytes(b"corrupt sqlite data")
+    try:
+        damaged = client.get("/api/bot/orders?page=1", headers=headers)
+        assert damaged.status_code == 503 and damaged.json()["detail"]["code"] == "orders_unavailable"
+    finally:
+        path.write_bytes(path_before)
+    # Missing optional tables are fine; a missing required schema is not.
+    with sqlite3.connect(root / "incomplete.db") as con:
+        con.execute("CREATE TABLE delivery_events (order_key TEXT)")
+    incomplete = (root / "incomplete.db").read_bytes()
+    path.write_bytes(incomplete)
+    try:
+        assert client.get("/api/bot/orders?page=1", headers=headers).status_code == 503
+    finally:
+        path.write_bytes(path_before)
+    if hasattr(os, "symlink") and os.name != "nt":
+        path.rename(root / "original.db")
+        path.symlink_to(root / "original.db")
+        try:
+            assert client.get("/api/bot/orders?page=1", headers=headers).status_code == 503
+        finally:
+            path.unlink()
+            (root / "original.db").rename(path)
+    assert hashlib.sha256(path.read_bytes()).digest() == hashlib.sha256(path_before).digest()
 
 
 def main() -> None:
@@ -341,7 +480,8 @@ def main() -> None:
     bot_manager.clear_auth_status(user_id, "second")
     assert bot_manager.status(user_id, "second")["auth_code"] == "ok"
 
-    print("account-isolation contract: cookies, snapshots, automation, jobs, attention, records and worker paths passed")
+    assert_order_queries(client, user_id, storage)
+    print("account-isolation contract: cookies, snapshots, automation, jobs, attention, orders pagination, records and worker paths passed")
 
 
 if __name__ == "__main__":

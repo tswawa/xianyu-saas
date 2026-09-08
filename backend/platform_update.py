@@ -17,6 +17,7 @@ import os
 import re
 import secrets
 import stat
+import subprocess
 import tarfile
 import tempfile
 from dataclasses import dataclass
@@ -28,6 +29,8 @@ import requests
 from cryptography.exceptions import InvalidSignature, UnsupportedAlgorithm
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+from version import VERSION, deployment_kind
 
 
 RELEASE_OWNER = "tswawa"
@@ -419,35 +422,57 @@ def _parse_release(raw, channel: str) -> ReleaseInfo | None:
     )
 
 
-def fetch_release(channel: str, current_version: str, session=None) -> ReleaseInfo | None:
-    channel = str(channel or "")
+def inspect_releases(channel: str, current_version: str, session=None) -> tuple[dict, ReleaseInfo | None]:
+    """Separate an empty channel from an up-to-date build and incomplete releases."""
     if channel not in VALID_CHANNELS:
         raise PlatformUpdateError("update_channel_invalid")
     current = SemVer.parse(current_version)
     session = session or requests.Session()
-    url = f"{GITHUB_API_ROOT}/releases?per_page=30"
-    raw = _request_bytes(session, url, max_bytes=MAX_RELEASE_METADATA_BYTES)
+    raw = _request_bytes(session, f"{GITHUB_API_ROOT}/releases?per_page=30", max_bytes=MAX_RELEASE_METADATA_BYTES)
     try:
         releases = json.loads(raw.decode("utf-8"))
     except (UnicodeError, json.JSONDecodeError) as exc:
         raise PlatformUpdateError("update_source_invalid") from exc
     if not isinstance(releases, list):
         raise PlatformUpdateError("update_source_invalid")
-    candidates: list[tuple[SemVer, ReleaseInfo]] = []
+    winner = None
+    winner_version = None
+    # Compare metadata first: old or wrong-channel assets cannot break a check.
     for item in releases:
-        release = _parse_release(item, channel)
-        if release is None:
+        if not isinstance(item, dict) or item.get("draft") is True:
             continue
-        version = SemVer.parse(release.version)
-        if version.compare(current) > 0:
-            candidates.append((version, release))
-    if not candidates:
-        return None
-    winner_version, winner = candidates[0]
-    for candidate_version, candidate in candidates[1:]:
-        if candidate_version.compare(winner_version) > 0:
-            winner_version, winner = candidate_version, candidate
-    return winner
+        try:
+            version = SemVer.parse(_version_from_tag(item.get("tag_name", "")))
+        except PlatformUpdateError:
+            continue
+        if channel == "stable" and (item.get("prerelease") or version.prerelease):
+            continue
+        if winner_version is None or version.compare(winner_version) > 0:
+            winner_version, winner = version, item
+    payload = {"channel": channel, "current_version": current_version, "available": False,
+               "status": "no_release", "version": "", "release_notes": "", "error_code": ""}
+    if winner is None:
+        return payload, None
+    payload.update(version=_version_from_tag(winner["tag_name"]),
+                   published_at=str(winner.get("published_at", ""))[:80])
+    if winner_version.compare(current) <= 0:
+        payload["status"] = "current"
+        return payload, None
+    payload.update(available=True, release_notes=str(winner.get("body", ""))[:MAX_RELEASE_NOTES_CHARS])
+    try:
+        release = _parse_release(winner, channel)
+    except PlatformUpdateError as exc:
+        payload.update(status="incomplete", error_code=exc.code)
+        return payload, None
+    payload["status"] = "available"
+    return payload, release
+
+
+def fetch_release(channel: str, current_version: str, session=None) -> ReleaseInfo | None:
+    payload, release = inspect_releases(channel, current_version, session=session)
+    if payload["status"] == "incomplete":
+        raise PlatformUpdateError(payload["error_code"])
+    return release
 
 
 def release_payload(release: ReleaseInfo | None, channel: str, current_version: str) -> dict:
@@ -505,6 +530,93 @@ def load_public_key() -> Ed25519PublicKey:
         return Ed25519PublicKey.from_public_bytes(decoded)
     except (TypeError, ValueError, UnsupportedAlgorithm, binascii.Error) as exc:
         raise PlatformUpdateError("update_public_key_invalid") from exc
+
+
+def _systemd_properties(unit: str) -> dict[str, str]:
+    """Read only two fixed units; no shell, service control or inherited secrets."""
+    if unit not in {"xianyu-saas-updater.path", "xianyu-saas-updater.service"}:
+        raise PlatformUpdateError("update_service_unavailable")
+    try:
+        result = subprocess.run(
+            ["/usr/bin/systemctl", "--no-pager", "--no-ask-password", "show", unit,
+             "--property=LoadState,ActiveState,SubState,Paths,Triggers"],
+            capture_output=True, text=True, timeout=2,
+            env={"PATH": "/usr/bin:/bin", "LANG": "C", "SYSTEMD_PAGER": "cat"},
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise PlatformUpdateError("update_service_unavailable") from exc
+    if result.returncode != 0:
+        raise PlatformUpdateError("update_service_unavailable")
+    return dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
+
+
+def _trusted_update_directory(path: Path, *, writable: bool = False) -> None:
+    if not path.is_absolute():
+        raise PlatformUpdateError("update_installation_unavailable")
+    for parent in (path, *path.parents):
+        metadata = parent.lstat()
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+            raise PlatformUpdateError("update_installation_unavailable")
+        allowed_owner = {0, os.geteuid()} if writable else {0}
+        if metadata.st_uid not in allowed_owner or metadata.st_mode & 0o022:
+            raise PlatformUpdateError("update_installation_unavailable")
+    if writable and not os.access(path, os.W_OK | os.X_OK):
+        raise PlatformUpdateError("update_installation_unavailable")
+
+
+def _systemd_update_ready() -> None:
+    current = Path(os.environ.get("SAAS_CURRENT_LINK", "/opt/xianyu-saas/current"))
+    releases = Path(os.environ.get("SAAS_RELEASES_DIR", "/opt/xianyu-saas/releases"))
+    _trusted_update_directory(releases)
+    _trusted_update_directory(current.parent)
+    if not current.is_symlink() or current.lstat().st_uid != 0:
+        raise PlatformUpdateError("update_installation_unavailable")
+    source = current.resolve(strict=True)
+    if source != releases / VERSION or source != PROJECT_ROOT.resolve() or source != _source_root():
+        raise PlatformUpdateError("update_installation_unavailable")
+    _trusted_update_directory(source)
+    load_public_key()
+    if _public_key_file().lstat().st_uid != 0:
+        raise PlatformUpdateError("update_public_key_invalid")
+    # A marker alone is not evidence that a deployment is a signed release.
+    marker = _marker_payload(source)
+    if marker.get("schema") != 1 or marker.get("version") != VERSION:
+        raise PlatformUpdateError("update_installation_unavailable")
+    manifest = _read_secure_file(source / CACHED_MANIFEST_FILE, MAX_MANIFEST_BYTES)
+    verify_manifest_signature(manifest, _read_secure_file(source / CACHED_SIGNATURE_FILE, MAX_SIGNATURE_BYTES))
+    parse_manifest(manifest, _release_from_marker(marker))
+    _verify_candidate_version(source, VERSION)
+    _trusted_update_directory(_staging_root(), writable=True)
+    _trusted_update_directory(_intent_file().parent, writable=True)
+    watcher = _systemd_properties("xianyu-saas-updater.path")
+    service = _systemd_properties("xianyu-saas-updater.service")
+    if (watcher.get("LoadState") != "loaded" or watcher.get("ActiveState") != "active"
+            or service.get("LoadState") != "loaded" or service.get("ActiveState") == "failed"
+            or "xianyu-saas-updater.service" not in watcher.get("Triggers", "").split()
+            or watcher.get("Paths") != f"{_intent_file()} (PathExists)"):
+        raise PlatformUpdateError("update_service_unavailable")
+
+
+def update_capabilities() -> dict:
+    mode = deployment_kind()
+    instructions = {
+        "docker": "这是源码构建的 Docker 部署。先备份数据并取得已确认的目标源码，再使用原 Compose 文件及本地覆盖配置重新构建、启动。保留原数据卷，不要删除数据卷。网页不能替宿主机执行升级。",
+        "source": "这是源码部署。请维护者备份数据、取得目标源码并按原部署方式更新和重启；当前未配置网页安装服务。",
+        "systemd": "签名版本部署需配置可信发布目录、签名公钥以及运行中的独立更新服务。应用前请备份数据；页面会显示请求及执行状态。",
+    }
+    result = {"deployment": mode, "check": True, "download": False, "apply": False,
+              "rollback": False, "reason": "update_installation_unsupported", "instruction": instructions[mode]}
+    if mode != "systemd":
+        return result
+    try:
+        _systemd_update_ready()
+    except PlatformUpdateError as exc:
+        result["reason"] = exc.code
+    except (OSError, ValueError, RuntimeError):
+        result["reason"] = "update_installation_unavailable"
+    else:
+        result.update(download=True, apply=True, rollback=True, reason="")
+    return result
 
 
 def _decode_signature(raw: bytes) -> bytes:

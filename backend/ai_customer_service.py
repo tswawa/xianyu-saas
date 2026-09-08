@@ -18,6 +18,7 @@ import os
 import re
 import secrets
 import socket
+import sqlite3
 import ssl
 import stat
 import time
@@ -73,6 +74,7 @@ ERROR_MESSAGES = {
     "verification_invalid": "连接测试凭证无效或已过期",
     "revision_conflict": "配置已更新，请刷新后重试",
     "address_unsafe": "连接地址不符合安全要求",
+    "dns_fake_ip": "域名被代理解析为 Fake-IP，请为模型域名配置真实 DNS 后重试；不要关闭私网访问保护",
     "authentication_failed": "模型服务鉴权失败",
     "model_not_found": "模型不存在或不可用",
     "rate_limited": "模型服务请求过于频繁",
@@ -285,6 +287,18 @@ def ensure_development_master_key(path: Path, tenants_root: Path) -> str:
         )
     except OSError as exc:
         raise AIServiceError("credential_store_unavailable", 503) from exc
+    database_path = Path(os.environ.get("SAAS_DB", str(key_path.parent / "saas.db")))
+    if database_path.exists():
+        connection = None
+        try:
+            connection = sqlite3.connect(database_path.resolve().as_uri() + "?mode=ro", uri=True, timeout=3)
+            if connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='user_ai_connections'").fetchone():
+                encrypted_connections_exist = encrypted_connections_exist or bool(connection.execute("SELECT 1 FROM user_ai_connections LIMIT 1").fetchone())
+        except (OSError, sqlite3.Error) as exc:
+            raise AIServiceError("credential_store_unavailable", 503) from exc
+        finally:
+            if connection is not None:
+                connection.close()
     if encrypted_connections_exist:
         raise AIServiceError(
             "credential_store_unavailable",
@@ -583,6 +597,7 @@ class AIService:
         self.clock = time.time if clock is None else clock
         self.resolver = socket.getaddrinfo if resolver is None else resolver
         self.requester = requester
+        self.user_connections = None
 
     @staticmethod
     def _scope(user_id: int, shop_account_id: int, account_key: str) -> tuple[int, int, str]:
@@ -784,6 +799,8 @@ class AIService:
             except (ValueError, IndexError, TypeError) as exc:
                 raise AIServiceError("address_unsafe", 400) from exc
             if not self._address_allowed(address, allow_loopback=allow_loopback):
+                if isinstance(address, ipaddress.IPv4Address) and address in ipaddress.ip_network("198.18.0.0/15"):
+                    raise AIServiceError("dns_fake_ip", 400)
                 raise AIServiceError("address_unsafe", 400)
             candidate = (family, socktype, protocol, sockaddr)
             if candidate not in resolved:
@@ -865,13 +882,24 @@ class AIService:
             return self.requester(url, api_key, payload, headers)
         return self.requester(url, api_key, payload)
 
-    def _request_json(self, provider: str, base_url: str, model: str, api_key: str, payload: dict) -> dict:
+    def _routing_session(self, scope, messages) -> str:
+        # A non-secret, stable routing/cache identifier. Do not send tenant IDs
+        # or conversation text as headers, and never impersonate another client.
+        first_user = next((item.get("content", "") for item in messages
+                           if isinstance(item, dict) and item.get("role") == "user"), "")
+        _, signing = self._master_keys()
+        identity = _json_bytes({"scope": scope, "first_user": first_user})
+        return "saas-" + hmac.new(signing, b"routing-session\0" + identity, hashlib.sha256).hexdigest()
+
+    def _request_json(self, provider: str, base_url: str, model: str, api_key: str, payload: dict, *, routing_session: str = "") -> dict:
         try:
             clean_provider = normalize_provider(provider)
             request_data = build_request(clean_provider, base_url, model, api_key, payload)
         except ProviderAdapterError as exc:
             raise AIServiceError(exc.code, 400, str(exc)) from exc
         allow_loopback = self._allow_local_provider(clean_provider)
+        if routing_session and clean_provider in {"openai_chat_completions", "openai_responses"}:
+            request_data["headers"]["x-opencode-session"] = routing_session
         if self.requester is not None:
             self._validate_target(request_data["url"], allow_loopback=allow_loopback)
             try:
@@ -1035,7 +1063,10 @@ class AIService:
                 ],
                 "max_tokens": 256 if clean_provider == "openai_responses" else 32,
                 "temperature": 0,
+                **({"thinking": {"type": "disabled"}} if clean_provider == "openai_chat_completions"
+                   and clean_model.lower() in {"deepseek-v4-flash", "deepseek-v4-pro"} else {}),
             },
+            routing_session=self._routing_session(scope, [{"role": "user", "content": "Connection test."}]),
         )
         self._response_text(response)
         return {
@@ -1137,8 +1168,24 @@ class AIService:
         self._write_root_json(scope, SETTINGS_FILE, settings)
         return saved
 
+    def effective_connection(self, user_id: int, shop_account_id: int, account_key: str) -> dict:
+        scope = self._scope(user_id, shop_account_id, account_key)
+        if self.user_connections is not None and self.user_connections.initialized(scope[0]):
+            return self.user_connections.read(scope[0])
+        return {**self.get_connection(*scope), "scope": "shop", "initialized": False}
+
+    def _connection_generation(self, scope) -> tuple:
+        metadata = self.effective_connection(*scope)
+        return (metadata.get("scope"), metadata.get("revision", 0), metadata.get("key_revision", 0), metadata.get("connection_status"))
+
+    def _ensure_connection_generation(self, scope, generation) -> None:
+        if self._connection_generation(scope) != generation:
+            raise AIServiceError("revision_conflict", 409, "模型连接已变更，本次旧连接的迟到结果已丢弃")
+
     def get_runtime_connection(self, user_id: int, shop_account_id: int, account_key: str) -> dict:
         scope = self._scope(user_id, shop_account_id, account_key)
+        if self.user_connections is not None and self.user_connections.initialized(scope[0]):
+            return self.user_connections.runtime(scope[0])
         metadata = self.get_connection(*scope)
         try:
             provider = normalize_provider(metadata.get("provider"))
@@ -1194,13 +1241,17 @@ class AIService:
             return False
 
     def forward_payload(self, user_id: int, shop_account_id: int, account_key: str, payload: dict) -> tuple[int, bytes]:
-        connection = self.get_runtime_connection(user_id, shop_account_id, account_key)
+        scope = self._scope(user_id, shop_account_id, account_key)
+        generation = self._connection_generation(scope)
+        connection = self.get_runtime_connection(*scope)
         outbound = dict(payload)
         outbound["stream"] = False
         response = self._request_json(
             connection["provider"], connection["base_url"], connection["model"],
             connection["api_key"], outbound,
+            routing_session=self._routing_session(scope, outbound.get("messages", [])),
         )
+        self._ensure_connection_generation(scope, generation)
         self._response_text(response)
         return 200, _json_bytes(response)
 
@@ -1618,12 +1669,17 @@ class AIService:
         return versions[-MAX_HISTORY:]
 
     def _chat(self, scope, messages: list[dict], *, max_tokens: int = 500) -> str:
+        generation = self._connection_generation(scope)
         connection = self.get_runtime_connection(*scope)
+        payload = {"stream": False, "messages": messages,
+                   "temperature": 0.2, "max_tokens": max(1, min(int(max_tokens), 1200))}
+        if connection["provider"] == "openai_chat_completions" and connection["model"].lower() in {"deepseek-v4-flash", "deepseek-v4-pro"}:
+            payload["thinking"] = {"type": "disabled"}
         response = self._request_json(
-            connection["provider"], connection["base_url"], connection["model"], connection["api_key"],
-            {"stream": False, "messages": messages,
-             "temperature": 0.2, "max_tokens": max(1, min(int(max_tokens), 1200))},
+            connection["provider"], connection["base_url"], connection["model"], connection["api_key"], payload,
+            routing_session=self._routing_session(scope, messages),
         )
+        self._ensure_connection_generation(scope, generation)
         return self._response_text(response)
 
     def extract_knowledge(

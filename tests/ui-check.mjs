@@ -14,8 +14,10 @@ const resultRoot = path.join(repoRoot, "test-results");
 const versionSource = fs.readFileSync(path.join(repoRoot, "backend", "version.py"), "utf8");
 const assetVersion = versionSource.match(/^ASSET_VERSION\s*=\s*["']([^"']+)["']\s*$/m)?.[1] || "";
 assert.match(assetVersion, /^[0-9]{8}-[0-9]{2}$/);
-fs.mkdirSync(resultRoot, { recursive: true });
-for (const staleName of [
+const desktopSettingsOpsScope = ["settings", "ops"].includes(process.env.SAAS_UI_SCOPE);
+const screenshotsEnabled = !desktopSettingsOpsScope && process.env.SAAS_UI_SCREENSHOTS !== "0";
+if (screenshotsEnabled) fs.mkdirSync(resultRoot, { recursive: true });
+for (const staleName of screenshotsEnabled ? [
   "local-live-desktop.png", "local-live-mobile.png", "shop-connector-missing-desktop.png",
   "dashboard-free-desktop.png", "shop-accounts-desktop.png", "shop-accounts-mobile.png",
   "products-free-desktop.png", "automation-free-desktop.png", "automation-free-mobile.png",
@@ -33,7 +35,7 @@ for (const staleName of [
   "ai-generated-preview-desktop.png", "ai-generated-preview-mobile.png",
   "manual-reply-multi-desktop.png", "manual-reply-multi-mobile.png",
   "docs-manual-desktop.png", "docs-manual-mobile.png",
-]) {
+] : []) {
   fs.rmSync(path.join(resultRoot, staleName), { force: true });
 }
 
@@ -63,18 +65,44 @@ const defaultAiStoreConfig = {
   forbidden_claims: "",
   handoff_rules: "",
 };
+const dockerUpdateCapabilities = { deployment: "docker", check: true, download: false, apply: false, rollback: false, reason: "update_installation_unsupported", instruction: "使用原 Compose 文件和本地覆盖配置重新构建，保留数据卷。" };
+const orderStatusOptions = [
+  ["all", "全部"], ["processing", "处理中"], ["sent", "已发送"], ["manual", "待人工"],
+  ["retry", "待重试"], ["ended", "已结束"], ["exception", "其他异常"],
+].map(([value, label]) => ({ value, label }));
+function orderFixturePage(rows, params, accountKey) {
+  const safeRows = rows.map((order) => {
+    const group = order.status_group || ({ delivered: "sent", manual_review: "manual", retry: "retry", failed: "exception", cancelled: "ended", expired: "ended" }[order.status] || "processing");
+    return { platform_order_id: "", item_title: "", buyer_id: "", chat_id: "", conversation_available: false,
+      reason_code: "", reason_label: "", delivery_type_label: "未获取", platform_status_label: "未获取", ...order,
+      status_group: group, status_label: order.status_label || orderStatusOptions.find((opt) => opt.value === group)?.label || "未知状态" };
+  });
+  if (!params.has("page") && !params.has("page_size")) return { orders: safeRows.slice(0, Number(params.get("limit") || 50)) };
+  const q = (params.get("q") || "").toLowerCase();
+  const field = params.get("search_field") || "all";
+  const searchKeys = { all: ["order_key", "platform_order_id", "item_id", "buyer_id"], order_id: ["order_key", "platform_order_id"], item_id: ["item_id"], buyer_id: ["buyer_id"] }[field] || [];
+  const start = params.get("created_from") ? Date.parse(params.get("created_from")) : -Infinity;
+  const end = params.get("created_to") ? Date.parse(params.get("created_to")) : Infinity;
+  const matched = safeRows.filter((row) => (!q || searchKeys.some((key) => String(row[key] || "").toLowerCase().includes(q)))
+    && (!(Number.isFinite(start) || Number.isFinite(end)) || (Date.parse(row.created_at) >= start && Date.parse(row.created_at) < end)));
+  const counts = Object.fromEntries(orderStatusOptions.map((opt) => [opt.value, 0]));
+  counts.all = matched.length;
+  for (const row of matched) counts[row.status_group] += 1;
+  const status = params.get("status") || "all";
+  const selected = matched.filter((row) => status === "all" || row.status_group === status)
+    .sort((a, b) => (Date.parse(b.created_at) - Date.parse(a.created_at)) || String(b.order_key).localeCompare(String(a.order_key)));
+  const pageSize = Number(params.get("page_size") || 15);
+  const pages = Math.ceil(selected.length / pageSize);
+  const page = Math.min(Number(params.get("page") || 1), Math.max(pages, 1));
+  return { account_key: accountKey, orders: selected.slice((page - 1) * pageSize, page * pageSize),
+    page, page_size: pageSize, total: selected.length, total_pages: pages, status_counts: counts, status_options: orderStatusOptions };
+}
 const fixtures = {
-  authCapabilities: { registration_enabled: true, first_registration_available: true, bootstrap_available: false, password_min_length: 12 },
-  authCapabilitiesRequests: 0,
-  authCapabilitiesError: null,
-  authCapabilitiesErrorAfterRegistration: null,
-  registrationError: null,
-  loginError: null,
-  registeredUsers: new Map(),
-  registrationRequests: [],
-  authLoginRequests: [],
-  authSequence: [],
-  bootstrapToken: "bootstrap-ui-contract-token-0123456789abcdef",
+  releaseCheckStatus: "available",
+  orderQueries: [],
+  orderQueryDelays: [],
+  orderQueryError: false,
+  authCapabilities: { registration_enabled: true, bootstrap_available: false, password_min_length: 12 },
   bootstrapRequests: [],
   passwordRequests: [],
   authLogoutRequests: 0,
@@ -90,6 +118,8 @@ const fixtures = {
     asset_version: assetVersion,
     update_channel: "stable",
     release_notes: "本地说明 <img src=x onerror=window.__releaseNotesInjected=true>",
+    deployment: "docker", build_dirty: true, capabilities: { ...dockerUpdateCapabilities },
+    update_check: { status: "unchecked", available: false, channel: "stable", checked_at: null },
     latest_update: null,
   },
   adminSettings: {
@@ -106,6 +136,8 @@ const fixtures = {
   updateStatus: {
     current: { version: "0.1.0", commit: "ui-contract", build_time: "2026-08-31T00:00:00Z", asset_version: assetVersion, update_channel: "stable" },
     latest_update: null,
+    capabilities: { ...dockerUpdateCapabilities },
+    update_check: { status: "unchecked", available: false, channel: "stable", checked_at: null },
     rollback_versions: ["0.0.9"],
   },
   updateRequests: [],
@@ -182,6 +214,22 @@ const fixtures = {
     versions: {},
   },
   aiRequests: [],
+  // User-scoped settings and ops are strictly local fixtures. Previewing a plan
+  // never mutates store fixtures; only its explicit confirm endpoint may write.
+  apiRequests: [],
+  userConnections: new Map(),
+  userConnectionTokens: new Map(),
+  settingsRequests: [],
+  settingsTestDelayMs: 0,
+  legacySources: [{ account_key: "default", name: "海风数字店", provider: "openai_chat_completions", base_url: "https://legacy.example.invalid/v1", model: "legacy-fixture-model", revision: 3, api_key_configured: true }],
+  opsRequests: [],
+  opsPlans: new Map(),
+  opsChatsByRequest: new Map(),
+  opsConfirmedRequests: new Map(),
+  opsWrites: [],
+  opsChatMode: "plan",
+  opsConfirmMode: "success",
+  opsConfirmDelayMs: 0,
   aiPreviewRequests: [],
   aiPreviewResponseDelays: [],
   aiExtractResponses: [],
@@ -415,9 +463,144 @@ function advanceManualReply(parent, mode, polls) {
   parent.attempts = polls;
 }
 
+const mockConnectionProviders = [
+  ["openai_chat_completions", "OpenAI / 兼容接口"], ["openai_responses", "OpenAI Responses"],
+  ["anthropic_messages", "Anthropic Claude"], ["google_gemini", "Google Gemini"], ["ollama_chat", "Ollama 本地服务"],
+].map(([code, label]) => ({ code, label, requires_api_key: code !== "ollama_chat" }));
+function userConnectionFixture(username = fixtures.me.username) {
+  if (!fixtures.userConnections.has(username)) {
+    fixtures.userConnections.set(username, {
+      scope: "user", initialized: false, provider: "openai_chat_completions", base_url: "", model: "",
+      api_key_configured: false, connection_status: "unconfigured",
+      revision: 0, key_revision: 0, last_error_code: "",
+    });
+  }
+  return fixtures.userConnections.get(username);
+}
+
+function mockConnectionFingerprint(payload) {
+  return JSON.stringify([payload.provider, payload.base_url, payload.model, payload.api_key || "",
+    payload.expected_revision, payload.source_account_key || "", payload.source_revision ?? null]);
+}
+
+function handleSettingsOpsMock(req, res, apiPath, payload) {
+  if (!apiPath.startsWith("/api/settings/ai/") && !apiPath.startsWith("/api/ops/")) return false;
+  const username = fixtures.me.username;
+  const accountKey = String(req.headers["x-shop-account"] || "default");
+  const connection = userConnectionFixture(username);
+  const reply = (value, status = 200) => { json(res, value, status); return true; };
+  const fail = (code, message, status = 409) => reply({ detail: { code, message } }, status);
+  const request = { method: req.method, path: apiPath, username, accountKey, payload: structuredClone(payload), idempotencyKey: String(req.headers["idempotency-key"] || "") };
+  if (apiPath.startsWith("/api/settings/ai/")) {
+    fixtures.settingsRequests.push(request);
+    if (apiPath === "/api/settings/ai/connection" && req.method === "GET") return reply({ ...structuredClone(connection), providers: mockConnectionProviders });
+    if (apiPath === "/api/settings/ai/connection/legacy-sources" && req.method === "GET") return reply({ sources: structuredClone(fixtures.legacySources) });
+    if (["POST", "PUT", "DELETE"].includes(req.method)) {
+      if (payload.expected_revision !== connection.revision) return fail("revision_conflict", "连接已被其他页面修改，请刷新后重新测试");
+      const source = payload.source_account_key ? fixtures.legacySources.find((item) => item.account_key === payload.source_account_key) : null;
+      if (payload.source_account_key && (!source || payload.source_revision !== source.revision)) return fail("source_revision_conflict", "旧连接已变化，请重新选择迁移来源");
+      if (apiPath === "/api/settings/ai/connection/test" && req.method === "POST") {
+        if (!mockConnectionProviders.some((item) => item.code === payload.provider)) return fail("invalid_provider", "不支持的接口格式", 400);
+        if (!String(payload.base_url || "").startsWith("https://")) return fail("unsafe_url", "连接地址不安全", 400);
+        if (!String(payload.model || "").trim()) return fail("model_not_found", "模型不存在", 404);
+        if (payload.provider !== "ollama_chat" && !payload.api_key && !source?.api_key_configured && !(connection.api_key_configured && connection.provider === payload.provider)) return fail("authentication_failed", "请输入当前接口的 API Key", 401);
+        const token = `mock-user-verification-${fixtures.userConnectionTokens.size + 1}`;
+        fixtures.userConnectionTokens.set(token, { username, fingerprint: mockConnectionFingerprint(payload) });
+        const result = { ok: true, status: "verified", verification_token: token, expires_in: 180 };
+        const delay = fixtures.settingsTestDelayMs;
+        fixtures.settingsTestDelayMs = 0;
+        if (delay) { setTimeout(() => json(res, result), delay); return true; }
+        return reply(result);
+      }
+      if (apiPath === "/api/settings/ai/connection" && req.method === "PUT") {
+        if (payload.confirm !== true) return fail("confirmation_required", "需要确认保存用户统一连接");
+        const verification = fixtures.userConnectionTokens.get(payload.verification_token);
+        if (!verification || verification.username !== username || verification.fingerprint !== mockConnectionFingerprint(payload)) return fail("verification_invalid", "测试凭证已失效，请重新测试连接");
+        fixtures.userConnectionTokens.delete(payload.verification_token);
+        const saved = { ...connection, initialized: true, provider: payload.provider, base_url: payload.base_url, model: payload.model,
+          api_key_configured: Boolean(payload.api_key || source?.api_key_configured || (connection.provider === payload.provider && connection.api_key_configured)),
+          connection_status: "verified", revision: connection.revision + 1,
+          key_revision: connection.key_revision + 1, last_error_code: "" };
+        fixtures.userConnections.set(username, saved);
+        return reply({ ok: true, connection: structuredClone(saved) });
+      }
+      if (apiPath === "/api/settings/ai/connection" && req.method === "DELETE") {
+        if (payload.confirm !== true) return fail("confirmation_required", "需要确认删除用户统一连接");
+        const cleared = { ...connection, initialized: true, provider: "openai_chat_completions", base_url: "", model: "", api_key_configured: false, connection_status: "unconfigured",
+          revision: connection.revision + 1, key_revision: connection.key_revision + 1 };
+        fixtures.userConnections.set(username, cleared);
+        return reply({ ok: true, connection: structuredClone(cleared) });
+      }
+    }
+    return fail("mock_route_missing", `未实现的设置 mock: ${req.method} ${apiPath}`, 404);
+  }
+
+  fixtures.opsRequests.push(request);
+  if (apiPath === "/api/ops/context" && req.method === "GET") {
+    const products = scopedFixture(req, "products", fixtures.products).value.slice(0, 3).map((item) => ({ item_id: item.id, title: item.title, knowledge_revision: 1 }));
+    const rules = structuredClone(scopedFixture(req, "automation", fixtures.automation).value.rules);
+    return reply({ products, rules, diagnostics: { product_count: products.length, listed_product_count: products.length,
+      products_truncated: false, knowledge_configured_count: products.length, knowledge_disabled_count: 0,
+      rule_count: rules.length, enabled_rule_count: rules.filter((rule) => rule.enabled).length, rules_file_present: true,
+      ai_content_published: true, ai_customer_service_enabled: false, scope: "current_shop", max_targets: 20,
+      runtime_state: "not_started", desired_state: "stopped" }, connection: structuredClone(connection) });
+  }
+  if (apiPath === "/api/ops/chat" && req.method === "POST") {
+    if (!payload.request_id || request.idempotencyKey !== payload.request_id) return fail("idempotency_key_required", "需要一致的幂等请求标识", 400);
+    if (!Array.isArray(payload.history) || !Array.isArray(payload.selected_item_ids) || !Array.isArray(payload.selected_rule_ids)) return fail("invalid_request", "缺少选择项或对话历史", 400);
+    const key = `${username}:${accountKey}:${payload.request_id}`;
+    if (fixtures.opsChatsByRequest.has(key)) return reply(structuredClone(fixtures.opsChatsByRequest.get(key)));
+    if (fixtures.opsChatMode === "error") return fail("provider_unavailable", "运维服务暂时不可用，请稍后重试", 503);
+    if (fixtures.opsChatMode === "reply") {
+      const result = { reply: "仅分析已选商品和规则；尚未生成可执行计划，也没有写入。", plan: null };
+      fixtures.opsChatsByRequest.set(key, result);
+      return reply(result);
+    }
+    const id = `mock-ops-plan-${fixtures.opsPlans.size + 1}`;
+    const itemId = payload.selected_item_ids[0] || "100001";
+    const plan = { id, revision: 1, digest: (fixtures.opsPlans.size + 1).toString(16).padStart(64, "0"), status: "proposed", expires_at: Math.floor(Date.now() / 1000) + 600,
+      summary: "仅 mock：更新所选商品知识，确认前不会写入。",
+      items: [{ id: `${id}-item-1`, tool: "knowledge.save", target: itemId,
+        before: { content: "原有商品说明", revision: 1, disabled: false }, after: { content: "仅限所选商品的使用说明（模拟变更）", revision: 2, disabled: false }, status: "pending", error_code: "" }] };
+    fixtures.opsPlans.set(id, { username, accountKey, plan });
+    const result = { reply: "已生成模拟预览，请核对逐项差异后再确认。", plan };
+    fixtures.opsChatsByRequest.set(key, structuredClone(result));
+    return reply(result);
+  }
+  const match = apiPath.match(/^\/api\/ops\/plans\/([^/]+)(?:\/(confirm|cancel))?$/);
+  if (match) {
+    const stored = fixtures.opsPlans.get(decodeURIComponent(match[1]));
+    if (!stored || stored.username !== username || stored.accountKey !== accountKey) return fail("plan_not_found", "计划不存在", 404);
+    const plan = stored.plan;
+    if (!match[2] && req.method === "GET") return reply(structuredClone(plan));
+    if (req.method !== "POST") return fail("method_not_allowed", "操作方法不支持", 405);
+    const confirmKey = `${username}:${accountKey}:${payload.request_id}`;
+    if (match[2] === "confirm" && fixtures.opsConfirmedRequests.has(confirmKey)) return reply(structuredClone(fixtures.opsConfirmedRequests.get(confirmKey)));
+    if (payload.revision !== plan.revision || payload.digest !== plan.digest) return fail("plan_conflict", "计划版本已变化，请刷新并重新核对");
+    if (match[2] === "cancel") {
+      plan.status = "cancelled";
+      return reply(structuredClone(plan));
+    }
+    if (payload.confirm !== true) return fail("confirmation_required", "需要明确确认计划");
+    if (!payload.request_id || request.idempotencyKey !== payload.request_id) return fail("idempotency_key_required", "需要一致的幂等请求标识", 400);
+    if (plan.status !== "proposed") return reply(structuredClone(plan));
+    if (fixtures.opsConfirmMode === "conflict") return fail("plan_conflict", "计划已被其他页面修改，请重新生成计划");
+    if (fixtures.opsConfirmMode === "error") return fail("operations_unavailable", "计划执行失败，请刷新后查看结果", 503);
+    plan.status = fixtures.opsConfirmMode === "item_error" ? "needs_review" : "succeeded";
+    plan.items[0].status = fixtures.opsConfirmMode === "item_error" ? "needs_review" : "succeeded";
+    plan.items[0].error_code = fixtures.opsConfirmMode === "item_error" ? "content_conflict" : "";
+    if (plan.items[0].status === "succeeded") fixtures.opsWrites.push({ planId: plan.id, itemId: plan.items[0].target, username, accountKey });
+    fixtures.opsConfirmedRequests.set(confirmKey, structuredClone(plan));
+    const delay = fixtures.opsConfirmDelayMs;
+    fixtures.opsConfirmDelayMs = 0;
+    if (delay) { setTimeout(() => json(res, structuredClone(plan)), delay); return true; }
+    return reply(structuredClone(plan));
+  }
+  return fail("mock_route_missing", `未实现的运维 mock: ${req.method} ${apiPath}`, 404);
+}
+
 function createServer() {
-  const sessions = new Map();
-  let sessionSequence = 0;
+  let loggedIn = false;
   return http.createServer((req, res) => {
     const url = new URL(req.url, "http://127.0.0.1");
     if (url.pathname === "/xianyu-saas" || url.pathname === "/xianyu-saas/") {
@@ -438,25 +621,14 @@ function createServer() {
     if (!url.pathname.startsWith("/xianyu-saas/api/")) { res.writeHead(404); res.end(); return; }
     if (req.headers.authorization) fixtures.authorizationHeaders.push(req.headers.authorization);
     const apiPath = url.pathname.slice("/xianyu-saas".length);
+    fixtures.apiRequests.push({ method: req.method, path: apiPath, username: loggedIn ? fixtures.me.username : "", accountKey: String(req.headers["x-shop-account"] || "default") });
     let rawBody = "";
     req.on("data", (chunk) => { rawBody += chunk; });
     req.on("end", () => {
       const contentType = String(req.headers["content-type"] || "").toLowerCase();
       const payload = contentType.includes("application/json") && rawBody ? JSON.parse(rawBody) : {};
-      const sessionId = String(req.headers.cookie || "").split(";").map((part) => part.trim()).find((part) => part.startsWith("xianyu_saas_session="))?.slice("xianyu_saas_session=".length) || "";
-      const me = sessions.get(sessionId);
       if (apiPath === "/api/auth/capabilities" && req.method === "GET") {
-        fixtures.authCapabilitiesRequests += 1;
-        fixtures.authSequence.push("capabilities");
-        if (fixtures.authCapabilitiesError) return json(res, { detail: fixtures.authCapabilitiesError.detail }, fixtures.authCapabilitiesError.status);
         return json(res, fixtures.authCapabilities);
-      }
-      if (["/api/auth/register", "/api/auth/bootstrap", "/api/auth/login"].includes(apiPath) && req.method === "POST") {
-        if (req.headers["x-saas-browser-intent"] !== "browser-write") return json(res, { detail: { code: "browser_intent_required", message: "缺少浏览器写入标记" } }, 403);
-        if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{2,31}$/.test(payload.username || "") || typeof payload.password !== "string"
-          || payload.password.length < fixtures.authCapabilities.password_min_length || payload.password.length > 1024) {
-          return json(res, { detail: "账号或密码格式无效" }, 422);
-        }
       }
       if (apiPath === "/api/auth/bootstrap" && req.method === "POST") {
         fixtures.bootstrapRequests.push({
@@ -465,70 +637,31 @@ function createServer() {
           browserIntent: String(req.headers["x-saas-browser-intent"] || ""),
           url: req.url,
         });
-        if (!fixtures.authCapabilities.bootstrap_available) {
-          return json(res, { detail: { code: "bootstrap_consumed", message: "初始化已完成" } }, 409);
-        }
-        if (req.headers["x-bootstrap-token"] !== fixtures.bootstrapToken) {
-          return json(res, { detail: { code: "bootstrap_denied", message: "无法完成初始化" } }, 403);
-        }
-        fixtures.registeredUsers.set(payload.username, { password: payload.password, role: "admin" });
-        fixtures.authCapabilities = { ...fixtures.authCapabilities, registration_enabled: false, first_registration_available: false, bootstrap_available: false };
+        fixtures.authCapabilities = { ...fixtures.authCapabilities, bootstrap_available: false };
         return json(res, { ok: true });
       }
-      if (apiPath === "/api/auth/register" && req.method === "POST") {
-        fixtures.authSequence.push("register");
-        fixtures.registrationRequests.push({
-          payload,
-          token: String(req.headers["x-bootstrap-token"] || ""),
-          browserIntent: String(req.headers["x-saas-browser-intent"] || ""),
-          url: req.url,
-        });
-        if (fixtures.registrationError) return json(res, { detail: fixtures.registrationError.detail }, fixtures.registrationError.status);
-        if (!fixtures.authCapabilities.registration_enabled || fixtures.authCapabilities.bootstrap_available) {
-          return json(res, { detail: { code: "registration_disabled", message: "注册当前未开放" } }, 403);
-        }
-        if (fixtures.registeredUsers.has(payload.username)) return json(res, { detail: { code: "username_unavailable", message: "账号名称不可用" } }, 409);
-        const role = fixtures.authCapabilities.first_registration_available ? "admin" : "owner";
-        fixtures.registeredUsers.set(payload.username, { password: payload.password, role });
-        if (role === "admin") {
-          fixtures.authCapabilities = { ...fixtures.authCapabilities, registration_enabled: false, first_registration_available: false, bootstrap_available: false };
-        }
-        if (fixtures.authCapabilitiesErrorAfterRegistration) fixtures.authCapabilitiesError = fixtures.authCapabilitiesErrorAfterRegistration;
-        // Registration never creates a session: the browser must explicitly log in.
-        return json(res, { ok: true, role });
-      }
       if (apiPath === "/api/auth/login" && req.method === "POST") {
-        fixtures.authSequence.push("login");
-        fixtures.authLoginRequests.push({ payload, browserIntent: String(req.headers["x-saas-browser-intent"] || "") });
-        if (fixtures.loginError) return json(res, { detail: fixtures.loginError.detail }, fixtures.loginError.status);
-        const registered = fixtures.registeredUsers.get(payload.username);
-        if ((registered && registered.password !== payload.password) || (!registered && payload.username !== fixtures.me.username)) {
-          return json(res, { detail: "账号或密码错误" }, 401);
-        }
-        const role = registered?.role || fixtures.me.role;
-        const nextSessionId = "mock-session-" + (++sessionSequence);
-        sessions.set(nextSessionId, {
-          ...fixtures.me, username: payload.username, role, role_label: role === "admin" ? "管理员" : "店主", is_admin: role === "admin",
-          platform_permissions: role === "admin" ? ["platform.audit.read", "platform.settings.manage", "platform.updates.manage", "platform.users.manage"] : [],
-        });
-        return json(res, { ok: true }, 200, { "set-cookie": `xianyu_saas_session=${nextSessionId}; Path=/xianyu-saas/; HttpOnly; SameSite=Strict` });
+        loggedIn = true;
+        return json(res, { ok: true }, 200, { "set-cookie": "xianyu_saas_session=mock-session; Path=/xianyu-saas/; HttpOnly; SameSite=Strict" });
       }
+      if (apiPath === "/api/auth/register" && req.method === "POST") return json(res, { ok: true });
       if (apiPath === "/api/auth/logout" && req.method === "POST") {
         fixtures.authLogoutRequests += 1;
         fixtures.requestSequence.push("auth-logout");
-        sessions.delete(sessionId);
+        loggedIn = false;
         return json(res, { ok: true }, 200, { "set-cookie": "xianyu_saas_session=; Path=/xianyu-saas/; Max-Age=0; HttpOnly" });
       }
-      if (apiPath === "/api/me") fixtures.authSequence.push("me");
-      if (!me) return json(res, { detail: "未登录" }, 401);
+      if (apiPath === "/api/version/public" && req.method === "GET") return json(res, { version: fixtures.version.version, asset_version: fixtures.version.asset_version });
+      if (!loggedIn) return json(res, { detail: "未登录" }, 401);
       if (req.headers["x-shop-account"]) fixtures.shopAccountHeaders.push(String(req.headers["x-shop-account"]));
-      if (apiPath === "/api/me") return json(res, me);
+      if (apiPath === "/api/me") return json(res, fixtures.me);
       if (apiPath === "/api/auth/password" && req.method === "POST") {
         fixtures.passwordRequests.push(payload);
         return json(res, { ok: true, other_sessions_revoked: true });
       }
+      if (handleSettingsOpsMock(req, res, apiPath, payload)) return;
       if (apiPath === "/api/version" && req.method === "GET") return json(res, fixtures.version);
-      if (apiPath.startsWith("/api/admin/") && me.is_admin !== true) {
+      if (apiPath.startsWith("/api/admin/") && fixtures.me?.is_admin !== true) {
         return json(res, { detail: { code: "admin_required", message: "需要管理员权限" } }, 403);
       }
       if (apiPath === "/api/admin/settings" && req.method === "GET") return json(res, fixtures.adminSettings);
@@ -573,8 +706,8 @@ function createServer() {
         const user = fixtures.adminUsers.find((item) => String(item.id) === adminSessionsMatch[1]);
         if (!user) return json(res, { detail: { code: "user_not_found", message: "账号不存在" } }, 404);
         fixtures.adminUserRequests.push({ action: "revoke", userId: user.id });
-        const revoked = Math.max(Number(user.session_count || 0) - (user.username === me.username ? 1 : 0), 0);
-        user.session_count = user.username === me.username ? 1 : 0;
+        const revoked = Math.max(Number(user.session_count || 0) - (user.username === fixtures.me.username ? 1 : 0), 0);
+        user.session_count = user.username === fixtures.me.username ? 1 : 0;
         return json(res, { ok: true, sessions_revoked: revoked });
       }
       if (apiPath === "/api/admin/audit" && req.method === "GET") {
@@ -583,20 +716,20 @@ function createServer() {
       if (apiPath === "/api/admin/updates" && req.method === "GET") return json(res, fixtures.updateStatus);
       if (apiPath === "/api/admin/updates/check" && req.method === "POST") {
         fixtures.updateRequests.push({ action: "check", payload });
-        fixtures.updateStatus.latest_update = {
-          version: "0.2.0", channel: fixtures.adminSettings.update_channel, status: "available",
-          release_notes: "Release 0.2.0 <script>window.__releaseNotesInjected=true</script>", error_code: "", updated_at: 1788134400,
+        fixtures.updateStatus.update_check = {
+          version: ["no_release", "error", "unchecked"].includes(fixtures.releaseCheckStatus) ? "" : fixtures.releaseCheckStatus === "current" ? fixtures.version.version : "0.2.0",
+          channel: fixtures.adminSettings.update_channel, status: fixtures.releaseCheckStatus,
+          available: ["available", "incomplete"].includes(fixtures.releaseCheckStatus), current_version: fixtures.version.version,
+          release_notes: "Release 0.2.0 <script>window.__releaseNotesInjected=true</script>",
+          error_code: fixtures.releaseCheckStatus === "error" ? "update_source_failed" : "", checked_at: 1788134400,
         };
-        return json(res, {
-          available: true, current_version: fixtures.version.version, version: "0.2.0",
-          channel: fixtures.adminSettings.update_channel, published_at: "2026-08-31T00:00:00Z",
-          release_notes: fixtures.updateStatus.latest_update.release_notes,
-        });
+        fixtures.version.update_check = structuredClone(fixtures.updateStatus.update_check);
+        return json(res, fixtures.updateStatus.update_check);
       }
       if (apiPath === "/api/admin/updates/download" && req.method === "POST") {
         fixtures.updateRequests.push({ action: "download", payload });
         fixtures.updateStatus.latest_update = {
-          ...fixtures.updateStatus.latest_update,
+          ...fixtures.updateStatus.update_check,
           version: String(payload.version || "0.2.0"), status: "staged", updated_at: 1788134401,
         };
         return json(res, {
@@ -828,7 +961,8 @@ function createServer() {
       }
       if (apiPath === "/api/bot/ai/connection" && req.method === "GET") {
         const scoped = scopedAi(req);
-        const response = structuredClone(scoped.value.connection);
+        const userConnection = fixtures.userConnections.get(fixtures.me.username);
+        const response = structuredClone(userConnection?.initialized ? userConnection : scoped.value.connection);
         const delay = takeLoaderDelay("ai", scoped.accountKey);
         if (delay > 0) {
           setTimeout(() => json(res, response), delay);
@@ -1468,8 +1602,11 @@ function createServer() {
       }
       if (apiPath === "/api/bot/orders" && req.method === "GET") {
         const scoped = scopedFixture(req, "orders", fixtures.orders);
-        const response = { orders: scoped.value };
-        const delay = takeLoaderDelay("orders", scoped.accountKey);
+        const paged = url.searchParams.has("page");
+        fixtures.orderQueries.push({ account: scoped.accountKey, ...Object.fromEntries(url.searchParams) });
+        if (paged && fixtures.orderQueryError) return json(res, { detail: { code: "orders_unavailable", message: "订单记录暂时无法读取，请稍后重试" } }, 503);
+        const response = orderFixturePage(scoped.value, url.searchParams, scoped.accountKey);
+        const delay = paged && fixtures.orderQueryDelays.length ? fixtures.orderQueryDelays.shift() : takeLoaderDelay("orders", scoped.accountKey);
         if (delay > 0) {
           setTimeout(() => json(res, response), delay);
           return;
@@ -1562,6 +1699,7 @@ async function waitForPanelSettled(page) {
 }
 
 async function captureScreenshot(page, options) {
+  if (!screenshotsEnabled) return;
   const viewport = page.viewportSize();
   if (viewport) await page.mouse.move(Math.max(1, viewport.width - 2), Math.max(1, viewport.height - 2));
   await page.locator("#toastRegion .toast").last().waitFor({ state: "detached", timeout: 4000 }).catch(() => undefined);
@@ -1587,185 +1725,525 @@ async function dispatchManualReplyImageEvent(page, type, file) {
   }, { type, ...file });
 }
 
-async function checkFirstRegistration(browser, baseUrl) {
-  const pages = [];
+async function checkOrderManagement(browser, baseUrl) {
+  const saved = { orders: fixtures.orders, accounts: fixtures.shopAccounts, accountData: fixtures.accountData };
+  const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
   const errors = [];
-  const failedResponses = [];
-  const emptyCapabilities = { registration_enabled: true, first_registration_available: true, bootstrap_available: false, password_min_length: 12 };
-  const databaseError = { status: 503, detail: { code: "database_unavailable", message: "控制面数据库不可用" } };
-  const initializationError = { status: 503, detail: { code: "account_initialization_failed", message: "账号初始化失败，请稍后重试" } };
-  const resetEmptyInstance = () => {
-    fixtures.authCapabilities = { ...emptyCapabilities };
-    fixtures.authCapabilitiesError = null;
-    fixtures.authCapabilitiesErrorAfterRegistration = null;
-    fixtures.registrationError = null;
-    fixtures.loginError = null;
-    fixtures.registeredUsers.clear();
+  page.on("pageerror", (error) => errors.push(error.message));
+  const groups = orderStatusOptions.filter((item) => item.value !== "all");
+  const makeOrder = (index, account = "default") => {
+    const group = groups[index % groups.length];
+    return { order_key: account + "-same-prefix-long-record-" + String(index).padStart(5, "0"),
+      platform_order_id: String(429175119103700000n + BigInt(index)), item_id: "100001",
+      item_title: "数字商品资料 " + index, item_image_url: "", buyer_id: "buyer-" + index,
+      chat_id: index === 61 ? "chat-1" : "", conversation_available: index === 61,
+      quantity: 1, paid_amount: index === 61 ? "0.00" : index === 60 ? null : "6.50",
+      status: { processing: "verified", sent: "delivered", manual: "manual_review", retry: "retry", ended: "expired", exception: "unknown" }[group.value],
+      status_group: group.value, status_label: group.label,
+      reason_code: group.value === "manual" ? "inventory_empty" : "",
+      reason_label: group.value === "manual" ? "库存不足，请核对后处理" : "",
+      created_at: new Date(Date.UTC(2026, 8, 5, 10, 0, index)).toISOString(), updated_at: "",
+      verified_at: "2026-09-05T10:00:00Z", delivered_at: "", platform_shipped_at: "",
+      delivery_type_label: "卡密", platform_status_label: "核验时待发货" };
   };
-  const openPage = async (expectedFailures = []) => {
-    const page = await browser.newPage({ viewport: { width: 1440, height: 900 }, deviceScaleFactor: 1 });
-    pages.push(page);
-    await page.route("https://cdn.example/**", (route) => route.fulfill({
-      status: 200,
-      contentType: "image/png",
-      body: Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", "base64"),
-    }));
-    const allowedFailures = new Set(["401 /api/me", ...expectedFailures]);
-    page.on("pageerror", (error) => errors.push(error.message));
-    page.on("console", (message) => {
-      if (message.type() === "error" && !Array.from(allowedFailures).some((item) => message.text().includes("status of " + item.split(" ")[0]))) {
-        errors.push(message.text());
-      }
-    });
-    page.on("response", (response) => {
-      const key = response.status() + " " + new URL(response.url()).pathname.replace("/xianyu-saas", "");
-      if (response.status() >= 400 && !allowedFailures.has(key)) failedResponses.push(key);
-    });
-    await page.goto(baseUrl, { waitUntil: "networkidle" });
-    return page;
+  fixtures.orders = Array.from({ length: 62 }, (_, index) => makeOrder(index));
+  fixtures.shopAccounts = [...saved.accounts, { ...saved.accounts[0], id: 2, key: "order-second", name: "第二订单店铺" }];
+  fixtures.accountData = { ...saved.accountData, "order-second": { orders: [makeOrder(900, "order-second")] } };
+  const orderRows = () => page.locator("#orderList [data-order-key]");
+  const settled = async () => page.waitForFunction(() => !document.querySelector("#refreshOrders")?.disabled);
+  const refresh = async () => {
+    const response = page.waitForResponse((item) => item.url().includes("/api/bot/orders?") && new URL(item.url()).searchParams.has("page"));
+    await page.click("#refreshOrders");
+    await response;
+    await settled();
+  };
+  const query = async (value) => {
+    await page.fill("#ordersSearchInput", value);
+    await page.locator("#ordersSearchInput").press("Enter");
+    await settled();
   };
   try {
-    resetEmptyInstance();
-    const firstPage = await openPage();
-    const competingPage = await openPage(["403 /api/auth/register"]);
-    assert.equal(await firstPage.locator("#authScreen").isVisible(), true);
-    assert.equal(await firstPage.locator("#authTitle").textContent(), "创建首个管理员账号", "empty instances must default to first registration, not login or token bootstrap");
-    assert.equal(await firstPage.locator("#registerTab").getAttribute("aria-selected"), "true");
-    assert.equal(await firstPage.locator("#registerTab").textContent(), "创建管理员");
-    assert.equal(await firstPage.locator("#bootstrapTab").isVisible(), false);
-    assert.equal(await firstPage.locator("#bootstrapTokenField").isVisible(), false);
-    assert.equal(await firstPage.locator("#bootstrapToken").isDisabled(), true);
-    assert.equal(await firstPage.locator("#bootstrapToken").getAttribute("required"), null);
-    assert.deepEqual(await firstPage.locator("#authForm input:enabled:visible").evaluateAll((nodes) => nodes.map((node) => node.name)), ["username", "password"], "first registration must ask only for username and password");
-    assert.equal(await firstPage.locator("#authPassword").getAttribute("autocomplete"), "new-password");
-    assert.equal(await firstPage.locator("#authPassword").getAttribute("minlength"), "12");
-    assert.equal(await firstPage.locator("#authPassword").getAttribute("maxlength"), "1024");
-    await assertNoOverflow(firstPage, "first administrator registration desktop");
-    await firstPage.setViewportSize({ width: 390, height: 844 });
-    await assertNoOverflow(firstPage, "first administrator registration mobile");
-    await firstPage.setViewportSize({ width: 1440, height: 900 });
-
-    const registrationCount = fixtures.registrationRequests.length;
-    await firstPage.fill("#authUsername", "invalid user");
-    await firstPage.fill("#authPassword", "First-Admin-Pass-123!");
-    await firstPage.click("#authSubmit");
-    assert.match(await firstPage.locator("#authError").textContent(), /账号需为/);
-    await firstPage.fill("#authUsername", "first-admin-demo");
-    await firstPage.fill("#authPassword", "short-pass");
-    await firstPage.click("#authSubmit");
-    assert.match(await firstPage.locator("#authError").textContent(), /12 至 1024/);
-    assert.equal(fixtures.registrationRequests.length, registrationCount, "first registration must retain username and password validation");
-
-    const password = "First-Admin-Pass-123!";
-    const loginCount = fixtures.authLoginRequests.length;
-    const bootstrapCount = fixtures.bootstrapRequests.length;
-    const capabilitiesCount = fixtures.authCapabilitiesRequests;
-    const sequenceStart = fixtures.authSequence.length;
-    await firstPage.fill("#authPassword", password);
-    const registeredResponse = firstPage.waitForResponse((response) => response.url().endsWith("/api/auth/register") && response.request().method() === "POST");
-    const loginResponse = firstPage.waitForResponse((response) => response.url().endsWith("/api/auth/login") && response.request().method() === "POST");
-    const meResponse = firstPage.waitForResponse((response) => response.url().endsWith("/api/me") && response.status() === 200);
-    await firstPage.click("#authSubmit");
-    const registered = await registeredResponse;
-    assert.deepEqual(await registered.json(), { ok: true, role: "admin" });
-    assert.equal(registered.headers()["set-cookie"], undefined, "registration itself must not create a session");
-    assert.equal((await loginResponse).status(), 200);
-    assert.equal((await (await meResponse).json()).role, "admin", "workspace identity must come from the login session, not client-side role elevation");
-    await firstPage.waitForSelector("#workspace:not([hidden])");
-    await firstPage.waitForSelector('[data-panel="home"]:not([hidden])');
-    assert.equal(fixtures.registrationRequests.length, registrationCount + 1);
-    assert.deepEqual(fixtures.registrationRequests.at(-1).payload, { username: "first-admin-demo", password });
-    assert.equal(fixtures.registrationRequests.at(-1).token, "", "first registration must never send a bootstrap token");
-    assert.equal(fixtures.registrationRequests.at(-1).browserIntent, "browser-write");
-    assert.equal(fixtures.registrationRequests.at(-1).url.includes(password), false);
-    assert.equal(fixtures.bootstrapRequests.length, bootstrapCount, "first registration must not call the legacy bootstrap endpoint");
-    assert.equal(fixtures.authLoginRequests.length, loginCount + 1);
-    assert.deepEqual(fixtures.authLoginRequests.at(-1), { payload: { username: "first-admin-demo", password }, browserIntent: "browser-write" });
-    assert.equal(fixtures.authCapabilitiesRequests, capabilitiesCount + 1, "successful first registration must refresh capabilities");
-    assert.deepEqual(fixtures.authSequence.slice(sequenceStart, sequenceStart + 4), ["register", "capabilities", "login", "me"]);
-    assert.deepEqual(fixtures.authCapabilities, { ...emptyCapabilities, registration_enabled: false, first_registration_available: false });
-    assert.equal(await firstPage.inputValue("#authPassword"), "", "automatic login must erase the password input");
-    assert.equal(await firstPage.inputValue("#bootstrapToken"), "");
-    assert.equal(await firstPage.evaluate((secret) => [localStorage, sessionStorage].some((storage) => Object.keys(storage).some((key) => String(storage.getItem(key)).includes(secret))), password), false, "first registration credentials must never reach browser storage");
-
-    // This second page read capabilities before the first request won. Its
-    // stale form must not silently create another administrator or log in.
-    await competingPage.fill("#authUsername", "competing-admin-demo");
-    await competingPage.fill("#authPassword", "Competing-Admin-Pass-123!");
-    const closedCapabilitiesCount = fixtures.authCapabilitiesRequests;
-    const closedResponse = competingPage.waitForResponse((response) => response.url().endsWith("/api/auth/register") && response.status() === 403);
-    await competingPage.click("#authSubmit");
-    await closedResponse;
-    await competingPage.waitForFunction(() => document.querySelector("#authError")?.textContent.includes("后续注册已关闭"));
-    assert.equal(fixtures.authCapabilitiesRequests, closedCapabilitiesCount + 1);
-    assert.equal(fixtures.authLoginRequests.length, loginCount + 1, "losing first registration must not attempt login");
-    assert.equal(await competingPage.locator("#authTitle").textContent(), "登录工作台");
-    assert.equal(await competingPage.locator("#registerTab").isVisible(), false);
-    assert.equal(await competingPage.locator("#bootstrapTab").isVisible(), false);
-    assert.equal(await competingPage.locator("#workspace").isVisible(), false);
-    assert.match(await competingPage.locator("#authError").textContent(), /首次管理员注册已结束.*注册当前未开放.*已有账号登录/);
-    assert.equal(await competingPage.inputValue("#authUsername"), "competing-admin-demo");
-    assert.equal(await competingPage.inputValue("#authPassword"), "");
-    assert.equal(fixtures.registeredUsers.has("competing-admin-demo"), false);
-    await firstPage.close();
-    await competingPage.close();
-
-    // Database failures are different from a closed registration gate. Both
-    // startup errors and refresh failures must remain visible and retryable.
-    resetEmptyInstance();
-    fixtures.authCapabilitiesError = databaseError;
-    const startupPage = await openPage(["503 /api/auth/capabilities"]);
-    assert.equal(await startupPage.locator("#authScreen").isVisible(), true);
-    assert.match(await startupPage.locator("#authError").textContent(), /控制面数据库不可用/);
-    assert.equal(await startupPage.locator("#registerTab").isVisible(), false);
-    assert.doesNotMatch(await startupPage.locator("#authError").textContent(), /注册已关闭/);
-    await startupPage.close();
-
-    for (const scenario of ["registration-unavailable", "refresh-unavailable", "created-refresh-unavailable", "created-login-unavailable"]) {
-      resetEmptyInstance();
-      fixtures.authCapabilities.password_min_length = 16;
-      const errorPage = await openPage(["503 /api/auth/capabilities", "503 /api/auth/register", "503 /api/auth/login"]);
-      const beforeCapabilities = fixtures.authCapabilitiesRequests;
-      const beforeLogin = fixtures.authLoginRequests.length;
-      const beforeRegistration = fixtures.registrationRequests.length;
-      await errorPage.fill("#authUsername", "error-admin-demo");
-      await errorPage.fill("#authPassword", "password-123");
-      await errorPage.click("#authSubmit");
-      assert.match(await errorPage.locator("#authError").textContent(), /16 至 1024/);
-      assert.equal(fixtures.registrationRequests.length, beforeRegistration, "the server's stricter password minimum must be retained");
-      if (scenario.startsWith("created-")) {
-        if (scenario === "created-refresh-unavailable") fixtures.authCapabilitiesErrorAfterRegistration = databaseError;
-        else fixtures.loginError = initializationError;
-      } else {
-        fixtures.registrationError = initializationError;
-        if (scenario === "refresh-unavailable") fixtures.authCapabilitiesError = databaseError;
-      }
-      await errorPage.fill("#authPassword", "Error-Admin-Pass-123!");
-      await errorPage.click("#authSubmit");
-      await errorPage.waitForFunction(() => document.querySelector("#authSubmit")?.disabled === false && /账号初始化失败|控制面数据库不可用/.test(document.querySelector("#authError")?.textContent || ""));
-      assert.equal(fixtures.authCapabilitiesRequests, beforeCapabilities + 1, `${scenario}: registration outcomes must refresh capabilities once`);
-      assert.doesNotMatch(await errorPage.locator("#authError").textContent(), /首次管理员注册已结束|后续注册已关闭/);
-      assert.equal(await errorPage.locator("#authPassword").getAttribute("minlength"), "16", "capabilities errors must not lower a known password minimum");
-      assert.equal(await errorPage.locator("#workspace").isVisible(), false);
-      assert.equal(fixtures.authLoginRequests.length, beforeLogin + (scenario === "created-login-unavailable" ? 1 : 0));
-      if (scenario.startsWith("created-")) {
-        assert.match(await errorPage.locator("#authError").textContent(), /管理员账号已创建.*请稍后登录/);
-        assert.equal(await errorPage.locator("#authTitle").textContent(), "登录工作台");
-        assert.equal(await errorPage.inputValue("#authPassword"), "");
-        assert.equal(await errorPage.inputValue("#authUsername"), "error-admin-demo");
-      } else if (scenario === "refresh-unavailable") {
-        assert.match(await errorPage.locator("#authError").textContent(), /账号初始化失败.*注册状态刷新失败.*控制面数据库不可用/);
-        assert.equal(await errorPage.locator("#registerTab").isVisible(), false);
-      } else {
-        assert.equal(await errorPage.locator("#registerTab").getAttribute("aria-selected"), "true", "a transient register error with an open gate must retain the retryable form");
-      }
-      await errorPage.close();
+    await page.goto(baseUrl, { waitUntil: "networkidle" });
+    await page.fill("#authUsername", "owner-demo");
+    await page.fill("#authPassword", "password-123");
+    await page.click("#authSubmit");
+    await page.waitForSelector("#workspace:not([hidden])");
+    await openView(page, "orders");
+    await page.waitForFunction(() => document.querySelectorAll("#orderList [data-order-key]").length === 15);
+    await settled();
+    assert.match(await page.locator("#ordersTotal").textContent(), /62/);
+    assert.equal(await page.inputValue("#ordersShopSelect"), "default");
+    assert.match(await page.locator("#orderList").textContent(), /0\.00/);
+    const firstKey = await orderRows().first().getAttribute("data-order-key");
+    await page.locator("#orderList [data-order-toggle]").first().click();
+    assert.equal(await page.locator("#orderList [data-order-toggle]").first().getAttribute("aria-expanded"), "true");
+    await page.evaluate(() => { window.__orderCopies = []; Object.defineProperty(navigator.clipboard, "writeText", { configurable: true, value: async (text) => window.__orderCopies.push(text) }); });
+    await page.locator("#orderList [data-order-copy]").first().click();
+    assert.deepEqual(await page.evaluate(() => window.__orderCopies), ["429175119103700061"]);
+    await page.locator("#orderList [data-order-toggle]").first().click();
+    await page.click("#ordersNext");
+    await settled();
+    assert.notEqual(await orderRows().first().getAttribute("data-order-key"), firstKey);
+    for (const size of ["30", "50", "15"]) {
+      await page.selectOption("#ordersPageSize", size);
+      await page.waitForFunction((n) => document.querySelectorAll("#orderList [data-order-key]").length === n, Number(size));
     }
-    assert.deepEqual(errors, [], "first-registration pages must have no runtime or unexpected console errors");
-    assert.deepEqual(failedResponses, [], "first-registration pages must have only explicitly simulated error responses");
+    await page.fill("#ordersPageInput", "5");
+    await page.click("#ordersPageJump");
+    await page.waitForFunction(() => document.querySelectorAll("#orderList [data-order-key]").length === 2);
+    await page.click("#ordersReset");
+    await page.waitForFunction(() => document.querySelectorAll("#orderList [data-order-key]").length === 15);
+    await page.locator("#ordersStatusTabs button").filter({ hasText: "待人工" }).click();
+    await settled();
+    assert.equal(await orderRows().count(), 10);
+    assert.match(await page.locator("#orderList").textContent(), /库存不足/);
+    await page.click("#ordersReset");
+    await settled();
+    await page.selectOption("#ordersSearchField", "order_id");
+    await query("429175119103700061");
+    assert.equal(await orderRows().count(), 1);
+    await page.locator("#orderList [data-order-chat]:not(:disabled)").first().click();
+    await page.waitForSelector('[data-panel="chat"]:not([hidden])');
+    await page.waitForFunction(() => document.querySelector("#chatMessages")?.textContent.includes("付款后会发送完整说明"));
+    await openView(page, "orders");
+    await query("no-such-order");
+    assert.equal(await orderRows().count(), 0);
+    assert.equal(await page.locator("#ordersEmpty").isVisible(), false, "filtered-empty results must not use the no-orders landing state");
+    assert.match(await page.locator("#orderList .orders-empty-filter").innerText(), /匹配|筛选|查询/);
+    await page.click("#ordersReset");
+    await settled();
+    fixtures.orderQueryError = true;
+    await refresh();
+    assert.match(await page.locator("#ordersMessage").textContent(), /暂时无法读取|读取失败/);
+    fixtures.orderQueryError = false;
+    await refresh();
+    await page.waitForFunction(() => document.querySelectorAll("#orderList [data-order-key]").length === 15);
+    await settled();
+    assert.doesNotMatch(await page.locator("#ordersMessage").textContent(), /暂时无法读取|读取失败/);
+    await assertNoOverflow(page, "orders desktop");
+    await captureScreenshot(page, { path: path.join(resultRoot, "orders-compact-desktop.png"), fullPage: true });
+    fixtures.orderQueryDelays = [500];
+    const stalePageRequest = page.waitForRequest((item) => item.url().includes("/api/bot/orders?") && new URL(item.url()).searchParams.has("page") && item.headers()["x-shop-account"] === "default");
+    await page.click("#refreshOrders");
+    await stalePageRequest;
+    await page.selectOption("#ordersShopSelect", "order-second");
+    await page.waitForFunction(() => document.querySelector("#orderList")?.textContent.includes("429175119103700900"));
+    await page.waitForTimeout(650);
+    assert.equal(await page.locator('[data-panel="orders"]').isVisible(), true);
+    assert.equal(await page.inputValue("#ordersShopSelect"), "order-second");
+    assert.equal(await orderRows().count(), 1);
+    assert.doesNotMatch(await page.locator("#orderList").textContent(), /429175119103700061/);
+    fixtures.accountData["order-second"].orders = [];
+    await refresh();
+    assert.equal(await orderRows().count(), 0);
+    assert.match(await page.locator("#ordersEmpty").textContent(), /记录|订单/);
+    assert.deepEqual(errors, []);
+    assert.ok(fixtures.orderQueries.some((entry) => entry.page === "5"));
+    assert.ok(fixtures.orderQueries.some((entry) => entry.account === "order-second"));
+    console.log(JSON.stringify({ ok: true, scope: "orders", rows: 62, desktop: 1440, screenshots: screenshotsEnabled ? resultRoot : 0 }));
   } finally {
-    for (const page of pages) if (!page.isClosed()) await page.close();
-    resetEmptyInstance();
+    fixtures.orders = saved.orders;
+    fixtures.shopAccounts = saved.accounts;
+    fixtures.accountData = saved.accountData;
+    fixtures.orderQueryError = false;
+    fixtures.orderQueryDelays = [];
+    await page.close();
+  }
+}
+
+async function desktopContractPage(browser, baseUrl) {
+  const page = await browser.newPage({ viewport: { width: 1440, height: 900 }, deviceScaleFactor: 1 });
+  page.setDefaultTimeout(8000);
+  const evidence = { pageErrors: [], failedResponses: [], externalRequests: [], allowedFailures: [], confirmDialogs: [] };
+  page.on("dialog", async (dialog) => {
+    if (dialog.type() === "confirm" && /统一|连接|密钥|方案|变更|执行/.test(dialog.message())) {
+      evidence.confirmDialogs.push(dialog.message());
+      await dialog.accept();
+    } else {
+      evidence.pageErrors.push(`unexpected ${dialog.type()} dialog: ${dialog.message()}`);
+      await dialog.dismiss();
+    }
+  });
+  const origin = new URL(baseUrl).origin;
+  await page.route("**/*", (route) => {
+    const url = new URL(route.request().url());
+    if (url.origin === origin || ["data:", "blob:"].includes(url.protocol)) return route.continue();
+    if (url.hostname === "cdn.example") return route.fulfill({ status: 200, contentType: "image/png", body: Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", "base64") });
+    evidence.externalRequests.push(url.href);
+    return route.abort();
+  });
+  page.on("pageerror", (error) => evidence.pageErrors.push(error.message));
+  page.on("console", (message) => {
+    if (message.type() === "error" && !/^Failed to load resource:.*status of \d+/.test(message.text())) evidence.pageErrors.push(message.text());
+  });
+  page.on("response", (response) => {
+    if (response.status() < 400) return;
+    const url = new URL(response.url());
+    if (url.pathname.endsWith("/api/me") && response.status() === 401) return;
+    evidence.failedResponses.push({ path: url.pathname.replace("/xianyu-saas", ""), status: response.status() });
+  });
+  await page.goto(baseUrl, { waitUntil: "networkidle" });
+  return { page, evidence };
+}
+
+async function desktopLogin(page, username) {
+  await page.fill("#authUsername", username);
+  await page.fill("#authPassword", "Mock-only-Pass-123!");
+  await page.click("#authSubmit");
+  await page.waitForSelector("#workspace:not([hidden])");
+}
+
+async function desktopApiClick(page, selector, apiPath, method = "POST", expectedStatus = 200) {
+  const [result] = await Promise.all([
+    page.waitForResponse((item) => new URL(item.url()).pathname === `/xianyu-saas${apiPath}` && item.request().method() === method),
+    page.locator(selector).click(),
+  ]);
+  assert.equal(result.status(), expectedStatus, `${method} ${apiPath}: ${await result.text()}`);
+  return result.json();
+}
+
+async function checkUpdateFromBadge(page) {
+  if (!(await page.locator("#versionBadgePopover").isVisible())) await page.click("#versionBadgeButton");
+  const result = await desktopApiClick(page, "#versionBadgeRefresh", "/api/admin/updates/check");
+  await page.waitForFunction(() => document.querySelector("#versionBadgeRefresh")?.disabled === false);
+  await page.click("#versionBadgeClose");
+  return result;
+}
+
+function assertDesktopEvidence(evidence) {
+  assert.deepEqual(evidence.pageErrors, [], "desktop must not raise page/console errors");
+  assert.deepEqual(evidence.failedResponses, evidence.allowedFailures, "only explicitly exercised conflict/error responses are allowed");
+  assert.deepEqual(evidence.externalRequests, [], "desktop scopes may only use the local mock server and fixture images");
+  assert.deepEqual(fixtures.authorizationHeaders, [], "browser must not send bearer authorization");
+}
+
+async function checkSettingsDesktop(browser, baseUrl) {
+  const { page, evidence } = await desktopContractPage(browser, baseUrl);
+  const owner = structuredClone(fixtures.me);
+  const accounts = fixtures.shopAccounts;
+  fixtures.shopAccounts = [...accounts, { ...accounts[0], id: 2, key: "settings-second", name: "设置保留测试店" }];
+  try {
+    await desktopLogin(page, owner.username);
+    await openView(page, "settings");
+    await page.waitForSelector('[data-settings-panel="ai"]:not([hidden])');
+    assert.equal(await page.locator('[data-panel="settings"] #aiModel').count(), 1, "the existing model form must move into settings");
+    assert.equal(await page.locator('[data-panel="ai-config"] #aiModel').count(), 0);
+    assert.equal(await page.locator("#checkUpdateButton").count(), 0, "the duplicate version check button must be removed");
+    for (const tab of ["ai", "security", "version"]) assert.equal(await page.locator(`[data-settings-tab="${tab}"]`).isVisible(), true);
+    for (const tab of ["accounts", "audit"]) assert.equal(await page.locator(`[data-settings-tab="${tab}"]`).isVisible(), false);
+
+    // Legacy source selection is an explicit migration; metadata never includes
+    // the old secret, and the test/save pair must bind the source revision.
+    assert.match(await page.locator('[data-settings-panel="ai"]').innerText(), /迁移|旧.*连接|导入.*连接/);
+    await page.selectOption("#settingsAiLegacySelect", "default");
+    assert.equal(await page.inputValue("#aiModel"), "legacy-fixture-model");
+    assert.equal(await page.inputValue("#aiApiKey"), "");
+    assert.equal(fixtures.settingsRequests.filter((item) => item.method === "PUT").length, 0, "selecting migration metadata is not a write");
+    await desktopApiClick(page, "#aiTestConnection", "/api/settings/ai/connection/test");
+    const migrationTest = fixtures.settingsRequests.at(-1).payload;
+    assert.equal(migrationTest.source_account_key, "default");
+    assert.equal(migrationTest.source_revision, 3);
+    assert.equal(migrationTest.expected_revision, 0);
+    await desktopApiClick(page, "#aiSaveConnection", "/api/settings/ai/connection", "PUT");
+    const migrationSave = fixtures.settingsRequests.findLast((item) => item.method === "PUT").payload;
+    assert.equal(migrationSave.confirm, true);
+    assert.ok(migrationSave.verification_token);
+    assert.equal(migrationSave.source_account_key, "default");
+    assert.equal(userConnectionFixture().revision, 1);
+    await page.waitForFunction(() => document.querySelector("#aiApiKey")?.value === "");
+
+    // A draft belongs to the signed-in user, not the selected shop. Switching
+    // stores must preserve both visible inputs and the draft's test context.
+    await page.fill("#aiBaseUrl", "https://draft.example.invalid/v1");
+    await page.fill("#aiModel", "owner-unsaved-model");
+    await page.fill("#aiApiKey", "mock-owner-unsaved-secret");
+    await openView(page, "shops");
+    await page.click('#shopAccountsPanelList [data-account-switch="settings-second"]');
+    await page.waitForFunction(() => document.querySelector("#accountTabs .account-tab.is-active")?.dataset.accountSwitch === "settings-second");
+    await openView(page, "settings");
+    assert.equal(await page.inputValue("#aiModel"), "owner-unsaved-model");
+    assert.equal(await page.inputValue("#aiBaseUrl"), "https://draft.example.invalid/v1");
+    assert.equal(await page.inputValue("#aiApiKey"), "mock-owner-unsaved-secret");
+    await desktopApiClick(page, "#aiTestConnection", "/api/settings/ai/connection/test");
+    await page.fill("#aiModel", "owner-edited-after-test");
+    assert.equal(await page.locator("#aiSaveConnection").isDisabled(), true, "editing after testing must invalidate the verification token");
+    await desktopApiClick(page, "#aiTestConnection", "/api/settings/ai/connection/test");
+    await desktopApiClick(page, "#aiSaveConnection", "/api/settings/ai/connection", "PUT");
+    await page.waitForFunction(() => document.querySelector("#aiApiKey")?.value === "");
+    assert.equal(userConnectionFixture().model, "owner-edited-after-test");
+    assert.equal(userConnectionFixture().revision, 2);
+    assert.equal(fixtures.aiRequests.filter((item) => ["connection", "connection-test", "key"].includes(item.kind)).length, 0, "settings must not fall back to legacy shop write endpoints");
+    assert.doesNotMatch(await page.locator("body").innerText(), /mock-owner-unsaved-secret/);
+    assert.equal(await page.evaluate(() => JSON.stringify({ local: { ...localStorage }, session: { ...sessionStorage } }).includes("mock-owner-unsaved-secret")), false, "secrets must not enter browser storage");
+
+    // A stale settings revision is a visible conflict, not a silent overwrite.
+    await page.fill("#aiModel", "conflicting-model");
+    userConnectionFixture().revision += 1;
+    evidence.allowedFailures.push({ path: "/api/settings/ai/connection/test", status: 409 });
+    await desktopApiClick(page, "#aiTestConnection", "/api/settings/ai/connection/test", "POST", 409);
+    await page.waitForFunction(() => /变化|修改|冲突|刷新/.test(document.querySelector("#aiConnectionMessage")?.textContent || ""));
+    assert.equal(userConnectionFixture().model, "owner-edited-after-test");
+    assert.equal(await page.locator("#aiSaveConnection").isDisabled(), true);
+
+    // Help is a reopenable dialog, not an extra navigation domain.
+    for (let cycle = 0; cycle < 2; cycle += 1) {
+      await page.click("#settingsDocsBtn");
+      await page.waitForSelector("#docsHelpModal[open]");
+      assert.equal(await page.locator("#docsHelpModal .docs-manual").count(), 1);
+      assert.equal(await page.locator("#docsHelpModal details.docs-faq-item").count(), 4);
+      await page.locator("#docsHelpModal").getByRole("button", { name: /关闭/ }).click();
+      await page.waitForSelector("#docsHelpModal:not([open])", { state: "attached" });
+    }
+    await page.click("#versionBadgeButton");
+    await page.waitForSelector("#versionBadgePopover:not([hidden])");
+    assert.match(await page.locator("#versionBadgeValue").innerText(), /0\.1\.0/);
+    assert.doesNotMatch(await page.locator("#versionBadgeStatus").innerText(), /已是最新|当前最新/);
+    assert.equal(await page.locator("#versionBadgeReleaseLink").isVisible(), true, "the project release list remains valid navigation even before a check");
+    assert.equal(await page.locator("#versionBadgeRefresh").isVisible(), false, "owners must not receive the administrator's external check action");
+    await page.click("#versionBadgeDetails");
+    await page.waitForSelector('[data-settings-panel="version"]:not([hidden])');
+    await assertNoOverflow(page, "settings/version desktop");
+    assert.equal(fixtures.updateRequests.length, 0, "opening version metadata must never check a remote release");
+    assert.deepEqual(fixtures.apiRequests.filter((item) => item.username === owner.username && item.path.startsWith("/api/admin/")), [], "ordinary users must not invoke any administrator endpoint");
+
+    await page.click('[data-settings-tab="ai"]');
+    await page.fill("#aiModel", "must-clear-at-logout");
+    await page.fill("#aiApiKey", "mock-clear-at-logout-secret");
+    await page.click("#logoutButton");
+    await page.waitForSelector("#authScreen:not([hidden])");
+    assert.equal(await page.inputValue("#aiApiKey"), "");
+    fixtures.me = { ...owner, username: "owner-second", id: 22 };
+    fixtures.legacySources = [];
+    await desktopLogin(page, "owner-second");
+    await openView(page, "settings");
+    assert.notEqual(await page.inputValue("#aiModel"), "must-clear-at-logout", "a different user must not inherit the previous draft");
+    assert.equal(await page.inputValue("#aiApiKey"), "");
+    assert.equal(userConnectionFixture().initialized, false);
+
+    // Delete requires its own explicit confirmation and keeps the user's
+    // initialized tombstone revision; subsequent testing must not fall back to 0.
+    await page.fill("#aiBaseUrl", "https://second.example.invalid/v1");
+    await page.fill("#aiModel", "second-user-model");
+    await page.fill("#aiApiKey", "mock-second-user-secret");
+    await desktopApiClick(page, "#aiTestConnection", "/api/settings/ai/connection/test");
+    await desktopApiClick(page, "#aiSaveConnection", "/api/settings/ai/connection", "PUT");
+    await page.click("#aiDeleteKey");
+    await page.waitForSelector("#confirmDialog[open]");
+    const deletesBeforeCancel = fixtures.settingsRequests.filter((item) => item.method === "DELETE").length;
+    await page.click("#confirmCancel");
+    assert.equal(fixtures.settingsRequests.filter((item) => item.method === "DELETE").length, deletesBeforeCancel);
+    await page.click("#aiDeleteKey");
+    await page.waitForSelector("#confirmDialog[open]");
+    await desktopApiClick(page, "#confirmAction", "/api/settings/ai/connection", "DELETE");
+    await page.waitForSelector("#confirmDialog:not([open])", { state: "attached" });
+    assert.deepEqual(fixtures.settingsRequests.findLast((item) => item.method === "DELETE").payload, { confirm: true, expected_revision: 1 });
+    assert.equal(userConnectionFixture().initialized, true);
+    assert.equal(userConnectionFixture().revision, 2);
+    assert.equal(userConnectionFixture().api_key_configured, false);
+    assert.equal(await page.inputValue("#aiModel"), "");
+    assert.equal(await page.inputValue("#aiApiKey"), "");
+    await page.fill("#aiBaseUrl", "https://second.example.invalid/v1");
+    await page.fill("#aiModel", "second-user-reconfigured");
+    await page.fill("#aiApiKey", "mock-second-new-secret");
+    await desktopApiClick(page, "#aiTestConnection", "/api/settings/ai/connection/test");
+    assert.equal(fixtures.settingsRequests.findLast((item) => item.path.endsWith("/test")).payload.expected_revision, 2);
+    await desktopApiClick(page, "#aiSaveConnection", "/api/settings/ai/connection", "PUT");
+    assert.equal(userConnectionFixture().revision, 3);
+    await page.click("#logoutButton");
+    await page.waitForSelector("#authScreen:not([hidden])");
+
+    fixtures.me = { ...owner, username: "admin-demo", id: 1, role: "admin", is_admin: true, role_label: "管理员",
+      platform_permissions: ["platform.audit.read", "platform.settings.manage", "platform.updates.manage", "platform.users.manage"] };
+    await desktopLogin(page, "admin-demo");
+    await openView(page, "settings");
+    for (const tab of ["ai", "security", "accounts", "audit", "version"]) assert.equal(await page.locator(`[data-settings-tab="${tab}"]`).isVisible(), true);
+    await page.click('[data-settings-tab="accounts"]');
+    await page.waitForFunction(() => document.querySelectorAll("#adminUsersBody [data-admin-user-id]").length === 2);
+    await page.click('[data-settings-tab="audit"]');
+    await page.waitForFunction(() => document.querySelectorAll("#auditEventList .audit-event").length === 1);
+    await page.click("#versionBadgeButton");
+    await page.waitForSelector("#versionBadgePopover:not([hidden])");
+    assert.equal(fixtures.updateRequests.length, 0, "administrator startup still reads cached status only");
+    for (const [status, text] of [["no_release", /无发布|尚无/], ["current", /未发现更高|无需更新/], ["error", /无法|失败|错误/], ["available", /0\.2\.0|可更新|更高版本/]]) {
+      fixtures.releaseCheckStatus = status;
+      const count = fixtures.updateRequests.length;
+      await desktopApiClick(page, "#versionBadgeRefresh", "/api/admin/updates/check");
+      await page.waitForFunction(() => !document.querySelector("#versionBadgeRefresh")?.disabled);
+      assert.equal(fixtures.updateRequests.length, count + 1, "one badge click must trigger one external-check mock request");
+      assert.match(await page.locator("#versionBadgeStatus").innerText(), text);
+      assert.doesNotMatch(await page.locator("#versionBadgeStatus").innerText(), /已是最新|当前最新/);
+      assert.match(await page.locator("#versionBadgeReleaseLink").getAttribute("href"), /^https:\/\/github\.com\/tswawa\/xianyu-saas\/releases(?:\/|$)/);
+    }
+    assert.equal(await page.locator("#versionBadgeReleaseLink").isVisible(), true);
+    assert.match(await page.locator("#versionBadgeReleaseLink").getAttribute("href"), /^https:\/\/github\.com\//);
+    const badgeTone = await page.locator("#versionBadgeButton").evaluate((node) => ({ className: node.className, color: getComputedStyle(node).color, background: getComputedStyle(node).backgroundColor }));
+    assert.match(badgeTone.className, /warning|update|available/, `a higher version needs a yellow warning state: ${JSON.stringify(badgeTone)}`);
+    await page.click("#versionBadgeDetails");
+    await page.waitForSelector('[data-settings-panel="version"]:not([hidden])');
+    const checksBeforeMetadataRefresh = fixtures.updateRequests.length;
+    await desktopApiClick(page, "#refreshVersionButton", "/api/version", "GET");
+    assert.equal(fixtures.updateRequests.length, checksBeforeMetadataRefresh, "details refresh must only reread cached metadata");
+    assert.equal(await page.locator("#versionReleaseNotes script").count(), 0);
+    assert.notEqual(await page.evaluate(() => window.__releaseNotesInjected), true);
+    await assertNoOverflow(page, "settings administrator desktop");
+    assertDesktopEvidence(evidence);
+    console.log(JSON.stringify({ ok: true, scope: "settings", desktop: 1440, screenshots: 0, connectionWrites: fixtures.settingsRequests.filter((item) => item.method === "PUT").length,
+      cases: ["migration", "cross-shop-draft", "test-invalidation", "revision-conflict", "cross-user-clear", "delete-confirm-tombstone", "help-reopen", "owner-no-admin", "cached-version", "badge-check"] }));
+  } finally {
+    fixtures.me = owner;
+    fixtures.shopAccounts = accounts;
+    await page.close();
+  }
+}
+
+async function checkOpsDesktop(browser, baseUrl) {
+  const connection = userConnectionFixture();
+  Object.assign(connection, { initialized: true, provider: "openai_chat_completions", base_url: "https://mock.example.invalid/v1", model: "mock-ops-model", connection_status: "verified", api_key_configured: true, revision: 1, key_revision: 1 });
+  const { page, evidence } = await desktopContractPage(browser, baseUrl);
+  const accounts = fixtures.shopAccounts;
+  const accountData = fixtures.accountData;
+  fixtures.shopAccounts = [...accounts, { ...accounts[0], id: 2, key: "ops-second", name: "运维隔离测试店" }];
+  fixtures.accountData = { ...accountData, "ops-second": { products: [{ ...fixtures.products[0], id: "second-100001", title: "第二店铺专属商品" }] } };
+  let releaseStaleChat = () => {};
+  const fixtureBeforePreview = JSON.stringify({ products: fixtures.products, automation: fixtures.automation, knowledge: fixtures.ai.knowledge });
+  const submitChat = async (message) => {
+    await page.fill("#opsPromptInput", message);
+    return desktopApiClick(page, '#opsPromptForm button[type="submit"]', "/api/ops/chat");
+  };
+  try {
+    await desktopLogin(page, fixtures.me.username);
+    await openView(page, "ops");
+    await page.waitForSelector('#opsShopSelect option[value="ops-second"]', { state: "attached" });
+    await page.waitForSelector('#opsProductSelect option[value="100001"]', { state: "attached" });
+    await page.selectOption("#opsProductSelect", ["100001"]);
+    await page.selectOption("#opsRuleSelect", ["rule-1"]);
+    fixtures.opsChatMode = "reply";
+    const answer = await submitChat("仅分析已选商品和规则，不要修改");
+    assert.equal(answer.plan, null);
+    await page.waitForFunction(() => document.querySelector("#opsChatHistory")?.textContent.includes("仅分析已选商品"));
+    assert.equal(fixtures.opsWrites.length, 0);
+    const initialChat = fixtures.opsRequests.findLast((item) => item.path === "/api/ops/chat");
+    assert.deepEqual(initialChat.payload.selected_item_ids, ["100001"]);
+    assert.deepEqual(initialChat.payload.selected_rule_ids, ["rule-1"]);
+    assert.ok(initialChat.payload.request_id);
+    assert.equal(initialChat.idempotencyKey, initialChat.payload.request_id);
+
+    fixtures.opsChatMode = "plan";
+    const preview = await submitChat("给已选商品补充使用说明，请先展示差异");
+    await page.waitForSelector("#opsPlanConfirmBtn:not(:disabled)");
+    const planId = preview.plan.id;
+    const confirmPath = `/api/ops/plans/${planId}/confirm`;
+    await page.click("#opsPlanViewDiffBtn");
+    await page.waitForSelector("#opsDiffModal[open]");
+    assert.match(await page.locator("#opsDiffTable").innerText(), /原有商品说明/);
+    assert.match(await page.locator("#opsDiffTable").innerText(), /仅限所选商品的使用说明/);
+    await assertNoOverflow(page, "ops diff dialog desktop");
+    await page.locator('[data-close-dialog="opsDiffModal"]').first().click();
+    assert.ok(fixtures.opsRequests.findLast((item) => item.path === "/api/ops/chat").payload.history.length > 0, "subsequent chat must carry conversation history");
+    assert.equal(fixtures.opsWrites.length, 0, "chat and diff preview must not write");
+    assert.equal(JSON.stringify({ products: fixtures.products, automation: fixtures.automation, knowledge: fixtures.ai.knowledge }), fixtureBeforePreview);
+    assert.equal(fixtures.opsRequests.filter((item) => item.path.endsWith("/confirm")).length, 0);
+    await assertNoOverflow(page, "ops preview desktop");
+
+    // A deliberate double click while a response is pending still dispatches a
+    // single confirm request. Refresh reads the same result without replaying it.
+    fixtures.opsConfirmDelayMs = 350;
+    const confirmation = page.waitForResponse((item) => item.url().endsWith(confirmPath) && item.request().method() === "POST");
+    await page.locator("#opsPlanConfirmBtn").evaluate((button) => { button.click(); button.click(); });
+    assert.equal((await confirmation).status(), 200);
+    await page.waitForFunction(() => /完成|成功/.test(document.querySelector("#opsPlanCard")?.textContent || ""));
+    assert.equal(fixtures.opsRequests.filter((item) => item.path === confirmPath).length, 1, "double click must not issue duplicate confirms");
+    assert.equal(fixtures.opsWrites.length, 1);
+    const confirm = fixtures.opsRequests.findLast((item) => item.path === confirmPath);
+    assert.deepEqual({ revision: confirm.payload.revision, digest: confirm.payload.digest, confirm: confirm.payload.confirm }, { revision: preview.plan.revision, digest: preview.plan.digest, confirm: true });
+    assert.equal(confirm.idempotencyKey, confirm.payload.request_id);
+    const result = await desktopApiClick(page, "#opsPlanRefreshBtn", `/api/ops/plans/${planId}`, "GET");
+    assert.equal(result.id, planId, "GET returns the direct plan, not a nested envelope");
+    assert.equal(fixtures.opsWrites.length, 1, "refreshing a terminal plan must not replay its write");
+    assert.equal(fixtures.opsRequests.filter((item) => item.path === confirmPath).length, 1);
+    assert.match(await page.locator("#opsPlanCard").innerText(), /完成|成功/);
+
+    const cancellation = await submitChat("先预览另一个方案，随后取消");
+    await desktopApiClick(page, "#opsPlanCancelBtn", `/api/ops/plans/${cancellation.plan.id}/cancel`);
+    await page.waitForFunction(() => /取消/.test(document.querySelector("#opsPlanCard")?.textContent || ""));
+    assert.equal(fixtures.opsWrites.length, 1);
+    const cancel = fixtures.opsRequests.findLast((item) => item.path.endsWith("/cancel"));
+    assert.deepEqual(cancel.payload, { revision: cancellation.plan.revision, digest: cancellation.plan.digest });
+
+    const conflicting = await submitChat("预览一个已被其他页面修改的商品");
+    fixtures.opsConfirmMode = "conflict";
+    const conflictPath = `/api/ops/plans/${conflicting.plan.id}/confirm`;
+    evidence.allowedFailures.push({ path: conflictPath, status: 409 });
+    await desktopApiClick(page, "#opsPlanConfirmBtn", conflictPath, "POST", 409);
+    await page.waitForFunction(() => /冲突|修改|变化|重新/.test(document.querySelector("#opsPlanMessage")?.textContent || ""));
+    assert.equal(fixtures.opsWrites.length, 1, "conflicts must not mutate the selected product");
+
+    fixtures.opsConfirmMode = "item_error";
+    const failed = await submitChat("显示逐项执行失败的模拟结果");
+    await desktopApiClick(page, "#opsPlanConfirmBtn", `/api/ops/plans/${failed.plan.id}/confirm`);
+    await page.waitForFunction(() => /失败|冲突|复核/.test(document.querySelector("#opsPlanCard")?.textContent || ""));
+    assert.match(await page.locator("#opsPlanCard").innerText(), /content_conflict|内容.*冲突|知识.*冲突|版本.*冲突/);
+    assert.equal(fixtures.opsWrites.length, 1);
+
+    fixtures.opsChatMode = "error";
+    evidence.allowedFailures.push({ path: "/api/ops/chat", status: 503 });
+    await page.fill("#opsPromptInput", "服务异常不能显示为成功");
+    await desktopApiClick(page, '#opsPromptForm button[type="submit"]', "/api/ops/chat", "POST", 503);
+    await page.waitForFunction(() => /暂时不可用|失败|重试/.test(document.querySelector("#opsPromptMessage")?.textContent || ""));
+    assert.equal(fixtures.opsWrites.length, 1);
+    assert.deepEqual(fixtures.apiRequests.filter((item) => item.path.startsWith("/api/admin/")), []);
+    assert.deepEqual(fixtures.apiRequests.filter((item) => item.path.startsWith("/api/bot/") && ["PUT", "PATCH", "DELETE"].includes(item.method)), [], "ops must not directly mutate production-style bot endpoints");
+    await assertNoOverflow(page, "ops error desktop");
+
+    // Hold a real mock response until the user has switched shops and sent a
+    // new request. The previous shop must neither lock the input nor inject a plan.
+    fixtures.opsChatMode = "plan";
+    const staleChatGate = new Promise((resolve) => { releaseStaleChat = resolve; });
+    await page.route("**/api/ops/chat", async (route) => {
+      if (route.request().headers()["x-shop-account"] !== "default") return route.continue();
+      const response = await route.fetch();
+      await staleChatGate;
+      await route.fulfill({ response });
+    });
+    const staleRequest = page.waitForRequest((request) => request.url().endsWith("/api/ops/chat") && request.headers()["x-shop-account"] === "default");
+    await page.fill("#opsPromptInput", "旧店铺迟到方案不得覆盖新店铺");
+    await page.click("#opsSendBtn");
+    await staleRequest;
+    assert.equal(await page.locator("#opsPromptInput").isDisabled(), true);
+    await page.selectOption("#opsShopSelect", "ops-second");
+    await page.waitForSelector('#opsProductSelect option[value="second-100001"]', { state: "attached" });
+    await page.waitForSelector("#opsSendBtn:not(:disabled)");
+    assert.equal(await page.locator("#opsPromptInput").isDisabled(), false);
+    assert.equal(await page.inputValue("#opsPromptInput"), "");
+    assert.equal(await page.locator("#opsPromptCount").innerText(), "0 / 2000");
+    assert.equal(await page.locator("#opsPlanCard").isVisible(), false);
+    assert.doesNotMatch(await page.locator("#opsChatHistory").innerText(), /旧店铺迟到|仅分析已选商品/);
+    await page.selectOption("#opsProductSelect", ["second-100001"]);
+    fixtures.opsChatMode = "reply";
+    await submitChat("只分析第二店铺的商品");
+    await page.waitForSelector("#opsSendBtn:not(:disabled)");
+    const secondRequest = fixtures.opsRequests.findLast((request) => request.path === "/api/ops/chat");
+    assert.equal(secondRequest.accountKey, "ops-second");
+    assert.deepEqual(secondRequest.payload.history, []);
+    assert.deepEqual(secondRequest.payload.selected_item_ids, ["second-100001"]);
+    const staleResponse = page.waitForResponse((response) => response.url().endsWith("/api/ops/chat") && response.request().headers()["x-shop-account"] === "default");
+    releaseStaleChat();
+    await (await staleResponse).finished();
+    await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+    assert.equal(await page.inputValue("#opsShopSelect"), "ops-second");
+    assert.equal(await page.locator("#opsPlanCard").isVisible(), false);
+    assert.equal(await page.locator("#opsSendBtn").isDisabled(), false);
+    assert.doesNotMatch(await page.locator("#opsChatHistory").innerText(), /旧店铺迟到|已生成模拟预览/);
+    assert.equal(fixtures.opsWrites.length, 1);
+    await assertNoOverflow(page, "ops shop switch desktop");
+    assertDesktopEvidence(evidence);
+    console.log(JSON.stringify({ ok: true, scope: "ops", desktop: 1440, screenshots: 0, mockWrites: fixtures.opsWrites.length,
+      cases: ["selection-history", "read-only-chat", "diff-preview", "single-confirm", "refresh-no-replay", "cancel", "conflict", "item-error", "chat-error", "direct-entry-shops", "switch-during-chat"] }));
+  } finally {
+    releaseStaleChat();
+    fixtures.shopAccounts = accounts;
+    fixtures.accountData = accountData;
+    await page.close();
   }
 }
 
@@ -1790,26 +2268,25 @@ async function run() {
   let expectedManualReplyNotFoundConsole = 0;
   let expectedManualReplyNotFoundResponses = 0;
   try {
-    await checkFirstRegistration(browser, `http://127.0.0.1:${port}/xianyu-saas/`);
-    const bootstrapToken = fixtures.bootstrapToken;
-    fixtures.authCapabilities = { registration_enabled: false, first_registration_available: false, bootstrap_available: true, password_min_length: 12 };
+    if (desktopSettingsOpsScope) {
+      const check = process.env.SAAS_UI_SCOPE === "settings" ? checkSettingsDesktop : checkOpsDesktop;
+      await check(browser, `http://127.0.0.1:${port}/xianyu-saas/`);
+      return;
+    }
+    if (process.env.SAAS_UI_SCOPE === "orders") {
+      await checkOrderManagement(browser, `http://127.0.0.1:${port}/xianyu-saas/`);
+      return;
+    }
+    const bootstrapToken = "bootstrap-ui-contract-token-0123456789abcdef";
+    fixtures.authCapabilities = { registration_enabled: false, bootstrap_available: true, password_min_length: 12 };
     const bootstrapPage = await browser.newPage({ viewport: { width: 1440, height: 900 }, deviceScaleFactor: 1 });
     await bootstrapPage.goto(`http://127.0.0.1:${port}/xianyu-saas/`, { waitUntil: "networkidle" });
     assert.equal(await bootstrapPage.locator("#bootstrapTab").isVisible(), true, "trusted first-admin state must expose bootstrap only");
     assert.equal(await bootstrapPage.locator("#registerTab").isVisible(), false, "bootstrap must not imply public registration");
-    assert.equal(await bootstrapPage.locator("#loginTab").getAttribute("aria-selected"), "true", "explicit legacy bootstrap must not enable token-free first registration");
     await bootstrapPage.click("#bootstrapTab");
     assert.match(await bootstrapPage.locator("#authTitle").textContent(), /首个管理员/);
-    assert.equal(await bootstrapPage.locator("#bootstrapTokenField").isVisible(), true);
-    assert.equal(await bootstrapPage.locator("#bootstrapToken").isDisabled(), false);
-    assert.equal(await bootstrapPage.locator("#bootstrapToken").getAttribute("required"), "");
     await bootstrapPage.fill("#authUsername", "bootstrap-admin");
     await bootstrapPage.fill("#authPassword", "Bootstrap-Pass-123!");
-    await bootstrapPage.click("#authSubmit");
-    assert.match(await bootstrapPage.locator("#authError").textContent(), /一次性初始化令牌无效/);
-    assert.equal(fixtures.bootstrapRequests.length, 0, "legacy bootstrap must still require a token");
-    const legacyLoginCount = fixtures.authLoginRequests.length;
-    const legacyCapabilitiesCount = fixtures.authCapabilitiesRequests;
     await bootstrapPage.fill("#bootstrapToken", bootstrapToken);
     await bootstrapPage.click("#authSubmit");
     await bootstrapPage.waitForFunction(() => document.querySelector("#authTitle")?.textContent === "登录工作台");
@@ -1820,16 +2297,8 @@ async function run() {
     assert.equal(fixtures.bootstrapRequests[0].url.includes(bootstrapToken), false, "bootstrap token must never enter the URL");
     assert.equal(JSON.stringify(fixtures.bootstrapRequests[0].payload).includes(bootstrapToken), false, "bootstrap token must never enter JSON");
     assert.equal((await bootstrapPage.locator("body").innerHTML()).includes(bootstrapToken), false, "bootstrap token must be cleared from rendered DOM");
-    assert.equal(await bootstrapPage.inputValue("#bootstrapToken"), "", "legacy bootstrap must erase the live token input");
-    assert.equal(await bootstrapPage.inputValue("#authPassword"), "");
-    assert.equal(await bootstrapPage.locator("#bootstrapToken").isDisabled(), true);
-    assert.equal(await bootstrapPage.locator("#bootstrapTab").isVisible(), false);
-    assert.equal(await bootstrapPage.locator("#registerTab").isVisible(), false);
-    assert.equal(fixtures.authCapabilitiesRequests, legacyCapabilitiesCount + 1);
-    assert.equal(fixtures.authLoginRequests.length, legacyLoginCount, "legacy bootstrap must retain its explicit login experience");
-    assert.match(await bootstrapPage.locator("#authError").textContent(), /管理员账号已创建，请登录/);
     await bootstrapPage.close();
-    fixtures.authCapabilities = { registration_enabled: true, first_registration_available: false, bootstrap_available: false, password_min_length: 12 };
+    fixtures.authCapabilities = { registration_enabled: true, bootstrap_available: false, password_min_length: 12 };
 
     const page = await browser.newPage({ viewport: { width: 1440, height: 900 }, deviceScaleFactor: 1 });
     await page.route("https://cdn.example/**", (route) => route.fulfill({
@@ -1901,25 +2370,9 @@ async function run() {
     assert.equal(await page.locator("#introCurtain").count(), 0, "startup curtain must be removed from the first-load DOM");
     assert.equal(await page.locator("#enterWorkspaceButton").count(), 0, "startup entry button must be removed");
     assert.equal(await page.locator("#authScreen").isVisible(), true, "login screen should be visible without a startup curtain");
-    assert.equal(await page.locator("#loginTab").getAttribute("aria-selected"), "true", "open owner registration must not be mistaken for first-admin setup");
     await page.click("#registerTab");
-    assert.equal(await page.locator("#authTitle").textContent(), "创建工作台账号", "subsequent registration must remain an owner signup");
-    assert.equal(await page.locator("#bootstrapTokenField").isVisible(), false);
-    const ownerLoginCount = fixtures.authLoginRequests.length;
-    const ownerCapabilitiesCount = fixtures.authCapabilitiesRequests;
-    await page.fill("#authUsername", "owner-demo");
-    await page.fill("#authPassword", "password-123");
-    const ownerRegistrationResponse = page.waitForResponse((response) => response.url().endsWith("/api/auth/register") && response.request().method() === "POST");
-    await page.click("#authSubmit");
-    assert.deepEqual(await (await ownerRegistrationResponse).json(), { ok: true, role: "owner" });
-    await page.waitForFunction(() => document.querySelector("#authError")?.textContent === "注册成功，请登录");
-    assert.equal(fixtures.authLoginRequests.length, ownerLoginCount, "owner registration must not automatically log in");
-    assert.equal(fixtures.authCapabilitiesRequests, ownerCapabilitiesCount + 1);
-    assert.equal(await page.inputValue("#authUsername"), "owner-demo");
-    assert.equal(await page.inputValue("#authPassword"), "");
-    assert.equal(await page.locator("#workspace").isVisible(), false);
-    assert.equal(await page.locator("#registerTab").isVisible(), true, "open owner registration must remain available");
-    assert.equal(await page.locator("#authTitle").textContent(), "登录工作台");
+    assert.match(await page.locator("#authTitle").textContent(), /创建/, "register tab must switch the auth title");
+    await page.click("#loginTab");
     await assertNoOverflow(page, "desktop login");
     await page.fill("#authUsername", "owner-demo");
     await page.fill("#authPassword", "password-123");
@@ -1932,10 +2385,10 @@ async function run() {
     assert.equal(await page.locator("#headerPlanBadge, #membershipCurrentBadge, #vipNavButton, #chatAiUpgrade, [data-panel=vip]").count(), 0, "membership and upgrade controls must not exist");
     assert.equal(await page.locator("#accountTabs").getAttribute("aria-label"), "当前店铺：海风数字店", "topbar tabs must expose the active shop");
     assert.equal(await page.locator("#accountTabs .account-tab.is-active .account-tab-name").textContent(), "海风数字店");
-    assert.deepEqual(await page.locator("#sideNav .side-nav-item").allTextContents(), ["运营概览", "智能客服", "履约中心", "订单管理"], "primary navigation is grouped into business domains");
+    assert.deepEqual(await page.locator("#sideNav .side-nav-item").allTextContents(), ["运营概览", "智能客服", "履约中心", "订单管理", "智能运维"], "primary navigation is grouped into business domains");
     assert.equal(await page.locator('#sideNav [data-view="chat"], #sideNav [data-view="goods"], #sideNav [data-view="orders"]').count(), 3, "chat, fulfillment and orders remain primary owner tools");
     assert.equal(await page.locator('[data-panel="chat"]:not([hidden]), [data-panel="goods"]:not([hidden]), [data-panel="orders"]:not([hidden])').count(), 0, "inactive panels stay hidden while the dashboard is active");
-    assert.deepEqual(await page.locator(".sidebar-bottom [data-view] .side-nav-tooltip").allTextContents(), ["店铺管理", "项目说明"], "shop and documentation domains stay in the sidebar footer");
+    assert.deepEqual(await page.locator(".sidebar-bottom [data-view] .side-nav-tooltip").allTextContents(), ["店铺管理", "系统设置"], "shop management and unified settings stay in the sidebar footer");
     assert.equal(await page.locator("#logoutButton").count(), 1, "sidebar footer keeps only the logout action");
     assert.equal(await page.evaluate(() => getComputedStyle(document.querySelector(".side-nav")).overflowY), "visible", "the left navigation must never scroll");
     assert.ok(await page.evaluate(() => {
@@ -1958,65 +2411,65 @@ async function run() {
     assert.equal(await page.locator('[data-panel="home"] .page-head-copy p').count(), 0, "page headers keep a clean title without annotation microcopy");
     assert.equal(await page.locator('[data-panel="home"] .section-title p').count(), 0, "section titles keep a clean heading without annotation microcopy");
 
-    // 项目说明保持为单一连续说明书，正文只保留三个小节，作者链接固定在文末页脚。
-    await openView(page, "docs");
+    // The former docs page is now a help dialog within unified settings.
+    await openView(page, "settings");
+    await page.click("#settingsDocsBtn");
+    await page.waitForSelector("#docsHelpModal[open]");
     await waitForPanelSettled(page);
-    assert.equal(await page.locator(".docs-manual").count(), 1, "project docs must use one manual surface");
-    assert.deepEqual(await page.locator(".docs-manual-section h3").allTextContents(), ["一、项目概览", "二、日常操作与异常处理", "三、技术与安全边界"], "project docs must keep exactly three body sections");
-    assert.equal(await page.locator(".docs-manual-section").count(), 3, "project docs must not fragment into many feature panels");
-    assert.deepEqual(await page.locator("#docsBusinessDomains tbody th").allTextContents(), ["运营概览", "智能客服", "履约中心", "订单管理", "店铺管理", "项目说明"], "six business domains must remain a compact manual table");
-    assert.equal(await page.locator(".docs-github-card, .docs-grid-cards, .docs-card, .btn-github-portal, .docs-manual-notice, .docs-manual-kicker").count(), 0, "legacy documentation card layout must be removed");
-    // 正式文档版式：外层不再是带阴影的卡片，标题和页脚使用实线分隔而不是色块。
-    assert.deepEqual(await page.evaluate(() => {
-      const manual = getComputedStyle(document.querySelector(".docs-manual"));
-      return [manual.boxShadow, manual.borderTopWidth];
-    }), ["none", "0px"], "the manual must read as a flat document instead of a stacked card");
-    assert.equal(await page.evaluate(() => getComputedStyle(document.querySelector(".docs-manual-footer")).backgroundColor), "rgba(0, 0, 0, 0)", "the closing signature must not become another tinted card");
-    assert.equal(await page.locator(".docs-manual-table").count(), 2, "supporting facts stay in lightweight manual tables");
-    assert.equal(await page.locator(".docs-manual-table caption").count(), 2, "every manual table keeps a caption");
-    assert.equal(await page.locator(".docs-manual > .docs-manual-footer").evaluate((footer) => footer === footer.parentElement.lastElementChild), true, "author links must stay in the final manual footer");
+    assert.equal(await page.locator(".docs-manual").count(), 1);
+    assert.equal(await page.locator(".docs-step-item").count(), 4);
+    assert.equal(await page.locator("details.docs-faq-item").count(), 4);
+    assert.doesNotMatch(await page.locator(".docs-manual").textContent(), /绝不会|全部测试通过|除此以外不向外部/);
+    for (const view of ["shops", "goods", "chat", "orders", "home"]) {
+      assert.ok(await page.locator('[data-view="' + view + '"]').count(), "guide destinations remain accessible from the workspace");
+      if (process.env.SAAS_UI_SCOPE === "docs") {
+        await page.locator('[data-close-dialog="docsHelpModal"]').first().click();
+        await openView(page, view);
+        await openView(page, "settings");
+        await page.click("#settingsDocsBtn");
+        await page.waitForSelector("#docsHelpModal[open]");
+      }
+    }
+    await page.locator(".docs-faq-summary").first().click();
+    assert.equal(await page.locator("details.docs-faq-item").first().getAttribute("open"), "");
+    assert.match(await page.locator(".docs-faq-content").first().textContent(), /关机|休眠/);
+    assert.equal(await page.locator("#docsHelpModal > .docs-help-footer").evaluate((footer) => footer === footer.parentElement.lastElementChild), true, "author links must stay in the final help dialog footer");
     for (const [selector, href] of [["#docsAuthorGithub", "https://github.com/tswawa"], ["#docsProjectGithub", "https://github.com/tswawa/xianyu-saas"]]) {
       const link = page.locator(selector);
       assert.equal(await link.getAttribute("href"), href, `${selector} must point to the expected GitHub destination`);
       assert.equal(await link.getAttribute("target"), "_blank", `${selector} must open in a new tab`);
       assert.equal(await link.getAttribute("rel"), "noopener noreferrer", `${selector} must use a safe external-link policy`);
     }
-    assert.equal(await page.locator(".docs-manual-footer").textContent().then((value) => value.includes("作者 GitHub") && value.includes("项目仓库")), true, "manual footer must label author and project links");
-    // 作者信息只出现在文末，不能回到首屏或页头横幅。
-    assert.equal(await page.locator('[data-panel="docs"] .page-head a[href*="github.com"], .docs-manual-head a[href*="github.com"]').count(), 0, "author links must not return to the top banner");
+    assert.equal(await page.locator(".docs-help-footer").textContent().then((value) => value.includes("作者 GitHub") && value.includes("项目仓库")), true, "manual footer must label author and project links");
+    assert.equal(await page.locator('#docsHelpModal .dialog-head a[href*="github.com"]').count(), 0, "author links must not return to the top banner");
     assert.ok(await page.evaluate(() => {
-      const manual = document.querySelector(".docs-manual");
-      const footer = document.querySelector(".docs-manual-footer");
-      return footer.getBoundingClientRect().top > manual.getBoundingClientRect().top + manual.getBoundingClientRect().height * 0.6;
-    }), "the signature block must sit at the end of the manual");
+      const manual = document.querySelector("#docsHelpModal .docs-manual");
+      const footer = document.querySelector("#docsHelpModal .docs-help-footer");
+      return Boolean(manual.compareDocumentPosition(footer) & Node.DOCUMENT_POSITION_FOLLOWING);
+    }), "the signature block must follow the manual in the dialog");
     await assertNoOverflow(page, "project manual desktop");
     await captureScreenshot(page, { path: path.join(resultRoot, "docs-manual-desktop.png"), fullPage: true });
-    await page.setViewportSize({ width: 390, height: 844 });
-    await waitForPanelSettled(page);
-    await assertNoOverflow(page, "project manual mobile");
-    // 移动端表格改为分块堆叠，说明书正文不得出现横向滚动。
-    assert.ok(await page.evaluate(() => Array.from(document.querySelectorAll(".docs-manual-table")).every((table) => table.scrollWidth <= table.clientWidth + 1)), "manual tables must not scroll horizontally at 390px");
-    // 表格标题在窄视口必须保持横向排版，不能被压成逐字竖排。
-    assert.ok(await page.evaluate(() => Array.from(document.querySelectorAll(".docs-manual-table-caption")).every((caption) => {
-      const box = caption.getBoundingClientRect();
-      const line = parseFloat(getComputedStyle(caption).fontSize) * 2.4;
-      return box.width > 120 && box.height < line;
-    })), "manual table captions must stay on a single horizontal line at 390px");
-    await captureScreenshot(page, { path: path.join(resultRoot, "docs-manual-mobile.png"), fullPage: true });
-    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.locator('[data-close-dialog="docsHelpModal"]').first().click();
+    await page.waitForSelector("#docsHelpModal:not([open])", { state: "attached" });
 
     // All signed-in owners can inspect version metadata and change their own password,
     // while platform account, audit and update actions remain hidden.
-    assert.equal(await page.locator('[data-docs-tab="accounts"]').isVisible(), false, "owners must not see platform account administration");
-    assert.equal(await page.locator('[data-docs-tab="audit"]').isVisible(), false, "owners must not see platform audit records");
-    await page.click('[data-docs-tab="version"]');
-    await page.waitForSelector('[data-docs-panel="version"]:not([hidden])');
+    assert.equal(await page.locator('[data-settings-tab="accounts"]').isVisible(), false, "owners must not see platform account administration");
+    assert.equal(await page.locator('[data-settings-tab="audit"]').isVisible(), false, "owners must not see platform audit records");
+    await page.click('[data-settings-tab="version"]');
+    await page.waitForSelector('[data-settings-panel="version"]:not([hidden])');
     await page.waitForFunction(() => document.querySelector("#currentVersionValue")?.textContent === "v0.1.0");
     assert.equal(await page.locator("#currentAssetVersionValue").textContent(), assetVersion);
     assert.equal(await page.locator("#adminUpdateControls").isVisible(), false, "owners can read releases but cannot operate updates");
-    assert.match(await page.locator("#versionReleaseNotes").textContent(), /<img src=x onerror=/, "release notes remain literal text");
-    assert.equal(await page.locator("#versionReleaseNotes img, #versionReleaseNotes script").count(), 0, "release notes must not create executable nodes");
+    assert.match(await page.locator("#localReleaseNotes").textContent(), /<img src=x onerror=/, "release notes remain literal text");
+    assert.equal(await page.locator("#localReleaseNotes img, #localReleaseNotes script").count(), 0, "release notes must not create executable nodes");
     assert.notEqual(await page.evaluate(() => window.__releaseNotesInjected), true, "release notes must never execute markup");
+    assert.equal(await page.locator("#passwordChangeForm").isVisible(), false);
+    assert.equal(await page.locator("#checkUpdateButton").count(), 0);
+    assert.equal(await page.locator("#versionBadgeRefresh").isVisible(), false);
+    await assertNoOverflow(page, "owner version desktop");
+    await page.click('[data-settings-tab="security"]');
+    assert.equal(await page.locator("#securityUsernameValue").textContent(), "owner-demo");
     await page.fill("#currentPasswordInput", "password-123");
     await page.fill("#newPasswordInput", "Owner-New-Pass-123!");
     const passwordChangeResponse = page.waitForResponse((response) => response.url().endsWith("/api/auth/password") && response.request().method() === "POST");
@@ -2024,16 +2477,15 @@ async function run() {
     assert.equal((await passwordChangeResponse).status(), 200, "password change must reach the authenticated API");
     await page.waitForFunction(() => document.querySelector("#passwordChangeMessage")?.textContent.includes("其他会话已撤销"));
     assert.deepEqual(fixtures.passwordRequests.at(-1), { current_password: "password-123", new_password: "Owner-New-Pass-123!" });
-    await page.setViewportSize({ width: 390, height: 844 });
     await waitForPanelSettled(page);
-    await assertNoOverflow(page, "owner version and password mobile");
-    await page.setViewportSize({ width: 1440, height: 900 });
+    await assertNoOverflow(page, "owner version and password desktop");
 
     await openView(page, "home");
     await page.waitForSelector('[data-panel="home"]:not([hidden])');
     await waitForPanelSettled(page);
     await assertNoOverflow(page, "dashboard after project manual");
 
+    if (process.env.SAAS_UI_SCOPE !== "docs") {
     await assertNoOverflow(page, "free dashboard desktop");
     await page.setViewportSize({ width: 1366, height: 768 });
     await page.waitForTimeout(220);
@@ -2119,7 +2571,8 @@ async function run() {
     await page.fill("#templateNameInput", "卡密自动发货模板（已编辑）");
     const editTemplateResponse = page.waitForResponse((response) => response.url().endsWith("/api/bot/templates") && response.request().method() === "PUT");
     await page.click("#templateEditorCommit");
-    await editTemplateResponse;
+    const savedTemplateResponse = await editTemplateResponse;
+    assert.equal(savedTemplateResponse.status(), 200, await savedTemplateResponse.text());
     await page.waitForFunction(() => document.querySelector("#templateEditorDialog")?.open !== true);
     await page.waitForFunction(() => document.querySelector('[data-template-id="tpl-1"] h3')?.textContent.includes("已编辑"));
     const preservedOverflowTemplate = fixtures.templateRequests.find((req) => req.method === "PUT" && req.template.name === "卡密自动发货模板（已编辑）")?.template;
@@ -3088,29 +3541,26 @@ async function run() {
       assert.equal(fixtures.aiRequests.filter((request) => request.kind === "config").length, configWritesBeforeEmpty);
     }
 
+    // The connection form retains its IDs but now lives in user settings.
+    await openView(page, "settings");
+    await page.click('[data-settings-tab="ai"]');
     await page.fill("#aiBaseUrl", "https://example.com/v1");
     await page.fill("#aiModel", "fixture-model");
     await page.fill("#aiApiKey", "fixture-ui-secret");
-    const aiTestResponse = page.waitForResponse((response) => response.url().endsWith("/api/bot/ai/connection/test") && response.request().method() === "POST");
-    await page.click("#aiTestConnection");
-    await aiTestResponse;
-    const aiSaveResponse = page.waitForResponse((response) => response.url().endsWith("/api/bot/ai/connection") && response.request().method() === "PUT");
-    await page.click("#aiSaveConnection");
-    await aiSaveResponse;
-    await page.waitForFunction(() => document.querySelector("#aiKeyState")?.textContent === "已安全保存");
-    assert.equal(fixtures.aiRequests.findLast((item) => item.kind === "connection").payload.provider, "openai_chat_completions");
-    assert.equal(await page.locator("#aiApiKey").inputValue(), "");
+    await desktopApiClick(page, "#aiTestConnection", "/api/settings/ai/connection/test");
+    await desktopApiClick(page, "#aiSaveConnection", "/api/settings/ai/connection", "PUT");
+    await page.waitForFunction(() => document.querySelector("#aiApiKey")?.value === "");
+    assert.equal(fixtures.settingsRequests.findLast((item) => item.method === "PUT").payload.provider, "openai_chat_completions");
+    assert.equal(fixtures.settingsRequests.findLast((item) => item.method === "PUT").payload.confirm, true);
 
-    const testsBeforeProviderSwitch = fixtures.aiRequests.filter((item) => item.kind === "connection-test").length;
+    const testsBeforeProviderSwitch = fixtures.settingsRequests.filter((item) => item.path.endsWith("/test")).length;
     await page.selectOption("#aiProvider", "anthropic_messages");
     await page.click("#aiTestConnection");
-    await page.waitForFunction(() => document.querySelector("#aiConnectionMessage")?.textContent.includes("切换接口格式后请输入对应的 API Key"));
-    assert.equal(fixtures.aiRequests.filter((item) => item.kind === "connection-test").length, testsBeforeProviderSwitch);
+    await page.waitForFunction(() => /请输入.*API Key/.test(document.querySelector("#aiConnectionMessage")?.textContent || ""));
+    assert.equal(fixtures.settingsRequests.filter((item) => item.path.endsWith("/test")).length, testsBeforeProviderSwitch);
     await page.fill("#aiApiKey", "anthropic-ui-secret");
-    const anthropicResponse = page.waitForResponse((response) => response.url().endsWith("/api/bot/ai/connection/test") && response.request().method() === "POST");
-    await page.click("#aiTestConnection");
-    await anthropicResponse;
-    assert.equal(fixtures.aiRequests.findLast((item) => item.kind === "connection-test").payload.provider, "anthropic_messages");
+    await desktopApiClick(page, "#aiTestConnection", "/api/settings/ai/connection/test");
+    assert.equal(fixtures.settingsRequests.findLast((item) => item.path.endsWith("/test")).payload.provider, "anthropic_messages");
     await page.selectOption("#aiProvider", "ollama_chat");
     assert.equal(await page.inputValue("#aiApiKey"), "");
     assert.equal(await page.locator("#aiApiKey").getAttribute("required"), null);
@@ -3119,12 +3569,9 @@ async function run() {
     await page.selectOption("#aiProvider", "google_gemini");
     assert.match(await page.locator("#aiBaseUrl").getAttribute("placeholder"), /generativelanguage\.googleapis\.com\/v1beta/);
     await page.selectOption("#aiProvider", "openai_chat_completions");
-    const retestSavedProvider = page.waitForResponse((response) => response.url().endsWith("/api/bot/ai/connection/test") && response.request().method() === "POST");
-    await page.click("#aiTestConnection");
-    await retestSavedProvider;
-    const resaveSavedProvider = page.waitForResponse((response) => response.url().endsWith("/api/bot/ai/connection") && response.request().method() === "PUT");
-    await page.click("#aiSaveConnection");
-    await resaveSavedProvider;
+    await desktopApiClick(page, "#aiTestConnection", "/api/settings/ai/connection/test");
+    await desktopApiClick(page, "#aiSaveConnection", "/api/settings/ai/connection", "PUT");
+    await openView(page, "ai-config");
 
     await page.fill("#aiStoreContent", "本店主营数字学习资料，先回答当前商品问题；价格和状态以实时商品信息为准。营业时间为 9:00—23:00。");
     await page.fill("#aiPersonaName", "小鲸客服");
@@ -3786,8 +4233,13 @@ async function run() {
     assert.equal(await page.inputValue("#manualReplyInput"), "", "a late reply response after logout must be ignored");
     assert.equal(await page.locator("#replyMessage").textContent(), "", "a late reply response after logout must not restore status");
 
+    } else {
+      await page.click("#logoutButton");
+      await page.waitForSelector("#authScreen:not([hidden])");
+    }
+
     // Platform administrators receive only account metadata, security events and
-    // signed-update controls inside the existing project documentation domain.
+    // signed-update controls inside the unified settings domain.
     fixtures.me = {
       username: "admin-demo", expires_at: 0, active: false, plan: "free", plan_label: "免费",
       role: "admin", role_label: "管理员", is_admin: true, permissions: selfUsePermissions,
@@ -3797,16 +4249,16 @@ async function run() {
     await page.fill("#authPassword", "Admin-Pass-123!");
     await page.click("#authSubmit");
     await page.waitForSelector("#workspace:not([hidden])");
-    await openView(page, "docs");
-    await page.waitForFunction(() => Array.from(document.querySelectorAll("[data-docs-tab]")).filter((node) => !node.hidden).length === 4);
+    await openView(page, "settings");
+    await page.waitForFunction(() => Array.from(document.querySelectorAll("[data-settings-tab]")).filter((node) => !node.hidden).length === 5);
     assert.deepEqual(
-      await page.locator('[data-docs-tab]:visible').allTextContents(),
-      ["使用说明", "版本与更新", "账号与权限", "安全记录"],
-      "administration must remain inside the existing project domain",
+      await page.locator('[data-settings-tab]:visible').allTextContents(),
+      ["模型连接", "账号安全", "账号与权限", "安全记录", "版本与更新"],
+      "administration and model connection must remain inside unified settings",
     );
 
-    await page.click('[data-docs-tab="accounts"]');
-    await page.waitForSelector('[data-docs-panel="accounts"]:not([hidden])');
+    await page.click('[data-settings-tab="accounts"]');
+    await page.waitForSelector('[data-settings-panel="accounts"]:not([hidden])');
     await page.waitForFunction(() => document.querySelectorAll("#adminUsersBody [data-admin-user-id]").length === 2);
     assert.match(await page.locator('[data-admin-user-id="2"]').textContent(), /owner-demo/);
     assert.doesNotMatch(await page.locator('[data-admin-user-id="2"]').textContent(), /Cookie|订单正文|库存正文/);
@@ -3833,45 +4285,69 @@ async function run() {
     assert.equal(await page.locator('[data-admin-user-id="2"] [data-admin-user-role]').inputValue(), "admin");
     assert.ok(fixtures.adminUserRequests.some((item) => item.action === "patch" && item.userId === 2 && item.payload.role === "admin"));
 
-    await page.click('[data-docs-tab="audit"]');
-    await page.waitForSelector('[data-docs-panel="audit"]:not([hidden])');
+    await page.click('[data-settings-tab="audit"]');
+    await page.waitForSelector('[data-settings-panel="audit"]:not([hidden])');
     await page.waitForFunction(() => document.querySelectorAll("#auditEventList .audit-event").length === 1);
     assert.match(await page.locator("#auditEventList").textContent(), /登录成功/);
     assert.doesNotMatch(await page.locator("#auditEventList").textContent(), /Admin-Pass-123|bootstrap-ui-contract-token/);
 
-    await page.click('[data-docs-tab="version"]');
-    await page.waitForSelector('[data-docs-panel="version"]:not([hidden])');
-    assert.equal(await page.locator("#adminUpdateControls").isVisible(), true);
-    await page.click("#checkUpdateButton");
-    await page.waitForFunction(() => document.querySelector("#updateActionMessage")?.textContent.includes("v0.2.0"));
+    await page.click('[data-settings-tab="version"]');
+    await page.waitForSelector('[data-settings-panel="version"]:not([hidden])');
+    await page.waitForFunction(() => document.querySelector("#versionBadgeRefresh")?.disabled === false);
+    assert.equal(await page.locator("#adminUpdateControls").isVisible(), false, "Docker must not expose unsupported installation controls");
+    fixtures.releaseCheckStatus = "no_release";
+    await checkUpdateFromBadge(page);
+    await page.waitForFunction(() => document.querySelector("#currentUpdateStatusValue")?.textContent === "此通道尚无发布版本" && !document.querySelector("#versionBadgeRefresh").disabled);
+    for (const [status, expected] of [["current", "未发现更高版本"], ["incomplete", "安装制品不完整"], ["error", "无法连接发布来源"]]) {
+      fixtures.releaseCheckStatus = status;
+      await checkUpdateFromBadge(page);
+      await page.waitForFunction((text) => document.querySelector("#currentUpdateStatusValue")?.textContent.includes(text) && !document.querySelector("#versionBadgeRefresh").disabled, expected);
+      assert.equal(await page.locator("#downloadUpdateButton").isDisabled(), true);
+    }
+    fixtures.releaseCheckStatus = "available";
+    fixtures.updateStatus.capabilities = { ...dockerUpdateCapabilities, deployment: "systemd", download: true, apply: true, rollback: true, reason: "" };
+    fixtures.version.capabilities = fixtures.updateStatus.capabilities;
+    fixtures.version.deployment = "systemd";
+    await page.click("#refreshVersionButton");
+    await page.waitForSelector("#adminUpdateControls:not([hidden])");
+    await checkUpdateFromBadge(page);
+    await page.waitForFunction(() => document.querySelector("#currentUpdateStatusValue")?.textContent.includes("v0.2.0") && !document.querySelector("#downloadUpdateButton").disabled);
     assert.equal(fixtures.updateRequests.at(-1).action, "check");
     assert.match(await page.locator("#versionReleaseNotes").textContent(), /<script>/, "network release notes must remain visible as text");
     assert.equal(await page.locator("#versionReleaseNotes script").count(), 0);
     assert.notEqual(await page.evaluate(() => window.__releaseNotesInjected), true);
     await page.click("#downloadUpdateButton");
-    await page.waitForFunction(() => document.querySelector("#updateActionMessage")?.textContent.includes("已校验"));
+    await page.waitForFunction(() => document.querySelector("#applyUpdateButton")?.disabled === false);
     assert.deepEqual(fixtures.updateRequests.at(-1), { action: "download", payload: { version: "0.2.0" } });
+    await checkUpdateFromBadge(page);
+    await page.waitForFunction(() => document.querySelector("#applyUpdateButton")?.disabled === false);
+    assert.equal(fixtures.updateStatus.latest_update.status, "staged", "rechecking must preserve a staged candidate");
     await page.fill("#updateAdminPassword", "Admin-Pass-123!");
     await page.click("#applyUpdateButton");
-    await page.waitForFunction(() => document.querySelector("#updateActionMessage")?.textContent.includes("独立 updater"));
+    await page.waitForFunction(() => document.querySelector("#updateActionMessage")?.textContent.includes("请求已提交"));
     assert.deepEqual(fixtures.adminConfirmRequests.at(-1), { password: "Admin-Pass-123!", action: "update.apply" });
     assert.deepEqual(fixtures.updateRequests.at(-1), {
       action: "apply", payload: { version: "0.2.0", confirmation_token: "ui-one-time-confirmation" },
     });
+    await page.waitForFunction(() => document.querySelector("#refreshVersionButton")?.disabled === false);
+    assert.equal(await page.locator("#rollbackUpdateButton").isDisabled(), true, "installation in progress blocks other operations");
+    assert.match(await page.locator("#updateInstallStatusValue").textContent(), /等待更新服务/);
+    fixtures.updateStatus.latest_update.status = "applied";
+    await page.click("#refreshVersionButton");
+    await page.waitForFunction(() => document.querySelector("#rollbackUpdateButton")?.disabled === false);
     await page.fill("#updateAdminPassword", "Admin-Pass-123!");
     await page.selectOption("#rollbackVersionSelect", "0.0.9");
     await page.click("#rollbackUpdateButton");
-    await page.waitForFunction(() => document.querySelector("#updateActionMessage")?.textContent.includes("回滚请求已提交"));
+    await page.waitForFunction(() => document.querySelector("#updateInstallStatusValue")?.textContent.includes("已提交回滚请求"));
     assert.deepEqual(fixtures.adminConfirmRequests.at(-1), { password: "Admin-Pass-123!", action: "update.rollback" });
     assert.deepEqual(fixtures.updateRequests.at(-1), {
       action: "rollback", payload: { version: "0.0.9", confirmation_token: "ui-one-time-confirmation" },
     });
 
-    await page.setViewportSize({ width: 390, height: 844 });
-    await page.click('[data-docs-tab="accounts"]');
-    await page.waitForSelector('[data-docs-panel="accounts"]:not([hidden])');
+    await page.click('[data-settings-tab="accounts"]');
+    await page.waitForSelector('[data-settings-panel="accounts"]:not([hidden])');
     await waitForPanelSettled(page);
-    await assertNoOverflow(page, "admin account controls mobile");
+    await assertNoOverflow(page, "admin account controls desktop");
     assert.ok(await page.evaluate(() => {
       const wrapper = document.querySelector(".docs-table-wrap");
       return wrapper && wrapper.scrollWidth >= wrapper.clientWidth;
@@ -3897,12 +4373,25 @@ async function run() {
     assert.deepEqual(failedResponses, [], "browser should have no failed responses");
     console.log(JSON.stringify({
       ok: true,
-      selfUseNav: 6,
+      scope: process.env.SAAS_UI_SCOPE === "docs" ? "docs" : "full",
+      selfUseNav: 7,
       productCards: fixtures.products.length,
       templates: fixtures.templates.length,
       cards: fixtures.cardRequests.length,
-      screenshots: resultRoot,
+      screenshots: screenshotsEnabled ? resultRoot : 0,
     }));
+  } catch (error) {
+    if (process.env.SAAS_UI_SCOPE === "docs") {
+      const activePage = browser.contexts().flatMap((context) => context.pages()).at(-1);
+      const state = activePage ? await activePage.evaluate(() => ({
+        view: document.querySelector('[data-panel]:not([hidden])')?.dataset.panel,
+        updateMessage: document.querySelector("#updateActionMessage")?.textContent,
+        updateStatus: document.querySelector("#updateInstallStatusValue")?.textContent,
+        applyDisabled: document.querySelector("#applyUpdateButton")?.disabled,
+      })) : null;
+      console.error(JSON.stringify({ scope: "docs", state, updateActions: fixtures.updateRequests.map((item) => item.action), adminConfirmCount: fixtures.adminConfirmRequests.length }));
+    }
+    throw error;
   } finally {
     await browser.close();
     await close(server);

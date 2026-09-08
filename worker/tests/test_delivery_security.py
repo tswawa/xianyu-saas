@@ -197,6 +197,8 @@ def chat_message(chat_id, sender_id, item_id, content, timestamp_ms=None):
 
 
 class AgentTestCase(unittest.IsolatedAsyncioTestCase):
+    automation_mode = "rules_ai"
+
     async def asyncSetUp(self):
         self.tempdir = tempfile.TemporaryDirectory()
         self.state_dir = Path(self.tempdir.name)
@@ -251,11 +253,11 @@ class AgentTestCase(unittest.IsolatedAsyncioTestCase):
         self.api = FakeApi()
         self.agent = XianyuLive(
             "unb=seller-test; token=not-a-secret",
-            reply_bot=FakeBot(),
+            reply_bot=FakeBot() if self.automation_mode == "rules_ai" else None,
             api_client=self.api,
             data_dir=str(self.state_dir),
             products_config_path=str(self.products_path),
-            automation_mode="rules_ai",
+            automation_mode=self.automation_mode,
         )
         async def acknowledge_send(*_args, **kwargs):
             before_attempt = kwargs.get("before_attempt")
@@ -1719,6 +1721,174 @@ class AgentTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.agent.classify_item(PAN_ITEM_ID)["delivery"], "pan")
         self.assertIsNone(self.agent.classify_item("keyboard-api-vps"))
         self.assertIsNone(self.agent.classify_item("9999"))
+
+
+class RulesDeliverySecurityTests(unittest.IsolatedAsyncioTestCase):
+    """Run the existing delivery guarantees with no AI client at startup."""
+
+    automation_mode = "rules"
+    asyncSetUp = AgentTestCase.asyncSetUp
+    asyncTearDown = AgentTestCase.asyncTearDown
+    bind = AgentTestCase.bind
+    test_buyer_bracket_payment_text_cannot_authorize_delivery = AgentTestCase.test_buyer_bracket_payment_text_cannot_authorize_delivery
+    test_trusted_platform_shape_is_required = AgentTestCase.test_trusted_platform_shape_is_required
+    test_payment_event_type_rejects_bool_float_and_string_aliases = AgentTestCase.test_payment_event_type_rejects_bool_float_and_string_aliases
+    test_buyer_reported_quantity_has_no_delivery_effect = AgentTestCase.test_buyer_reported_quantity_has_no_delivery_effect
+    test_concurrent_duplicate_event_sends_and_reserves_once = AgentTestCase.test_concurrent_duplicate_event_sends_and_reserves_once
+    test_failed_send_retries_the_same_reserved_code = AgentTestCase.test_failed_send_retries_the_same_reserved_code
+    test_different_orders_for_same_buyer_get_separate_codes = AgentTestCase.test_different_orders_for_same_buyer_get_separate_codes
+    test_multi_quantity_order_reserves_distinct_codes_atomically = AgentTestCase.test_multi_quantity_order_reserves_distinct_codes_atomically
+    test_multi_quantity_order_with_insufficient_pool_never_partially_sends = AgentTestCase.test_multi_quantity_order_with_insufficient_pool_never_partially_sends
+    test_quantity_change_before_send_is_rejected = AgentTestCase.test_quantity_change_before_send_is_rejected
+    test_pan_resource_is_reusable_and_stable_per_order = AgentTestCase.test_pan_resource_is_reusable_and_stable_per_order
+    test_pan_resource_groups_do_not_match_by_tag_subset = AgentTestCase.test_pan_resource_groups_do_not_match_by_tag_subset
+    test_order_identity_conflicts_never_send = AgentTestCase.test_order_identity_conflicts_never_send
+    test_temporary_order_api_failure_retries_without_consuming_inventory = AgentTestCase.test_temporary_order_api_failure_retries_without_consuming_inventory
+    test_payment_reminder_without_chat_binding_is_manual = AgentTestCase.test_payment_reminder_without_chat_binding_is_manual
+    test_order_reverification_waits_until_connection_is_ready = AgentTestCase.test_order_reverification_waits_until_connection_is_ready
+    test_platform_ship_failure_keeps_delivery_and_retries = AgentTestCase.test_platform_ship_failure_keeps_delivery_and_retries
+
+    async def test_rules_startup_imports_inventory_without_constructing_ai(self):
+        self.assertIsNone(self.agent.bot)
+        self.assertEqual(self.agent.delivery_store.inventory_counts()["redeem"], {"available": 3})
+        self.bind()
+        await self.agent.handle_paid_order(paid_event(SESSION_ID, int(time.time() * 1000)))
+        self.assertIsNone(self.agent.bot)
+        self.assertEqual(self.api.detail_calls, 2)
+        self.assertEqual(self.api.consign_calls, 1)
+        self.agent.send_text_reliably.assert_awaited_once()
+
+    async def test_missing_inventory_on_restart_never_sends_cached_resources(self):
+        (self.state_dir / "redeem_codes.json").unlink()
+        (self.state_dir / "pan_links.json").unlink()
+        self.agent = XianyuLive(
+            "unb=seller-test; token=not-a-secret", api_client=self.api,
+            data_dir=str(self.state_dir), products_config_path=str(self.products_path),
+            automation_mode="rules",
+        )
+        self.agent.send_text_reliably = AsyncMock()
+        for index, item_id in enumerate((API_ITEM_ID, PAN_ITEM_ID)):
+            chat_id = str(8000 + index)
+            self.bind(chat_id=chat_id, item_id=item_id)
+            self.api.order_item_id = item_id
+            self.api.order_id = self.api.head_order_id = str(8100 + index)
+            await self.agent.handle_paid_order(paid_event(chat_id, int(time.time() * 1000)))
+            order = self.agent.delivery_store.get_order(self.agent._canonical_order_key(self.api.order_id))
+            self.assertEqual(order.status, "manual_review")
+            self.assertEqual(order.resources, ())
+        self.agent.send_text_reliably.assert_not_awaited()
+        self.assertEqual(self.api.consign_calls, 0)
+        self.assertEqual(self.agent.delivery_store.inventory_counts()["redeem"], {"available": 3})
+
+    async def test_redeem_manifest_revocation_during_reverification_prevents_wire_send(self):
+        self.bind()
+        wire_send = AsyncMock()
+        original_reverify = self.agent._reverify_order
+
+        async def reverify_then_remove(reservation):
+            await original_reverify(reservation)
+            write_json(self.state_dir / "redeem_codes.json", [])
+
+        async def send_after_checks(*_args, **kwargs):
+            await kwargs["before_attempt"]()
+            await wire_send()
+
+        self.agent._reverify_order = reverify_then_remove
+        self.agent.send_text_reliably = AsyncMock(side_effect=send_after_checks)
+        await self.agent.handle_paid_order(paid_event(SESSION_ID, int(time.time() * 1000)))
+        order = self.agent.delivery_store.get_order(self.agent._canonical_order_key(ORDER_ID))
+        self.assertEqual(order.status, "manual_review")
+        self.assertEqual(order.reason, "inventory_removed_from_manifest")
+        self.assertEqual(self.agent.delivery_store.inventory_counts()["redeem"], {"quarantined": 3})
+        wire_send.assert_not_awaited()
+        self.assertEqual(self.api.consign_calls, 0)
+
+    async def test_pan_manifest_removal_during_reverification_prevents_wire_send(self):
+        self.bind(item_id=PAN_ITEM_ID)
+        self.api.order_item_id = PAN_ITEM_ID
+        wire_send = AsyncMock()
+        original_reverify = self.agent._reverify_order
+
+        async def reverify_then_remove(reservation):
+            await original_reverify(reservation)
+            (self.state_dir / "pan_links.json").unlink()
+
+        async def send_after_checks(*_args, **kwargs):
+            await kwargs["before_attempt"]()
+            await wire_send()
+
+        self.agent._reverify_order = reverify_then_remove
+        self.agent.send_text_reliably = AsyncMock(side_effect=send_after_checks)
+        await self.agent.handle_paid_order(paid_event(SESSION_ID, int(time.time() * 1000)))
+        order = self.agent.delivery_store.get_order(self.agent._canonical_order_key(ORDER_ID))
+        self.assertEqual(order.status, "manual_review")
+        self.assertEqual(order.reason, "pan_resource_unavailable")
+        wire_send.assert_not_awaited()
+        self.assertEqual(self.api.consign_calls, 0)
+
+    async def test_order_fields_are_reverified_before_rules_delivery(self):
+        self.bind()
+        wire_send = AsyncMock()
+        cases = (
+            ("order_id", "9999", "order_identity_mismatch"),
+            ("order_item_id", PAN_ITEM_ID, "order_item_mismatch"),
+            ("order_buyer_id", "9999", "order_buyer_mismatch"),
+            ("order_seller", False, "seller_identity_mismatch"),
+            ("order_status", 7, "order_not_awaiting_shipment"),
+            ("order_quantity", 2, "unsupported_quantity"),
+            ("paid_amount", "6.00", "order_reverification_failed"),
+        )
+        for index, (field, value, reason) in enumerate(cases):
+            with self.subTest(field=field):
+                self.api = FakeApi()
+                self.api.order_id = self.api.head_order_id = str(8200 + index)
+                self.agent.xianyu = self.api
+                key = self.agent._canonical_order_key(self.api.order_id)
+                write_json(self.state_dir / "redeem_codes.json", [
+                    {"code": f"TEST-REVERIFY-{index}", "used": False},
+                ])
+
+                async def send_after_change(*_args, **kwargs):
+                    setattr(self.api, field, value)
+                    await kwargs["before_attempt"]()
+                    await wire_send()
+
+                self.agent.send_text_reliably = AsyncMock(side_effect=send_after_change)
+                await self.agent.handle_paid_order(paid_event(SESSION_ID, int(time.time() * 1000) + index))
+                order = self.agent.delivery_store.get_order(key)
+                self.assertEqual(order.status, "manual_review")
+                self.assertEqual(order.reason, reason)
+                self.assertEqual(self.api.consign_calls, 0)
+        wire_send.assert_not_awaited()
+
+    async def test_inventory_repair_does_not_revive_historical_manual_review(self):
+        self.bind()
+        key = self.agent._canonical_order_key(ORDER_ID)
+        self.agent.delivery_store.record_verified_payment_event(
+            key, SESSION_ID, time.time(), 86400,
+            platform_order_id=ORDER_ID, platform_status="2", paid_amount="5", quantity=1,
+        )
+        self.agent.delivery_store.mark_order_manual_review(key, "unsupported_item")
+        write_json(self.state_dir / "redeem_codes.json", [{"code": "TEST-REPAIRED", "used": False}])
+        await self.agent.retry_pending_deliveries()
+        await self.agent.handle_paid_order(paid_event(SESSION_ID, int(time.time() * 1000)))
+        self.assertEqual(self.agent.delivery_store.get_order(key).status, "manual_review")
+        self.agent.send_text_reliably.assert_not_awaited()
+        self.assertEqual(self.api.consign_calls, 0)
+
+    async def test_rules_fulfillment_logs_never_expose_inventory_or_credentials(self):
+        self.bind()
+        captured = io.StringIO()
+        sink = logger.add(captured, format="{message}")
+        try:
+            await self.agent.handle_paid_order(paid_event(SESSION_ID, int(time.time() * 1000)))
+            write_json(self.state_dir / "redeem_codes.json", [{"code": "SECRET-BAD-CODE", "used": "invalid"}])
+            self.agent._refresh_runtime_config()
+        finally:
+            logger.remove(sink)
+        for secret in ("REDEEM-A", "REDEEM-B", "SECRET-BAD-CODE", "not-a-secret", "seller-test"):
+            self.assertNotIn(secret, captured.getvalue())
+        self.assertIn("DeliveryStoreError", captured.getvalue())
 
 
 class StoreTestCase(unittest.TestCase):

@@ -15,9 +15,9 @@ fi
 
 npm run test:repository
 npm run test:syntax
-npm run test:first-registration
 npm run test:auth
 npm run test:update
+npm run test:settings
 npm run test:api
 npm run test:p0
 npm run test:ai

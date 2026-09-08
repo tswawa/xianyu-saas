@@ -23,6 +23,8 @@ deploy
 !worker/NOTICE.md
 !LICENSE
 !LICENSING.md
+!CHANGELOG.md
+backend/build-info.json
 *.log
 *.db
 *.db-*

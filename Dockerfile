@@ -30,6 +30,7 @@ ENV TZ=Asia/Shanghai \
     PYTHONUNBUFFERED=1 \
     PYTHONIOENCODING=utf-8 \
     SAAS_APP_ROOT=/app \
+    SAAS_DEPLOYMENT_MODE=docker \
     SAAS_BOT_ROOT=/app/worker \
     SAAS_DB=/data/saas.db \
     SAAS_TENANTS_DIR=/data/tenants
@@ -55,7 +56,12 @@ COPY frontend/ /app/frontend/
 COPY scripts/dev-server.mjs /app/scripts/dev-server.mjs
 COPY docker/entrypoint.sh /app/docker/entrypoint.sh
 # GPL 要求随二进制分发许可与来源署名。
-COPY LICENSE LICENSING.md /app/
+COPY LICENSE LICENSING.md CHANGELOG.md package.json /app/
+
+ARG SAAS_BUILD_COMMIT=""
+ARG SAAS_BUILD_DIRTY="unknown"
+RUN SAAS_BUILD_COMMIT="$SAAS_BUILD_COMMIT" SAAS_BUILD_DIRTY="$SAAS_BUILD_DIRTY" \
+    python backend/version.py --write-build-info
 
 # 代码保持 root 拥有且不可写；仅 /data 与运行期目录对服务账号开放。
 RUN chmod +x /app/docker/entrypoint.sh \

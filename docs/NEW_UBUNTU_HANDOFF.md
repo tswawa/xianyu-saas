@@ -35,9 +35,11 @@ cd xianyu-saas
 
 ## 3. 初始化项目与依赖安装
 
-运行初始化脚本，自动创建 Python 虚拟环境并安装全部前后端依赖：
+开发初始化脚本创建 Python 虚拟环境并安装开发依赖；服务器部署请使用 [`DEPLOYMENT.md`](DEPLOYMENT.md) 中的运行依赖步骤。
 ```bash
 ./scripts/bootstrap-dev.sh
+
+# 可选：仅在运行浏览器 UI 测试时安装 Chromium
 npx playwright install --with-deps chromium
 ```
 

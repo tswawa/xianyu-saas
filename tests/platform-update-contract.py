@@ -52,6 +52,8 @@ from platform_update import (  # noqa: E402
     _asset_names,
     available_rollback_versions,
     fetch_release,
+    inspect_releases,
+    update_capabilities,
     load_verified_candidate,
     stage_release,
     validate_candidate,
@@ -338,6 +340,32 @@ def main() -> None:
     selected = fetch_release("stable", "0.1.0", session=session)
     assert selected is not None and selected.version == "0.2.0"
     assert all(call[1]["allow_redirects"] is False for call in session.seen)
+
+    def inspect_metadata(items, channel="stable", current="0.1.0"):
+        return inspect_releases(channel, current, session=FakeSession({
+            metadata_url: FakeResponse(json.dumps(items).encode()),
+        }))
+
+    assert inspect_metadata([])[0]["status"] == "no_release"
+    assert inspect_metadata([release_metadata(beta)])[0]["status"] == "no_release"
+    assert inspect_metadata([release_metadata(beta)], "beta")[0]["status"] == "available"
+    old_without_assets = {"tag_name": "v0.1.0", "draft": False, "assets": []}
+    assert inspect_metadata([old_without_assets])[0]["status"] == "current"
+    assert inspect_metadata([old_without_assets, release_metadata(stable)])[1].version == "0.2.0"
+    incomplete, release = inspect_metadata([{**release_metadata(stable), "assets": []}])
+    assert incomplete["status"] == "incomplete" and incomplete["available"] is True and release is None
+    assert incomplete["version"] == "0.2.0" and incomplete["error_code"] == "release_assets_missing"
+    assert inspect_metadata([release_metadata(stable)], current="0.3.0")[0]["status"] == "current"
+    with patch("platform_update.deployment_kind", return_value="docker"), patch("platform_update._systemd_update_ready") as probe:
+        capabilities = update_capabilities()
+        assert capabilities["check"] and not capabilities["apply"] and not capabilities["download"]
+        probe.assert_not_called()
+    with patch("platform_update.deployment_kind", return_value="systemd"):
+        with patch("platform_update._systemd_update_ready", side_effect=PlatformUpdateError("update_service_unavailable")):
+            assert update_capabilities()["reason"] == "update_service_unavailable"
+            assert not update_capabilities()["rollback"]
+        with patch("platform_update._systemd_update_ready"):
+            assert update_capabilities()["apply"] is True
 
     redirect = FakeSession(
         {metadata_url: FakeResponse(b"", status_code=302, headers={"location": "https://evil.invalid"})}
