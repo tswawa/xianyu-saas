@@ -28,6 +28,7 @@ from account_storage import (
 )
 from automation import AutomationValidationError, normalise_settings, rules_document
 from platform_ai import issue_token, revoke_token
+from runtime_settings import validate_limits
 from shop_sync import (
     PERSISTED_SYNC_CODES,
     ShopSyncError,
@@ -102,6 +103,32 @@ _modes: dict[tuple[int, str], str] = {}
 _generations: dict[tuple[int, str], int] = {}
 _desired_running: dict[tuple[int, str], bool] = {}
 _transitions: dict[tuple[int, str], "_ProcessTransition"] = {}
+_start_reservations: dict[tuple[int, str], object] = {}
+_resource_limits_provider = None
+
+
+def configure_resource_limits(provider):
+    """Wire a read-only policy provider without coupling supervision to the API."""
+    if provider is not None and not callable(provider):
+        raise TypeError("resource limit provider must be callable")
+    global _resource_limits_provider
+    _resource_limits_provider = provider
+
+
+def _runtime_limits():
+    # Called before taking the process lock, never in the forked child.
+    try:
+        data = _resource_limits_provider() if _resource_limits_provider else {
+            "max_shop_accounts": 20, "max_running_workers": MAX_BOTS,
+            "worker_memory_mib": MEM_LIMIT_MB, "revision": 0,
+        }
+        values = validate_limits({key: data[key] for key in ("max_shop_accounts", "max_running_workers", "worker_memory_mib")})
+        revision = data.get("revision", 0)
+        if type(revision) is not int or revision < 0:
+            raise ValueError("invalid resource policy revision")
+        return {**values, "revision": revision}
+    except Exception as exc:
+        raise OSError("resource_settings_unavailable") from exc
 
 
 class _ProcessTransition:
@@ -542,10 +569,11 @@ def initialize_unused_account_storage(user_id: int) -> bool:
     return True
 
 
-def _limit():
+def _limit(memory_mib=None):
     import resource
 
-    limit = MEM_LIMIT_MB * 1024 * 1024
+    # Resolve in the parent. The child only applies the captured numeric limit.
+    limit = (MEM_LIMIT_MB if memory_mib is None else memory_mib) * 1024 * 1024
 
     def apply():
         resource.setrlimit(resource.RLIMIT_AS, (limit, limit))
@@ -788,7 +816,7 @@ def is_running(user_id: int, account_key: str | None = DEFAULT_ACCOUNT_ID) -> bo
     with _lock:
         key = _proc_key(user_id, account_key)
         proc = _procs.get(key)
-        return (proc is not None and proc.poll() is None) or key in _transitions
+        return (proc is not None and proc.poll() is None) or key in _transitions or key in _start_reservations
 
 
 def process_id(user_id: int, account_key: str | None = DEFAULT_ACCOUNT_ID) -> int | None:
@@ -823,9 +851,28 @@ def _runtime_state(
         return False, None
 
 
-def running_count() -> int:
+def running_count(user_id: int | None = None) -> int:
     with _lock:
-        return sum(1 for proc in _procs.values() if proc.poll() is None) + len(_transitions)
+        keys = {key for key, proc in _procs.items() if proc.poll() is None} | set(_transitions) | set(_start_reservations)
+        return sum(user_id is None or key[0] == int(user_id) for key in keys)
+
+
+def managed_resource_snapshot(user_id: int, account_key: str = DEFAULT_ACCOUNT_ID) -> dict:
+    """Private registry projection; never takes an arbitrary client-supplied PID."""
+    key = _proc_key(user_id, account_key)
+    with _lock:
+        transition = _transitions.get(key)
+        proc = transition.proc if transition is not None else _procs.get(key)
+        mode = transition.mode if transition is not None else _modes.get(key)
+        state = "stopping" if transition is not None and transition.terminating else "starting" if transition is not None or key in _start_reservations else "running"
+        if proc is None or proc.poll() is not None:
+            return {"pid": None, "generation": _generations.get(key, 0),
+                "state": state if transition is not None or key in _start_reservations else "stopped", "mode": mode}
+        limits = getattr(proc, "_saas_resource_limits", None)
+        applied = limits.get("worker_memory_mib") if isinstance(limits, dict) else None
+        return {"pid": int(proc.pid), "generation": _generations.get(key, 0),
+            "identity_token": id(proc), "state": state, "mode": mode,
+            "applied_memory_limit_bytes": applied * 1024 * 1024 if type(applied) is int else None}
 
 
 def _close_file(file) -> None:
@@ -892,7 +939,7 @@ def _terminate_process(proc) -> tuple[bool, str]:
         return False, "stop_failed"
 
 
-def _spawn_process(user_id: int, mode: str, key: tuple[int, str]):
+def _spawn_process(user_id: int, mode: str, key: tuple[int, str], limits):
     account_key = key[1]
     ensure_dir(user_id, account_key)
     if mode == "rules":
@@ -911,9 +958,10 @@ def _spawn_process(user_id: int, mode: str, key: tuple[int, str]):
             stdout=log_file,
             stderr=subprocess.STDOUT,
             cwd=str(BOT_ROOT),
-            preexec_fn=_limit(),
+            preexec_fn=_limit(limits["worker_memory_mib"]),
             start_new_session=True,
         )
+        proc._saas_resource_limits = dict(limits)
     except Exception:
         _close_file(log_file)
         _revoke_token_value(user_id, account_key, token)
@@ -937,8 +985,8 @@ def _register_process_locked(
     return next_generation
 
 
-def _spawn_locked(user_id: int, mode: str, key: tuple[int, str]) -> None:
-    proc, token, log_file = _spawn_process(user_id, mode, key)
+def _spawn_locked(user_id: int, mode: str, key: tuple[int, str], limits) -> None:
+    proc, token, log_file = _spawn_process(user_id, mode, key, limits)
     _register_process_locked(key, proc, token, log_file, mode)
 
 
@@ -950,35 +998,57 @@ def start(
     mode = _normalise_mode(automation_mode)
     key = _proc_key(user_id, account_key)
     with _lock:
-        if key in _transitions:
+        if key in _transitions or key in _start_reservations:
             return False, "transition_in_progress"
         current = _procs.get(key)
-        current_running = current is not None and current.poll() is None
-        if current_running and _modes.get(key) == mode:
+        generation = _generations.get(key, 0)
+        if current is not None and current.poll() is None and _modes.get(key) == mode:
             _desired_running[key] = True
             return True, "already_running"
-    if current_running:
-        # Process termination may wait up to the TERM/KILL deadlines, so never
-        # invoke it while an outer acquisition of ``_lock`` is still held.
-        stopped, reason = stop(user_id, account_key)
-        if not stopped:
-            return False, reason
+    limits = _runtime_limits()
+    reservation = None
     with _lock:
-        if key in _transitions:
+        if key in _transitions or key in _start_reservations or _generations.get(key, 0) != generation:
             return False, "transition_in_progress"
-        if is_running(user_id, account_key):
-            return False, "already_running"
-        _desired_running[key] = True
-        if running_count() >= MAX_BOTS:
-            return False, "max_bots_reached"
-        _spawn_locked(user_id, mode, key)
-        return True, "started"
+        current = _procs.get(key)
+        if current is not None and current.poll() is None:
+            # Hold this existing slot across the stop/start gap. No extra slot
+            # is created when a running shop changes reply mode.
+            reservation = object()
+            _start_reservations[key] = reservation
+    try:
+        if reservation is not None:
+            stopped, reason = stop(user_id, account_key, _restart_token=reservation)
+            if not stopped and reason not in {"not_running", "already_dead"}:
+                return False, reason
+        with _lock:
+            if reservation is not None and _start_reservations.get(key) is not reservation:
+                return False, "start_cancelled"
+            if key in _transitions:
+                return False, "transition_in_progress"
+            current = _procs.get(key)
+            if current is not None and current.poll() is None:
+                return False, "already_running"
+            _desired_running[key] = True
+            if reservation is None and running_count() >= limits["max_running_workers"]:
+                return False, "max_bots_reached"
+            _spawn_locked(user_id, mode, key, limits)
+            return True, "started"
+    finally:
+        if reservation is not None:
+            with _lock:
+                if _start_reservations.get(key) is reservation:
+                    _start_reservations.pop(key, None)
 
 
-def stop(user_id: int, account_key: str | None = DEFAULT_ACCOUNT_ID) -> tuple[bool, str]:
+def stop(user_id: int, account_key: str | None = DEFAULT_ACCOUNT_ID, *, _restart_token=None) -> tuple[bool, str]:
     key = _proc_key(user_id, account_key)
     created_transition = False
     with _lock:
+        if _restart_token is None:
+            _start_reservations.pop(key, None)
+        elif _start_reservations.get(key) is not _restart_token:
+            return False, "start_cancelled"
         _desired_running[key] = False
         _generations[key] = _generations.get(key, 0) + 1
         transition = _transitions.get(key)
@@ -1401,6 +1471,17 @@ def _transition_snapshot_inner(
         transition.done.set()
         return "stopped" if persisted else "persist_failed"
 
+    try:
+        limits = _runtime_limits()
+    except OSError:
+        # Access revocation has already retired the old Worker. An unavailable
+        # policy must not permit a replacement with an unbounded allocation.
+        with _lock:
+            if _transitions.get(key) is transition:
+                _transitions.pop(key, None)
+        transition.reason = "resource_settings_unavailable"
+        transition.done.set()
+        return "stopped"
     automation_enabled = _automation_settings(user_id, account_key)["enabled"]
     with _lock:
         if (
@@ -1413,7 +1494,7 @@ def _transition_snapshot_inner(
             transition.done.set()
             return "stopped"
         try:
-            replacement, replacement_token, replacement_log = _spawn_process(user_id, target_mode, key)
+            replacement, replacement_token, replacement_log = _spawn_process(user_id, target_mode, key, limits)
         except Exception:
             transition.reason = "spawn_failed"
             transition.terminated = True
@@ -1568,7 +1649,7 @@ def _expiry_watchdog(
 
 def shutdown_all():
     with _lock:
-        keys = set(_procs) | set(_transitions)
+        keys = set(_procs) | set(_transitions) | set(_start_reservations)
     for uid, account_key in keys:
         try:
             stop(uid, account_key)

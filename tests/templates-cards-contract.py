@@ -97,6 +97,21 @@ def main() -> None:
     assert empty.status_code == 200, empty.text
     assert empty.json() == {"templates": []}
 
+    # A corrupt existing file is not an empty template collection. Reads and
+    # explicit edits must fail without replacing the owner's original bytes.
+    config_path = default_root / "products_config.json"
+    initial_config = config_path.read_bytes()
+    for corrupt in (b"{broken", b"null", b"[]", b""):
+        config_path.write_bytes(corrupt)
+        denied_read = client.get("/api/bot/templates")
+        assert denied_read.status_code == 503, denied_read.text
+        denied_save = client.put("/api/bot/templates", json={"template": {
+            "name": "不得重置原文件", "delivery": "redeem", "item_ids": ["100001"],
+        }})
+        assert denied_save.status_code == 503, denied_save.text
+        assert config_path.read_bytes() == corrupt
+    config_path.write_bytes(initial_config)
+
     # Create a redeem template. The generated id is a template-<uuid8> style.
     redeem = client.put(
         "/api/bot/templates",
@@ -156,6 +171,28 @@ def main() -> None:
     assert all("payload" not in item for item in templates.json()["templates"])
     assert "payload_set" not in templates.json()["templates"][0]
 
+    # Manual edits share the Agent's DB-backed products-config lease.
+    from account_leases import acquire_account_lease
+    from fulfillment_config import digest
+    account = app.db.get_shop_account(user_id, account_key="default")
+    before_lock = config_path.read_bytes()
+    with acquire_account_lease(app.db, "products-config", user_id, int(account["id"])):
+        conflict = client.put("/api/bot/templates", json={"template": {
+            "id": redeem_template["id"], "name": "并发修改不得覆盖", "delivery": "redeem", "item_ids": ["100001"],
+        }})
+        assert conflict.status_code == 409, conflict.text
+        assert config_path.read_bytes() == before_lock
+
+    # A manual edit after an Agent receipt must preserve unknown fields and
+    # other templates, while replacing the obsolete receipt rather than its hash.
+    document = read_products_config(user_id)
+    document["custom_metadata"] = {"owner_note": "keep"}
+    original_pan = next(item.copy() for item in document["types"] if item["id"] == pan_template["id"])
+    next(item for item in document["types"] if item["id"] == redeem_template["id"])["custom_binding"] = {"value": "keep"}
+    document["_ops_receipt"] = {"plan_id": "test-agent-run", "item_id": "100001",
+        "digest": "a" * 64, "after_hash": digest(document)}
+    app.write_secret(user_id, "products_config.json", json.dumps(document, ensure_ascii=False), "default")
+
     # Updating an existing template by id preserves the id and replaces fields.
     updated = client.put(
         "/api/bot/templates",
@@ -178,6 +215,12 @@ def main() -> None:
     assert updated_template["enabled"] is False
     assert "description" not in updated_template
     assert "price" not in updated_template
+    after_manual = read_products_config(user_id)
+    assert after_manual["custom_metadata"] == {"owner_note": "keep"}
+    assert next(item for item in after_manual["types"] if item["id"] == redeem_template["id"])["custom_binding"] == {"value": "keep"}
+    assert next(item for item in after_manual["types"] if item["id"] == pan_template["id"]) == original_pan
+    assert "_ops_receipt" not in after_manual
+    assert client.get("/api/bot/templates").status_code == 200
 
     # A truncated catalog may omit a still-valid legacy binding. Editing can
     # preserve that exact existing ID, but must not introduce a new unknown ID.

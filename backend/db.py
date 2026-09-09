@@ -16,6 +16,7 @@ import time
 from collections.abc import Callable
 
 from account_storage import AccountStorageError, normalize_account_key
+from runtime_settings import RuntimeSettingsError, settings_payload, validate_limits
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.environ.get("SAAS_DB", os.path.join(BASE_DIR, "saas.db"))
@@ -32,7 +33,8 @@ PASSWORD_ITERATIONS = 600_000
 LEGACY_PASSWORD_ITERATIONS = 120_000
 MAX_ACTIVE_SESSIONS = 8
 VALID_ROLES = frozenset({"admin", "owner"})
-VALID_UPDATE_CHANNELS = frozenset({"stable", "beta"})
+# Legacy values remain readable for old signed artifacts; current UI uses release.
+VALID_UPDATE_CHANNELS = frozenset({"stable", "beta", "release"})
 logger = logging.getLogger(__name__)
 
 
@@ -252,6 +254,15 @@ class DB:
                     updated_at REAL NOT NULL,
                     updated_by INTEGER
                 );
+                CREATE TABLE IF NOT EXISTS runtime_settings (
+                    singleton_id INTEGER PRIMARY KEY CHECK(singleton_id = 1),
+                    revision INTEGER NOT NULL,
+                    max_shop_accounts INTEGER NOT NULL,
+                    max_running_workers INTEGER NOT NULL,
+                    worker_memory_mib INTEGER NOT NULL,
+                    updated_at REAL NOT NULL,
+                    updated_by INTEGER NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS login_failures (
                     username_hash TEXT NOT NULL,
                     client_hash TEXT NOT NULL,
@@ -385,14 +396,6 @@ class DB:
             INSERT OR IGNORE INTO platform_settings(
                 setting_key, setting_value, updated_at, updated_by
             ) VALUES ('registration_open', '0', ?, NULL)
-            """,
-            (now,),
-        )
-        self.con.execute(
-            """
-            INSERT OR IGNORE INTO platform_settings(
-                setting_key, setting_value, updated_at, updated_by
-            ) VALUES ('update_channel', 'stable', ?, NULL)
             """,
             (now,),
         )
@@ -638,20 +641,30 @@ class DB:
             raise ValueError("invalid account key")
         now = time.time()
         with self._lock:
-            cur = self.con.execute(
-                """
-                INSERT INTO shop_accounts(
-                    user_id, account_key, platform, display_name, status, enabled,
-                    created_at, updated_at
-                ) VALUES (?, ?, 'xianyu', ?, 'unconfigured', 1, ?, ?)
-                """,
-                (user_id, account_key, display_name, now, now),
-            )
-            self.con.commit()
-            return self.con.execute(
-                "SELECT * FROM shop_accounts WHERE user_id = ? AND id = ?",
-                (user_id, cur.lastrowid),
-            ).fetchone()
+            self.con.execute("BEGIN IMMEDIATE")
+            try:
+                policy = self.get_runtime_settings()
+                count = self.con.execute(
+                    "SELECT COUNT(*) FROM shop_accounts WHERE user_id = ?", (user_id,),
+                ).fetchone()[0]
+                if count >= policy["max_shop_accounts"]:
+                    raise RuntimeSettingsError("shop_limit_reached", 409,
+                        f"已达到可添加店铺上限（{policy['max_shop_accounts']}个，包含停用店铺），请由管理员在设置中调整")
+                cur = self.con.execute(
+                    """INSERT INTO shop_accounts(
+                        user_id, account_key, platform, display_name, status, enabled,
+                        created_at, updated_at
+                    ) VALUES (?, ?, 'xianyu', ?, 'unconfigured', 1, ?, ?)""",
+                    (user_id, account_key, display_name, now, now),
+                )
+                row = self.con.execute(
+                    "SELECT * FROM shop_accounts WHERE user_id = ? AND id = ?", (user_id, cur.lastrowid),
+                ).fetchone()
+                self.con.commit()
+                return row
+            except BaseException:
+                self.con.rollback()
+                raise
 
     def get_shop_account(self, user_id, account_id=None, account_key=None):
         user_id = int(user_id)
@@ -1076,6 +1089,22 @@ class DB:
                   AND lease_until IS NOT NULL AND lease_until > ?
                 """,
                 (lease_until, now, int(job_id), str(lease_owner), now),
+            )
+            self.con.commit()
+            return cur.rowcount == 1
+
+    def defer_job(self, job_id, lease_owner, delay_seconds=1, now=None):
+        """Yield a live claim without charging an attempt when no work can start."""
+        now = time.time() if now is None else float(now)
+        available_at = now + min(max(float(delay_seconds), 0.05), 900.0)
+        with self._lock:
+            cur = self.con.execute(
+                """UPDATE jobs SET status = 'retry', available_at = ?,
+                       attempts = MAX(attempts - 1, 0), lease_owner = NULL,
+                       lease_until = NULL, updated_at = ?
+                   WHERE id = ? AND status = 'running' AND lease_owner = ?
+                     AND lease_until IS NOT NULL AND lease_until > ?""",
+                (available_at, now, int(job_id), str(lease_owner), now),
             )
             self.con.commit()
             return cur.rowcount == 1
@@ -2199,6 +2228,68 @@ class DB:
             ).fetchone()
         locked_until = float(row["locked_until"] or 0) if row else 0.0
         return {"locked": locked_until > now, "locked_until": locked_until}
+
+    # ---- runtime resource settings (no passive initialization writes) ----
+    def get_runtime_settings(self):
+        with self._lock:
+            row = self.con.execute("SELECT * FROM runtime_settings WHERE singleton_id = 1").fetchone()
+        return settings_payload(row)
+
+    def save_runtime_settings(self, user_id, expected_revision, values, *, emergency_admin=False):
+        values = validate_limits(values)
+        if type(expected_revision) is not int or expected_revision < 0 or expected_revision >= 2**63 - 1:
+            raise RuntimeSettingsError()
+        emergency = type(user_id) is int and user_id == 0 and emergency_admin is True
+        if type(user_id) is not int or (user_id <= 0 and not emergency):
+            raise RuntimeSettingsError("admin_required", 403)
+        with self._lock:
+            self.con.execute("BEGIN IMMEDIATE")
+            try:
+                admin = self.con.execute("SELECT role, disabled_at FROM users WHERE id = ?", (user_id,)).fetchone()
+                if not emergency and (admin is None or admin["role"] != "admin" or admin["disabled_at"] is not None):
+                    raise RuntimeSettingsError("admin_required", 403)
+                row = self.con.execute("SELECT * FROM runtime_settings WHERE singleton_id = 1").fetchone()
+                current_revision = settings_payload(row)["revision"] if row else 0
+                if current_revision != expected_revision:
+                    raise RuntimeSettingsError("resource_revision_conflict", 409)
+                now, revision = time.time(), current_revision + 1
+                self.con.execute(
+                    """INSERT INTO runtime_settings(singleton_id, revision, max_shop_accounts,
+                        max_running_workers, worker_memory_mib, updated_at, updated_by)
+                    VALUES (1, ?, ?, ?, ?, ?, ?) ON CONFLICT(singleton_id) DO UPDATE SET
+                        revision=excluded.revision, max_shop_accounts=excluded.max_shop_accounts,
+                        max_running_workers=excluded.max_running_workers, worker_memory_mib=excluded.worker_memory_mib,
+                        updated_at=excluded.updated_at, updated_by=excluded.updated_by""",
+                    (revision, values["max_shop_accounts"], values["max_running_workers"],
+                     values["worker_memory_mib"], now, user_id),
+                )
+                self.con.execute(
+                    """INSERT INTO audit_log(event_type, actor_user_id, target_type, target_id,
+                        outcome, metadata_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    ("platform.resource_settings_changed", user_id, "runtime_settings", "global", "success",
+                     json.dumps({**values, "revision": revision}, separators=(",", ":")), now),
+                )
+                result = settings_payload(self.con.execute("SELECT * FROM runtime_settings WHERE singleton_id = 1").fetchone())
+                self.con.commit()
+                return result
+            except BaseException:
+                self.con.rollback()
+                raise
+
+    def resource_accounts_page(self, user_id, cursor=0, limit=50):
+        """Tenant-scoped metadata without creating a default account or opening files."""
+        if type(cursor) is not int or not 0 <= cursor < 2**63 or type(limit) is not int or not 1 <= limit <= 100:
+            raise ValueError("invalid resource page")
+        with self._lock:
+            rows = self.con.execute(
+                """SELECT a.id, a.account_key, a.display_name, a.enabled, a.generation,
+                    r.state AS runtime_state, r.pid AS runtime_pid, r.mode AS runtime_mode
+                    FROM shop_accounts a LEFT JOIN worker_runtimes r ON r.account_id=a.id AND r.user_id=a.user_id
+                    WHERE a.user_id=? AND a.id>? ORDER BY a.id LIMIT ?""",
+                (int(user_id), cursor, limit + 1),
+            ).fetchall()
+            total = self.con.execute("SELECT COUNT(*) FROM shop_accounts WHERE user_id=?", (int(user_id),)).fetchone()[0]
+        return rows[:limit], (int(rows[limit - 1]["id"]) if len(rows) > limit else None), int(total)
 
     # ---- platform settings, audit and high-risk confirmations ----
     def get_platform_setting(self, key, default=""):

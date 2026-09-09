@@ -18,6 +18,7 @@ from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.dont_write_bytecode = True
 sys.path.insert(0, str(ROOT / "backend"))
 
 from ai_customer_service import AIService, AIServiceError, CONNECTION_FILE, CONNECTION_SECRET_FILE  # noqa: E402
@@ -32,17 +33,21 @@ CONFIG = {"provider": "openai_chat_completions", "base_url": "https://models.exa
 
 class UserConnectionContracts(unittest.TestCase):
     def setUp(self):
+        for target, name in ((socket, "create_connection"), (socket.socket, "connect"), (socket.socket, "connect_ex")):
+            guard = patch.object(target, name, side_effect=AssertionError("real network forbidden"))
+            guard.start()
+            self.addCleanup(guard.stop)
         self.temp = tempfile.TemporaryDirectory(prefix="user-ai-contract-")
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.path = self.root / "control.sqlite"
         self.db = self.open_db()
         self.db.con.executescript("""
-            CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT NOT NULL);
+            CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT NOT NULL, disabled_at REAL);
             CREATE TABLE shop_accounts (id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL,
                 account_key TEXT NOT NULL, display_name TEXT NOT NULL, enabled INTEGER NOT NULL,
                 UNIQUE(user_id, account_key));
-            INSERT INTO users VALUES (1, 'first'), (2, 'second'), (3, 'no-shops');
+            INSERT INTO users(id, username) VALUES (1, 'first'), (2, 'second'), (3, 'no-shops');
             INSERT INTO shop_accounts VALUES
                 (11, 1, 'shop-a', 'First shop', 1), (12, 1, 'shop-b', 'Second shop', 1),
                 (13, 1, 'disabled', 'Disabled shop', 0), (14, 1, 'unused', 'Unused shop', 1),
@@ -305,6 +310,37 @@ class UserConnectionContracts(unittest.TestCase):
         self.error("user_not_found", lambda: store.read(91), 404)
         self.error("user_not_found", lambda: store.save(91, **CONFIG, expected_revision=2,
                    verification_token=token, confirm=True), 404)
+
+    def test_user_settings_do_not_depend_on_selected_shop_or_legacy_storage(self):
+        self.legacy()
+        self.legacy(1, 12, "shop-b", key="second-legacy-key")
+        before = self.files()
+        with patch.object(self.ai, "get_connection", side_effect=AssertionError("no implicit legacy migration")):
+            saved = self.saved()
+            with self.db.con:
+                self.db.con.execute("UPDATE shop_accounts SET enabled=0 WHERE user_id=1")
+            self.assertEqual(self.shared.read(1), saved)
+            self.assertEqual(self.shared.runtime(1)["api_key"], CONFIG["api_key"])
+            self.shared.delete(1, expected_revision=1, confirm=True)
+            self.error("connection_unconfigured", lambda: self.shared.runtime(1), 503)
+        self.assertEqual(self.files(), before)
+        self.assertFalse(self.shared.initialized(3))
+        self.saved(3)
+        self.assertEqual(self.shared.runtime(3)["api_key"], CONFIG["api_key"])
+
+    def test_disabled_user_cannot_reuse_test_token_or_load_credentials(self):
+        self.saved()
+        config, token = self.verified_config(revision=1)
+        before = dict(self.db.con.execute("SELECT * FROM user_ai_connections WHERE user_id=1").fetchone())
+        with self.db.con:
+            self.db.con.execute("UPDATE users SET disabled_at=1 WHERE id=1")
+        for operation in (lambda: self.shared.read(1), lambda: self.shared.runtime(1),
+                          lambda: self.shared.test(1, **CONFIG, expected_revision=1),
+                          lambda: self.shared.save(1, **config, verification_token=token, confirm=True),
+                          lambda: self.shared.delete(1, expected_revision=1, confirm=True)):
+            self.error("user_not_found", operation, 404)
+        self.assertEqual(dict(self.db.con.execute("SELECT * FROM user_ai_connections WHERE user_id=1").fetchone()), before)
+        self.assertEqual(self.files(), {})
 
     def test_concurrent_saves_on_independent_sqlite_connections_have_one_winner(self):
         db2 = self.open_db()

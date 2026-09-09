@@ -10,6 +10,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import html
 import http.client
 import inspect
 import ipaddress
@@ -21,6 +22,7 @@ import socket
 import sqlite3
 import ssl
 import stat
+import threading
 import time
 import urllib.parse
 from pathlib import Path
@@ -33,6 +35,9 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from account_storage import AccountStorage, AccountStorageError, DEFAULT_ACCOUNT_ID, normalize_account_key
 from ai_provider_adapters import (
     ProviderAdapterError,
+    agent_json_loads,
+    build_agent_request,
+    parse_agent_response,
     build_request,
     is_api_key_required,
     normalize_base_url as normalize_provider_base_url,
@@ -56,6 +61,11 @@ KNOWLEDGE_DIR = "ai_knowledge"
 SNAPSHOT_FILE = "shop_snapshot.json"
 MAX_REQUEST_BYTES = 128 * 1024
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
+# Agent transport memory boundaries, not message/context/product quotas. A
+# rejected body is reported explicitly; neither request nor response is cut.
+AGENT_MAX_REQUEST_BYTES = 64 * 1024 * 1024
+AGENT_MAX_RESPONSE_BYTES = 16 * 1024 * 1024
+_AGENT_DNS_SLOTS = threading.BoundedSemaphore(8)
 MAX_HISTORY = 20
 MAX_TEMPLATES = 50
 VERIFICATION_TTL_SECONDS = 300
@@ -95,6 +105,99 @@ class AIServiceError(RuntimeError):
         self.code = safe_code
         self.status_code = int(status_code)
         super().__init__(message or ERROR_MESSAGES.get(safe_code, "AI 服务暂时不可用"))
+
+
+def _agent_public_text(value: Any, secret_values=(), *, limit: int = 6000) -> str:
+    """Only provider explanation/identifiers enter here, never exception reprs."""
+    if not isinstance(value, (str, int, float)) or isinstance(value, bool):
+        return ""
+    text = html.unescape(str(value))
+    for secret in secret_values:
+        if not isinstance(secret, str) or not secret:
+            continue
+        variants = {secret, urllib.parse.quote(secret, safe=""), urllib.parse.quote_plus(secret),
+                    json.dumps(secret, ensure_ascii=True)[1:-1], base64.b64encode(secret.encode()).decode()}
+        for variant in sorted(variants, key=len, reverse=True):
+            text = text.replace(variant, "[已脱敏]")
+        # Providers sometimes echo a masked key rather than the literal key.
+        if len(secret) >= 12:
+            text = text.replace(secret[:8], "[已脱敏]").replace(secret[-8:], "[已脱敏]")
+    text = re.sub(r"(?is)<(?:script|style)\b[^>]*>.*?</(?:script|style)\s*>", " ", text)
+    text = re.sub(r"<[^>]*>", " ", text).replace("<", "").replace(">", "")
+    # Upstreams may embed a JSON/header dump in an otherwise useful error.
+    # Match quoted keys and whole quoted values as well as plain header lines.
+    quoted_value = r'''(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')'''
+    text = re.sub(r'''(?im)\b(?:authorization|proxy-authorization|cookie|set-cookie)["']?\s*[:=]\s*(?:'''
+                  + quoted_value + r"|[^\r\n]*)", "[认证信息已脱敏]", text)
+    text = re.sub(r"(?i)\b(?:Bearer|Basic)\s+[^\s,;]+", "[认证信息已脱敏]", text)
+    text = re.sub(r'''(?i)\b(?:api[_ -]?key|x-api-key|x-goog-api-key|access_token|refresh_token|password|secret)["']?\s*[:=]\s*(?:'''
+                  + quoted_value + r'''|[^\s"',;]+)''', "[凭据已脱敏]", text)
+    text = re.sub(r"\b(?:sk-[A-Za-z0-9_.-]{6,}|AIza[A-Za-z0-9_-]{10,}|eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)", "[凭据已脱敏]", text)
+    text = re.sub(r"(?i)\b(?:https?|file)://[^\s<>\"']+", "[地址已脱敏]", text)
+    text = re.sub(r"[\"'](?:[A-Za-z]:[\\/]|/|\\\\)[^\"'\r\n]+[\"']", "[路径已脱敏]", text)
+    text = re.sub(r"(?i)(?:\b[A-Z]:[\\/]|\\\\)[^\s<>\"']+", "[路径已脱敏]", text)
+    text = re.sub(r"(?<![\w])/(?:[^\s<>\"',;]+)", "[路径已脱敏]", text)
+    text = _CONTROL_RE.sub(" ", text).strip()
+    if len(text) > limit:
+        text = text[:limit] + " [错误说明超过显示安全长度]"
+    return text
+
+
+class AgentProviderError(AIServiceError):
+    """Safe, source-labelled Agent errors; provider 401 is NEVER local HTTP 401."""
+    def __init__(self, code: str = "provider_error", status_code: int = 502, message: str | None = None,
+                 *, source: str = "provider", upstream_status: int | None = None,
+                 upstream_code: Any = None, upstream_type: Any = None,
+                 upstream_request_id: Any = None, secret_values=()):
+        source = source if source in {"provider", "transport", "application"} else "application"
+        safe_code = code if _SAFE_CODE_RE.fullmatch(str(code or "")) else "provider_error"
+        safe_message = _agent_public_text(message or ERROR_MESSAGES.get(safe_code, "Agent 请求失败"), secret_values)
+        local_status = 502 if source == "provider" else int(status_code)
+        if local_status == 401:
+            local_status = 502
+        super().__init__(safe_code, local_status, safe_message or "Agent 请求失败（无可公开的错误说明）")
+        self.source = source
+        self._public = {"source": source, "code": self.code, "message": str(self)}
+        if type(upstream_status) is int and 100 <= upstream_status <= 599:
+            self._public["upstream_status"] = upstream_status
+        for key, value in (("upstream_code", upstream_code), ("upstream_type", upstream_type),
+                           ("upstream_request_id", upstream_request_id)):
+            clean = _agent_public_text(value, secret_values, limit=300)
+            if clean:
+                self._public[key] = clean
+
+    def public_detail(self) -> dict:
+        return dict(self._public)
+
+
+def _agent_header_request_id(headers: dict) -> Any:
+    normalized = {str(key).lower(): value for key, value in headers.items()}
+    return next((normalized[key] for key in ("x-request-id", "request-id", "x-goog-request-id", "x-amzn-requestid")
+                 if normalized.get(key)), None)
+
+
+def _agent_upstream_error(status: int, body: Any, headers: dict, api_key: str) -> AgentProviderError:
+    payload, raw_text = body, ""
+    if isinstance(body, bytes):
+        raw_text = body.decode("utf-8", errors="replace")
+    elif isinstance(body, str):
+        raw_text = body
+    if raw_text:
+        try:
+            payload = agent_json_loads(raw_text)
+        except ProviderAdapterError:
+            payload = None
+    root = payload if isinstance(payload, dict) else {}
+    error = root.get("error", root)
+    detail = error if isinstance(error, dict) else {}
+    message = detail.get("message") or (error if isinstance(error, str) else "") or root.get("message") or raw_text
+    if not isinstance(message, str) or not message.strip():
+        message = f"上游模型返回 HTTP {status}，没有可公开的错误说明"
+    request_id = detail.get("request_id") or root.get("request_id") or root.get("requestId") or _agent_header_request_id(headers)
+    return AgentProviderError("provider_error", message=message, source="provider", upstream_status=status,
+                              upstream_code=detail.get("code", root.get("code")),
+                              upstream_type=detail.get("type") or detail.get("status") or root.get("type") or root.get("status"),
+                              upstream_request_id=request_id, secret_values=(api_key,))
 
 
 def _now_iso(now: float | None = None) -> str:
@@ -820,9 +923,18 @@ class AIService:
         *,
         allow_loopback: bool,
         timeout: float = 60,
+        agent: bool = False,
+        response_headers: dict | None = None,
+        resolved_target=None,
     ) -> tuple[int, bytes]:
-        """Resolve, validate and connect to the same numeric address set."""
-        parsed, addresses = self._resolved_target(url, allow_loopback=allow_loopback)
+        """Resolve, validate and connect to the same numeric address set.
+
+        Agent uses the identical TLS/SSRF framing with a larger explicit body
+        boundary and a total I/O deadline. Old callers keep their old defaults.
+        """
+        parsed, addresses = resolved_target if resolved_target is not None else self._resolved_target(url, allow_loopback=allow_loopback)
+        deadline = time.monotonic() + timeout
+        maximum = AGENT_MAX_RESPONSE_BYTES if agent else MAX_RESPONSE_BYTES
         host = parsed.hostname or ""
         port = parsed.port or (443 if parsed.scheme == "https" else 80)
         target = urllib.parse.urlunsplit(("", "", parsed.path or "/", parsed.query, ""))
@@ -835,11 +947,21 @@ class AIService:
         for family, socktype, protocol, sockaddr in addresses:
             raw_socket = None
             connection = None
+            timer = None
+            request_started = False
             try:
+                remaining = deadline - time.monotonic() if agent else timeout
+                if remaining <= 0:
+                    raise TimeoutError()
                 raw_socket = socket.socket(family, socktype, protocol)
-                raw_socket.settimeout(timeout)
+                raw_socket.settimeout(remaining)
                 raw_socket.connect(sockaddr)
                 connected_socket = raw_socket
+                if agent:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError()
+                    raw_socket.settimeout(remaining)
                 if parsed.scheme == "https":
                     connected_socket = ssl.create_default_context().wrap_socket(
                         raw_socket, server_hostname=host
@@ -850,21 +972,53 @@ class AIService:
                 # cannot perform a second hostname resolution. Host and SNI
                 # still use the original hostname, preserving virtual hosting
                 # and default TLS certificate verification.
-                connection = http.client.HTTPConnection(host, port, timeout=timeout)
+                connection = http.client.HTTPConnection(host, port, timeout=remaining)
                 connection.sock = connected_socket
+                if agent:
+                    # Socket idle timeouts alone do not bound a trickling HTTP
+                    # header/body. Abort that exact pinned socket at deadline.
+                    def expire(sock=connected_socket):
+                        try:
+                            sock.shutdown(socket.SHUT_RDWR)
+                        except (OSError, AttributeError):
+                            pass
+                        try:
+                            sock.close()
+                        except OSError:
+                            pass
+                    timer = threading.Timer(max(0, deadline - time.monotonic()), expire)
+                    timer.daemon = True
+                    timer.start()
+                request_started = True
                 connection.request("POST", target, body=body, headers=request_headers)
                 response = connection.getresponse()
-                response_body = response.read(MAX_RESPONSE_BYTES + 1)
-                if len(response_body) > MAX_RESPONSE_BYTES:
+                response_body = response.read(maximum + 1)
+                if agent and time.monotonic() >= deadline:
+                    raise TimeoutError()
+                if len(response_body) > maximum:
+                    if agent:
+                        raise AgentProviderError("transport_response_too_large", message="上游响应超过 16 MiB 传输内存安全边界，未裁剪或执行内容", source="transport")
                     raise AIServiceError("response_invalid", 502)
+                if response_headers is not None:
+                    # Copy only diagnostic identifiers, never cookies or auth.
+                    for key in ("x-request-id", "request-id", "x-goog-request-id", "x-amzn-requestid"):
+                        value = response.getheader(key) if hasattr(response, "getheader") else None
+                        if value:
+                            response_headers[key] = value
                 return int(response.status), response_body
             except AIServiceError:
                 raise
             except (TimeoutError, socket.timeout) as exc:
                 raise AIServiceError("timeout", 504) from exc
             except (OSError, ssl.SSLError, http.client.HTTPException) as exc:
+                if agent and time.monotonic() >= deadline:
+                    raise AgentProviderError("timeout", 504, "模型传输达到总 I/O 超时，未自动重试", source="transport") from None
+                if agent and request_started:
+                    raise AgentProviderError("transport_failed", 502, "模型请求已发出但传输失败，未自动重试", source="transport") from None
                 last_error = exc
             finally:
+                if timer is not None:
+                    timer.cancel()
                 if connection is not None:
                     connection.close()
                 elif raw_socket is not None:
@@ -935,6 +1089,149 @@ class AIService:
             raise AIServiceError(exc.code, 502, str(exc)) from exc
         except (UnicodeError, json.JSONDecodeError) as exc:
             raise AIServiceError("response_invalid", 502) from exc
+
+    def _agent_resolved_target(self, url: str, *, allow_loopback: bool, timeout: float):
+        """Bound Windows getaddrinfo without permitting unbounded stuck threads."""
+        if not _AGENT_DNS_SLOTS.acquire(blocking=False):
+            raise AgentProviderError("dns_busy", 503, "安全 DNS 解析通道暂忙，请稍后重试", source="transport")
+        complete = threading.Event()
+        result = []
+
+        def resolve():
+            try:
+                result.append((True, self._resolved_target(url, allow_loopback=allow_loopback)))
+            except Exception as exc:
+                result.append((False, exc))
+            finally:
+                _AGENT_DNS_SLOTS.release()
+                complete.set()
+
+        thread = threading.Thread(target=resolve, name="agent-safe-dns", daemon=True)
+        try:
+            thread.start()
+        except RuntimeError:
+            _AGENT_DNS_SLOTS.release()
+            raise AgentProviderError("dns_busy", 503, "安全 DNS 解析暂时无法启动", source="transport") from None
+        if not complete.wait(timeout):
+            raise AgentProviderError("dns_timeout", 504, "安全 DNS 解析超时，未发出模型请求", source="transport")
+        ok, value = result[0]
+        if ok:
+            return value
+        if isinstance(value, AIServiceError) and value.code in {"address_unsafe", "dns_fake_ip"}:
+            raise AgentProviderError(value.code, 502, ERROR_MESSAGES[value.code], source="application") from None
+        raise AgentProviderError("dns_failed", 502, "模型地址的安全 DNS 解析失败，未发出请求", source="transport") from None
+
+    def _request_agent_json(self, provider: str, base_url: str, model: str, api_key: str,
+                            messages: list, tools: list, *, output_tokens: int | None = None,
+                            routing_session: str = "") -> dict:
+        """Functions-only Agent transport; never route errors through客服 fallback."""
+        try:
+            clean_provider = normalize_provider(provider)
+            safe_url = self.normalize_base_url(base_url, clean_provider)
+            request_data = build_agent_request(clean_provider, safe_url, model, api_key, messages, tools,
+                                               output_tokens=output_tokens)
+            encoded = json.dumps(request_data["payload"], ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
+        except ProviderAdapterError as exc:
+            raise AgentProviderError(exc.code, 502, str(exc), source="application", secret_values=(api_key,)) from None
+        except AIServiceError as exc:
+            raise AgentProviderError(exc.code, 502, ERROR_MESSAGES.get(exc.code, "Agent 连接配置无效"), source="application") from None
+        except (TypeError, ValueError, UnicodeError, RecursionError):
+            raise AgentProviderError("invalid_payload", 502, "Agent 请求无法安全编码，未裁剪输入", source="application") from None
+        if len(encoded) > AGENT_MAX_REQUEST_BYTES:
+            raise AgentProviderError("transport_request_too_large", 502,
+                                     "Agent 请求超过 64 MiB 传输内存安全边界，未裁剪历史；这不是模型上下文或商品配额", source="transport")
+        if routing_session and clean_provider in {"openai_chat_completions", "openai_responses"}:
+            request_data["headers"]["x-opencode-session"] = routing_session
+        request_data["headers"].update({"User-Agent": "xianyu-saas-agent/1", "Accept-Encoding": "identity"})
+        allow_loopback = self._allow_local_provider(clean_provider)
+        # These values bound network I/O only, not generated tokens or history.
+        timeout = 120.0
+        started = time.monotonic()
+        target = self._agent_resolved_target(request_data["url"], allow_loopback=allow_loopback, timeout=10.0)
+        response_headers = {}
+        status = 200
+        try:
+            if self.requester is not None:
+                # Injected offline/test transport can also return HTTP fixtures.
+                result = self._call_requester(request_data["url"], api_key, request_data["payload"], request_data["headers"])
+                if isinstance(result, tuple) and len(result) in {2, 3}:
+                    status, body = result[:2]
+                    if len(result) == 3 and isinstance(result[2], dict):
+                        response_headers = result[2]
+                else:
+                    body = result
+                if type(status) is not int or not 100 <= status <= 599:
+                    raise AgentProviderError("response_invalid", message="模型 HTTP 状态无效", source="transport")
+                size = len(body) if isinstance(body, bytes) else len(json.dumps(body, ensure_ascii=False, allow_nan=False).encode("utf-8"))
+                if size > AGENT_MAX_RESPONSE_BYTES:
+                    raise AgentProviderError("transport_response_too_large", message="上游响应超过 16 MiB 传输安全边界，未裁剪内容", source="transport")
+            else:
+                status, body = self._request_pinned(request_data["url"], encoded, request_data["headers"],
+                                                    allow_loopback=allow_loopback, timeout=max(1, timeout - (time.monotonic() - started)),
+                                                    agent=True, response_headers=response_headers, resolved_target=target)
+        except AgentProviderError:
+            raise
+        except AIServiceError as exc:
+            code = "timeout" if exc.code == "timeout" else "transport_failed"
+            raise AgentProviderError(code, 504 if code == "timeout" else 502,
+                                     "模型传输超时，未自动重试" if code == "timeout" else "模型传输失败，未自动重试", source="transport") from None
+        except (TimeoutError, socket.timeout):
+            raise AgentProviderError("timeout", 504, "模型传输超时，未自动重试", source="transport") from None
+        except Exception:
+            # In particular, do not expose exception text containing URLs,
+            # request headers, tenant paths or injected transport credentials.
+            raise AgentProviderError("transport_failed", 502, "模型传输失败，未自动重试", source="transport") from None
+        if 300 <= status < 400:
+            raise AgentProviderError("address_unsafe", 502, "模型端返回重定向，安全传输未跟随地址", source="transport", upstream_status=status)
+        if not 200 <= status < 300:
+            raise _agent_upstream_error(status, body, response_headers, api_key)
+        try:
+            result = agent_json_loads(body) if isinstance(body, (bytes, str)) else body
+            if isinstance(result, dict) and result.get("error"):
+                raise _agent_upstream_error(status, result, response_headers, api_key)
+            return parse_agent_response(clean_provider, result, tools)
+        except ProviderAdapterError as exc:
+            request_id = _agent_header_request_id(response_headers)
+            raise AgentProviderError(exc.code, 502, str(exc), source="provider", upstream_status=status,
+                                     upstream_request_id=request_id, secret_values=(api_key,)) from None
+        except (TypeError, ValueError, UnicodeError, RecursionError):
+            raise AgentProviderError("response_invalid", 502, "模型原生工具响应无法安全解析", source="provider", upstream_status=status) from None
+
+    def agent_turn(self, user_id: int, shop_account_id: int, account_key: str,
+                   messages: list, tools: list) -> dict:
+        """One native Agent turn; orchestration and tool execution belong to ops.
+
+        SAAS_AI_AGENT_MAX_OUTPUT_TOKENS is an optional *generation* budget. When
+        unset we omit optional token caps; only Claude's required max_tokens
+        defaults to 16384. No local model allowlist or context truncation.
+        """
+        try:
+            scope = self._scope(user_id, shop_account_id, account_key)
+            generation = self._connection_generation(scope)
+            connection = self.get_runtime_connection(*scope)
+            self._ensure_connection_generation(scope, generation)
+            raw_budget = self.environ.get("SAAS_AI_AGENT_MAX_OUTPUT_TOKENS", "")
+            if raw_budget in ("", None):
+                budget = None
+            elif not isinstance(raw_budget, (str, int)) or isinstance(raw_budget, bool) or not str(raw_budget).isascii() or not str(raw_budget).isdigit() or int(raw_budget) <= 0:
+                raise AgentProviderError("agent_output_budget_invalid", 502, "Agent 输出生成预算配置无效（并非上下文限制）", source="application")
+            else:
+                budget = int(raw_budget)
+            try:
+                result = self._request_agent_json(connection["provider"], connection["base_url"], connection["model"],
+                                                   connection["api_key"], messages, tools, output_tokens=budget)
+            finally:
+                # Discard late successes AND errors from a deleted/replaced key
+                # or connection. The runner separately checks shop generation.
+                self._ensure_connection_generation(scope, generation)
+            return result
+        except AgentProviderError:
+            raise
+        except AIServiceError as exc:
+            raise AgentProviderError(exc.code, 502 if exc.status_code < 500 else exc.status_code,
+                                     str(exc), source="application") from None
+        except Exception:
+            raise AgentProviderError("agent_application_failed", 502, "本站无法读取或校验 Agent 连接状态", source="application") from None
 
     @staticmethod
     def _response_text(response: dict) -> str:
@@ -1941,7 +2238,7 @@ service = AIService()
 
 
 __all__ = [
-    "AIService", "AIServiceError", "CONNECTION_FILE", "CONNECTION_SECRET_FILE",
+    "AIService", "AIServiceError", "AgentProviderError", "CONNECTION_FILE", "CONNECTION_SECRET_FILE",
     "KNOWLEDGE_DIR", "SETTINGS_FILE", "SNAPSHOT_FILE", "TEMPLATES_FILE", "catgirl_preset",
     "empty_knowledge", "empty_store_config", "facts_fingerprint", "identity_fingerprint",
     "knowledge_has_content", "normalize_knowledge", "normalize_store_config", "product_facts",

@@ -3,10 +3,13 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sys
 import tempfile
+import threading
+import time
 from pathlib import Path
 
 
@@ -188,7 +191,179 @@ def main() -> None:
     assert db.renew_job(lease_job["id"], "lease-owner", now=lease_now, lease_seconds=30) is True
     assert db.complete_job(lease_job["id"], "lease-owner") is True
 
-    print("job-consumer-contract: scoped refresh, retries, lease renewal and payload safety passed")
+    ops_consumer_contract(db, storage, user_id, default, second)
+    print("job-consumer-contract: scoped sync, ops dispatch, retry fencing, lease recovery and independent lanes passed")
+
+
+def ops_consumer_contract(db, storage, uid, account, other):
+    from ai_customer_service import AIServiceError
+    from operations import OperationsService
+
+    class Model:
+        clock = staticmethod(time.time)
+
+        def __init__(self):
+            self.storage = storage
+            self.calls = 0
+            self.respond = None
+
+        def _connection_generation(self, _scope):
+            return ("user", 1, 1, "verified")
+
+        def agent_turn(self, *_args):
+            self.calls += 1
+            if self.respond:
+                self.respond()
+            return {"role": "assistant", "content": "本轮查询已完成，未修改配置。", "tool_calls": []}
+
+    class ReadOnlyTools:
+        def catalog(self, _run):
+            return []
+
+        def execute(self, *_args):
+            raise AssertionError("consumer must not dispatch an unrequested write")
+
+    class ProviderFailure(AIServiceError):
+        def __init__(self):
+            super().__init__("provider_error", 502, "模型暂时不可用")
+
+        def public_detail(self):
+            return {"source": "provider", "code": "provider_error", "message": "模型暂时不可用", "upstream_status": 503}
+
+    model = Model()
+    service = OperationsService(db, model)
+    service.tools = ReadOnlyTools()
+    consumer = JobConsumer(db, storage=storage, operations_service=service, owner="ops-contract", poll_seconds=0.05)
+    scope = (uid, int(account["id"]), str(account["account_key"]))
+    token_hash = hashlib.sha256(db.create_token(uid).encode()).hexdigest()
+    counter = 0
+
+    def enqueue():
+        nonlocal counter
+        counter += 1
+        return service.chat(*scope, request_id=f"ops-queue-{counter}", message="只读查询本店商品", auth_session_hash=token_hash)
+
+    def job_for(run):
+        with db._lock:
+            identity = db.con.execute("SELECT job_id FROM ops_runs WHERE id=?", (run["run_id"],)).fetchone()[0]
+        return db.get_job(identity)
+
+    # Construction is local to the consumer, never imports the API or uses a
+    # different DB/storage root. It does not resolve keys or call a model.
+    constructed = JobConsumer(db, storage=storage, owner="ops-construct")._operations()
+    assert constructed.db is db
+    assert constructed.ai_service.storage.root == storage.root
+    assert constructed.ai_service.user_connections.db is db
+    assert "app" not in sys.modules
+
+    normal = enqueue()
+    assert set(json.loads(job_for(normal)["payload_json"])) == {"run_id"}
+    assert consumer.run_once(kinds=("ops_run",)) == 1
+    assert service.get_run(*scope, normal["run_id"])["status"] == "succeeded"
+    assert job_for(normal)["status"] == "completed"
+    assert model.calls == 1
+
+    # A persisted provider error finishes the dispatch, not an automatic retry.
+    def fail_provider():
+        raise ProviderFailure()
+
+    model.respond = fail_provider
+    failed = enqueue()
+    consumer.run_once(kinds=("ops_run",))
+    failed_result = service.get_run(*scope, failed["run_id"])
+    assert failed_result["status"] == "failed" and failed_result["recoverable"]
+    assert failed_result["error"]["upstream_status"] == 503
+    assert job_for(failed)["status"] == "completed"
+    called = model.calls
+    assert consumer.run_once(kinds=("ops_run",)) == 0 and model.calls == called
+
+    # An explicit retry changes job_id; a stale duplicate cannot execute it.
+    model.respond = None
+    service.retry(*scope, failed["run_id"], request_id="explicit-retry-1", auth_session_hash=token_hash)
+    obsolete = db.enqueue_job(uid, "ops_run", "obsolete-dispatch", account_id=account["id"], payload={"run_id": failed["run_id"]})
+    claimed = db.claim_job(obsolete["id"], consumer.owner)
+    assert consumer.process(claimed) == "completed" and model.calls == called
+    assert job_for(failed)["status"] == "queued"
+    consumer.run_once(kinds=("ops_run",))
+    assert service.get_run(*scope, failed["run_id"])["status"] == "succeeded"
+    assert model.calls == called + 1
+
+    # Queue metadata and payloads do not grant another shop access to the run.
+    for label, sid, payload in (
+        ("wrong-shop", other["id"], {"run_id": normal["run_id"]}),
+        ("extra-field", account["id"], {"run_id": normal["run_id"], "message": "must-not-dispatch"}),
+        ("fake-run", account["id"], {"run_id": "unknown-run"}),
+    ):
+        invalid = db.enqueue_job(uid, "ops_run", label, account_id=sid, payload=payload, max_attempts=1)
+        called = model.calls
+        consumer.run_once(kinds=("ops_run",))
+        assert db.get_job(invalid["id"])["status"] == "dead_letter"
+        assert db.get_job(invalid["id"])["last_error_code"] == "invalid_payload"
+        assert model.calls == called
+
+    # Yielding on a busy claim doesn't consume an attempt or mark a run done.
+    deferred = enqueue()
+    process_run = service.process_run
+    service.process_run = lambda *_args, **_kwargs: {"status": "running"}
+    try:
+        claimed = db.claim_job(job_for(deferred)["id"], consumer.owner)
+        assert consumer.process(claimed) == "deferred"
+    finally:
+        service.process_run = process_run
+    row = job_for(deferred)
+    assert row["status"] == "retry" and row["attempts"] == 0
+    consumer.run_once(now=row["available_at"], kinds=("ops_run",))
+    assert job_for(deferred)["status"] == "completed"
+
+    # A lost queue lease cannot be acknowledged or dispatched by the old owner.
+    fenced = enqueue()
+    claimed = db.claim_job(job_for(fenced)["id"], consumer.owner)
+    def steal_lease():
+        with db._lock, db.con:
+            db.con.execute("UPDATE jobs SET lease_owner='another-consumer' WHERE id=?", (claimed["id"],))
+    model.respond = steal_lease
+    assert consumer.process(claimed) == "lease_lost"
+    assert db.get_job(claimed["id"])["lease_owner"] == "another-consumer"
+    assert service.get_run(*scope, fenced["run_id"])["status"] == "running"
+    model.respond = None
+    with db._lock, db.con:
+        db.con.execute("UPDATE jobs SET lease_until=? WHERE id=?", (time.time() - 1, claimed["id"]))
+    consumer.run_once(kinds=("ops_run",))
+    assert job_for(fenced)["status"] == "completed"
+
+    # One waiting model must not block an independent shop-sync lane. A process
+    # stop yields the live run, which a new consumer resumes durably.
+    entered, release, synced = threading.Event(), threading.Event(), threading.Event()
+    def slow_model():
+        entered.set()
+        assert release.wait(10), "test model gate was not released"
+    def sync_without_network(cookie_header):
+        synced.set()
+        return snapshot_for(cookie_header)
+    model.respond = slow_model
+    pending = enqueue()
+    consumer.sync_func = sync_without_network
+    consumer.reserve_sync_func = lambda *_args: None
+    thread = threading.Thread(target=consumer.run_forever, daemon=True)
+    thread.start()
+    try:
+        assert entered.wait(5), "operations lane didn't start"
+        sync_job = db.enqueue_job(uid, "shop_sync", "while-model-waits", account_id=other["id"], payload={"replace_cookie": False})
+        assert synced.wait(5), "shop sync was blocked by a model request"
+        consumer.stop()
+    finally:
+        release.set()
+        thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert db.get_job(sync_job["id"])["status"] == "completed"
+    interrupted = job_for(pending)
+    assert interrupted["status"] == "retry" and interrupted["attempts"] == 0
+    assert service.get_run(*scope, pending["run_id"])["status"] == "running"
+    model.respond = None
+    resumed = JobConsumer(db, storage=storage, operations_service=service, owner="ops-resumed")
+    resumed.run_once(now=interrupted["available_at"], kinds=("ops_run",))
+    assert job_for(pending)["status"] == "completed"
+    assert "app" not in sys.modules
 
 
 if __name__ == "__main__":

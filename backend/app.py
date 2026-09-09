@@ -23,13 +23,19 @@ import uuid
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, Field
 
 from access import account_payload, has_permission, is_platform_admin, plan_for
 from account_storage import AccountStorage, AccountStorageError, DEFAULT_ACCOUNT_ID, normalize_account_key
+from account_leases import AccountLease, AccountLeaseError, acquire_account_lease
+from fulfillment_config import (
+    FulfillmentConfig, FulfillmentConfigError,
+    normalise_template_input, normalise_template_item_ids, template_public,
+    upsert_template, remove_template, digest as fulfillment_digest,
+)
 from ai_customer_service import AIServiceError, catgirl_preset, service as ai_service
 from ai_provider_adapters import provider_catalog
 from automation import (
@@ -84,7 +90,7 @@ from platform_update import (
     available_rollback_versions,
     SemVer,
     fetch_release,
-    inspect_releases,
+    inspect_public_releases,
     update_capabilities,
     stage_release,
     validate_candidate,
@@ -102,10 +108,13 @@ from shop_sync import (
     sync_status_payload,
 )
 from shop_sync_service import ShopSyncPersistenceError, run_shop_sync_inner
-from version import local_release_notes, version_payload
+from version import RELEASE_CHANNEL, local_release_notes, version_payload
 from user_ai_connection import UserAIConnections
 from operations import OperationsService, OperationsError
 from xianyu_login import XianyuLoginError, qr_logins
+from runtime_settings import RuntimeSettings, RuntimeSettingsError
+from shop_resources import ShopResources
+import bot_manager as worker_manager
 
 
 ADMIN_TOKEN = os.environ.get("SAAS_ADMIN_TOKEN", "")
@@ -133,6 +142,7 @@ AUDIT_EVENT_TYPES = frozenset(
         "auth.logout",
         "auth.password_changed",
         "platform.settings_changed",
+        "platform.resource_settings_changed",
         "platform.user_changed",
         "platform.user_unlocked",
         "platform.sessions_revoked",
@@ -163,6 +173,10 @@ AUDIT_METADATA_KEYS = frozenset(
         "channel",
         "status",
         "sessions_revoked",
+        "max_shop_accounts",
+        "max_running_workers",
+        "worker_memory_mib",
+        "revision",
     }
 )
 TRUSTED_BROWSER_HOSTS = {
@@ -210,6 +224,10 @@ db = DB()
 user_ai_connections = UserAIConnections(db, ai_service)
 ai_service.user_connections = user_ai_connections
 operations_service = OperationsService(db, ai_service)
+fulfillment_config = FulfillmentConfig(ai_service.storage)
+runtime_settings = RuntimeSettings(db)
+worker_manager.configure_resource_limits(runtime_settings.read)
+shop_resources = ShopResources(db, runtime_settings, worker_manager.managed_resource_snapshot, worker_manager._expected_worker_pid)
 app = FastAPI(title="xianyu-saas-api", docs_url=None, redoc_url=None)
 
 
@@ -574,7 +592,7 @@ def _platform_update_payload(row) -> dict | None:
 
 @app.get("/api/version/public")
 def public_version():
-    payload = version_payload("stable")
+    payload = version_payload()
     return {
         "version": payload["version"],
         "asset_version": payload["asset_version"],
@@ -633,7 +651,7 @@ class Auth:
 
 @app.get("/api/version")
 def get_version(user=Depends(Auth.current_user)):
-    channel = db.get_platform_setting("update_channel", "stable")
+    channel = RELEASE_CHANNEL
     return {
         **version_payload(channel),
         "release_notes": _local_release_notes(),
@@ -744,24 +762,16 @@ def _acquire_account_lease(
     busy_message: str,
     unavailable_message: str,
 ):
-    lease_key = f"{scope}:{int(user['id'])}:{int(account['id'])}"
-    lease_owner = f"api:{os.getpid()}:{threading.get_ident()}:{time.time_ns()}"
     try:
-        lease_result = db.acquire_control_lease(
-            lease_key,
-            lease_owner,
-            lease_seconds=lease_seconds,
-            cooldown_seconds=0,
-        )
-    except (sqlite3.Error, ValueError) as exc:
-        raise HTTPException(503, unavailable_message) from exc
-    if lease_result != "acquired":
-        raise HTTPException(409, busy_message)
-    return _AccountLease(lease_key, lease_owner, lease_seconds), lease_owner
+        lease = acquire_account_lease(db, scope, int(user["id"]), int(account["id"]), lease_seconds)
+    except AccountLeaseError as exc:
+        raise HTTPException(409 if exc.code == "lease_busy" else 503,
+                            busy_message if exc.code == "lease_busy" else unavailable_message) from exc
+    return lease, lease.owner
 
 
 def _ensure_account_lease(lease, unavailable_message: str = "操作租约已失效，请重试") -> None:
-    if isinstance(lease, _AccountLease):
+    if isinstance(lease, (_AccountLease, AccountLease)):
         try:
             lease.ensure_owned()
         except RuntimeError as exc:
@@ -769,6 +779,9 @@ def _ensure_account_lease(lease, unavailable_message: str = "操作租约已失�
 
 
 def _release_account_lease(lease, lease_owner: str) -> None:
+    if isinstance(lease, AccountLease):
+        lease.release()
+        return
     lease_key = lease.key if isinstance(lease, _AccountLease) else str(lease)
     if isinstance(lease, _AccountLease):
         lease.stop_event.set()
@@ -805,7 +818,16 @@ class PasswordChangeIn(BaseModel):
 
 class PlatformSettingsIn(BaseModel):
     registration_open: bool | None = None
-    update_channel: str | None = None
+
+    class Config:
+        extra = "forbid"
+
+
+class RuntimeSettingsIn(BaseModel):
+    expected_revision: int = Field(ge=0, lt=2**63 - 1, strict=True)
+    max_shop_accounts: int = Field(ge=1, le=1000, strict=True)
+    max_running_workers: int = Field(ge=1, le=1000, strict=True)
+    worker_memory_mib: int = Field(ge=128, le=16384, strict=True)
 
     class Config:
         extra = "forbid"
@@ -899,8 +921,7 @@ class AIConnectionDeleteIn(BaseModel):
 
 
 class UserAIConnectionTestIn(AIConnectionTestIn):
-    source_account_key: str = Field(default="", max_length=80)
-    source_revision: int | None = Field(default=None, ge=0)
+    pass
 
 
 class UserAIConnectionSaveIn(UserAIConnectionTestIn):
@@ -908,36 +929,20 @@ class UserAIConnectionSaveIn(UserAIConnectionTestIn):
     confirm: bool = Field(default=False, strict=True)
 
 
-class OpsHistoryIn(BaseModel):
-    role: str = Field(max_length=16)
-    content: str = Field(max_length=4000)
-
-    class Config:
-        extra = "forbid"
-
-
 class OpsChatIn(BaseModel):
-    message: str = Field(min_length=1, max_length=2000)
-    history: list[OpsHistoryIn] = Field(default_factory=list, max_length=10)
-    selected_item_ids: list[str] = Field(default_factory=list, max_length=20)
-    selected_rule_ids: list[str] = Field(default_factory=list, max_length=20)
-    request_id: str = Field(min_length=8, max_length=120)
+    message: str = Field(min_length=1, strict=True)
+    session_id: str = Field(default="", max_length=80, strict=True)
+    request_id: str = Field(min_length=8, max_length=80, strict=True)
 
     class Config:
         extra = "forbid"
 
 
-class OpsPlanActionIn(BaseModel):
-    revision: int = Field(ge=1)
-    digest: str = Field(min_length=64, max_length=64)
+class OpsRetryIn(BaseModel):
+    request_id: str = Field(min_length=8, max_length=80, strict=True)
 
     class Config:
         extra = "forbid"
-
-
-class OpsConfirmIn(OpsPlanActionIn):
-    confirm: bool = Field(default=False, strict=True)
-    request_id: str = Field(min_length=8, max_length=120)
 
 
 class AIConfigIn(BaseModel):
@@ -1773,6 +1778,9 @@ def _start_account_worker_locked(
                 last_error=_safe_worker_error_code(reason),
                 mode=mode,
             )
+        if reason == "max_bots_reached":
+            raise HTTPException(409, detail={"code": "max_bots_reached",
+                "message": "已达到同时运行店铺上限，请先暂停其他店铺，或由管理员调整运行限制"})
         raise HTTPException(409, reason)
     try:
         _ensure_account_lease(lease)
@@ -2343,14 +2351,23 @@ def _async_job_response(job, account):
 
 
 def _read_products_document(user_id: int, account_key: str = "default") -> dict:
-    raw = read_secret(user_id, "products_config.json", account_key)
-    if not raw:
-        return {"version": 1, "types": []}
     try:
-        payload = json.loads(raw)
-    except (TypeError, ValueError):
-        return {"version": 1, "types": []}
-    return payload if isinstance(payload, dict) else {"version": 1, "types": []}
+        return fulfillment_config.read_products(user_id, account_key)
+    except FulfillmentConfigError as error:
+        raise HTTPException(error.status_code, str(error)) from error
+
+
+def _write_products_document(user_id, account_key, document, *, before=None, ensure_current=None):
+    try:
+        before = fulfillment_config.read_products(user_id, account_key) if before is None else before
+        # A manual edit replaces the old operations receipt, not its old hash.
+        clean = {key: value for key, value in document.items() if key != "_ops_receipt"}
+        return fulfillment_config.write_products(user_id, account_key, clean,
+            expected_revision=fulfillment_digest(before), ensure_current=ensure_current)
+    except FulfillmentConfigError as error:
+        raise HTTPException(error.status_code, str(error)) from error
+    except (OSError, AccountStorageError) as error:
+        raise HTTPException(503, "商品履约配置暂时无法保存") from error
 
 
 def _material_batch_token(account, snapshot: dict, products: dict, updates: list[dict]) -> str:
@@ -2967,8 +2984,14 @@ def _save_automation_locked(body: AutomationIn, user, account, leases=()):
                 db.save_config(user["id"], {"keywords_json": encoded})
         if deliveries is not None:
             snapshot = load_verified_snapshot(user["id"], account_key)
-            merged = merge_material_products(_read_products_document(user["id"], account_key), deliveries, snapshot)
-            write_secret(user["id"], "products_config.json", json.dumps(merged, ensure_ascii=False, separators=(",", ":")), account_key)
+            products = _read_products_document(user["id"], account_key)
+            merged = merge_material_products(products, deliveries, snapshot)
+            def ensure_delivery_write():
+                for lease, _owner in leases:
+                    _ensure_account_lease(lease)
+                return _ensure_fulfillment_write(user, account, None, "fulfillment.basic")
+            _write_products_document(user["id"], account_key, merged, before=products,
+                                     ensure_current=ensure_delivery_write)
         if settings is not None:
             write_secret(user["id"], "automation_settings.json", json.dumps(settings, ensure_ascii=False, separators=(",", ":")), account_key)
             if body.enabled is False:
@@ -3042,6 +3065,22 @@ def get_bot_status(
     return result
 
 
+@app.get("/api/bot/resources")
+def get_shop_resources(request: Request, cursor: int = Query(default=0, ge=0, lt=2**63),
+                       limit: int = Query(default=50, ge=1, le=100), user=Depends(Auth.current_user)):
+    _require_permission(user, "shop.configure")
+    if set(request.query_params) - {"cursor", "limit"} or any(len(request.query_params.getlist(key)) != 1 for key in request.query_params):
+        raise HTTPException(400, detail={"code": "invalid_resource_query", "message": "资源查询参数无效"})
+    try:
+        payload = shop_resources.page(int(user["id"]), cursor=cursor, limit=limit)
+        payload["usage"] = {"shop_accounts": payload["total"], "running_workers": worker_manager.running_count(int(user["id"]))}
+        return payload
+    except RuntimeSettingsError as exc:
+        raise HTTPException(exc.status_code, detail=exc.public_detail()) from exc
+    except (OSError, sqlite3.Error) as exc:
+        raise HTTPException(503, detail={"code": "resources_unavailable", "message": "店铺资源暂时无法读取"}) from exc
+
+
 @app.get("/api/bot/accounts")
 def get_shop_accounts(user=Depends(Auth.current_user)):
     _require_permission(user, "shop.configure")
@@ -3060,9 +3099,6 @@ def create_shop_account(body: ShopAccountIn, user=Depends(Auth.current_user)):
     name = body.name.strip()
     if len(name) > 160:
         raise HTTPException(400, "店铺备注不能超过 160 个字")
-    existing = db.list_shop_accounts(user["id"], include_disabled=True)
-    if len(existing) >= 20:
-        raise HTTPException(409, "最多添加 20 个店铺账号")
     if key:
         if len(key) > 80 or not key.isascii():
             raise HTTPException(400, "店铺账号标识无效")
@@ -3101,6 +3137,8 @@ def create_shop_account(body: ShopAccountIn, user=Depends(Auth.current_user)):
         if runtime is None:
             raise RuntimeError("initial worker runtime generation changed")
         db.mark_shop_storage_initialized(user["id"], row["id"])
+    except RuntimeSettingsError as exc:
+        raise HTTPException(exc.status_code, detail=exc.public_detail()) from exc
     except sqlite3.IntegrityError as exc:
         if row is not None:
             removed = db.remove_unconfigured_shop_account(user["id"], row["id"])
@@ -3442,12 +3480,8 @@ def commit_product_batch(
         merged = merge_material_product_updates(products, updates, snapshot)
         try:
             if merged != products:
-                write_secret(
-                    user["id"],
-                    "products_config.json",
-                    json.dumps(merged, ensure_ascii=False, separators=(",", ":")),
-                    str(account["account_key"]),
-                )
+                _write_products_document(user["id"], str(account["account_key"]), merged,
+                    before=products, ensure_current=lambda: _ensure_fulfillment_write(user, account, lease_key, "fulfillment.basic"))
         except OSError as error:
             raise HTTPException(503, "商品资料保存失败，请稍后重试") from error
         automation = _automation_payload(user, account, persist_legacy=False)
@@ -3463,6 +3497,41 @@ def commit_product_batch(
         return {"ok": True, "preview": preview, "automation": automation}
     finally:
         _release_account_lease(lease_key, lease_owner)
+
+
+@app.get("/api/bot/products/delivery-status")
+def get_product_delivery_status(user=Depends(Auth.current_user), account=Depends(current_shop_account)):
+    """Expose binding type/state, never materials, URLs, tags or inventory."""
+    _require_permission(user, "fulfillment.basic")
+    key = str(account["account_key"])
+    snapshot = load_verified_snapshot(user["id"], key)
+    if snapshot is None:
+        return {"available": False, "items": []}
+    allowed = {str(item.get("id")) for item in snapshot.get("products", []) if isinstance(item, dict)}
+    document = _read_products_document(user["id"], key)
+    items = {}
+    for entry in document["types"]:
+        kind = entry["delivery"]
+        ids = entry.get("item_ids")
+        if not isinstance(ids, list):
+            ids = [entry.get("item_id")]
+        content = entry.get("payload", entry.get("material"))
+        configured = bool(isinstance(content, str) and content.strip()) if kind == "material" else bool(entry.get("resource_match")) if kind == "pan" else True
+        for raw_id in ids:
+            item_id = str(raw_id)
+            if item_id not in allowed:
+                continue
+            if item_id in items:
+                items[item_id] = {"item_id": item_id, "delivery": "conflict", "configured": False,
+                                  "enabled": False, "template_id": None}
+                continue
+            template_id = entry.get("id")
+            template_id = str(template_id) if isinstance(template_id, (str, int)) and not isinstance(template_id, bool) else None
+            if template_id is not None and (not 1 <= len(template_id) <= 120 or any(ord(char) < 32 for char in template_id)):
+                template_id = None
+            items[item_id] = {"item_id": item_id, "delivery": kind, "configured": configured,
+                "enabled": entry.get("enabled", True), "template_id": template_id if kind in {"pan", "redeem"} else None}
+    return {"available": True, "items": list(items.values())}
 
 
 @app.get("/api/bot/products")
@@ -3493,15 +3562,6 @@ def get_user_ai_connection(user=Depends(Auth.current_user)):
         _raise_ai_error(error)
 
 
-@app.get("/api/settings/ai/connection/legacy-sources")
-def get_legacy_ai_connections(user=Depends(Auth.current_user)):
-    _require_permission(user, "automation.ai")
-    try:
-        return {"sources": user_ai_connections.legacy_sources(int(user["id"]))}
-    except AIServiceError as error:
-        _raise_ai_error(error)
-
-
 @app.post("/api/settings/ai/connection/test")
 def test_user_ai_connection(body: UserAIConnectionTestIn, user=Depends(Auth.current_user)):
     _require_permission(user, "automation.ai")
@@ -3514,24 +3574,13 @@ def test_user_ai_connection(body: UserAIConnectionTestIn, user=Depends(Auth.curr
 @app.put("/api/settings/ai/connection")
 def save_user_ai_connection(body: UserAIConnectionSaveIn, request: Request, user=Depends(Auth.current_user)):
     _require_permission(user, "automation.ai")
-    lease = owner = None
     try:
-        if body.source_account_key:
-            account = db.get_shop_account(user["id"], account_key=body.source_account_key)
-            if account is None or not account["enabled"]:
-                raise HTTPException(404, "迁移来源店铺不存在或已停用")
-            lease, owner = _acquire_account_lease("ai-config", user, account, lease_seconds=45,
-                busy_message="来源连接正在更新，请稍后重试", unavailable_message="来源连接暂时不可用")
-            _ensure_account_lease(lease)
         saved = user_ai_connections.save(int(user["id"]), **body.model_dump())
         _audit("ai.connection_changed", request, actor_user_id=user["id"], target_type="user", target_id=str(user["id"]),
                metadata={"status": "shared", "version": str(saved["revision"])})
         return {"ok": True, "connection": saved}
     except AIServiceError as error:
         _raise_ai_error(error)
-    finally:
-        if lease is not None:
-            _release_account_lease(lease, owner)
 
 
 @app.delete("/api/settings/ai/connection")
@@ -3555,89 +3604,87 @@ def _ops_request_id(request: Request, request_id: str) -> str:
 
 def _ops_backend_failure(error):
     if isinstance(error, AIServiceError):
-        _raise_ai_error(error)
-    raise HTTPException(503, detail={"code": "operations_unavailable", "message": "运维服务暂时不可用，请稍后重试"}) from error
+        public = getattr(error, "public_detail", None)
+        detail = public() if callable(public) else {
+            "source": "application", "code": error.code, "message": str(error),
+        }
+        status = error.status_code
+        if detail.get("source") == "provider" or status == 401:
+            status = 502  # A provider/session-bound run failure is not browser logout.
+        raise HTTPException(status, detail=detail) from error
+    raise HTTPException(503, detail={"source": "application", "code": "operations_unavailable",
+                                   "message": "运维服务暂时不可用，请稍后重试"}) from error
 
 
-@app.get("/api/ops/context")
-def get_ops_context(user=Depends(Auth.current_user), account=Depends(current_shop_account)):
+@app.get("/api/ops/sessions/current")
+def get_ops_session(user=Depends(Auth.current_user), account=Depends(current_shop_account)):
     _require_permission(user, "automation.ai")
     try:
-        result = operations_service.context(*_ai_scope(user, account))
-        runtime = db.get_worker_runtime(user["id"], account["id"])
-        diagnostics = dict(result.get("diagnostics") or {})
-        diagnostics.update(runtime_state=str(runtime["state"]) if runtime else "not_started",
-                           desired_state=str(runtime["desired_state"]) if runtime else "stopped")
-        return {**result, "diagnostics": diagnostics, "connection": user_ai_connections.read(int(user["id"]))}
+        return operations_service.current_session(*_ai_scope(user, account))
     except (AIServiceError, OSError, sqlite3.Error) as error:
         _ops_backend_failure(error)
 
 
-@app.post("/api/ops/chat")
-def ops_chat(body: OpsChatIn, request: Request, user=Depends(Auth.current_user), account=Depends(current_shop_account)):
-    _require_permission(user, "automation.ai")
-    request_id = _ops_request_id(request, body.request_id)
-    lease = owner = None
-    try:
-        if not user_ai_connections.initialized(int(user["id"])):
-            raise AIServiceError("connection_unconfigured", 409, "请先在设置中测试并保存统一模型连接")
-        user_ai_connections.runtime(int(user["id"]))
-        lease, owner = _acquire_account_lease("ops-chat", user, account, lease_seconds=180,
-            busy_message="此店铺已有运维请求正在生成，请稍后重试", unavailable_message="运维生成服务暂时不可用")
-        return operations_service.chat(*_ai_scope(user, account), message=body.message,
-            history=[item.model_dump() for item in body.history], selected_item_ids=body.selected_item_ids,
-            selected_rule_ids=body.selected_rule_ids, request_id=request_id)
-    except (AIServiceError, OSError, sqlite3.Error) as error:
-        _ops_backend_failure(error)
-    finally:
-        if lease is not None:
-            _release_account_lease(lease, owner)
-
-
-@app.get("/api/ops/plans/{plan_id}")
-def get_ops_plan(plan_id: str, user=Depends(Auth.current_user), account=Depends(current_shop_account)):
+@app.post("/api/ops/sessions", status_code=201)
+def create_ops_session(user=Depends(Auth.current_user), account=Depends(current_shop_account)):
     _require_permission(user, "automation.ai")
     try:
-        return operations_service.get_plan(*_ai_scope(user, account), plan_id)
+        return operations_service.create_session(*_ai_scope(user, account))
     except (AIServiceError, OSError, sqlite3.Error) as error:
         _ops_backend_failure(error)
 
 
-@app.post("/api/ops/plans/{plan_id}/confirm")
-def confirm_ops_plan(plan_id: str, body: OpsConfirmIn, request: Request,
+@app.get("/api/ops/sessions/{session_id}/messages")
+def get_ops_messages(session_id: str, cursor: int = Query(default=0, ge=0),
                      user=Depends(Auth.current_user), account=Depends(current_shop_account)):
     _require_permission(user, "automation.ai")
-    _require_permission(user, "automation.rules")
-    request_id = _ops_request_id(request, body.request_id)
-    leases = []
     try:
-        for resource in ("automation-save", "ai-config"):
-            leases.append(_acquire_account_lease(resource, user, account, lease_seconds=120,
-                busy_message="店铺资料正在修改，请稍后确认", unavailable_message="资料写入服务暂时不可用"))
-        def ensure_owned():
-            for lease, _ in leases:
-                _ensure_account_lease(lease)
-            current_user = db.get_user_by_id(user["id"])
-            current_account = db.get_shop_account(user["id"], account_id=account["id"])
-            if current_user is None or current_user["disabled_at"] is not None or current_account is None or not current_account["enabled"]:
-                raise OperationsError("scope_invalid", 409)
-        ensure_owned()
-        return operations_service.confirm(*_ai_scope(user, account), plan_id,
-            revision=body.revision, digest=body.digest, confirm=body.confirm,
-            request_id=request_id, ensure_lease=ensure_owned)
+        return operations_service.messages(*_ai_scope(user, account), session_id, cursor=cursor)
     except (AIServiceError, OSError, sqlite3.Error) as error:
         _ops_backend_failure(error)
-    finally:
-        for lease, owner in reversed(leases):
-            _release_account_lease(lease, owner)
 
 
-@app.post("/api/ops/plans/{plan_id}/cancel")
-def cancel_ops_plan(plan_id: str, body: OpsPlanActionIn,
-                    user=Depends(Auth.current_user), account=Depends(current_shop_account)):
+@app.post("/api/ops/chat", status_code=202)
+def ops_chat(body: OpsChatIn, request: Request, user=Depends(Auth.current_user),
+             account=Depends(current_shop_account), token=Depends(Auth.current_token)):
+    _require_permission(user, "automation.ai")
+    request_id = _ops_request_id(request, body.request_id)
+    try:
+        return operations_service.chat(*_ai_scope(user, account), session_id=body.session_id,
+            request_id=request_id, message=body.message,
+            auth_session_hash=hashlib.sha256(token.encode("utf-8")).hexdigest())
+    except (AIServiceError, OSError, sqlite3.Error) as error:
+        _ops_backend_failure(error)
+
+
+@app.get("/api/ops/runs/{run_id}")
+def get_ops_run(run_id: str, after_seq: int = Query(default=0, ge=0),
+                user=Depends(Auth.current_user), account=Depends(current_shop_account)):
     _require_permission(user, "automation.ai")
     try:
-        return operations_service.cancel(*_ai_scope(user, account), plan_id, revision=body.revision, digest=body.digest)
+        return operations_service.get_run(*_ai_scope(user, account), run_id, after_seq=after_seq)
+    except (AIServiceError, OSError, sqlite3.Error) as error:
+        _ops_backend_failure(error)
+
+
+@app.post("/api/ops/runs/{run_id}/cancel")
+def cancel_ops_run(run_id: str, user=Depends(Auth.current_user), account=Depends(current_shop_account)):
+    _require_permission(user, "automation.ai")
+    try:
+        return operations_service.cancel(*_ai_scope(user, account), run_id)
+    except (AIServiceError, OSError, sqlite3.Error) as error:
+        _ops_backend_failure(error)
+
+
+@app.post("/api/ops/runs/{run_id}/retry", status_code=202)
+def retry_ops_run(run_id: str, body: OpsRetryIn, request: Request,
+                  user=Depends(Auth.current_user), account=Depends(current_shop_account),
+                  token=Depends(Auth.current_token)):
+    _require_permission(user, "automation.ai")
+    request_id = _ops_request_id(request, body.request_id)
+    try:
+        return operations_service.retry(*_ai_scope(user, account), run_id, request_id,
+            auth_session_hash=hashlib.sha256(token.encode("utf-8")).hexdigest())
     except (AIServiceError, OSError, sqlite3.Error) as error:
         _ops_backend_failure(error)
 
@@ -4390,13 +4437,14 @@ def save_products(
         unavailable_message="商品履约配置暂时不可用，请稍后重试",
     )
     try:
-        return _save_products_locked(body, user, account)
+        return _save_products_locked(body, user, account, lease_key)
     finally:
         _release_account_lease(lease_key, lease_owner)
 
 
-def _save_products_locked(body: ProductsIn, user, account):
+def _save_products_locked(body: ProductsIn, user, account, lease=None):
     account_key = str(account["account_key"])
+    before = _read_products_document(user["id"], account_key)
     products = body.products
     types = products.get("types") if isinstance(products, dict) else None
     if not isinstance(types, list):
@@ -4445,12 +4493,8 @@ def _save_products_locked(body: ProductsIn, user, account):
         normalized_types.append(item)
     normalized_products = dict(products)
     normalized_products["types"] = normalized_types
-    write_secret(
-        user["id"],
-        "products_config.json",
-        json.dumps(normalized_products, ensure_ascii=False),
-        account_key,
-    )
+    _write_products_document(user["id"], account_key, normalized_products, before=before,
+        ensure_current=lambda: _ensure_fulfillment_write(user, account, lease))
     return {"ok": True}
 
 
@@ -4462,121 +4506,24 @@ def _delivery_template_targets(products, types):
 
 
 def _normalise_template_item_ids(raw, snapshot, preserved_item_ids=None):
-    """Validate item IDs, preserving only existing bindings under a partial snapshot."""
-    item_ids = raw.get("item_ids")
-    if item_ids is None:
-        legacy = raw.get("item_id")
-        item_ids = [legacy] if legacy is not None else []
-    if not isinstance(item_ids, list):
-        raise HTTPException(400, "item_ids 必须是列表")
-    if len(item_ids) > 500:
-        raise HTTPException(400, "绑定商品数量过多")
-    snapshot_ids = {
-        str(item.get("id")).strip()
-        for item in (snapshot or {}).get("products", [])
-        if isinstance(item, dict) and str(item.get("id") or "").strip().isdigit()
-    }
-    preserved_ids = {
-        str(value).strip()
-        for value in (preserved_item_ids or [])
-        if not isinstance(value, bool) and str(value).strip().isdigit()
-    }
-    snapshot_truncated = bool((snapshot or {}).get("truncated"))
-    clean = []
-    seen: set[str] = set()
-    for value in item_ids:
-        if isinstance(value, bool):
-            item_key = ""
-        else:
-            item_key = str(value).strip()
-        if not item_key.isdigit() or len(item_key) > 64:
-            raise HTTPException(400, "商品配置必须使用有效的数字商品 ID")
-        if item_key not in snapshot_ids and not (
-            snapshot_truncated and item_key in preserved_ids
-        ):
-            raise HTTPException(400, "商品配置只能绑定当前店铺已识别的商品")
-        if item_key in seen:
-            raise HTTPException(400, "同一个商品不能重复配置")
-        seen.add(item_key)
-        clean.append(item_key)
-    return clean
+    try:
+        return normalise_template_item_ids(raw, snapshot, preserved_item_ids)
+    except FulfillmentConfigError as error:
+        raise HTTPException(error.status_code, str(error)) from error
 
 
 def _normalise_template_input(raw, snapshot, preserved_item_ids=None):
-    """Validate one redeem/pan delivery template and return a clean dict."""
-    if not isinstance(raw, dict):
-        raise HTTPException(400, "template 格式无效")
-    name = str(raw.get("name") or "").strip()
-    if not name:
-        raise HTTPException(400, "模板名称必填")
-    if len(name) > 120:
-        raise HTTPException(400, "模板名称最多 120 字")
-    delivery = str(raw.get("delivery") or "").strip()
-    if delivery not in {"redeem", "pan"}:
-        raise HTTPException(400, "delivery 只能是 redeem/pan")
-    description = raw.get("description")
-    if description is not None and not isinstance(description, str):
-        raise HTTPException(400, "description 格式无效")
-    if description is not None and len(description.strip()) > 500:
-        raise HTTPException(400, "模板说明最多 500 字")
-    price = raw.get("price")
-    if price is not None and not isinstance(price, str):
-        raise HTTPException(400, "price 必须是字符串")
-    if price is not None and len(price.strip()) > 120:
-        raise HTTPException(400, "price 过长")
-    enabled = True if raw.get("enabled") is None else raw.get("enabled")
-    if not isinstance(enabled, bool):
-        raise HTTPException(400, "enabled 必须是布尔值")
-    if delivery == "pan":
-        tags = raw.get("resource_match")
-        if not isinstance(tags, list) or not tags or not all(
-            isinstance(tag, str) and tag.strip() for tag in tags
-        ):
-            raise HTTPException(400, "网盘模板必须配置资源匹配标签")
-        resource_match = [tag.strip()[:120] for tag in tags[:32]]
-    else:
-        resource_match = None
-    item_ids = _normalise_template_item_ids(raw, snapshot, preserved_item_ids)
-    template = {
-        "name": name,
-        "description": description.strip() if description is not None else None,
-        "price": price.strip() if price is not None else None,
-        "delivery": delivery,
-        "item_ids": item_ids,
-        "enabled": enabled,
-    }
-    if delivery == "pan":
-        template["resource_match"] = resource_match
-    return {key: value for key, value in template.items() if value is not None}
+    try:
+        return normalise_template_input(raw, snapshot, preserved_item_ids)
+    except FulfillmentConfigError as error:
+        raise HTTPException(error.status_code, str(error)) from error
 
 
 def _template_public(item):
-    """Stable UI-safe delivery template; never expose payload text."""
-    out = {}
-    if item.get("id") is not None:
-        out["id"] = str(item["id"])
-    if item.get("name") is not None:
-        out["name"] = str(item["name"])
-    if item.get("description") is not None:
-        out["description"] = str(item["description"])
-    if item.get("price") is not None:
-        out["price"] = str(item["price"])
-    if item.get("delivery") is not None:
-        out["delivery"] = str(item["delivery"])
-    raw_ids = item.get("item_ids")
-    if not isinstance(raw_ids, list):
-        raw_ids = [item["item_id"]] if item.get("item_id") is not None else []
-    out["item_ids"] = [str(value).strip() for value in raw_ids if not isinstance(value, bool)]
-    if item.get("resource_match") is not None:
-        out["resource_match"] = [
-            str(tag) for tag in item["resource_match"] if isinstance(tag, str)
-        ]
-    if "enabled" in item:
-        out["enabled"] = item["enabled"] is True
-    out["item_count"] = len(out["item_ids"])
-    if item.get("payload") or item.get("material"):
-        out["payload_set"] = True
-    return out
+    try:
+        return template_public(item)
+    except FulfillmentConfigError as error:
+        raise HTTPException(error.status_code, str(error)) from error
 
 
 @app.get("/api/bot/templates")
@@ -4610,51 +4557,33 @@ def save_template(
         unavailable_message="商品履约配置暂时不可用，请稍后重试",
     )
     try:
-        return _save_template_locked(body, user, account)
+        return _save_template_locked(body, user, account, lease_key)
     finally:
         _release_account_lease(lease_key, lease_owner)
 
 
-def _save_template_locked(body: TemplateIn, user, account):
+def _ensure_fulfillment_write(user, account, lease, permission="fulfillment.manage"):
+    _ensure_account_lease(lease)
+    current = db.get_user_by_id(user["id"])
+    if current is None or current["disabled_at"] is not None:
+        raise HTTPException(403, "当前用户已无权保存履约配置")
+    _require_permission(current, permission)
+    if not db.account_is_current(user["id"], account["id"], int(account["generation"] or 0)):
+        raise HTTPException(409, "店铺身份已变化，请重新读取配置")
+    return True
+
+
+def _save_template_locked(body: TemplateIn, user, account, lease=None):
     account_key = str(account["account_key"])
     snapshot = load_verified_snapshot(user["id"], account_key)
     document = _read_products_document(user["id"], account_key)
-    types = document.get("types", [])
-    if not isinstance(types, list):
-        types = []
-    template_id = body.template.id
-    template_id = str(template_id).strip() if template_id is not None else ""
-    index = None
-    for pos, item in enumerate(types):
-        if isinstance(item, dict) and item.get("delivery") in {"redeem", "pan"} and str(item.get("id") or "") == template_id:
-            index = pos
-            break
-    existing_item_ids = types[index].get("item_ids", []) if index is not None else []
-    template = _normalise_template_input(
-        body.template.model_dump(), snapshot, existing_item_ids
-    )
-    if index is not None:
-        updated = dict(template)
-        updated["id"] = template_id
-        types[index] = updated
-        persisted = updated
-    else:
-        new_id = f"template-{uuid.uuid4().hex[:8]}"
-        created = dict(template)
-        created["id"] = new_id
-        types.append(created)
-        persisted = created
-    normalized_document = dict(document)
-    normalized_document["types"] = types
     try:
-        write_secret(
-            user["id"],
-            "products_config.json",
-            json.dumps(normalized_document, ensure_ascii=False),
-            account_key,
-        )
-    except OSError as error:
-        raise HTTPException(503, "发货模板保存失败，请稍后重试") from error
+        updated, persisted = upsert_template(document, body.template.model_dump(), snapshot,
+            new_id=f"template-{uuid.uuid4().hex[:8]}")
+    except FulfillmentConfigError as error:
+        raise HTTPException(error.status_code, str(error)) from error
+    _write_products_document(user["id"], account_key, updated, before=document,
+        ensure_current=lambda: _ensure_fulfillment_write(user, account, lease))
     return {"ok": True, "template": _template_public(persisted)}
 
 
@@ -4674,42 +4603,23 @@ def delete_template(
         unavailable_message="商品履约配置暂时不可用，请稍后重试",
     )
     try:
-        return _delete_template_locked(template_id, user, account)
+        return _delete_template_locked(template_id, user, account, lease_key)
     finally:
         _release_account_lease(lease_key, lease_owner)
 
 
-def _delete_template_locked(template_id: str, user, account):
+def _delete_template_locked(template_id: str, user, account, lease=None):
     account_key = str(account["account_key"])
     template_id = str(template_id).strip()
     if not template_id or len(template_id) > 120:
         raise HTTPException(400, "模板标识无效")
     document = _read_products_document(user["id"], account_key)
-    types = document.get("types", [])
-    if not isinstance(types, list):
-        types = []
-    remaining = [
-        item
-        for item in types
-        if not (
-            isinstance(item, dict)
-            and item.get("delivery") in {"redeem", "pan"}
-            and str(item.get("id") or "") == template_id
-        )
-    ]
-    if len(remaining) == len(types):
-        raise HTTPException(404, "发货模板不存在")
-    normalized_document = dict(document)
-    normalized_document["types"] = remaining
     try:
-        write_secret(
-            user["id"],
-            "products_config.json",
-            json.dumps(normalized_document, ensure_ascii=False),
-            account_key,
-        )
-    except OSError as error:
-        raise HTTPException(503, "发货模板删除失败，请稍后重试") from error
+        updated = remove_template(document, template_id)
+    except FulfillmentConfigError as error:
+        raise HTTPException(error.status_code, str(error)) from error
+    _write_products_document(user["id"], account_key, updated, before=document,
+        ensure_current=lambda: _ensure_fulfillment_write(user, account, lease))
     return {"ok": True}
 
 
@@ -5501,7 +5411,6 @@ def _platform_settings_payload() -> dict:
             "users_exist": users_exist,
             "effective": bool(environment_allowed and database_open and users_exist),
         },
-        "update_channel": db.get_platform_setting("update_channel", "stable"),
     }
 
 
@@ -5529,6 +5438,33 @@ def _platform_user_payload(row) -> dict:
     }
 
 
+def _runtime_settings_payload():
+    return {"settings": runtime_settings.read(), "bounds": RuntimeSettings.bounds(),
+        "usage": {"running_workers": worker_manager.running_count()},
+        "memory_limit_kind": "address_space", "applies_to": "new_starts", "restart_performed": False}
+
+
+@app.get("/api/admin/resource-settings")
+def admin_get_resource_settings(_=Depends(require_platform_admin)):
+    try:
+        return _runtime_settings_payload()
+    except RuntimeSettingsError as exc:
+        raise HTTPException(exc.status_code, detail=exc.public_detail()) from exc
+    except sqlite3.Error as exc:
+        raise HTTPException(503, detail={"code": "resource_settings_unavailable", "message": "运行限制暂时无法读取"}) from exc
+
+
+@app.put("/api/admin/resource-settings")
+def admin_save_resource_settings(body: RuntimeSettingsIn, admin=Depends(require_platform_admin)):
+    try:
+        runtime_settings.save(int(admin["id"]), **body.model_dump(), emergency_admin=int(admin["id"]) == 0)
+        return _runtime_settings_payload()
+    except RuntimeSettingsError as exc:
+        raise HTTPException(exc.status_code, detail=exc.public_detail()) from exc
+    except sqlite3.Error as exc:
+        raise HTTPException(503, detail={"code": "resource_settings_unavailable", "message": "运行限制暂时无法保存"}) from exc
+
+
 @app.get("/api/admin/settings")
 def admin_get_settings(_=Depends(require_platform_admin)):
     return _platform_settings_payload()
@@ -5540,34 +5476,19 @@ def admin_save_settings(
     request: Request,
     admin=Depends(require_platform_admin),
 ):
-    if body.registration_open is None and body.update_channel is None:
+    if body.registration_open is None:
         raise HTTPException(
             400,
             detail={"code": "settings_empty", "message": "没有可保存的平台设置"},
         )
-    if body.update_channel is not None and body.update_channel not in {"stable", "beta"}:
-        raise HTTPException(
-            400,
-            detail={"code": "update_channel_invalid", "message": "更新通道无效"},
-        )
-    changed = []
-    if body.registration_open is not None:
-        db.set_platform_setting(
-            "registration_open", "1" if body.registration_open else "0", admin["id"]
-        )
-        changed.append("registration_open")
-    if body.update_channel is not None:
-        db.set_platform_setting("update_channel", body.update_channel, admin["id"])
-        changed.append("update_channel")
-    for setting in changed:
-        _audit(
-            "platform.settings_changed",
-            request,
-            actor_user_id=admin["id"],
-            target_type="setting",
-            target_id=setting,
-            metadata={"setting": setting, "value": db.get_platform_setting(setting)},
-        )
+    db.set_platform_setting(
+        "registration_open", "1" if body.registration_open else "0", admin["id"]
+    )
+    _audit(
+        "platform.settings_changed", request, actor_user_id=admin["id"],
+        target_type="setting", target_id="registration_open",
+        metadata={"setting": "registration_open", "value": db.get_platform_setting("registration_open")},
+    )
     return _platform_settings_payload()
 
 
@@ -5837,7 +5758,7 @@ def _require_update_operation(operation: str) -> None:
 
 
 def _admin_update_status_payload() -> dict:
-    channel = db.get_platform_setting("update_channel", "stable")
+    channel = RELEASE_CHANNEL
     current = version_payload(channel)
     capabilities = update_capabilities()
     active = db.active_platform_update()
@@ -5860,11 +5781,11 @@ def admin_check_update(
     request: Request,
     admin=Depends(require_platform_admin),
 ):
-    channel = db.get_platform_setting("update_channel", "stable")
+    channel = RELEASE_CHANNEL
     current = version_payload(channel)
     lease, owner = _begin_platform_update_lease(120)
     try:
-        payload, _ = inspect_releases(channel, current["version"])
+        payload = inspect_public_releases(current["version"])
         payload = db.save_platform_update_check(channel, payload)
         _audit(
             "platform.update_checked", request, actor_user_id=admin["id"],
@@ -5893,7 +5814,7 @@ def admin_download_update(
     admin=Depends(require_platform_admin),
 ):
     _require_update_operation("download")
-    channel = db.get_platform_setting("update_channel", "stable")
+    channel = RELEASE_CHANNEL
     current = version_payload(channel)
     lease, owner = _begin_platform_update_lease(900)
     try:
@@ -5955,7 +5876,7 @@ def _request_platform_install(action: str, body, request: Request, admin):
     lease, owner = _begin_platform_update_lease(300)
     try:
         _require_update_operation(action)
-        channel = db.get_platform_setting("update_channel", "stable")
+        channel = RELEASE_CHANNEL
         current = version_payload(channel)
         row = db.get_platform_update(body.version, channel)
         fields = {}
@@ -6036,11 +5957,13 @@ def _persist_restore_runtime(
     )
 
 
-def restore_desired_workers():
-    """Reconcile one durable worker intent for every enabled shop account."""
+def restore_desired_workers(_pending=None):
+    """Adopt existing processes before allocating slots to missing Workers."""
     if os.environ.get("SAAS_RESTORE_WORKERS", "1").strip().lower() in {"0", "false", "no"}:
         return
-    for runtime in db.list_worker_runtimes():
+    first_pass = _pending is None
+    pending = []
+    for runtime in (db.list_worker_runtimes() if first_pass else _pending):
         if runtime["desired_state"] != "running" and not runtime["pid"]:
             continue
         user_id = int(runtime["user_id"])
@@ -6082,7 +6005,7 @@ def restore_desired_workers():
             if runtime["desired_state"] != "running":
                 _stop_account_worker_locked(user_id, account, "restore_stopped")
                 continue
-            if user is None or not account["enabled"]:
+            if user is None or not account["enabled"] or _runtime_value(user, "disabled_at") is not None:
                 _stop_account_worker_locked(user_id, account, "account_unavailable")
                 continue
 
@@ -6213,7 +6136,22 @@ def restore_desired_workers():
                     last_error="shop_not_connected",
                 )
                 continue
+            if first_pass:
+                # A confirmed dead/retired PID is no longer an orphan. Persist
+                # that observation so the second pass cannot re-adopt or signal
+                # the old numeric PID (which the OS might already have reused).
+                if persisted_pid:
+                    runtime = _persist_restore_runtime(runtime, desired_state="running", mode=mode,
+                        state="starting", pid=None, last_error="")
+                    if runtime is None:
+                        continue
+                pending.append(runtime)
+                continue
             ok, reason = bot_start(user_id, mode, account_key)
+            if not ok and reason == "max_bots_reached":
+                _persist_restore_runtime(runtime, desired_state="running", state="capacity_limited",
+                                         pid=None, last_error="max_bots_reached")
+                continue
             if not ok:
                 raise RuntimeError(reason)
             persist_kwargs = {"account": account} if has_account_key else {}
@@ -6245,6 +6183,12 @@ def restore_desired_workers():
                 db.release_control_lease(lease_key, lease_owner)
             except (OSError, sqlite3.Error):
                 pass
+
+    if first_pass and pending:
+        # The second pass re-reads rows under each account lease. A concurrent
+        # stop/disable remains authoritative, while already adopted processes
+        # now occupy their real global slots before any new allocation.
+        restore_desired_workers(_pending=pending)
 
 
 def shutdown_services():

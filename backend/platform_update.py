@@ -30,7 +30,7 @@ from cryptography.exceptions import InvalidSignature, UnsupportedAlgorithm
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
-from version import VERSION, deployment_kind
+from version import VERSION, RELEASE_CHANNEL, deployment_kind
 
 
 RELEASE_OWNER = "tswawa"
@@ -50,7 +50,7 @@ MAX_ARCHIVE_MEMBERS = 5000
 MAX_RELEASE_NOTES_CHARS = 16_000
 MAX_PATH_LENGTH = 500
 MAX_PATH_COMPONENT = 240
-VALID_CHANNELS = frozenset({"stable", "beta"})
+VALID_CHANNELS = frozenset({"stable", "beta", RELEASE_CHANNEL})
 SEMVER_RE = re.compile(
     r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
     r"(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?"
@@ -226,7 +226,8 @@ def _validate_fixed_api_url(url: str, *, asset: bool = False) -> None:
             raise PlatformUpdateError("update_source_rejected")
         return
     expected = f"/repos/{RELEASE_OWNER}/{RELEASE_REPOSITORY}/releases"
-    if parsed.path != expected or parsed.query != "per_page=30":
+    allowed_query = parsed.query == "per_page=30" or re.fullmatch(r"per_page=100&page=[1-9][0-9]*", parsed.query)
+    if parsed.path != expected or not allowed_query:
         raise PlatformUpdateError("update_source_rejected")
 
 
@@ -466,6 +467,53 @@ def inspect_releases(channel: str, current_version: str, session=None) -> tuple[
         return payload, None
     payload["status"] = "available"
     return payload, release
+
+
+def inspect_public_releases(current_version: str, session=None) -> dict:
+    """One published-version feed, independent of signed installer artifacts."""
+    current = SemVer.parse(current_version)
+    session = session or requests.Session()
+    winner = winner_version = None
+    page = 1
+    seen_pages = set()
+    total_bytes = 0
+    while True:
+        raw = _request_bytes(session, f"{GITHUB_API_ROOT}/releases?per_page=100&page={page}",
+                             max_bytes=MAX_RELEASE_METADATA_BYTES)
+        total_bytes += len(raw)
+        fingerprint = hashlib.sha256(raw).hexdigest()
+        if total_bytes > MAX_RELEASE_METADATA_BYTES or fingerprint in seen_pages:
+            raise PlatformUpdateError("update_source_invalid")
+        seen_pages.add(fingerprint)
+        try:
+            releases = json.loads(raw.decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError) as exc:
+            raise PlatformUpdateError("update_source_invalid") from exc
+        if not isinstance(releases, list):
+            raise PlatformUpdateError("update_source_invalid")
+        for item in releases:
+            if not isinstance(item, dict) or item.get("draft") is True:
+                continue
+            try:
+                parsed = SemVer.parse(_version_from_tag(item.get("tag_name", "")))
+            except (PlatformUpdateError, TypeError, AttributeError):
+                continue
+            if winner_version is None or parsed.compare(winner_version) > 0:
+                winner, winner_version = item, parsed
+        if len(releases) < 100:
+            break
+        page += 1
+    payload = {"channel": RELEASE_CHANNEL, "current_version": current_version,
+               "available": False, "status": "no_release", "version": "",
+               "release_notes": "", "error_code": ""}
+    if winner is None:
+        return payload
+    available = winner_version.compare(current) > 0
+    payload.update(version=_version_from_tag(winner["tag_name"]), available=available,
+                   status="available" if available else "current",
+                   published_at=str(winner.get("published_at") or "")[:80],
+                   release_notes=str(winner.get("body") or "")[:MAX_RELEASE_NOTES_CHARS])
+    return payload
 
 
 def fetch_release(channel: str, current_version: str, session=None) -> ReleaseInfo | None:

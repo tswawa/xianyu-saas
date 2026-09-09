@@ -570,7 +570,47 @@ def main() -> None:
         continued_start.assert_called_once_with(13, "rules", "default")
         continued_persist.assert_called_once_with(13, "rules", already_running=False)
 
-    print("worker-recovery contract: safe adoption, token replacement, lookup isolation and PID reuse protection passed")
+        class CapacityDB(FakeDB):
+            def __init__(self):
+                super().__init__({"user_id": 22, "account_id": 1, "pid": None, "mode": "rules"})
+                self.rows = [dict(self.row), {**self.row, "user_id": 23, "account_id": 2, "pid": 23001}]
+
+            def list_worker_runtimes(self, desired_state=None):
+                return self.rows
+
+            def get_worker_runtime(self, user_id, account_id=None):
+                return next(row for row in self.rows if row["user_id"] == user_id and row["account_id"] == account_id)
+
+            def persist_worker_runtime(self, user_id, account_id, **fields):
+                row = self.get_worker_runtime(user_id, account_id)
+                row.update(fields)
+                self.updates.append((user_id, account_id, fields))
+                return row
+
+        capacity_db = CapacityDB()
+        actions = []
+        def adopt_before_start(uid, *_args):
+            actions.append(("adopt", uid))
+            return True, "adopted"
+        def blocked_start(uid, *_args):
+            actions.append(("start", uid))
+            return False, "max_bots_reached"
+        with (
+            patch.object(app, "db", capacity_db),
+            patch.object(app, "bot_status", return_value={"connected": True}),
+            patch.object(app, "bot_adopt", side_effect=adopt_before_start),
+            patch.object(app, "bot_start", side_effect=blocked_start),
+            patch.object(app, "_persist_worker_started"),
+            patch.object(app, "bot_stop") as no_forced_stop,
+        ):
+            app.restore_desired_workers()
+        assert actions == [("adopt", 23), ("start", 22)], actions
+        assert capacity_db.rows[0]["desired_state"] == "running"
+        assert capacity_db.rows[0]["state"] == "capacity_limited"
+        assert capacity_db.rows[0]["last_error"] == "max_bots_reached"
+        no_forced_stop.assert_not_called()
+
+    print("worker-recovery contract: safe adoption, token replacement, capacity-first recovery, lookup isolation and PID reuse protection passed")
 
 
 if __name__ == "__main__":

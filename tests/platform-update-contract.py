@@ -53,6 +53,7 @@ from platform_update import (  # noqa: E402
     available_rollback_versions,
     fetch_release,
     inspect_releases,
+    inspect_public_releases,
     update_capabilities,
     load_verified_candidate,
     stage_release,
@@ -345,6 +346,41 @@ def main() -> None:
         return inspect_releases(channel, current, session=FakeSession({
             metadata_url: FakeResponse(json.dumps(items).encode()),
         }))
+
+    public_url = "https://api.github.com/repos/tswawa/xianyu-saas/releases?per_page=100&page=1"
+
+    def public_metadata(items, current="0.1.0"):
+        return inspect_public_releases(current, session=FakeSession({
+            public_url: FakeResponse(json.dumps(items).encode()),
+        }))
+
+    assert public_metadata([])["status"] == "no_release"
+    # Public release discovery is not signed-installer validation. Pre-releases
+    # and normal releases participate in the same semantic version comparison.
+    published = [{"tag_name": "v0.2.0", "draft": False, "assets": []},
+                 {"tag_name": "v0.3.0-beta.1", "draft": False, "prerelease": True},
+                 {"tag_name": "v9.0.0", "draft": True}]
+    found = public_metadata(published)
+    assert found["version"] == "0.3.0-beta.1" and found["available"] is True
+    assert found["status"] == "available" and found["channel"] == "release"
+    assert public_metadata(published, current="0.3.0")["status"] == "current"
+    published.append({"tag_name": "v0.3.0", "draft": False, "assets": []})
+    assert public_metadata(published)["version"] == "0.3.0"
+    first_page = [{"tag_name": f"v0.1.{n}", "draft": False} for n in range(100)]
+    paged = FakeSession({
+        public_url: FakeResponse(json.dumps(first_page).encode()),
+        public_url.replace("&page=1", "&page=2"): FakeResponse(json.dumps([
+            {"tag_name": "v1.0.0", "draft": False, "assets": []},
+        ]).encode()),
+    })
+    assert inspect_public_releases("0.1.0", session=paged)["version"] == "1.0.0"
+    assert len(paged.seen) == 2
+    assert_error("update_source_invalid", lambda: inspect_public_releases("0.1.0", session=FakeSession({
+        public_url: FakeResponse(b'{"error":"bad response"}'),
+    })))
+    assert_error("update_redirect_rejected", lambda: inspect_public_releases("0.1.0", session=FakeSession({
+        public_url: FakeResponse(b"", status_code=302, headers={"location": "https://evil.invalid"}),
+    })))
 
     assert inspect_metadata([])[0]["status"] == "no_release"
     assert inspect_metadata([release_metadata(beta)])[0]["status"] == "no_release"

@@ -4,7 +4,7 @@
 
   const API_PREFIX = "/xianyu-saas";
   const QR_LOGIN_POLL_MS = 1500;
-  const ASSET_VERSION = "20260908-01";
+  const ASSET_VERSION = "20260909-01";
   const AI_TEXT_PLACEHOLDERS = new Set(["无", "暂无", "没有", "未填写", "待填写", "待补充", "占位", "n/a", "na", "none", "null", "todo", "tbd"]);
   const ICONS = API_PREFIX + "/assets/icons.svg?v=" + ASSET_VERSION + "#";
   // 旧版视图 key → 新版视图 key（历史会话/书签兜底）。
@@ -53,8 +53,6 @@
       connection: null,
       verificationToken: "",
       testedFingerprint: "",
-      legacySources: [],
-      selectedLegacySource: null,
       draft: null,
     },
     ops: newOpsState(),
@@ -86,13 +84,35 @@
     attention: [],
     summary: null,
     analytics: null,
-    analyticsPeriod: 1,
+    todayAnalytics: null,
+    trendAnalytics: null,
+    trendPeriod: 7,
+    analyticsPeriod: 7,
     analyticsPage: null,
+    resources: null,
+    resourcesError: null,
+    resourcesLoading: false,
+    resourcesInflightPromise: null,
+    resourcesPendingReload: false,
+    resourcesPollTimer: null,
+    resourcesGeneration: 0,
+    resourceSettings: null,
+    resourceRevision: 0,
+    resourceDraft: null,
+    resourceDraftDirty: false,
     products: [],
     productsAccountKey: "",
     productsLoad: null,
     productsTruncated: null,
     productsTruncatedAccountKey: "",
+    goodsViewMode: "cards",
+    goodsSearch: "",
+    goodsStatusFilter: "all",
+    goodsPage: 1,
+    goodsPageSize: 12,
+    deliveryStatus: { available: false, items: new Map(), loaded: false, error: null },
+    deliveryStatusAccountKey: "",
+    deliveryStatusEpoch: 0,
     catalogStatusGeneration: 0,
     catalogStatus: null,
     productsRequestGeneration: 0,
@@ -246,6 +266,38 @@
     if (image) return '<span class="' + thumbClass + '"><img src="' + esc(image) + '" alt="" loading="lazy" referrerpolicy="no-referrer"></span>';
     if (title) return '<span class="' + thumbClass + '"><span class="' + monogramClass + '" aria-hidden="true">' + esc(title.slice(0, 1)) + '</span></span>';
     return '<span class="' + thumbClass + '"><svg class="icon"><use href="' + ICONS + 'box"></use></svg></span>';
+  }
+
+  function loadGoodsPreferences() {
+    try {
+      const raw = JSON.parse(window.localStorage.getItem("xianyu-saas.goods-prefs") || "{}");
+      if (raw.viewMode === "cards" || raw.viewMode === "list") state.goodsViewMode = raw.viewMode;
+      if (raw.pageSize === 12 || raw.pageSize === 24) state.goodsPageSize = raw.pageSize;
+    } catch (error) {}
+  }
+
+  function persistGoodsPreferences() {
+    try {
+      window.localStorage.setItem("xianyu-saas.goods-prefs", JSON.stringify({
+        viewMode: state.goodsViewMode,
+        pageSize: state.goodsPageSize,
+      }));
+    } catch (error) {}
+  }
+
+  function setGoodsViewMode(mode) {
+    if (mode !== "cards" && mode !== "list") return;
+    state.goodsViewMode = mode;
+    persistGoodsPreferences();
+    renderProducts();
+  }
+
+  function setGoodsPageSize(size) {
+    const parsed = Number(size);
+    state.goodsPageSize = parsed === 24 ? 24 : 12;
+    state.goodsPage = 1;
+    persistGoodsPreferences();
+    renderProducts();
   }
 
   function accountStorageKey() {
@@ -477,6 +529,7 @@
       if (size) size.value = String(pageSize);
     }
     renderAccountTabs();
+    renderShopResources();
   }
 
   function renderAccountTabs() {
@@ -1211,6 +1264,7 @@
   }
 
   async function loadAiKnowledge(itemId, context = captureAccountContext()) {
+    if (!state.me || !accountContextMatches(context)) return;
     const selected = String(itemId || "").trim();
     if (!selected) return;
     const productGeneration = Number(state.ai.productGeneration || 0);
@@ -1220,7 +1274,7 @@
       accountScopedApi(context, basePath + "/knowledge"),
       accountScopedApi(context, basePath + "/versions").catch(() => ({ versions: [] })),
     ]);
-    if (!accountContextMatches(context) || generation !== state.ai.knowledgeGeneration || productGeneration !== Number(state.ai.productGeneration || 0) || selected !== state.ai.selectedItemId) return;
+    if (!state.me || !accountContextMatches(context) || generation !== state.ai.knowledgeGeneration || productGeneration !== Number(state.ai.productGeneration || 0) || selected !== state.ai.selectedItemId) return;
     state.ai.knowledge = knowledge?.knowledge || knowledge || null;
     state.ai.versions = Array.isArray(versions?.versions) ? versions.versions : [];
     state.ai.generatedKnowledge = null;
@@ -1229,6 +1283,7 @@
   }
 
   async function loadAiConfig({ preserveSelection = true } = {}) {
+    if (!state.me) return false;
     const context = captureAccountContext();
     const generation = ++state.ai.loadGeneration;
     const [status, connection, config, templates, products] = await Promise.all([
@@ -1238,7 +1293,7 @@
       accountScopedApi(context, "/api/bot/ai/templates"),
       accountScopedApi(context, "/api/bot/ai/products"),
     ]);
-    if (!accountContextMatches(context) || generation !== state.ai.loadGeneration) return false;
+    if (!state.me || !accountContextMatches(context) || generation !== state.ai.loadGeneration) return false;
     state.ai.status = status || null;
     state.ai.connection = connection?.connection || connection || null;
     state.ai.config = config?.config || config || null;
@@ -1256,7 +1311,9 @@
     state.ai.verificationToken = "";
     state.ai.testedFingerprint = "";
     renderAiConfig();
-    if (state.ai.selectedItemId) await loadAiKnowledge(state.ai.selectedItemId, context);
+    if (state.ai.selectedItemId && accountContextMatches(context) && state.view === "ai-config") {
+      await loadAiKnowledge(state.ai.selectedItemId, context);
+    }
     return accountContextMatches(context) && generation === state.ai.loadGeneration;
   }
 
@@ -1267,8 +1324,6 @@
       candidate.model,
       candidate.api_key || "",
       Number(state.settingsAi?.connection?.revision || 0),
-      state.settingsAi?.selectedLegacySource?.account_key || "",
-      state.settingsAi?.selectedLegacySource?.revision ?? null,
     ]);
   }
 
@@ -1285,12 +1340,6 @@
         model: $("#aiModel")?.value || "",
         api_key: $("#aiApiKey")?.value || "",
       };
-      if (state.settingsAi.selectedLegacySource) {
-        const src = state.settingsAi.selectedLegacySource;
-        if (state.settingsAi.draft.model !== src.model || state.settingsAi.draft.base_url !== src.base_url || state.settingsAi.draft.provider !== src.provider) {
-          state.settingsAi.selectedLegacySource = null;
-        }
-      }
     }
     if ($("#aiSaveConnection")) $("#aiSaveConnection").disabled = true;
     const connection = state.ai.connection || {};
@@ -1319,7 +1368,6 @@
     try {
       const hasConfiguredKey = Boolean(
         candidate.api_key ||
-        state.settingsAi?.selectedLegacySource?.api_key_configured ||
         (state.settingsAi?.connection?.api_key_configured && state.settingsAi?.connection?.provider === candidate.provider)
       );
       validateAiConnectionCandidate(candidate, { requireKey: !hasConfiguredKey });
@@ -1340,10 +1388,6 @@
         expected_revision: Number(state.settingsAi?.connection?.revision || 0),
       };
       if (candidate.api_key) payload.api_key = candidate.api_key;
-      if (state.settingsAi?.selectedLegacySource) {
-        payload.source_account_key = state.settingsAi.selectedLegacySource.account_key;
-        payload.source_revision = state.settingsAi.selectedLegacySource.revision;
-      }
       const result = await api("/api/settings/ai/connection/test", {
         method: "POST",
         body: JSON.stringify(payload),
@@ -1382,7 +1426,6 @@
     try {
       const hasConfiguredKey = Boolean(
         candidate.api_key ||
-        state.settingsAi?.selectedLegacySource?.api_key_configured ||
         (state.settingsAi?.connection?.api_key_configured && state.settingsAi?.connection?.provider === candidate.provider)
       );
       validateAiConnectionCandidate(candidate, { requireKey: !hasConfiguredKey });
@@ -1407,10 +1450,6 @@
         confirm: true,
       };
       if (candidate.api_key) payload.api_key = candidate.api_key;
-      if (state.settingsAi?.selectedLegacySource) {
-        payload.source_account_key = state.settingsAi.selectedLegacySource.account_key;
-        payload.source_revision = state.settingsAi.selectedLegacySource.revision;
-      }
       const result = await api("/api/settings/ai/connection", {
         method: "PUT",
         body: JSON.stringify(payload),
@@ -1422,7 +1461,6 @@
       settings.verificationToken = "";
       settings.testedFingerprint = "";
       if (unchanged) {
-        settings.selectedLegacySource = null;
         settings.draft = null;
         if ($("#aiApiKey")) $("#aiApiKey").value = "";
       }
@@ -1462,7 +1500,6 @@
       settings.connection = result.connection;
       settings.verificationToken = "";
       settings.testedFingerprint = "";
-      settings.selectedLegacySource = null;
       settings.draft = null;
       $("#aiApiKey").value = "";
       $("#aiSaveConnection").disabled = true;
@@ -2661,7 +2698,7 @@
   function clearSession(showMessage = true) {
     resetQrLogin();
     stopMerchantPolling();
-    ["xianyuLoginDialog", "quickRepliesDialog", "batchDeliveryDialog", "templateEditorDialog", "cardsEditorDialog", "confirmDialog", "docsHelpModal", "opsDiffModal"].forEach(closeDialog);
+    ["xianyuLoginDialog", "quickRepliesDialog", "batchDeliveryDialog", "templateEditorDialog", "cardsEditorDialog", "confirmDialog", "docsHelpModal"].forEach(closeDialog);
     closeVersionBadgePopover();
     state.confirmAction = null;
     resetManualReplyContext();
@@ -2679,7 +2716,7 @@
     state.automation = { rules: [], deliveries: [], running: false, strategy: "standard", enabled: true };
     resetAiState();
     resetOpsState();
-    state.settingsAi = { connection: null, verificationToken: "", testedFingerprint: "", legacySources: [], selectedLegacySource: null, draft: null };
+    state.settingsAi = { connection: null, verificationToken: "", testedFingerprint: "", draft: null };
     if ($("#aiApiKey")) $("#aiApiKey").value = "";
     if ($("#aiModel")) $("#aiModel").value = "";
     if ($("#aiBaseUrl")) $("#aiBaseUrl").value = "";
@@ -2689,8 +2726,23 @@
     state.attention = [];
     state.summary = null;
     state.analytics = null;
+    state.todayAnalytics = null;
+    state.trendAnalytics = null;
+    state.trendPeriod = 7;
     state.analyticsPage = null;
-    state.analyticsPeriod = 1;
+    state.analyticsPeriod = 7;
+    state.resources = null;
+    state.resourcesError = null;
+    state.resourcesLoading = false;
+    state.resourcesInflightPromise = null;
+    state.resourcesPendingReload = false;
+    state.resourcesGeneration = Number(state.resourcesGeneration || 0) + 1;
+    state.resourceSettings = null;
+    state.resourceRevision = 0;
+    state.resourceDraft = null;
+    state.resourceDraftDirty = false;
+    state.resourceBounds = null;
+    stopResourcePolling();
     state.products = [];
     state.productsAccountKey = "";
     state.productsLoad = null;
@@ -2714,11 +2766,18 @@
     state.versionUpdate = null;
     closeVersionBadgePopover();
     renderVersionBadge();
-    ["templateEditorForm", "cardsEditorForm", "cardsCreateForm", "batchDeliveryForm", "passwordChangeForm", "platformSettingsForm", "ordersFilterForm", "aiConnectionForm", "opsPromptForm"].forEach((id) => $("#" + id)?.reset());
+    ["templateEditorForm", "cardsEditorForm", "cardsCreateForm", "batchDeliveryForm", "passwordChangeForm", "platformSettingsForm", "resourceSettingsForm", "ordersFilterForm", "aiConnectionForm", "opsPromptForm"].forEach((id) => $("#" + id)?.reset());
+    const resSettingsMsg = $("#resourceSettingsMessage");
+    if (resSettingsMsg) { resSettingsMsg.textContent = ""; resSettingsMsg.className = "form-message"; }
+    ["homeResourcesMessage", "shopResourcesMessage"].forEach((id) => {
+      const el = $("#" + id);
+      if (el) { el.textContent = ""; el.className = "resources-message"; }
+    });
     [
       "homeStatCards", "homeProductGrid", "homeOrderList", "attentionList", "shopAccountsPanelList",
       "productGrid", "conversationItems", "chatMessages", "orderList", "ordersStatusTabs", "replyRuleList",
       "templateGrid", "cardsStats", "cardsList", "analyticsCards", "analyticsChart",
+      "homeResourceBody", "shopResourcesBody",
     ].forEach((id) => {
       const node = $("#" + id);
       if (node) node.innerHTML = "";
@@ -2736,7 +2795,7 @@
     $("#authPassword").value = "";
     if ($("#bootstrapToken")) $("#bootstrapToken").value = "";
     if ($("#updateAdminPassword")) $("#updateAdminPassword").value = "";
-    ["#updateActionMessage", "#passwordChangeMessage", "#versionLoadMessage", "#aiConnectionMessage", "#opsPromptMessage", "#opsPlanMessage"].forEach((selector) => text(selector, ""));
+    ["#updateActionMessage", "#passwordChangeMessage", "#versionLoadMessage", "#aiConnectionMessage", "#opsPromptMessage"].forEach((selector) => text(selector, ""));
     $("#workspace").hidden = true;
     $("#authScreen").hidden = false;
     void loadPublicVersionOnce();
@@ -2744,6 +2803,16 @@
   }
 
   function logout() {
+    state.refreshEpoch = Number(state.refreshEpoch || 0) + 1;
+    state.accountEpoch = Number(state.accountEpoch || 0) + 1;
+    state.resourcesGeneration = Number(state.resourcesGeneration || 0) + 1;
+    state.resourcesInflightPromise = null;
+    state.resourcesPendingReload = false;
+    stopResourcePolling();
+    if (state.ai) {
+      state.ai.knowledgeGeneration = Number(state.ai.knowledgeGeneration || 0) + 1;
+      state.ai.loadGeneration = Number(state.ai.loadGeneration || 0) + 1;
+    }
     return runManualReplyDestructiveAction(async () => {
       await cancelQrLogin(true, true);
       const accountKey = state.activeAccountKey;
@@ -2823,12 +2892,26 @@
     state.attention = [];
     state.summary = null;
     state.analytics = null;
+    state.todayAnalytics = null;
+    state.trendAnalytics = null;
+    state.trendPeriod = 7;
     state.analyticsPage = null;
+    state.resources = null;
     state.products = [];
     state.productsAccountKey = "";
     state.productsLoad = null;
     state.productsTruncated = null;
     state.productsTruncatedAccountKey = "";
+    state.deliveryStatus = { available: false, items: new Map(), loaded: false, error: null };
+    state.deliveryStatusAccountKey = "";
+    state.deliveryStatusEpoch = state.accountEpoch;
+    state.goodsSearch = "";
+    state.goodsStatusFilter = "all";
+    state.goodsPage = 1;
+    const goodsSearchInput = $("#productSearch");
+    if (goodsSearchInput) goodsSearchInput.value = "";
+    const goodsFilterSelect = $("#productStatusFilter");
+    if (goodsFilterSelect) goodsFilterSelect.value = "all";
     state.catalogStatus = null;
     state.batchDelivery = { enabled: true, previewToken: "", preview: null, generation: Number(state.batchDelivery?.generation || 0) + 1 };
     resetAccountInboxState({ restorePreferences: true });
@@ -3027,9 +3110,9 @@
 
   function renderNav() {
     const items = [
-      { view: "home", label: "运营概览", icon: "layout-dashboard" },
+      { view: "home", label: "店铺概览", icon: "layout-dashboard" },
       { view: "chat", label: "智能客服", icon: "message-square-text" },
-      { view: "goods", label: "履约中心", icon: "box" },
+      { view: "goods", label: "商品与发货", icon: "box" },
       { view: "orders", label: "订单管理", icon: "package-check" },
       { view: "ops", label: "智能运维", icon: "sparkles" },
     ];
@@ -3091,12 +3174,164 @@
     renderAccountSwitcher();
   }
 
+  async function loadProductDeliveryStatus() {
+    const context = captureAccountContext();
+    const epoch = context.epoch;
+    const accountKey = context.accountKey;
+    try {
+      const data = await accountScopedApi(context, "/api/bot/products/delivery-status");
+      if (!accountContextMatches(context) || epoch !== state.accountEpoch || accountKey !== state.activeAccountKey) {
+        return;
+      }
+      const items = Array.isArray(data?.items) ? data.items : [];
+      state.deliveryStatus = {
+        available: data?.available === true,
+        items: new Map(items.map((it) => [String(it.item_id), it])),
+        loaded: true,
+        error: null,
+      };
+      state.deliveryStatusAccountKey = accountKey;
+      state.deliveryStatusEpoch = epoch;
+      renderProducts();
+    } catch (error) {
+      if (!accountContextMatches(context) || epoch !== state.accountEpoch) return;
+      state.deliveryStatus.error = error;
+    }
+  }
+
+  function getProductDeliveryInfo(product) {
+    const itemId = String(product.id || "");
+    let item = null;
+    if (state.deliveryStatus?.loaded && state.deliveryStatus?.items) {
+      item = state.deliveryStatus.items.get(itemId);
+    }
+
+    if (item) {
+      const delivery = item.delivery || "material";
+      const configured = Boolean(item.configured);
+      const enabled = item.enabled !== false;
+      const templateId = item.template_id || null;
+
+      let filterCategory = "unconfigured";
+      if (delivery === "conflict") {
+        filterCategory = "conflict";
+      } else if (configured && !enabled) {
+        filterCategory = "paused";
+      } else if (configured && enabled) {
+        filterCategory = "configured";
+      } else {
+        filterCategory = "unconfigured";
+      }
+
+      return {
+        delivery,
+        configured,
+        enabled,
+        templateId,
+        filterCategory,
+      };
+    }
+
+    if (state.deliveryStatus?.loaded && state.deliveryStatus?.available) {
+      return {
+        delivery: "unconfigured",
+        configured: false,
+        enabled: false,
+        templateId: null,
+        filterCategory: "unconfigured",
+      };
+    }
+
+    const legacyDelivery = (state.automation?.deliveries || []).find((d) => String(d.item_id) === itemId);
+    if (legacyDelivery) {
+      const configured = Boolean(String(legacyDelivery.material || "").trim());
+      const enabled = legacyDelivery.enabled !== false;
+      return {
+        delivery: "material",
+        configured,
+        enabled,
+        templateId: null,
+        filterCategory: configured ? (enabled ? "configured" : "paused") : "unconfigured",
+      };
+    }
+
+    return {
+      delivery: "unconfigured",
+      configured: false,
+      enabled: false,
+      templateId: null,
+      filterCategory: "unconfigured",
+    };
+  }
+
+  function renderProductDeliveryBadge(info) {
+    if (info.delivery === "pan") {
+      return info.enabled
+        ? '<span class="badge badge-green">网盘自动发货</span>'
+        : '<span class="badge badge-amber">网盘已暂停</span>';
+    }
+    if (info.delivery === "redeem") {
+      return info.enabled
+        ? '<span class="badge badge-green">卡密自动发货</span>'
+        : '<span class="badge badge-amber">卡密已暂停</span>';
+    }
+    if (info.delivery === "conflict") {
+      return '<span class="badge badge-red">配置冲突</span>';
+    }
+    if (info.delivery === "material") {
+      if (info.configured) {
+        return info.enabled
+          ? '<span class="badge badge-green">已设置资料</span>'
+          : '<span class="badge badge-amber">资料已暂停</span>';
+      }
+      return '<span class="badge badge-muted">未设置资料</span>';
+    }
+    return '<span class="badge badge-muted">未设置资料</span>';
+  }
+
+  function renderProductActions(product, itemId, info) {
+    if (info.delivery === "pan" || info.delivery === "redeem") {
+      return '<button class="button button-secondary button-compact" type="button" data-view="templates" aria-label="查看' + esc(product.title || "未命名商品") + '的发货模板"><span>查看发货模板</span></button>';
+    }
+    if (info.delivery === "conflict") {
+      return '<button class="button button-secondary button-compact" type="button" data-view="templates" aria-label="查看发货模板排查配置冲突"><span>查看模板</span></button>';
+    }
+    if (info.delivery === "material" && info.configured) {
+      return '<button class="button button-secondary button-compact" type="button" data-edit-delivery data-item-id="' + esc(itemId) + '" aria-label="编辑' + esc(product.title || "未命名商品") + '的资料"><span>编辑资料</span></button>' +
+        '<button class="button button-secondary button-compact" type="button" data-delivery-toggle="' + esc(itemId) + '" aria-label="' + (info.enabled ? "暂停" : "恢复") + esc(product.title || "未命名商品") + '的资料"><span>' + (info.enabled ? "暂停资料" : "恢复资料") + "</span></button>";
+    }
+    return '<button class="button button-secondary button-compact" type="button" data-edit-delivery data-item-id="' + esc(itemId) + '" aria-label="编辑' + esc(product.title || "未命名商品") + '的资料"><span>编辑资料</span></button>';
+  }
+
   function renderProducts() {
     const grid = $("#productGrid");
     const empty = $("#productsEmpty");
     const notice = $("#productsNotice");
     const view = shopStateView(state.bot || {});
-    const deliveryById = new Map((state.automation?.deliveries || []).map((item) => [String(item.item_id), item]));
+
+    const cardsBtn = $("#productViewCards");
+    const listBtn = $("#productViewList");
+    if (cardsBtn) {
+      cardsBtn.classList.toggle("is-active", state.goodsViewMode === "cards");
+      cardsBtn.setAttribute("aria-pressed", String(state.goodsViewMode === "cards"));
+    }
+    if (listBtn) {
+      listBtn.classList.toggle("is-active", state.goodsViewMode === "list");
+      listBtn.setAttribute("aria-pressed", String(state.goodsViewMode === "list"));
+    }
+    const searchInput = $("#productSearch");
+    if (searchInput && document.activeElement !== searchInput && searchInput.value !== state.goodsSearch) {
+      searchInput.value = state.goodsSearch;
+    }
+    const statusSelect = $("#productStatusFilter");
+    if (statusSelect && statusSelect.value !== state.goodsStatusFilter) {
+      statusSelect.value = state.goodsStatusFilter;
+    }
+    const pageSizeSelect = $("#productPageSize");
+    if (pageSizeSelect && pageSizeSelect.value !== String(state.goodsPageSize)) {
+      pageSizeSelect.value = String(state.goodsPageSize);
+    }
+
     const setProductsNotice = (message) => {
       if (!notice) return;
       if (message) {
@@ -3106,13 +3341,13 @@
         notice.hidden = true;
       }
     };
+
     const homeGrid = $("#homeProductGrid");
     if (homeGrid) {
       const featured = state.products.slice(0, 6);
       homeGrid.innerHTML = featured.length ? featured.map((product) => {
-        const delivery = deliveryById.get(String(product.id || ""));
-        const configured = Boolean(delivery) && Boolean(String(delivery.material || "").trim());
-        const active = configured && delivery.enabled !== false;
+        const info = getProductDeliveryInfo(product);
+        const active = info.configured && info.enabled;
         return '<a class="home-product-card" href="#" data-view="goods" aria-label="查看商品：' + esc(product.title || "未命名商品") + '">' +
           productThumb(product, "home") +
           '<strong class="home-product-name">' + esc(product.title || "未命名商品") + "</strong>" +
@@ -3120,9 +3355,12 @@
           '<span class="badge ' + (active ? "badge-green" : "badge-muted") + '">' + (active ? "已设置资料" : "未设置") + "</span></a>";
       }).join("") : '<div class="automation-empty">还没有商品，连接店铺后自动整理。</div>';
     }
+
     if (!state.products.length) {
-      grid.innerHTML = "";
-      empty.hidden = false;
+      if (grid) grid.innerHTML = "";
+      if (empty) empty.hidden = false;
+      const paginationWrap = $("#productPagination");
+      if (paginationWrap) paginationWrap.hidden = true;
       const copies = {
         not_started: ["还没有连接店铺", "先连接闲鱼店铺，系统会自动读取商品名称、简介和价格。", "连接店铺", "view"],
         syncing: ["商品正在整理", "登录已确认，系统正在后台读取商品，完成后会自动显示。", "正在整理商品", "disabled"],
@@ -3155,29 +3393,109 @@
       $$('[data-open-batch-delivery]').forEach((button) => { button.disabled = true; });
       return;
     }
-    empty.hidden = true;
+
+    if (empty) empty.hidden = true;
     setProductsNotice(view.restricted
       ? "账号已连接，当前商品来自上次成功检测；发布相关操作受到闲鱼限制。"
       : view.catalog === "stale"
         ? "当前显示上次成功整理的商品，新的检测暂未完成。"
         : "");
-    grid.innerHTML = state.products.map((product) => {
-      const itemId = String(product.id || "");
-      const delivery = deliveryById.get(itemId);
-      const configured = Boolean(delivery) && Boolean(String(delivery.material || "").trim());
-      const paused = configured && delivery.enabled === false;
-      const badge = configured
-        ? (paused ? '<span class="badge badge-amber">资料已暂停</span>' : '<span class="badge badge-green">已设置资料</span>')
-        : '<span class="badge badge-muted">未设置资料</span>';
-      const actions = '<button class="button button-secondary button-compact" type="button" data-edit-delivery data-item-id="' + esc(itemId) + '" aria-label="编辑' + esc(product.title || "未命名商品") + '的资料"><span>编辑资料</span></button>' +
-        (configured ? '<button class="button button-secondary button-compact" type="button" data-delivery-toggle="' + esc(itemId) + '" aria-label="' + (paused ? "恢复" : "暂停") + esc(product.title || "未命名商品") + '的资料"><span>' + (paused ? "恢复资料" : "暂停资料") + "</span></button>" : "");
-      return '<div class="product-row">' +
-        '<div class="product-cell product-cell-main">' + productThumb(product, "product") + '<div><strong class="product-title">' + esc(product.title || "未命名商品") + '</strong><small class="product-desc">' + esc(product.description || "暂无商品简介") + "</small></div></div>" +
-        '<span class="product-price">' + esc(product.price_display || "价格待同步") + "</span>" +
-        badge +
-        '<div class="product-actions">' + actions + "</div>" +
-        "</div>";
-    }).join("");
+    $$('[data-open-batch-delivery]').forEach((button) => { button.disabled = false; });
+
+    const query = String(state.goodsSearch || "").trim().toLowerCase();
+    const filterCat = state.goodsStatusFilter || "all";
+
+    const filtered = state.products.filter((product) => {
+      const info = getProductDeliveryInfo(product);
+      if (filterCat !== "all" && info.filterCategory !== filterCat) {
+        return false;
+      }
+      if (query) {
+        const idStr = String(product.id || "").toLowerCase();
+        const titleStr = String(product.title || "").toLowerCase();
+        const descStr = String(product.description || "").toLowerCase();
+        if (!idStr.includes(query) && !titleStr.includes(query) && !descStr.includes(query)) {
+          return false;
+        }
+      }
+      return true;
+    });
+
+    const pageSize = state.goodsPageSize === 24 ? 24 : 12;
+    const totalCount = filtered.length;
+    const pageCount = Math.max(1, Math.ceil(totalCount / pageSize));
+    state.goodsPage = Math.min(pageCount, Math.max(1, state.goodsPage));
+    const startIndex = (state.goodsPage - 1) * pageSize;
+    const pageItems = filtered.slice(startIndex, startIndex + pageSize);
+
+    const paginationWrap = $("#productPagination");
+    if (paginationWrap) {
+      paginationWrap.hidden = false;
+      text("#productPageLabel", "第 " + state.goodsPage + " / " + pageCount + " 页");
+      const prevBtn = $("#productPrevPage");
+      if (prevBtn) prevBtn.disabled = state.goodsPage <= 1;
+      const nextBtn = $("#productNextPage");
+      if (nextBtn) nextBtn.disabled = state.goodsPage >= pageCount;
+    }
+
+    if (!pageItems.length) {
+      if (grid) {
+        grid.className = state.goodsViewMode === "list" ? "product-card-grid is-list-view" : "product-card-grid";
+        grid.innerHTML = '<div class="table-cell-empty" style="grid-column: 1 / -1; padding: 40px 16px; text-align: center; color: var(--muted);">' +
+          (query || filterCat !== "all" ? "没有找到符合筛选条件的商品" : "暂无可展示的商品") + "</div>";
+      }
+      return;
+    }
+
+    if (state.goodsViewMode === "list") {
+      if (grid) {
+        grid.className = "product-card-grid is-list-view";
+        grid.innerHTML = pageItems.map((product) => {
+          const itemId = String(product.id || "");
+          const info = getProductDeliveryInfo(product);
+          const badge = renderProductDeliveryBadge(info);
+          const actions = renderProductActions(product, itemId, info);
+          return '<div class="product-row" data-product-id="' + esc(itemId) + '">' +
+            '<div class="product-cell product-cell-main">' +
+            productThumb(product, "product") +
+            '<div><strong class="product-title" title="' + esc(product.title || "未命名商品") + '">' + esc(product.title || "未命名商品") + '</strong>' +
+            '<small class="product-desc">' + esc(product.description || "暂无商品简介") + "</small></div></div>" +
+            '<span class="product-price">' + esc(product.price_display || "价格待同步") + "</span>" +
+            badge +
+            '<div class="product-actions">' + actions + "</div>" +
+            "</div>";
+        }).join("");
+      }
+    } else {
+      if (grid) {
+        grid.className = "product-card-grid";
+        grid.innerHTML = pageItems.map((product) => {
+          const itemId = String(product.id || "");
+          const info = getProductDeliveryInfo(product);
+          const badge = renderProductDeliveryBadge(info);
+          const actions = renderProductActions(product, itemId, info);
+          const titleChar = String(product.title || "").trim().slice(0, 1) || "商";
+          const image = productImageUrl(product);
+          return '<div class="product-card" data-product-id="' + esc(itemId) + '">' +
+            '<div class="product-card-cover">' +
+            (image
+              ? '<img src="' + esc(image) + '" alt="' + esc(product.title || "") + '" loading="lazy" referrerpolicy="no-referrer" onerror="this.style.display=\'none\';if(this.nextElementSibling)this.nextElementSibling.style.display=\'flex\';">' +
+                '<span class="cover-monogram" style="display:none;" aria-hidden="true">' + esc(titleChar) + "</span>"
+              : '<span class="cover-monogram" aria-hidden="true">' + esc(titleChar) + "</span>"
+            ) +
+            "</div>" +
+            '<div class="product-card-body">' +
+            '<strong class="product-card-title" title="' + esc(product.title || "未命名商品") + '">' + esc(product.title || "未命名商品") + "</strong>" +
+            '<div class="product-card-meta">' +
+            '<span class="product-card-price">' + esc(product.price_display || "价格待同步") + "</span>" +
+            badge +
+            "</div>" +
+            '<div class="product-card-actions">' + actions + "</div>" +
+            "</div>" +
+            "</div>";
+        }).join("");
+      }
+    }
     $$('[data-open-batch-delivery]').forEach((button) => { button.disabled = false; });
   }
 
@@ -3745,94 +4063,458 @@
   function renderHomeStats() {
     const host = $("#homeStatCards");
     if (!host) return;
-    const rules = Array.isArray(state.automation?.rules) ? state.automation.rules : [];
-    const deliveries = Array.isArray(state.automation?.deliveries) ? state.automation.deliveries : [];
-    const configuredDeliveries = deliveries.filter((item) => Boolean(String(item.material || "").trim()));
-    const connected = shopStateView(state.bot || {}).connection === "connected";
-    const activeAnalytics = state.analyticsPage || state.analytics;
-    const totals = activeAnalytics?.totals && typeof activeAnalytics.totals === "object"
-      ? activeAnalytics.totals
-      : null;
+    const totals = state.todayAnalytics?.totals && typeof state.todayAnalytics.totals === "object"
+      ? state.todayAnalytics.totals
+      : (state.analytics?.totals && typeof state.analytics.totals === "object" ? state.analytics.totals : null);
     if (totals) {
       const buyerMessages = Number(totals.buyer_messages_total ?? totals.messages_total ?? 0);
       const autoReplies = Number(totals.auto_replies_total || 0);
-      const replyRate = buyerMessages > 0 ? Math.min(100, Math.round((autoReplies / buyerMessages) * 1000) / 10) : 0;
-      const periodLabel = Number(state.analyticsPeriod || 1) === 1 ? "今日已接收" : "当前周期已接收";
+      const fulfillmentSuccess = Number(totals.fulfillment_success_total || 0);
+      const unreadConversations = Number(totals.unread_conversations_total || 0);
       host.innerHTML =
-        statCard("买家咨询总数", buyerMessages, "message-square-text", "tone-yellow", periodLabel) +
-        statCard("自动回复率", replyRate + "%", "zap", "tone-blue", "规则与 AI 回复 " + autoReplies + " 次") +
-        statCard("履约自动发送", Number(totals.fulfillment_success_total || 0) + " 笔", "package-check", "tone-green", "订单核验后执行") +
-        statCard("异常与待办", String(attentionPendingTotal() + Number(totals.fulfillment_failed_total || 0)) + " 项", "circle-alert", "tone-red", "需要人工关注");
+        statCard("今日买家消息", buyerMessages, "message-square-text", "tone-yellow") +
+        statCard("今日自动回复", autoReplies, "bot", "tone-blue") +
+        statCard("今日发货成功", fulfillmentSuccess, "package-check", "tone-green") +
+        statCard("当前未读会话", unreadConversations, "clock", "tone-amber");
       return;
     }
     host.innerHTML =
-      statCard("在售商品", state.products.length ? String(state.products.length) : "0", "box", "tone-yellow", "当前店铺已识别") +
-      statCard("关键词规则", String(rules.length), "settings", "tone-blue", rules.length ? "按列表顺序匹配" : "尚未配置") +
-      statCard("已设资料商品", String(configuredDeliveries.length), "file-text", "tone-green", configuredDeliveries.length ? "付款后自动发送" : "尚未配置") +
-      statCard("店铺状态", connected ? "已连接" : "未连接", connected ? "wifi" : "wifi-off", connected ? "tone-green" : "tone-amber", connected ? "可正常自动处理" : "先连接店铺");
+      statCard("今日买家消息", "--", "message-square-text", "tone-yellow") +
+      statCard("今日自动回复", "--", "bot", "tone-blue") +
+      statCard("今日发货成功", "--", "package-check", "tone-green") +
+      statCard("当前未读会话", "--", "clock", "tone-amber");
   }
 
-  function renderAnalytics() {
-    const cards = $("#analyticsCards");
+  function renderAnalyticsChart() {
     const chart = $("#analyticsChart");
     const periodHost = $("#analyticsPeriod");
     if (!chart) return;
     if (periodHost) {
       $$("[data-period]", periodHost).forEach((button) => {
-        const active = Number(button.dataset.period || 1) === Number(state.analyticsPeriod || 1);
+        const active = Number(button.dataset.period || 7) === Number(state.trendPeriod || 7);
         button.classList.toggle("is-active", active);
         button.setAttribute("aria-pressed", String(active));
       });
     }
-    const totals = state.analyticsPage?.totals && typeof state.analyticsPage.totals === "object"
-      ? state.analyticsPage.totals
-      : null;
-    if (cards) {
-      if (totals) {
-        cards.innerHTML =
-          statCard("买家消息", Number(totals.buyer_messages_total ?? totals.messages_total ?? 0), "message-square-text", "tone-yellow") +
-          statCard("自动回复", Number(totals.auto_replies_total || 0), "bot", "tone-blue") +
-          statCard("发货成功", Number(totals.fulfillment_success_total || 0), "package-check", "tone-green") +
-          statCard("发货失败", Number(totals.fulfillment_failed_total || 0), "circle-alert", "tone-red");
-      } else {
-        cards.innerHTML = '<div class="automation-empty">暂无统计数据</div>';
-      }
-    }
-    renderHomeStats();
-    const buckets = Array.isArray(state.analyticsPage?.buckets) ? state.analyticsPage.buckets : [];
-    const nonEmpty = buckets.filter((bucket) => Number(bucket?.messages_total || 0) > 0);
+    const buckets = Array.isArray(state.trendAnalytics?.buckets) ? state.trendAnalytics.buckets : [];
     const emptyNote = chart.parentElement?.querySelector(".chart-empty") || null;
-    if (!nonEmpty.length) {
+    if (!buckets.length) {
       chart.innerHTML = "";
       if (emptyNote) emptyNote.hidden = false;
       return;
     }
     if (emptyNote) emptyNote.hidden = true;
-    const peak = Math.max(...nonEmpty.map((bucket) => Number(bucket.messages_total || 0)));
+    const peak = Math.max(
+      ...buckets.map((b) => Math.max(Number(b?.buyer_messages_total ?? b?.messages_total ?? 0), Number(b?.auto_replies_total || 0))),
+      1
+    );
     chart.innerHTML = buckets.map((bucket) => {
-      const value = Number(bucket?.messages_total || 0);
-      const height = peak > 0 ? Math.max(4, Math.round((value / peak) * 100)) : 0;
+      const buyerVal = Number(bucket?.buyer_messages_total ?? bucket?.messages_total ?? 0);
+      const replyVal = Number(bucket?.auto_replies_total || 0);
+      const buyerHeight = peak > 0 && buyerVal > 0 ? Math.max(4, Math.round((buyerVal / peak) * 100)) : 0;
+      const replyHeight = peak > 0 && replyVal > 0 ? Math.max(4, Math.round((replyVal / peak) * 100)) : 0;
       const date = String(bucket?.date || "");
       const label = date.length >= 10 ? date.slice(5, 10).replace("-", "/") : date;
-      return '<div class="chart-bar" title="' + esc(label + " · " + value + " 条消息") + '">' +
-        '<span class="chart-bar-fill" style="height:' + height + '%"></span>' +
-        '<span class="chart-bar-label">' + esc(label) + "</span></div>";
+      const tip = `${date || label} · 买家消息 ${buyerVal} 条 · 自动回复 ${replyVal} 条`;
+      return '<div class="chart-bar" title="' + esc(tip) + '">' +
+        '<div class="chart-bar-bars">' +
+          '<span class="chart-bar-fill is-buyer" style="height:' + buyerHeight + '%" title="买家消息: ' + buyerVal + '"></span>' +
+          '<span class="chart-bar-fill is-reply" style="height:' + replyHeight + '%" title="自动回复: ' + replyVal + '"></span>' +
+        '</div>' +
+        '<span class="chart-bar-label">' + esc(label) + '</span></div>';
     }).join("");
   }
 
-  async function loadAnalytics(period = state.analyticsPeriod) {
+  function renderAnalytics() {
+    renderHomeStats();
+    renderAnalyticsChart();
+  }
+
+  async function loadTrendAnalytics(period = state.trendPeriod) {
     const context = captureAccountContext();
-    state.analyticsPeriod = Number(period) === 7 || Number(period) === 30 ? Number(period) : 1;
-    const data = await api("/api/bot/analytics?period=" + state.analyticsPeriod);
-    if (!accountContextMatches(context)) return;
-    state.analyticsPage = data || null;
-    renderAnalytics();
+    const p = Number(period) === 30 ? 30 : 7;
+    state.trendPeriod = p;
+    state.analyticsPeriod = p;
+    try {
+      const data = await api("/api/bot/analytics?period=" + p);
+      if (!accountContextMatches(context)) return null;
+      state.trendAnalytics = data || null;
+      state.analyticsPage = data || null;
+      renderAnalyticsChart();
+      return data;
+    } catch {
+      return null;
+    }
+  }
+
+  async function loadTodayAnalytics(epoch = state.accountEpoch) {
+    const context = captureAccountContext(epoch);
+    try {
+      const data = await api("/api/bot/analytics?period=1");
+      if (!accountContextMatches(context)) return null;
+      state.todayAnalytics = data || null;
+      state.analytics = data || null;
+      renderHomeStats();
+      return data;
+    } catch {
+      return null;
+    }
+  }
+
+  async function loadAnalytics(period) {
+    const p = Number(period);
+    if (p === 7 || p === 30) {
+      return loadTrendAnalytics(p);
+    }
+    return loadTodayAnalytics();
+  }
+
+  function formatCpuUsage(account) {
+    const s = account.metrics_state;
+    const w = account.worker_state;
+    if (s === "sampling" || (w === "running" && account.cpu_percent === null && s !== "stopped" && s !== "unavailable")) {
+      return "采样中...";
+    }
+    if (s === "stopped" || w === "stopped" || w === "disabled") {
+      return "已停止";
+    }
+    if (s === "unavailable" || account.cpu_percent === null || account.cpu_percent === undefined) {
+      return "--";
+    }
+    const num = Number(account.cpu_percent);
+    if (Number.isFinite(num)) {
+      return num.toFixed(1) + "%";
+    }
+    return "--";
+  }
+
+  function formatMemoryBytes(bytes) {
+    if (bytes === null || bytes === undefined) return "--";
+    const num = Number(bytes);
+    if (!Number.isFinite(num)) return "--";
+    const mib = Math.round(num / (1024 * 1024));
+    return mib + " MiB";
+  }
+
+  function formatMemoryLimitCell(account) {
+    if (account.memory_limit_bytes === null || account.memory_limit_bytes === undefined) return "--";
+    return formatMemoryBytes(account.memory_limit_bytes);
+  }
+
+  function formatNextStartupMemoryCell(account) {
+    if (account.configured_memory_limit_bytes === null || account.configured_memory_limit_bytes === undefined) return "--";
+    const base = formatMemoryBytes(account.configured_memory_limit_bytes);
+    if (account.pending_restart === true) {
+      return base + ' <span class="badge badge-amber" title="新配置将在该店铺下次重启时生效">待重启生效</span>';
+    }
+    return base;
+  }
+
+  function formatUptime(account) {
+    if (!account) return "--";
+    if (account.worker_state === "stopped" || account.metrics_state === "stopped") {
+      return "未运行";
+    }
+    if (account.uptime_seconds === null || account.uptime_seconds === undefined) {
+      return "--";
+    }
+    const sec = Math.floor(Number(account.uptime_seconds));
+    if (!Number.isFinite(sec) || sec < 0) return "--";
+    if (sec === 0) return "刚刚启动";
+    if (sec < 60) return sec + "秒";
+    if (sec < 3600) {
+      const m = Math.floor(sec / 60);
+      const s = sec % 60;
+      return s > 0 ? `${m}分${s}秒` : `${m}分钟`;
+    }
+    if (sec < 86400) {
+      const h = Math.floor(sec / 3600);
+      const m = Math.floor((sec % 3600) / 60);
+      return m > 0 ? `${h}小时${m}分` : `${h}小时`;
+    }
+    const d = Math.floor(sec / 86400);
+    const h = Math.floor((sec % 86400) / 3600);
+    return h > 0 ? `${d}天${h}小时` : `${d}天`;
+  }
+
+  function formatWorkerStatusBadge(account) {
+    if (!account) return '<span class="badge badge-muted">--</span>';
+    if (account.metrics_state === "sampling") {
+      return '<span class="badge badge-amber">采样中</span>';
+    }
+    if (account.worker_state === "running" || account.metrics_state === "ready") {
+      return '<span class="badge badge-green">运行中</span>';
+    }
+    if (account.worker_state === "starting") {
+      return '<span class="badge badge-blue">启动中</span>';
+    }
+    if (account.worker_state === "stopping") {
+      return '<span class="badge badge-amber">停止中</span>';
+    }
+    if (account.worker_state === "disabled" || account.enabled === false) {
+      return '<span class="badge badge-muted">已停用</span>';
+    }
+    if (account.worker_state === "stopped" || account.metrics_state === "stopped") {
+      return '<span class="badge badge-muted">已停止</span>';
+    }
+    return '<span class="badge badge-muted">未知</span>';
+  }
+
+  function formatSampledTime(timestamp) {
+    if (!timestamp) return "未知时间";
+    const numeric = Number(timestamp);
+    if (!Number.isFinite(numeric) || numeric <= 0) return "未知时间";
+    const ms = numeric > 1e11 ? numeric : numeric * 1000;
+    const date = new Date(ms);
+    const pad = (n) => String(n).padStart(2, "0");
+    return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+  }
+
+  function isResourcesStale() {
+    if (!state.resources?.sampled_at) return false;
+    const staleAfter = Number(state.resources.stale_after_seconds) || 15;
+    const sampledAt = Number(state.resources.sampled_at);
+    if (!Number.isFinite(sampledAt) || sampledAt <= 0) return false;
+    const sampledMs = sampledAt > 1e11 ? sampledAt : sampledAt * 1000;
+    const ageSeconds = (Date.now() - sampledMs) / 1000;
+    return ageSeconds > staleAfter;
+  }
+
+  function renderResourcesMessages() {
+    const homeMsg = $("#homeResourcesMessage");
+    const shopMsg = $("#shopResourcesMessage");
+    if (!homeMsg && !shopMsg) return;
+
+    let text = "";
+    let className = "resources-message";
+
+    if (state.resourcesError) {
+      if (state.resources) {
+        const sampledText = state.resources.sampled_at ? ` · 上次采样 ${formatSampledTime(state.resources.sampled_at)}` : "";
+        const staleLabel = isResourcesStale() ? "（数据已过期）" : "";
+        text = `读取失败（当前显示上次采样数据${staleLabel}${sampledText}）：${state.resourcesError}`;
+      } else {
+        text = `读取失败：${state.resourcesError}`;
+      }
+      className = "resources-message resources-message-error";
+    } else if (isResourcesStale()) {
+      const sampledText = state.resources?.sampled_at ? `（上次采样 ${formatSampledTime(state.resources.sampled_at)}）` : "";
+      text = `采样数据已过期${sampledText}，正在等待重新采样`;
+      className = "resources-message resources-message-warning";
+    } else if (state.resourcesLoading && !state.resources) {
+      text = "正在读取店铺运行数据...";
+      className = "resources-message resources-message-loading";
+    }
+
+    [homeMsg, shopMsg].forEach((el) => {
+      if (!el) return;
+      el.textContent = text;
+      el.className = className;
+    });
+  }
+
+  function renderHomeResources() {
+    const tbody = $("#homeResourceBody");
+    if (!tbody) return;
+    if (!state.resources) {
+      if (state.resourcesError) {
+        tbody.innerHTML = '<tr><td colspan="7" class="table-cell-empty">店铺运行情况读取失败，请稍后重试</td></tr>';
+      } else {
+        tbody.innerHTML = '<tr><td colspan="7" class="table-cell-empty">正在加载店铺运行情况...</td></tr>';
+      }
+      renderResourcesMessages();
+      return;
+    }
+    const accounts = Array.isArray(state.resources.accounts) ? state.resources.accounts.slice(0, 5) : [];
+    if (!accounts.length) {
+      tbody.innerHTML = '<tr><td colspan="7" class="table-cell-empty">暂无店铺客服运行记录</td></tr>';
+      renderResourcesMessages();
+      return;
+    }
+    tbody.innerHTML = accounts.map((account) => {
+      const isActive = account.key === state.activeAccountKey;
+      const name = esc(account.name || account.key || "未命名店铺");
+      const activeTag = isActive ? ' <span class="badge badge-muted" style="margin-left:4px;">当前店</span>' : '';
+      return '<tr class="' + (isActive ? "resource-row-active" : "") + '">' +
+        '<td><strong>' + name + '</strong>' + activeTag + '</td>' +
+        '<td>' + formatWorkerStatusBadge(account) + '</td>' +
+        '<td><code>' + esc(formatCpuUsage(account)) + '</code></td>' +
+        '<td><strong class="resource-mem-val">' + esc(formatMemoryBytes(account.rss_bytes)) + '</strong></td>' +
+        '<td>' + esc(formatMemoryLimitCell(account)) + '</td>' +
+        '<td>' + formatNextStartupMemoryCell(account) + '</td>' +
+        '<td class="resource-uptime-cell">' + esc(formatUptime(account)) + '</td>' +
+        '</tr>';
+    }).join("");
+    renderResourcesMessages();
+  }
+
+  function renderShopResources() {
+    const tbody = $("#shopResourcesBody");
+    if (!tbody) return;
+    if (!state.resources) {
+      if (state.resourcesError) {
+        tbody.innerHTML = '<tr><td colspan="7" class="table-cell-empty">店铺运行情况读取失败，请稍后重试</td></tr>';
+      } else {
+        tbody.innerHTML = '<tr><td colspan="7" class="table-cell-empty">正在加载店铺运行情况...</td></tr>';
+      }
+      renderResourcesMessages();
+      return;
+    }
+    const accounts = Array.isArray(state.resources.accounts) ? state.resources.accounts : [];
+    if (!accounts.length) {
+      tbody.innerHTML = '<tr><td colspan="7" class="table-cell-empty">暂无店铺客服运行记录</td></tr>';
+      renderResourcesMessages();
+      return;
+    }
+    tbody.innerHTML = accounts.map((account) => {
+      const isActive = account.key === state.activeAccountKey;
+      const name = esc(account.name || account.key || "未命名店铺");
+      const activeTag = isActive ? ' <span class="badge badge-muted" style="margin-left:4px;">当前店</span>' : '';
+      return '<tr class="' + (isActive ? "resource-row-active" : "") + '">' +
+        '<td><strong>' + name + '</strong>' + activeTag + '</td>' +
+        '<td>' + formatWorkerStatusBadge(account) + '</td>' +
+        '<td><code>' + esc(formatCpuUsage(account)) + '</code></td>' +
+        '<td><strong class="resource-mem-val">' + esc(formatMemoryBytes(account.rss_bytes)) + '</strong></td>' +
+        '<td>' + esc(formatMemoryLimitCell(account)) + '</td>' +
+        '<td>' + formatNextStartupMemoryCell(account) + '</td>' +
+        '<td class="resource-uptime-cell">' + esc(formatUptime(account)) + '</td>' +
+        '</tr>';
+    }).join("");
+    renderResourcesMessages();
+  }
+
+  async function loadShopResources({ silent = false, force = false } = {}) {
+    if (!state.me) return null;
+    if (state.resourcesInflightPromise) {
+      if (force) {
+        state.resourcesPendingReload = true;
+      }
+      return state.resourcesInflightPromise;
+    }
+
+    const generation = ++state.resourcesGeneration;
+    const username = state.me.username;
+    state.resourcesLoading = true;
+    renderResourcesMessages();
+
+    state.resourcesInflightPromise = (async () => {
+      try {
+        let cursor = 0;
+        let allAccounts = [];
+        let lastData = null;
+        const visitedCursors = new Set([0]);
+
+        while (cursor !== null) {
+          const data = await api(`/api/bot/resources?cursor=${cursor}&limit=50`);
+          if (generation !== state.resourcesGeneration || state.me?.username !== username) {
+            return null;
+          }
+          lastData = data;
+          const pageAccounts = Array.isArray(data?.accounts) ? data.accounts : [];
+          allAccounts = allAccounts.concat(pageAccounts);
+
+          const rawNext = data?.next_cursor;
+          if (rawNext === null || rawNext === undefined || rawNext === "" || pageAccounts.length === 0) {
+            break;
+          }
+
+          const nextCursor = typeof rawNext === "number" ? rawNext : (typeof rawNext === "string" && /^\d+$/.test(rawNext) ? Number(rawNext) : null);
+          if (nextCursor === null || !Number.isSafeInteger(nextCursor) || nextCursor <= cursor || visitedCursors.has(nextCursor)) {
+            throw new Error("资源分页游标异常");
+          }
+          visitedCursors.add(nextCursor);
+          cursor = nextCursor;
+        }
+
+        state.resources = {
+          ...(lastData || {}),
+          accounts: allAccounts,
+        };
+        state.resourcesError = null;
+        renderHomeResources();
+        renderShopResources();
+        renderResourcesMessages();
+        if (state.docs?.tab === "resources") {
+          renderResourceSettings();
+        }
+        return state.resources;
+      } catch (error) {
+        if (generation !== state.resourcesGeneration || state.me?.username !== username) {
+          return null;
+        }
+        state.resourcesError = error?.message || "店铺运行情况读取失败";
+        renderHomeResources();
+        renderShopResources();
+        renderResourcesMessages();
+        if (!silent && (state.view === "home" || state.view === "shops")) {
+          showToast(state.resourcesError, "error");
+        }
+        return null;
+      } finally {
+        if (generation === state.resourcesGeneration) {
+          state.resourcesLoading = false;
+          state.resourcesInflightPromise = null;
+          renderResourcesMessages();
+          if (state.resourcesPendingReload) {
+            state.resourcesPendingReload = false;
+            if (shouldPollResources() && state.me?.username === username) {
+              void loadShopResources({ silent: true });
+            }
+          } else if (shouldPollResources() && !state.resourcesPollTimer) {
+            state.resourcesPollTimer = setTimeout(pollResourcesTick, 5000);
+          }
+        }
+      }
+    })();
+
+    return state.resourcesInflightPromise;
+  }
+
+  function shouldPollResources() {
+    return (state.view === "home" || state.view === "shops") && !document.hidden && Boolean(state.me);
+  }
+
+  function stopResourcePolling() {
+    if (state.resourcesPollTimer) {
+      clearTimeout(state.resourcesPollTimer);
+      state.resourcesPollTimer = null;
+    }
+  }
+
+  function syncResourcePolling() {
+    if (!shouldPollResources()) {
+      stopResourcePolling();
+      return;
+    }
+    if (!state.resourcesPollTimer && !state.resourcesInflightPromise) {
+      state.resourcesPollTimer = setTimeout(pollResourcesTick, 5000);
+    }
+  }
+
+  async function pollResourcesTick() {
+    state.resourcesPollTimer = null;
+    if (!shouldPollResources()) return;
+    const generation = state.resourcesGeneration;
+    const username = state.me?.username;
+    try {
+      await loadShopResources({ silent: true });
+    } catch {
+      // Polling errors handled within loadShopResources
+    } finally {
+      if (shouldPollResources() && !state.resourcesPollTimer && !state.resourcesInflightPromise && state.me?.username === username && generation === state.resourcesGeneration) {
+        state.resourcesPollTimer = setTimeout(pollResourcesTick, 5000);
+      }
+    }
   }
 
   function renderOverview() {
     renderShopStatus();
     renderAttention();
     renderHomeStats();
+    renderAnalyticsChart();
+    renderHomeOrders();
+    renderHomeResources();
+    renderResourcesMessages();
     renderProducts();
     renderAutomation();
     renderAiStatus();
@@ -4571,13 +5253,31 @@
   }
 
   function renderHomeOrders() {
-    const homePanel = $("#homeOrdersPanel");
     const homeList = $("#homeOrderList");
-    if (homePanel && homeList) {
-      const visible = state.orders.length > 0;
-      homePanel.hidden = !visible;
-      if (visible) homeList.innerHTML = state.orders.slice(0, 4).map(orderRowMarkup).join("");
+    if (!homeList) return;
+    const orders = Array.isArray(state.orders) ? state.orders.slice(0, 5) : [];
+    if (!orders.length) {
+      homeList.innerHTML = '<tr><td colspan="5" class="table-cell-empty">暂无最近订单</td></tr>';
+      return;
     }
+    const statusLabels = { delivered: "已发送", manual_review: "待人工", retry: "待重试", failed: "发送失败", queued: "处理中", processing: "处理中", sent: "已发送" };
+    const statusBadges = { delivered: "badge-green", manual_review: "badge-amber", retry: "badge-blue", failed: "badge-red", queued: "badge-muted", processing: "badge-blue", sent: "badge-green" };
+    homeList.innerHTML = orders.map((order) => {
+      const status = String(order.status || "queued");
+      const badge = statusBadges[status] || "badge-muted";
+      const label = statusLabels[status] || status;
+      const buyer = esc(order.buyer_nick || order.buyer || "--");
+      const itemTitle = esc(order.title || order.item_title || order.item_id || "--");
+      const price = esc(order.paid_amount ? "¥" + order.paid_amount : (order.price_display || (order.amount ? "¥" + order.amount : "--")));
+      const time = esc(formatDate(order.paid_at || order.time || order.created_at));
+      return '<tr>' +
+        '<td><strong>' + buyer + '</strong></td>' +
+        '<td class="order-item-cell" title="' + itemTitle + '">' + itemTitle + '</td>' +
+        '<td class="price-cell">' + price + '</td>' +
+        '<td><span class="badge ' + badge + '">' + esc(label) + '</span></td>' +
+        '<td><time class="order-time">' + time + '</time></td>' +
+        '</tr>';
+    }).join("");
   }
 
   const DEFAULT_STATUS_OPTIONS = [
@@ -5078,6 +5778,7 @@
         state.productsAccountKey = pipeline.context.accountKey;
         state.productsTruncated = pairedStatus ? pairedStatus.truncated : null;
         state.productsTruncatedAccountKey = pairedStatus ? pipeline.context.accountKey : "";
+        void loadProductDeliveryStatus();
         renderProducts();
         renderShopStatus();
         renderAutomation();
@@ -5387,17 +6088,25 @@
     const context = captureAccountContext(epoch);
     const attentionResult = await api("/api/bot/attention").catch(() => ({ items: [] }));
     if (!accountContextMatches(context)) return;
-    const [summary, analytics] = await Promise.all([
+    const [summary, todayData, trendData] = await Promise.all([
       api("/api/bot/summary").catch(() => null),
       api("/api/bot/analytics?period=1").catch(() => null),
+      api("/api/bot/analytics?period=" + (state.trendPeriod || 7)).catch(() => null),
     ]);
     if (!accountContextMatches(context)) return;
     state.attention = Array.isArray(attentionResult?.items) ? attentionResult.items : [];
     state.summary = summary;
-    state.analytics = analytics;
-    if (Number(state.analyticsPeriod || 1) === 1) state.analyticsPage = analytics;
+    state.todayAnalytics = todayData;
+    state.analytics = todayData;
+    state.trendAnalytics = trendData;
+    state.analyticsPage = trendData;
     renderAttention();
-    renderAnalytics();
+    renderHomeStats();
+    renderAnalyticsChart();
+    renderHomeOrders();
+    if (["home", "shops"].includes(state.view)) {
+      void loadShopResources({ silent: true });
+    }
   }
 
   function isPlatformAdmin() {
@@ -5419,12 +6128,11 @@
 
   function setSettingsTab(tab, { load = true } = {}) {
     const admin = isPlatformAdmin();
-    const allowed = new Set(["ai", "security", "version", ...(admin ? ["accounts", "audit"] : [])]);
+    const allowed = new Set(["ai", "resources", "security", ...(admin ? ["accounts", "audit"] : [])]);
     const selectedTab = allowed.has(tab) ? tab : "ai";
     if (state.docs.tab !== selectedTab) {
       stopDocsPolling();
       state.docs.pollAttempts = 0;
-      if (state.docs.tab === "version" && $("#updateAdminPassword")) $("#updateAdminPassword").value = "";
       if (state.docs.tab === "security") $("#passwordChangeForm")?.reset();
     }
     state.docs.tab = selectedTab;
@@ -5443,6 +6151,9 @@
     if (selectedTab === "ai") {
       renderSettingsAiPanel();
       if (load) void loadUnifiedAiConnection();
+    } else if (selectedTab === "resources") {
+      renderResourceSettings();
+      if (load) void loadResourceSettings();
     } else if (load) {
       void loadSettingsData();
     }
@@ -5492,77 +6203,8 @@
   }
 
   function renderVersionPanel() {
-    const docs = state.docs;
-    const version = docs.version || {};
-    const update = docs.update || {};
-    const caps = update.capabilities || version.capabilities || {};
-    const check = update.update_check || version.update_check || {};
-    const latest = update.latest_update || version.latest_update || null;
-    const active = UPDATE_ACTIVE_STATES.has(latest?.status);
-    const busy = !!docs.operation || !!docs.loading.version || !!docs.errors.version;
-    text("#currentVersionValue", version.version ? "v" + version.version : "--");
-    const buildParts = [version.commit && version.commit !== "development" ? "提交 " + String(version.commit).slice(0, 12) : "本地构建 · 提交号未提供"];
-    const buildDate = new Date(version.build_time || "");
-    if (Number.isFinite(buildDate.getTime())) buildParts.push(buildDate.toLocaleString("zh-CN", { hour12: false }));
-    else buildParts.push("构建时间未提供");
-    buildParts.push(version.build_dirty === true ? "包含未提交改动" : version.build_dirty === false ? "构建时工作区干净" : "本地修改状态未知");
-    text("#currentBuildValue", docs.version ? buildParts.join(" · ") : "未获取");
-    text("#currentDeploymentValue", { docker: "Docker 容器", systemd: "systemd 服务", source: "源码部署" }[version.deployment] || "未获取");
-    text("#currentAssetVersionValue", version.asset_version || "--");
-    text("#currentUpdateChannelValue", { beta: "测试版", stable: "稳定版" }[version.update_channel] || "--");
-    const checkLabels = {
-      unchecked: "尚未检查", no_release: "此通道尚无发布版本", current: "未发现更高版本",
-      available: "发现新版本 v" + (check.version || ""),
-      incomplete: "发现 v" + (check.version || "") + "，但安装制品不完整",
-      error: UPDATE_REASON_LABELS[check.error_code] || "更新查询失败，请稍后重试",
-    };
-    text("#currentUpdateStatusValue", docs.operation === "check" ? "正在检查发布信息…" : checkLabels[check.status] || "尚未检查");
-    text("#lastUpdateCheckValue", check.checked_at ? formatDate(check.checked_at) : "尚未检查");
-    text("#updateInstallStatusValue", latest ? (latest.version ? "v" + latest.version + " · " : "")
-      + (UPDATE_INSTALL_LABELS[latest.status] || "未知状态，请刷新后联系维护者") : "尚无安装操作");
-    text("#localReleaseNotes", version.release_notes || "当前构建未提供对应版本说明。");
-    text("#versionReleaseNotes", ["available", "incomplete"].includes(check.status)
-      ? check.release_notes || "该候选版本未提供说明。" : "检查发现新版本后将在此显示说明。");
-    text("#manualUpdateGuideText", caps.instruction
-      ? (UPDATE_REASON_LABELS[caps.reason] || "") + caps.instruction : "正在读取部署信息，暂不提供安装操作。");
-    const checkMatches = check.channel === version.update_channel && check.current_version === version.version;
-    const available = !busy && !active && checkMatches && check.status === "available" ? String(check.version || "") : "";
-    const staged = available && latest?.status === "staged" && latest.channel === version.update_channel
-      && latest.version === available ? available : "";
-    docs.availableVersion = caps.download === true ? available : "";
-    docs.stagedVersion = caps.apply === true ? staged : "";
-    const admin = isPlatformAdmin();
-    $("#adminUpdateControls").hidden = !admin || !(caps.download || caps.apply || caps.rollback);
-    if ($("#checkUpdateButton")) {
-      $("#checkUpdateButton").disabled = !admin || caps.check !== true || busy;
-      text("#checkUpdateButton", docs.operation === "check" ? "正在检查…" : "检查更新");
-    }
-    if ($("#versionBadgeRefresh")) {
-      $("#versionBadgeRefresh").disabled = !admin || caps.check !== true || busy;
-      text("#versionBadgeRefresh", docs.operation === "check" ? "正在检查…" : "检查更新");
-    }
-    $("#downloadUpdateButton").disabled = !admin || !docs.availableVersion || !!staged;
-    text("#downloadUpdateButton", docs.operation === "download" ? "正在下载校验…" : available ? "下载并校验 v" + available : "下载并校验");
-    $("#applyUpdateButton").disabled = !admin || !docs.stagedVersion;
-    text("#applyUpdateButton", docs.operation === "apply" ? "正在提交…" : staged ? "应用 v" + staged : "应用已校验版本");
-    const rollbackSelect = $("#rollbackVersionSelect");
-    const selected = rollbackSelect.value;
-    const versions = caps.rollback === true && !active && Array.isArray(update.rollback_versions) ? update.rollback_versions : [];
-    rollbackSelect.replaceChildren();
-    for (const item of versions.length ? versions : [""]) {
-      const option = document.createElement("option");
-      option.value = String(item);
-      option.textContent = item ? "v" + String(item) : "没有可用版本";
-      rollbackSelect.append(option);
-    }
-    if (versions.includes(selected)) rollbackSelect.value = selected;
-    rollbackSelect.disabled = busy || !admin || !versions.length;
-    $("#rollbackUpdateButton").disabled = busy || !admin || !rollbackSelect.value || caps.rollback !== true;
-    $("#updateAdminPassword").disabled = busy || active || !admin || !(caps.apply || caps.rollback);
-    $("#refreshVersionButton").disabled = !!docs.loading.version || !!docs.operation;
-    formMessage("#versionLoadMessage", docs.errors.version || (docs.loading.version ? "正在读取版本信息…" : ""));
-    state.version = docs.version;
-    state.versionUpdate = docs.update;
+    state.version = state.docs?.version || state.version;
+    state.versionUpdate = state.docs?.update || state.versionUpdate;
     renderVersionBadge();
   }
 
@@ -5573,10 +6215,8 @@
     const toggle = $("#registrationOpenToggle");
     if (toggle) {
       toggle.checked = registration.database_open === true;
-      toggle.disabled = registration.environment_allowed !== true;
+      toggle.disabled = registration.environment_allowed === false;
     }
-    const channel = $("#updateChannelSelect");
-    if (channel) channel.value = settings.update_channel === "beta" ? "beta" : "stable";
     text(
       "#registrationCeilingHint",
       registration.environment_allowed
@@ -5621,6 +6261,7 @@
     "auth.logout": "退出登录",
     "auth.password_changed": "密码已修改",
     "platform.settings_changed": "平台设置已修改",
+    "platform.resource_settings_changed": "运行限制已修改",
     "platform.user_changed": "账号角色或状态已修改",
     "platform.user_unlocked": "账号登录锁已清除",
     "platform.sessions_revoked": "账号会话已撤销",
@@ -5677,7 +6318,7 @@
     if (!admin && ["accounts", "audit"].includes(state.docs.tab)) state.docs.tab = "ai";
     setSettingsTab(state.docs.tab || "ai", { load: false });
     renderSettingsAiPanel();
-    renderVersionPanel();
+    renderResourceSettings();
     if (admin) {
       renderPlatformSettings();
       renderAdminUsers();
@@ -5693,6 +6334,7 @@
     const tab = docs.tab;
     if (["guide", "security"].includes(tab)) { renderSettings(); return; }
     if (tab === "ai") { renderSettings(); void loadUnifiedAiConnection(); return; }
+    if (tab === "resources") { renderResourceSettings(); void loadResourceSettings({ force }); return; }
     if (!force && (docs.loading[tab] || docs.loaded[tab])) { renderSettings(); scheduleDocsPolling(); return; }
     const id = (docs.requests[tab] || 0) + 1;
     docs.requests[tab] = id;
@@ -5703,19 +6345,7 @@
     docs.errors[tab] = "";
     renderSettings();
     try {
-      if (tab === "version") {
-        const [version, update] = await Promise.all([
-          api("/api/version"), isPlatformAdmin() ? api("/api/admin/updates") : Promise.resolve(null),
-        ]);
-        if (!valid()) return;
-        // Responses straddling a channel change cannot be combined.
-        if (update && update.current?.update_channel !== version.update_channel) throw new Error("更新通道已变化，请刷新状态");
-        docs.version = version;
-        docs.update = update;
-        state.version = version;
-        state.versionUpdate = update;
-        renderVersionBadge();
-      } else if (tab === "accounts" && isPlatformAdmin()) {
+      if (tab === "accounts" && isPlatformAdmin()) {
         const [settings, users] = await Promise.all([api("/api/admin/settings"), api("/api/admin/users?limit=100")]);
         if (!valid()) return;
         docs.settings = settings;
@@ -5730,7 +6360,7 @@
       if (!valid()) return;
       docs.loaded[tab] = false;
       docs.errors[tab] = error.message || "信息读取失败，请重试";
-      if (tab !== "version") showToast(docs.errors[tab], "error");
+      showToast(docs.errors[tab], "error");
     } finally {
       if (valid()) {
         docs.loading[tab] = false;
@@ -5776,23 +6406,15 @@
     setBusy(button, true);
     try {
       const docs = state.docs;
+      const toggle = $("#registrationOpenToggle");
       const settings = await api("/api/admin/settings", {
         method: "PUT",
         body: JSON.stringify({
-          registration_open: $("#registrationOpenToggle").checked,
-          update_channel: $("#updateChannelSelect").value,
+          registration_open: Boolean(toggle?.checked),
         }),
       });
       if (state.docs !== docs || !isPlatformAdmin()) return;
       docs.settings = settings;
-      docs.requests.version = (docs.requests.version || 0) + 1;
-      docs.loading.version = false;
-      docs.loaded.version = false;
-      docs.version = null;
-      docs.update = null;
-      docs.availableVersion = "";
-      docs.stagedVersion = "";
-      stopDocsPolling();
       formMessage("#platformSettingsMessage", "平台设置已保存", true);
       await loadDocsData({ force: true });
     } catch (error) {
@@ -5802,14 +6424,207 @@
     }
   }
 
+  function parseStrictInteger(value) {
+    if (value === null || value === undefined) return null;
+    const str = String(value).trim();
+    if (!str || !/^-?\d+$/.test(str)) return null;
+    const num = Number(str);
+    return Number.isSafeInteger(num) ? num : null;
+  }
+
+  function renderResourceSettings() {
+    const form = $("#resourceSettingsForm");
+    if (!form) return;
+    const admin = isPlatformAdmin();
+    const shopsInput = $("#resourceMaxShops");
+    const workersInput = $("#resourceMaxWorkers");
+    const memInput = $("#resourceMemoryMiB");
+    const saveBtn = $("#saveResourceSettings");
+
+    let shopsVal = "";
+    let workersVal = "";
+    let memVal = "";
+
+    if (admin) {
+      if (state.resourceDraftDirty && state.resourceDraft) {
+        shopsVal = state.resourceDraft.max_shop_accounts ?? "";
+        workersVal = state.resourceDraft.max_running_workers ?? "";
+        memVal = state.resourceDraft.worker_memory_mib ?? "";
+      } else if (state.resourceSettings) {
+        shopsVal = state.resourceSettings.max_shop_accounts ?? "";
+        workersVal = state.resourceSettings.max_running_workers ?? "";
+        memVal = state.resourceSettings.worker_memory_mib ?? "";
+      } else if (state.resources?.limits) {
+        shopsVal = state.resources.limits.max_shop_accounts ?? "";
+        workersVal = state.resources.limits.max_running_workers ?? "";
+        memVal = state.resources.limits.worker_memory_mib ?? "";
+      }
+    } else {
+      const limits = state.resources?.limits;
+      if (limits) {
+        shopsVal = limits.max_shop_accounts ?? "";
+        workersVal = limits.max_running_workers ?? "";
+        memVal = limits.worker_memory_mib ?? "";
+      }
+    }
+
+    const active = document.activeElement;
+    if (shopsInput && (active !== shopsInput || !state.resourceDraftDirty)) {
+      shopsInput.value = shopsVal !== "" ? String(shopsVal) : "";
+    }
+    if (workersInput && (active !== workersInput || !state.resourceDraftDirty)) {
+      workersInput.value = workersVal !== "" ? String(workersVal) : "";
+    }
+    if (memInput && (active !== memInput || !state.resourceDraftDirty)) {
+      memInput.value = memVal !== "" ? String(memVal) : "";
+    }
+
+    [shopsInput, workersInput, memInput].forEach((input) => {
+      if (!input) return;
+      if (admin) {
+        input.disabled = false;
+        input.removeAttribute("readonly");
+      } else {
+        input.disabled = true;
+        input.setAttribute("readonly", "readonly");
+      }
+    });
+
+    if (saveBtn) {
+      saveBtn.hidden = !admin;
+      saveBtn.disabled = !admin || Boolean(state.resourceLoading);
+    }
+  }
+
+  async function loadResourceSettings({ force = false } = {}) {
+    if (!state.me) return;
+    if (!isPlatformAdmin()) {
+      if (!state.resources || force) {
+        try {
+          await loadShopResources({ silent: true });
+        } catch {
+          // ignore
+        }
+      }
+      renderResourceSettings();
+      return;
+    }
+
+    state.resourceLoading = true;
+    try {
+      const data = await api("/api/admin/resource-settings");
+      state.resourceSettings = data?.settings || null;
+      state.resourceRevision = Number(data?.settings?.revision || 0);
+      state.resourceBounds = data?.bounds || null;
+      if (force) {
+        state.resourceDraftDirty = false;
+        state.resourceDraft = null;
+        formMessage("#resourceSettingsMessage", "");
+      }
+      renderResourceSettings();
+    } catch (error) {
+      showToast(error.message || "运行限制读取失败", "error");
+    } finally {
+      state.resourceLoading = false;
+      renderResourceSettings();
+    }
+  }
+
+  async function saveResourceSettings(event) {
+    if (event) event.preventDefault();
+    if (!state.me) return;
+    if (!isPlatformAdmin()) {
+      showToast("需要管理员权限才能修改运行限制", "error");
+      return;
+    }
+
+    const saveBtn = $("#saveResourceSettings") || event?.submitter;
+    const rawShops = $("#resourceMaxShops")?.value;
+    const rawWorkers = $("#resourceMaxWorkers")?.value;
+    const rawMemory = $("#resourceMemoryMiB")?.value;
+
+    const shops = parseStrictInteger(rawShops);
+    const workers = parseStrictInteger(rawWorkers);
+    const memory = parseStrictInteger(rawMemory);
+
+    if (shops === null || shops < 1 || shops > 1000) {
+      formMessage("#resourceSettingsMessage", "店铺上限需为 1 到 1000 的整数", false);
+      return;
+    }
+    if (workers === null || workers < 1 || workers > 1000) {
+      formMessage("#resourceSettingsMessage", "全局客服并发上限需为 1 到 1000 的整数", false);
+      return;
+    }
+    if (memory === null || memory < 128 || memory > 16384) {
+      formMessage("#resourceSettingsMessage", "单店内存上限需为 128 到 16384 MiB 的整数", false);
+      return;
+    }
+
+    const payload = {
+      expected_revision: Number(state.resourceRevision || 0),
+      max_shop_accounts: shops,
+      max_running_workers: workers,
+      worker_memory_mib: memory,
+    };
+
+    formMessage("#resourceSettingsMessage", "");
+    setBusy(saveBtn, true);
+
+    try {
+      const data = await api("/api/admin/resource-settings", {
+        method: "PUT",
+        body: JSON.stringify(payload),
+      });
+      state.resourceSettings = data?.settings || null;
+      state.resourceRevision = Number(data?.settings?.revision ?? (payload.expected_revision + 1));
+      state.resourceBounds = data?.bounds || null;
+      state.resourceDraftDirty = false;
+      state.resourceDraft = null;
+
+      formMessage("#resourceSettingsMessage", "运行限制已保存，新配置将在下次启动客服时生效", true);
+      showToast("运行限制已更新");
+      renderResourceSettings();
+      void loadShopResources({ silent: true, force: true });
+    } catch (error) {
+      if (error?.status === 409 || error?.code === "resource_revision_conflict") {
+        formMessage("#resourceSettingsMessage", error.message || "运行限制已被修改，请刷新后再保存", false);
+        showToast(error.message || "运行限制已被其他操作修改，请刷新后再试", "warning");
+      } else {
+        formMessage("#resourceSettingsMessage", error?.message || "运行限制保存失败，请检查输入格式后重试", false);
+        showToast(error?.message || "运行限制保存失败", "error");
+      }
+    } finally {
+      setBusy(saveBtn, false);
+    }
+  }
+
+  async function reloadResourceSettings() {
+    if (isPlatformAdmin()) {
+      await loadResourceSettings({ force: true });
+      showToast("已刷新运行限制配置");
+    } else {
+      await loadShopResources({ silent: true, force: true });
+      renderResourceSettings();
+      showToast("已刷新店铺运行情况");
+    }
+  }
+
+  function onResourceInputChange() {
+    if (!isPlatformAdmin()) return;
+    state.resourceDraftDirty = true;
+    state.resourceDraft = {
+      max_shop_accounts: $("#resourceMaxShops")?.value ?? "",
+      max_running_workers: $("#resourceMaxWorkers")?.value ?? "",
+      worker_memory_mib: $("#resourceMemoryMiB")?.value ?? "",
+    };
+  }
+
   async function runUpdateAction(action, perform, successMessage) {
     const docs = state.docs;
     const caps = docs.update?.capabilities || docs.version?.capabilities || {};
     if (docs.operation || docs.loading.version || docs.errors.version || !isPlatformAdmin() || (action !== "check" && caps[action] !== true)) return;
     const username = state.me.username;
-    const channel = docs.version?.update_channel;
-    const valid = () => state.docs === docs && state.me?.username === username && isPlatformAdmin()
-      && (!docs.version || docs.version.update_channel === channel);
+    const valid = () => state.docs === docs && state.me?.username === username && isPlatformAdmin();
     docs.operation = action;
     docs.requests.version = (docs.requests.version || 0) + 1;
     stopDocsPolling();
@@ -5818,7 +6633,6 @@
     try {
       const result = await perform(valid);
       if (!valid()) return;
-      if (result?.channel && channel && result.channel !== channel) throw new Error("更新通道已变化，请重新刷新状态");
       if (action === "check") {
         if (docs.version) docs.version.update_check = result;
         if (docs.update) docs.update.update_check = result;
@@ -5829,7 +6643,7 @@
     } catch (error) {
       if (!valid()) return;
       if (action === "check") {
-        const failed = { status: "error", available: false, channel, current_version: docs.version?.version, checked_at: Date.now() / 1000 };
+        const failed = { status: "error", available: false, current_version: docs.version?.version, checked_at: Date.now() / 1000 };
         if (docs.version) docs.version.update_check = failed;
         if (docs.update) docs.update.update_check = failed;
         state.versionUpdate = { update_check: failed };
@@ -5840,7 +6654,7 @@
       if (state.docs === docs) {
         docs.operation = "";
         docs.loaded.version = false;
-        if (action === "apply" || action === "rollback") $("#updateAdminPassword").value = "";
+        if ((action === "apply" || action === "rollback") && $("#updateAdminPassword")) $("#updateAdminPassword").value = "";
         if (valid()) {
           docs.pollAttempts = 0;
           renderVersionPanel();
@@ -5860,30 +6674,6 @@
       if (refreshBtn) setBusy(refreshBtn, false);
       renderVersionBadge();
     }
-  }
-
-  async function downloadPlatformUpdate() {
-    const version = state.docs.availableVersion;
-    if (!version || $("#downloadUpdateButton").disabled) return;
-    await runUpdateAction("download", () => api("/api/admin/updates/download", {
-      method: "POST", body: JSON.stringify({ version }),
-    }), "v" + version + " 已下载并校验，尚未安装。");
-  }
-
-  async function confirmAdminUpdate(action, version) {
-    const button = $(action === "apply" ? "#applyUpdateButton" : "#rollbackUpdateButton");
-    if (button.disabled || !["apply", "rollback"].includes(action)) return;
-    const password = $("#updateAdminPassword").value;
-    if (!password) { formMessage("#updateActionMessage", "请先输入当前管理员密码"); return; }
-    await runUpdateAction(action, async (valid) => {
-      const confirmation = await api("/api/admin/confirm", {
-        method: "POST", body: JSON.stringify({ password, action: "update." + action }),
-      });
-      if (!valid()) return null;
-      return api("/api/admin/updates/" + action, {
-        method: "POST", body: JSON.stringify({ version, confirmation_token: confirmation.confirmation_token }),
-      });
-    }, "请求已提交，请查看安装进度；提交成功不代表升级或回滚已经完成。");
   }
 
   async function handleAdminUserAction(button) {
@@ -5952,15 +6742,71 @@
         api("/api/version"), admin ? api("/api/admin/updates") : Promise.resolve(null),
       ]);
       if (!valid()) return;
-      if (update && update.current?.update_channel !== version.update_channel) throw new ApiError("更新通道已变化，请刷新");
       docs.version = state.version = version;
       docs.update = state.versionUpdate = update;
       docs.badgeLoaded = true;
       renderVersionBadge();
-      renderVersionPanel();
     } catch (error) {
       if (valid()) formMessage("#versionLoadMessage", error.message || "版本信息读取失败");
     } finally { if (valid()) docs.badgeLoading = false; }
+  }
+
+  const SEMVER_RE = /^v?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z.-]+)?$/;
+
+  function parseSemVer(v) {
+    if (typeof v !== "string") return null;
+    const m = v.trim().match(SEMVER_RE);
+    if (!m) return null;
+    return {
+      major: parseInt(m[1], 10),
+      minor: parseInt(m[2], 10),
+      patch: parseInt(m[3], 10),
+      prerelease: m[4] ? m[4].split(".") : [],
+    };
+  }
+
+  function compareSemVer(aStr, bStr) {
+    const a = parseSemVer(aStr);
+    const b = parseSemVer(bStr);
+    if (!a || !b) return null;
+    if (a.major !== b.major) return a.major > b.major ? 1 : -1;
+    if (a.minor !== b.minor) return a.minor > b.minor ? 1 : -1;
+    if (a.patch !== b.patch) return a.patch > b.patch ? 1 : -1;
+    if (a.prerelease.length === 0 && b.prerelease.length === 0) return 0;
+    if (a.prerelease.length === 0) return 1;
+    if (b.prerelease.length === 0) return -1;
+    const maxLen = Math.max(a.prerelease.length, b.prerelease.length);
+    for (let i = 0; i < maxLen; i++) {
+      if (i >= a.prerelease.length) return -1;
+      if (i >= b.prerelease.length) return 1;
+      const ap = a.prerelease[i];
+      const bp = b.prerelease[i];
+      if (ap === bp) continue;
+      const aNum = /^\d+$/.test(ap);
+      const bNum = /^\d+$/.test(bp);
+      if (aNum && bNum) {
+        const diff = parseInt(ap, 10) - parseInt(bp, 10);
+        return diff > 0 ? 1 : -1;
+      }
+      if (aNum !== bNum) return aNum ? -1 : 1;
+      return ap > bp ? 1 : -1;
+    }
+    return 0;
+  }
+
+  function isHigherVersion(candidate, current) {
+    return compareSemVer(candidate, current) === 1;
+  }
+
+  function isConfirmedHigherRelease(check, currentVersion) {
+    if (!check || typeof check !== "object") return false;
+    if (check.status !== "available") return false;
+    if (check.available !== true) return false;
+    if (check.error_code || check.error) return false;
+    if (!currentVersion || typeof currentVersion !== "string") return false;
+    if (check.current_version && check.current_version !== currentVersion) return false;
+    if (!check.version || typeof check.version !== "string") return false;
+    return isHigherVersion(check.version, currentVersion);
   }
 
   function renderVersionBadge() {
@@ -5971,7 +6817,8 @@
     text("#versionBadgeValue", curVer);
     text("#versionBadgeCurrent", versionObj.version ? "v" + versionObj.version : "--");
 
-    const hasUpdate = Boolean(state.me && check.available === true && ["available", "incomplete"].includes(check.status));
+    const hasHigher = isConfirmedHigherRelease(check, versionObj.version);
+    const hasUpdate = Boolean(state.me && hasHigher);
     const btn = $("#versionBadgeButton");
     const dot = $("#versionBadgeDot");
     if (btn) {
@@ -5982,16 +6829,16 @@
     if (dot) dot.hidden = !hasUpdate;
 
     let statusText = "尚未检查";
-    if (check.status === "available") {
-      statusText = "可更新至更高版本 v" + (check.version || "");
+    if (hasHigher) {
+      statusText = "发现新版本 v" + (check.version || "");
     } else if (check.status === "incomplete") {
       statusText = "发现更高版本（安装包不完整）";
-    } else if (check.status === "current") {
-      statusText = "未发现更高版本，无需更新";
     } else if (check.status === "no_release") {
-      statusText = "尚无发布";
-    } else if (check.status === "error") {
+      statusText = "尚无发布版本";
+    } else if (check.status === "error" || check.error_code || check.error) {
       statusText = "更新检查失败";
+    } else if (check.status === "current" || check.status === "available") {
+      statusText = "未发现更高版本，无需更新";
     }
     text("#versionBadgeStatus", statusText);
 
@@ -6004,6 +6851,8 @@
     if (relLink) {
       relLink.hidden = false;
       relLink.href = "https://github.com/tswawa/xianyu-saas/releases";
+      relLink.target = "_blank";
+      relLink.rel = "noopener noreferrer";
     }
   }
 
@@ -6032,10 +6881,7 @@
     const valid = () => state.settingsAi === settings && state.me?.username === username;
     settings.loading = (async () => {
       try {
-        const [res, legacyRes] = await Promise.all([
-          api("/api/settings/ai/connection"),
-          api("/api/settings/ai/connection/legacy-sources"),
-        ]);
+        const res = await api("/api/settings/ai/connection");
         if (!valid() || settings.operation || settings.connection?.revision !== revision) return;
         if (res?.scope !== "user" || !Number.isInteger(res.revision)) throw new ApiError("连接信息格式无效");
         if (revision !== undefined && res.revision !== revision) {
@@ -6043,7 +6889,6 @@
           settings.testedFingerprint = "";
         }
         settings.connection = res;
-        settings.legacySources = Array.isArray(legacyRes?.sources) ? legacyRes.sources : [];
         settings.error = "";
         if (Array.isArray(res.providers)) populateAiProviders(res.providers);
       } catch (error) {
@@ -6115,567 +6960,693 @@
       if ($("#aiBaseUrl")) $("#aiBaseUrl").value = conn.base_url || "";
       if ($("#aiModel")) $("#aiModel").value = conn.model || "";
     }
-    populateSettingsAiLegacySelect();
     renderAiProviderFields();
   }
 
-  function populateSettingsAiLegacySelect() {
-    const select = $("#settingsAiLegacySelect") || $("#settingsLegacySource");
-    if (!select) return;
-    const cur = select.value;
-    select.replaceChildren();
-    const optDefault = document.createElement("option");
-    optDefault.value = "";
-    optDefault.textContent = "-- 选择已有店铺连接迁移 --";
-    select.append(optDefault);
-    const sources = Array.isArray(state.settingsAi?.legacySources) ? state.settingsAi.legacySources : [];
-    sources.forEach((src) => {
-      const opt = document.createElement("option");
-      opt.value = src.account_key;
-      opt.textContent = (src.name || src.account_key) + " (" + (src.model || src.provider || "") + ")";
-      select.append(opt);
-    });
-    if (cur) select.value = cur;
-  }
-
-  function handleLegacySourceImport() {
-    const select = $("#settingsAiLegacySelect") || $("#settingsLegacySource");
-    const accountKey = select?.value;
-    if (!accountKey) return;
-    const sources = Array.isArray(state.settingsAi?.legacySources) ? state.settingsAi.legacySources : [];
-    const source = sources.find((s) => s.account_key === accountKey);
-    if (!source) return;
-    state.settingsAi.selectedLegacySource = source;
-    if ($("#aiProvider") && source.provider) $("#aiProvider").value = source.provider;
-    if ($("#aiBaseUrl")) $("#aiBaseUrl").value = String(source.base_url || "");
-    if ($("#aiModel")) $("#aiModel").value = String(source.model || "");
-    if ($("#aiApiKey")) $("#aiApiKey").value = "";
-    state.settingsAi.verificationToken = "";
-    state.settingsAi.testedFingerprint = "";
-    state.settingsAi.draft = {
-      provider: $("#aiProvider")?.value || "",
-      base_url: $("#aiBaseUrl")?.value || "",
-      model: $("#aiModel")?.value || "",
-      api_key: "",
-    };
-    if ($("#aiSaveConnection")) $("#aiSaveConnection").disabled = true;
-    formMessage("#aiConnectionMessage", "已从旧连接【" + (source.name || source.account_key) + "】导入参数。请点击“测试连接”并在测试通过后保存升级为全局配置。", true);
-  }
-
-  const handleLegacySourceSelect = handleLegacySourceImport;
-
   function newOpsState() {
-    return { selectedItemIds: [], selectedRuleIds: [], chatHistory: [], currentPlan: null,
-      connection: null, diagnostics: null, contextLoaded: false, loading: false, loadGeneration: 0,
-      inFlight: false, confirming: false, cancelling: false, refreshing: false,
-      pendingChat: null, confirmRequests: {}, contextError: "" };
+    return {
+      session: null,
+      messages: [],
+      activeRun: null,
+      runEvents: [],
+      pendingChat: null,
+      loading: false,
+      sending: false,
+      stopping: false,
+      loadGeneration: 0,
+      pollTimer: null,
+      error: null,
+    };
   }
 
   function resetOpsState() {
+    if (state.ops?.pollTimer) {
+      clearTimeout(state.ops.pollTimer);
+      state.ops.pollTimer = null;
+    }
     state.ops = newOpsState();
-    closeDialog("opsDiffModal");
-    $("#opsPromptForm")?.reset();
-    $("#opsShopSelect")?.replaceChildren();
-    for (const id of ["opsPromptMessage", "opsPlanMessage", "opsDiffMessage", "opsDiffMeta", "opsDiffTable", "opsPlanDiffList"]) text("#" + id, "");
-    text("#opsPromptCount", "0 / 2000");
-    renderOpsProductList([]);
-    renderOpsRuleList([]);
-    updateOpsConnectionBadge({});
-    renderOpsChatMessages();
-    renderOpsPlan();
+    const form = $("#opsPromptForm");
+    if (form) form.reset();
+    const input = $("#opsPromptInput");
+    if (input) {
+      input.value = "";
+      input.style.height = "auto";
+    }
+    renderOpsChat();
   }
 
   function opsContextMatches(ops, context) {
     return state.ops === ops && Boolean(state.me) && accountContextMatches(context);
   }
 
-  function opsPlanStatus(plan) {
-    return plan?.status === "proposed" && Number(plan.expires_at) * 1000 <= Date.now() ? "expired" : plan?.status;
+  function newOpsRequestId() {
+    return "opr-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 10);
   }
 
-  const OPS_TOOLS = { "knowledge.save": "更新客服资料", "knowledge.disable": "停用客服资料", "rules.replace": "修改回复规则" };
-  const OPS_STATUSES = { proposed: "待核对确认", executing: "正在执行", succeeded: "执行完成（成功）",
-    partial_failed: "部分执行失败", failed: "执行失败", cancelled: "方案已取消", expired: "方案已过期", needs_review: "待人工复核" };
-
-  function updateOpsConnectionBadge(overrideConn) {
-    const badge = $("#opsConnectionBadge");
-    if (!badge) return;
-    const conn = overrideConn || state.settingsAi?.connection || state.ops.connection;
-    const verified = conn?.initialized === true && conn?.connection_status === "verified";
-    if (verified) {
-      badge.textContent = "已连接 (" + (conn.model || "") + ")";
-      badge.className = "badge badge-green";
-    } else {
-      badge.textContent = "请先在设置保存统一连接";
-      badge.className = "badge badge-muted";
-    }
+  function escapeHtml(str) {
+    if (str == null) return "";
+    return String(str)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
   }
 
-  function getSelectedOpsItemIds() {
-    const select = $("#opsProductSelect");
-    if (select) return Array.from(select.selectedOptions).map((el) => el.value);
-    const checked = document.querySelectorAll('#opsProductList input[type="checkbox"]:checked');
-    if (checked.length) return Array.from(checked).map((el) => el.value).slice(0, 20);
-    return state.ops.selectedItemIds || [];
+  function updateOpsConnectionBadge() {
+    // Retained for backward compatibility
   }
 
-  function getSelectedOpsRuleIds() {
-    const select = $("#opsRuleSelect");
-    if (select) return Array.from(select.selectedOptions).map((el) => el.value);
-    const checked = document.querySelectorAll('#opsRuleList input[type="checkbox"]:checked');
-    if (checked.length) return Array.from(checked).map((el) => el.value);
-    return state.ops.selectedRuleIds || [];
+  function formatOpsError(err, fallbackRequestId = "") {
+    const detail = err?.detail || {};
+    return {
+      source: detail.source || (err?.status === 401 ? "authentication" : "application"),
+      message: detail.message || err?.message || "运维请求执行异常",
+      code: detail.code || err?.code || "",
+      upstream_status: detail.upstream_status ?? null,
+      upstream_code: detail.upstream_code ?? null,
+      upstream_type: detail.upstream_type ?? null,
+      upstream_request_id: detail.upstream_request_id ?? null,
+      request_id: detail.request_id || fallbackRequestId,
+    };
   }
 
-  function renderOpsProductList(products) {
-    const select = $("#opsProductSelect");
-    const list = $("#opsProductList");
-    const items = Array.isArray(products) ? products : [];
-    if (select) {
-      select.replaceChildren();
-      items.forEach((prod) => {
-        const id = String(prod.item_id || prod.id || "");
-        const title = String(prod.title || "商品 " + id);
-        const opt = document.createElement("option");
-        opt.value = id;
-        opt.textContent = title;
-        if (state.ops.selectedItemIds.includes(id)) opt.selected = true;
-        select.append(opt);
-      });
-    }
-    if (list) {
-      list.replaceChildren();
-      if (!items.length) {
-        const empty = document.createElement("span");
-        empty.className = "ops-empty-hint";
-        empty.textContent = "暂无关联商品";
-        list.append(empty);
-      } else {
-        items.forEach((prod) => {
-          const id = String(prod.item_id || prod.id || "");
-          const title = String(prod.title || "商品 " + id);
-          const label = document.createElement("label");
-          label.className = "ops-checkbox-label";
-          const input = document.createElement("input");
-          input.type = "checkbox";
-          input.value = id;
-          if (state.ops.selectedItemIds.includes(id)) input.checked = true;
-          input.addEventListener("change", () => {
-            const selectEl = $("#opsProductSelect");
-            if (selectEl) {
-              Array.from(selectEl.options).forEach((opt) => {
-                if (opt.value === id) opt.selected = input.checked;
-              });
-            }
-            state.ops.selectedItemIds = getSelectedOpsItemIds();
-          });
-          const span = document.createElement("span");
-          span.textContent = title;
-          label.append(input, span);
-          list.append(label);
-        });
-      }
-    }
-  }
+  function renderErrorDetails(err) {
+    if (!err) return "";
+    const sourceLabel = {
+      provider: "上游模型服务提供方",
+      transport: "网络传输超时或中断",
+      application: "系统业务逻辑异常",
+      authentication: "用户登录凭证异常",
+    }[err.source] || (err.source ? String(err.source) : "系统异常");
 
-  function renderOpsRuleList(rules) {
-    const select = $("#opsRuleSelect");
-    const list = $("#opsRuleList");
-    const items = Array.isArray(rules) ? rules : [];
-    if (select) {
-      select.replaceChildren();
-      items.forEach((rule, idx) => {
-        const id = String(rule.id || "rule-" + (idx + 1));
-        const name = rule.name || (Array.isArray(rule.keywords) ? rule.keywords.slice(0, 3).join(",") : "规则 #" + (idx + 1));
-        const opt = document.createElement("option");
-        opt.value = id;
-        opt.textContent = name;
-        if (state.ops.selectedRuleIds.includes(id)) opt.selected = true;
-        select.append(opt);
-      });
-    }
-    if (list) {
-      list.replaceChildren();
-      if (!items.length) {
-        const empty = document.createElement("span");
-        empty.className = "ops-empty-hint";
-        empty.textContent = "暂无关联规则";
-        list.append(empty);
-      } else {
-        items.forEach((rule, idx) => {
-          const id = String(rule.id || "rule-" + (idx + 1));
-          const name = rule.name || (Array.isArray(rule.keywords) ? rule.keywords.slice(0, 3).join(",") : "规则 #" + (idx + 1));
-          const label = document.createElement("label");
-          label.className = "ops-checkbox-label";
-          const input = document.createElement("input");
-          input.type = "checkbox";
-          input.value = id;
-          if (state.ops.selectedRuleIds.includes(id)) input.checked = true;
-          input.addEventListener("change", () => {
-            const selectEl = $("#opsRuleSelect");
-            if (selectEl) {
-              Array.from(selectEl.options).forEach((opt) => {
-                if (opt.value === id) opt.selected = input.checked;
-              });
-            }
-            state.ops.selectedRuleIds = getSelectedOpsRuleIds();
-          });
-          const span = document.createElement("span");
-          span.textContent = name;
-          label.append(input, span);
-          list.append(label);
-        });
-      }
-    }
+    let meta = `<span>错误来源: <strong>${escapeHtml(sourceLabel)}</strong></span>`;
+    if (err.upstream_status != null) meta += `<span>上游HTTP状态: <code>${escapeHtml(String(err.upstream_status))}</code></span>`;
+    if (err.upstream_code != null) meta += `<span>上游错误代码: <code>${escapeHtml(String(err.upstream_code))}</code></span>`;
+    if (err.upstream_type != null) meta += `<span>上游错误类型: <code>${escapeHtml(String(err.upstream_type))}</code></span>`;
+    if (err.upstream_request_id != null) meta += `<span>上游请求ID: <code>${escapeHtml(String(err.upstream_request_id))}</code></span>`;
+    if (err.code) meta += `<span>系统错误代码: <code>${escapeHtml(err.code)}</code></span>`;
+    if (err.request_id) meta += `<span>请求ID: <code>${escapeHtml(err.request_id)}</code></span>`;
+
+    const providerHint = err.source === "provider"
+      ? '<p class="ops-error-hint">提示：此错误由模型提供方返回，您的本站系统登录状态依然有效，无需重新登录。</p>'
+      : "";
+
+    return `
+      <div class="ops-error-card">
+        <div class="ops-error-head">
+          <svg class="icon"><use href="/xianyu-saas/assets/icons.svg?v=20260908-02#circle-alert"></use></svg>
+          <strong>${escapeHtml(err.message || "操作执行异常")}</strong>
+        </div>
+        <div class="ops-error-meta">${meta}</div>
+        ${providerHint}
+      </div>
+    `;
   }
 
   async function loadOpsContext() {
     if (!state.me) return;
+    const context = captureAccountContext();
+    const ops = state.ops;
+    ops.loadGeneration += 1;
+    const gen = ops.loadGeneration;
+    const valid = () => opsContextMatches(ops, context) && ops.loadGeneration === gen;
+
+    if (ops.pollTimer) {
+      clearTimeout(ops.pollTimer);
+      ops.pollTimer = null;
+    }
+
+    ops.loading = true;
+    ops.error = null;
+    renderOpsChat();
+
+    try {
+      const res = await accountScopedApi(context, "/api/ops/sessions/current");
+      if (!valid()) return;
+
+      const session = res?.session || null;
+      let activeRun = res?.active_run || null;
+
+      if (!session) {
+        // Zero write on empty GET. Render empty state.
+        ops.session = null;
+        ops.messages = [];
+        ops.activeRun = null;
+        ops.runEvents = [];
+        ops.loading = false;
+        renderOpsChat();
+        return;
+      }
+
+      ops.session = session;
+      ops.activeRun = activeRun;
+
+      // Cursor-based message loop without truncation
+      let allMessages = [];
+      let cursor = 0;
+      while (true) {
+        const msgRes = await accountScopedApi(context, "/api/ops/sessions/" + encodeURIComponent(session.id) + "/messages?cursor=" + cursor);
+        if (!valid()) return;
+        const msgs = Array.isArray(msgRes?.messages) ? msgRes.messages : [];
+        allMessages = allMessages.concat(msgs);
+        if (msgRes?.active_run) {
+          ops.activeRun = msgRes.active_run;
+          activeRun = msgRes.active_run;
+        }
+        if (msgRes?.next_cursor != null) {
+          cursor = msgRes.next_cursor;
+        } else {
+          break;
+        }
+      }
+
+      ops.messages = allMessages;
+
+      if (activeRun && ["queued", "running", "cancel_requested"].includes(activeRun.status)) {
+        ops.loading = false;
+        renderOpsChat();
+        startOpsRunPolling(ops, context, session.id, activeRun.id || activeRun.run_id, gen);
+        return;
+      }
+
+      // Restore last run details for retry eligibility and summary counts
+      const lastRunId = activeRun?.id || [...allMessages].reverse().find((m) => m.run_id)?.run_id;
+      if (lastRunId) {
+        try {
+          const runDetail = await accountScopedApi(context, "/api/ops/runs/" + encodeURIComponent(lastRunId));
+          if (valid()) {
+            ops.activeRun = runDetail;
+          }
+        } catch (_) {
+          // Metadata fetch failure is non-fatal
+        }
+      }
+
+      ops.loading = false;
+      renderOpsChat();
+    } catch (err) {
+      if (!valid()) return;
+      ops.loading = false;
+      ops.error = formatOpsError(err);
+      renderOpsChat();
+    }
+  }
+
+  async function createNewOpsSession() {
     const ops = state.ops;
     const context = captureAccountContext();
-    if (ops.loading) return;
-    const generation = ++ops.loadGeneration;
+    if (ops.sending || ops.stopping) {
+      showToast("当前有任务正在执行，请先等待或停止", "warning");
+      return;
+    }
+    if (ops.pollTimer) {
+      clearTimeout(ops.pollTimer);
+      ops.pollTimer = null;
+    }
+    ops.loadGeneration += 1;
+    const gen = ops.loadGeneration;
+    const valid = () => opsContextMatches(ops, context) && ops.loadGeneration === gen;
+
     ops.loading = true;
-    ops.contextError = "";
-    const valid = () => opsContextMatches(ops, context) && ops.loadGeneration === generation;
-    const shopSelect = $("#opsShopSelect");
-    renderOpsPlan();
-    formMessage("#opsPromptMessage", "正在读取当前店铺资料…");
+    renderOpsChat();
+
     try {
-      await loadAccounts();
-      if (!valid()) return;
-      shopSelect.replaceChildren();
-      for (const account of state.accounts.filter((item) => item.enabled !== false)) {
-        const option = document.createElement("option");
-        option.value = account.key;
-        option.textContent = accountLabel(account);
-        shopSelect.append(option);
-      }
-      shopSelect.value = context.accountKey;
-      const result = await accountScopedApi(context, "/api/ops/context");
-      if (!valid()) return;
-      if (!Array.isArray(result.products) || !Array.isArray(result.rules)) throw new ApiError("运维资料响应格式无效");
-      ops.connection = result.connection;
-      ops.diagnostics = result.diagnostics || {};
-      ops.contextLoaded = true;
-      ops.selectedItemIds = ops.selectedItemIds.filter((id) => result.products.some((item) => item.item_id === id));
-      ops.selectedRuleIds = ops.selectedRuleIds.filter((id) => result.rules.some((item) => item.id === id));
-      renderOpsProductList(result.products);
-      renderOpsRuleList(result.rules);
-      updateOpsConnectionBadge(result.connection);
-      formMessage("#opsPromptMessage", result.connection?.initialized && result.connection?.connection_status === "verified" ? "" : "请前往设置测试并保存统一模型连接");
-    } catch (error) {
-      if (!valid()) return;
-      ops.contextLoaded = false;
-      ops.contextError = error.message || "运维资料读取失败，请重试";
-      renderOpsProductList([]);
-      renderOpsRuleList([]);
-      formMessage("#opsPromptMessage", ops.contextError);
-    } finally {
-      if (valid()) {
-        ops.loading = false;
-        renderOpsChatMessages();
-        renderOpsPlan();
-      }
-    }
-  }
-
-  function handleOpsProductSelectChange(event) {
-    const selected = Array.from(event.target.selectedOptions).map((o) => o.value).slice(0, 20);
-    state.ops.selectedItemIds = selected;
-    document.querySelectorAll('#opsProductList input[type="checkbox"]').forEach((box) => {
-      box.checked = selected.includes(box.value);
-    });
-  }
-
-  function handleOpsRuleSelectChange(event) {
-    const selected = Array.from(event.target.selectedOptions).map((o) => o.value);
-    state.ops.selectedRuleIds = selected;
-    document.querySelectorAll('#opsRuleList input[type="checkbox"]').forEach((box) => {
-      box.checked = selected.includes(box.value);
-    });
-  }
-
-  async function handleOpsShopSelectChange(event) {
-    const key = event.target.value;
-    await switchShopAccount(key);
-    if ($("#opsShopSelect")) $("#opsShopSelect").value = state.activeAccountKey;
-  }
-
-  function handleOpsPromptInput(event) {
-    const val = event.target.value || "";
-    text("#opsPromptCount", val.length + " / 2000");
-  }
-
-  function renderOpsChatMessages() {
-    const container = $("#opsChatHistory") || $("#opsChatMessages");
-    if (!container) return;
-    const msgs = Array.isArray(state.ops.chatHistory) ? state.ops.chatHistory : [];
-    if (!msgs.length) {
-      container.innerHTML = '<div class="ops-chat-empty">选择店铺与关联资料后，在下方输入运维需求开始对话。</div>';
-      return;
-    }
-    container.innerHTML = msgs.map((msg) => {
-      const isUser = msg.role === "user";
-      return '<div class="ops-chat-msg ' + (isUser ? "is-user" : "is-assistant") + '">' +
-        '<div class="ops-chat-bubble">' + esc(msg.content) + '</div>' +
-        '</div>';
-    }).join("");
-    container.scrollTop = container.scrollHeight;
-  }
-
-  const renderOpsChat = renderOpsChatMessages;
-
-  function renderOpsPlan() {
-    const busy = state.ops.inFlight || state.ops.confirming || state.ops.cancelling || state.ops.refreshing;
-    const sendButton = $("#opsSendBtn");
-    setBusy(sendButton, state.ops.inFlight);
-    if (sendButton) sendButton.disabled = busy || state.ops.loading;
-    if ($("#opsPromptInput")) $("#opsPromptInput").disabled = busy;
-    const plan = state.ops.currentPlan;
-    const planNode = $("#opsPlanCard") || $("#opsPlan");
-    const emptyNode = $("#opsPlanEmpty");
-    if (!planNode) return;
-    if (!plan) {
-      planNode.hidden = true;
-      if (emptyNode) emptyNode.hidden = false;
-      return;
-    }
-    if (emptyNode) emptyNode.hidden = true;
-    planNode.hidden = false;
-
-    text("#opsPlanTitle", plan.title || "拟执行运维方案 (" + (plan.id || "") + ")");
-    text("#opsPlanSummary", plan.summary || "请核对拟执行操作与差异后确认执行。");
-
-    const badge = $("#opsPlanStatusBadge") || $("#opsPlanRisk");
-    const status = opsPlanStatus(plan);
-    const invalidPlan = !Array.isArray(plan.items) || plan.items.some((item) => !Object.hasOwn(OPS_TOOLS, item.tool));
-
-    if (badge) {
-      if (status === "succeeded") {
-        badge.textContent = "执行完成 (成功)";
-        badge.className = "badge badge-green";
-      } else if (status === "cancelled") {
-        badge.textContent = "方案已取消";
-        badge.className = "badge badge-muted";
-      } else if (status === "partial_failed") {
-        badge.textContent = "部分执行失败";
-        badge.className = "badge badge-red";
-      } else if (status === "needs_review") {
-        badge.textContent = "执行失败 / 待人工复核";
-        badge.className = "badge badge-red";
-      } else if (status === "failed") {
-        badge.textContent = "执行失败";
-        badge.className = "badge badge-red";
-      } else if (status === "expired") {
-        badge.textContent = "方案已过期";
-        badge.className = "badge badge-muted";
-      } else if (status === "executing") {
-        badge.textContent = "正在执行中…";
-        badge.className = "badge badge-amber";
-      } else if (status === "proposed") {
-        badge.textContent = "待核对确认";
-        badge.className = "badge badge-amber";
-      } else {
-        badge.textContent = status;
-        badge.className = "badge badge-muted";
-      }
-    }
-
-    const diffContainer = $("#opsPlanDiffList") || $("#opsPlanActions");
-    if (diffContainer) {
-      diffContainer.replaceChildren();
-      const items = Array.isArray(plan.items) ? plan.items : [];
-      items.forEach((item, idx) => {
-        const itemCard = document.createElement("div");
-        itemCard.className = "ops-plan-diff-item";
-
-        const title = document.createElement("div");
-        title.className = "ops-plan-diff-item-title";
-        const statusText = { succeeded: "已完成", failed: "失败", needs_review: "待复核", executing: "执行中", pending: "待执行" }[item.status] || "未知状态";
-        title.textContent = "#" + (idx + 1) + " " + (OPS_TOOLS[item.tool] || "不支持的操作") + " · " + (item.target || "--") + "【" + statusText + "】";
-        itemCard.append(title);
-
-        if (item.error_code) {
-          const errBox = document.createElement("div");
-          errBox.className = "ops-diff-error-box";
-          errBox.textContent = "错误原因: " + item.error_code + " (内容冲突 / 需人工复核)";
-          itemCard.append(errBox);
-        }
-
-        const grid = document.createElement("div");
-        grid.className = "ops-plan-diff-grid";
-
-        const beforeBox = document.createElement("div");
-        beforeBox.className = "ops-diff-before";
-        const beforeContent = item.before?.content !== undefined ? String(item.before.content) : (typeof item.before === "object" ? JSON.stringify(item.before, null, 2) : String(item.before || "--"));
-        beforeBox.innerHTML = '<strong>原有商品说明 (原值):</strong><pre>' + esc(beforeContent) + '</pre>';
-
-        const afterBox = document.createElement("div");
-        afterBox.className = "ops-diff-after";
-        const afterContent = item.after?.content !== undefined ? String(item.after.content) : (typeof item.after === "object" ? JSON.stringify(item.after, null, 2) : String(item.after || "--"));
-        afterBox.innerHTML = '<strong>仅限所选商品的使用说明 (拟更新):</strong><pre>' + esc(afterContent) + '</pre>';
-
-        grid.append(beforeBox, afterBox);
-        itemCard.append(grid);
-        diffContainer.append(itemCard);
+      const res = await accountScopedApi(context, "/api/ops/sessions", {
+        method: "POST",
       });
+      if (!valid()) return;
+      ops.session = res?.session || null;
+      ops.activeRun = null;
+      ops.runEvents = [];
+      ops.messages = [];
+      ops.pendingChat = null;
+      ops.error = null;
+      ops.loading = false;
+      renderOpsChat();
+      showToast("已开启新会话，旧会话已安全归档在服务端");
+    } catch (err) {
+      if (!valid()) return;
+      ops.loading = false;
+      showToast(err.message || "新建会话失败", "error");
+      renderOpsChat();
     }
-
-    const confirmBtn = $("#opsPlanConfirmBtn") || $("#opsPlanConfirm");
-    const cancelBtn = $("#opsPlanCancelBtn") || $("#opsPlanCancel");
-    const refreshBtn = $("#opsPlanRefreshBtn") || $("#opsPlanRefresh");
-
-    if (confirmBtn) confirmBtn.disabled = busy || invalidPlan || status !== "proposed";
-    if ($("#opsDiffConfirmBtn")) $("#opsDiffConfirmBtn").disabled = busy || invalidPlan || status !== "proposed";
-    if (cancelBtn) cancelBtn.disabled = busy || status !== "proposed";
-    if (refreshBtn) refreshBtn.disabled = busy;
-  }
-
-  function formatDiffVal(val) {
-    if (val === null || val === undefined) return "--";
-    if (typeof val === "object") {
-      if (val.content !== undefined) return String(val.content);
-      try { return JSON.stringify(val, null, 2); } catch (_) { return String(val); }
-    }
-    return String(val);
-  }
-
-  function openOpsDiffModal() {
-    const plan = state.ops.currentPlan;
-    if (!plan) return;
-    openDialog("opsDiffModal");
-    const meta = $("#opsDiffMeta");
-    if (meta) {
-      meta.innerHTML = '<span>方案: <strong>' + esc(plan.title || "运维方案") + '</strong></span> · ' +
-        '<span>状态: <strong>' + esc(OPS_STATUSES[opsPlanStatus(plan)] || "未知") + '</strong></span> · ' +
-        '<span>共 ' + (Array.isArray(plan.items) ? plan.items.length : 0) + ' 项拟变更</span>';
-    }
-    const tableBody = $("#opsDiffTable");
-    if (tableBody) {
-      const items = Array.isArray(plan.items) ? plan.items : [];
-      tableBody.innerHTML = items.map((act) => {
-        return '<tr>' +
-          '<td><strong>' + esc(act.tool || "操作") + '</strong></td>' +
-          '<td>' + esc(act.target || "--") + '</td>' +
-          '<td class="ops-diff-before"><strong>原有商品说明</strong><pre>' + esc(formatDiffVal(act.before)) + '</pre></td>' +
-          '<td class="ops-diff-after"><strong>仅限所选商品的使用说明</strong><pre>' + esc(formatDiffVal(act.after)) + '</pre></td>' +
-          '</tr>';
-      }).join("");
-    }
-    formMessage("#opsDiffMessage", "");
   }
 
   async function sendOpsChat(event) {
-    event?.preventDefault();
+    if (event) event.preventDefault();
     const ops = state.ops;
-    if (!state.me || ops.inFlight || ops.confirming || ops.cancelling || ops.refreshing) return;
-    const context = captureAccountContext();
-    const valid = () => opsContextMatches(ops, context);
+    if (ops.sending || ops.stopping || ops.loading) return;
+
     const input = $("#opsPromptInput");
-    const prompt = input.value.trim();
-    if (!prompt || prompt.length > 2000) { formMessage("#opsPromptMessage", "请输入不超过 2000 字的需求"); return; }
-    const selectedItemIds = getSelectedOpsItemIds();
-    const selectedRuleIds = getSelectedOpsRuleIds();
-    if (selectedItemIds.length + selectedRuleIds.length > 20) {
-      formMessage("#opsPromptMessage", "每次最多选择 20 个商品或规则目标"); return;
+    const rawText = input ? input.value : "";
+    if (!rawText.trim()) return;
+
+    // Lock sending synchronously before any await to avoid double submits
+    ops.sending = true;
+    ops.error = null;
+
+    const context = captureAccountContext();
+    const gen = ops.loadGeneration;
+    const currentSessionId = ops.session?.id || "";
+
+    // Reuse requestId on failure retry of identical message
+    let requestId;
+    if (ops.pendingChat && ops.pendingChat.session_id === currentSessionId && ops.pendingChat.message === rawText) {
+      requestId = ops.pendingChat.request_id;
+    } else {
+      requestId = newOpsRequestId();
+      ops.pendingChat = { session_id: currentSessionId, message: rawText, request_id: requestId };
     }
-    if (!ops.contextLoaded || ops.contextError) {
-      formMessage("#opsPromptMessage", ops.contextError || "请等店铺资料加载完成后再发送"); return;
-    }
-    const connection = state.settingsAi.connection || ops.connection;
-    if (connection?.initialized !== true || connection.connection_status !== "verified") {
-      formMessage("#opsPromptMessage", "请先在设置中测试并保存统一模型连接"); return;
-    }
-    const signature = JSON.stringify([prompt, selectedItemIds, selectedRuleIds]);
-    if (!ops.pendingChat || ops.pendingChat.signature !== signature) {
-      const payload = { request_id: newClientRequestId(), message: prompt,
-        selected_item_ids: selectedItemIds, selected_rule_ids: selectedRuleIds,
-        history: ops.chatHistory.slice(-10).map(({ role, content }) => ({ role, content: content.slice(0, 4000) })) };
-      ops.pendingChat = { signature, payload };
-      ops.chatHistory = [...ops.chatHistory, { role: "user", content: prompt }].slice(-10);
-    }
-    const pending = ops.pendingChat;
-    ops.inFlight = true;
-    const button = $("#opsSendBtn");
-    setBusy(button, true);
-    input.disabled = true;
-    formMessage("#opsPromptMessage", "正在分析，尚未修改资料…");
-    renderOpsChatMessages();
-    renderOpsPlan();
+
+    renderOpsChat();
+
+    const valid = (targetSessionId) => {
+      if (!opsContextMatches(ops, context)) return false;
+      if (ops.loadGeneration !== gen) return false;
+      if (targetSessionId !== undefined && (ops.session?.id || "") !== targetSessionId) return false;
+      return true;
+    };
+
     try {
-      const result = await accountScopedApi(context, "/api/ops/chat", {
-        method: "POST", headers: { "Idempotency-Key": pending.payload.request_id }, body: JSON.stringify(pending.payload),
+      const payload = {
+        session_id: currentSessionId,
+        request_id: requestId,
+        message: rawText,
+      };
+      const res = await accountScopedApi(context, "/api/ops/chat", {
+        method: "POST",
+        headers: {
+          "Idempotency-Key": requestId,
+        },
+        body: JSON.stringify(payload),
+      });
+
+      if (!valid(currentSessionId)) return;
+
+      // Successful dispatch: clear input and pendingChat
+      ops.pendingChat = null;
+      if (input) {
+        input.value = "";
+        input.style.height = "auto";
+      }
+
+      ops.messages.push({
+        id: "local-" + Date.now(),
+        role: "user",
+        content: rawText,
+      });
+
+      const newSessionId = res?.session_id || currentSessionId;
+      if (!ops.session || ops.session.id !== newSessionId) {
+        ops.session = { id: newSessionId, account_key: context.accountKey };
+      }
+
+      const runId = res?.run_id;
+      ops.activeRun = {
+        id: runId,
+        run_id: runId,
+        session_id: newSessionId,
+        status: res?.status || "queued",
+      };
+      ops.runEvents = [];
+      renderOpsChat();
+
+      if (runId) {
+        startOpsRunPolling(ops, context, newSessionId, runId, gen);
+      } else {
+        ops.sending = false;
+        renderOpsChat();
+      }
+    } catch (err) {
+      if (!valid(currentSessionId)) return;
+      ops.sending = false;
+      // Do not clear input on failure so user can retry or edit
+      ops.error = formatOpsError(err, requestId);
+      renderOpsChat();
+    }
+  }
+
+  function startOpsRunPolling(ops, context, sessionId, runId, gen, initialAfterSeq = 0) {
+    if (ops.pollTimer) {
+      clearTimeout(ops.pollTimer);
+      ops.pollTimer = null;
+    }
+
+    let afterSeq = initialAfterSeq;
+    const seenSeqs = new Set((ops.runEvents || []).map((e) => e.seq));
+
+    const poll = async () => {
+      if (!opsContextMatches(ops, context)) return;
+      if (ops.loadGeneration !== gen) return;
+      if ((ops.session?.id || "") !== sessionId) return;
+      if ((ops.activeRun?.id || ops.activeRun?.run_id || "") !== runId) return;
+
+      try {
+        const run = await accountScopedApi(context, "/api/ops/runs/" + encodeURIComponent(runId) + "?after_seq=" + afterSeq);
+        if (!opsContextMatches(ops, context)) return;
+        if (ops.loadGeneration !== gen) return;
+        if ((ops.session?.id || "") !== sessionId) return;
+        if ((ops.activeRun?.id || ops.activeRun?.run_id || "") !== runId) return;
+
+        ops.activeRun = run;
+
+        // Advance afterSeq with run.next_seq
+        if (run.next_seq != null && run.next_seq > afterSeq) {
+          afterSeq = run.next_seq;
+        }
+
+        // Deduplicate and accumulate live events
+        if (Array.isArray(run.events)) {
+          ops.runEvents = ops.runEvents || [];
+          for (const ev of run.events) {
+            if (!seenSeqs.has(ev.seq)) {
+              seenSeqs.add(ev.seq);
+              ops.runEvents.push(ev);
+            }
+          }
+        }
+
+        const isActive = ["queued", "running", "cancel_requested"].includes(run.status);
+        if (isActive) {
+          renderOpsChat();
+          ops.pollTimer = setTimeout(poll, 1000);
+        } else {
+          ops.pollTimer = null;
+          ops.sending = false;
+          ops.stopping = false;
+
+          // Reload committed messages from server upon reaching terminal status
+          if (sessionId) {
+            let allMessages = [];
+            let cursor = 0;
+            while (true) {
+              const msgRes = await accountScopedApi(context, "/api/ops/sessions/" + encodeURIComponent(sessionId) + "/messages?cursor=" + cursor);
+              if (!opsContextMatches(ops, context) || ops.loadGeneration !== gen || (ops.session?.id || "") !== sessionId) return;
+              const msgs = Array.isArray(msgRes?.messages) ? msgRes.messages : [];
+              allMessages = allMessages.concat(msgs);
+              if (msgRes?.next_cursor != null) {
+                cursor = msgRes.next_cursor;
+              } else {
+                break;
+              }
+            }
+            ops.messages = allMessages;
+          }
+          renderOpsChat();
+        }
+      } catch (err) {
+        if (!opsContextMatches(ops, context) || ops.loadGeneration !== gen) return;
+        ops.pollTimer = setTimeout(poll, 2000);
+      }
+    };
+
+    ops.pollTimer = setTimeout(poll, 500);
+  }
+
+  async function cancelOpsRun() {
+    const ops = state.ops;
+    const context = captureAccountContext();
+    const sessionId = ops.session?.id || "";
+    const runId = ops.activeRun?.id || ops.activeRun?.run_id;
+    const gen = ops.loadGeneration;
+    if (!runId || ops.stopping) return;
+
+    ops.stopping = true;
+    renderOpsChat();
+
+    const valid = () => opsContextMatches(ops, context) && ops.loadGeneration === gen && (ops.session?.id || "") === sessionId && (ops.activeRun?.id || ops.activeRun?.run_id || "") === runId;
+
+    try {
+      const res = await accountScopedApi(context, "/api/ops/runs/" + encodeURIComponent(runId) + "/cancel", {
+        method: "POST",
       });
       if (!valid()) return;
-      if (typeof result?.reply !== "string" || !result.reply.trim()) throw new ApiError("运维服务未返回有效回答，请重试");
-      if (result.plan && (!result.plan.id || !Array.isArray(result.plan.items))) throw new ApiError("计划格式无效，未执行修改");
-      ops.chatHistory = [...ops.chatHistory, { role: "assistant", content: result.reply }].slice(-10);
-      ops.currentPlan = result.plan || null;
-      ops.pendingChat = null;
-      input.value = "";
-      text("#opsPromptCount", "0 / 2000");
-      formMessage("#opsPromptMessage", result.plan ? "已生成待确认方案，尚未修改资料" : "分析完成，未修改资料", true);
-      renderOpsChatMessages();
-    } catch (error) {
-      if (valid()) formMessage("#opsPromptMessage", error.message || "运维服务暂时不可用；保留原请求，可重试查询结果");
-    } finally {
-      if (valid()) {
-        ops.inFlight = false;
-        setBusy(button, false);
-        input.disabled = false;
-        renderOpsPlan();
+      if (res) {
+        ops.activeRun = res;
       }
-    }
-  }
-
-  async function runOpsPlanAction(action) {
-    const ops = state.ops;
-    const plan = ops.currentPlan;
-    if (!state.me || !plan?.id || ops.inFlight || ops.confirming || ops.cancelling || ops.refreshing) return;
-    if (action !== "refresh" && opsPlanStatus(plan) !== "proposed") return;
-    if (!Array.isArray(plan.items) || plan.items.some((item) => !Object.hasOwn(OPS_TOOLS, item.tool))) return;
-    const context = captureAccountContext();
-    const valid = () => opsContextMatches(ops, context) && ops.currentPlan?.id === plan.id;
-    const field = { confirm: "confirming", cancel: "cancelling", refresh: "refreshing" }[action];
-    ops[field] = true;
-    renderOpsPlan();
-    formMessage("#opsPlanMessage", action === "refresh" ? "正在读取执行结果…" : "正在提交，请勿重复操作…");
-    const suffix = action === "refresh" ? "" : "/" + action;
-    const options = { method: action === "refresh" ? "GET" : "POST" };
-    if (action !== "refresh") {
-      const payload = { revision: plan.revision, digest: plan.digest };
-      if (action === "confirm") {
-        const requestId = ops.confirmRequests[plan.id] || newClientRequestId();
-        ops.confirmRequests[plan.id] = requestId;
-        Object.assign(payload, { confirm: true, request_id: requestId });
-        options.headers = { "Idempotency-Key": requestId };
+      if (res && !["queued", "running", "cancel_requested"].includes(res.status)) {
+        if (ops.pollTimer) {
+          clearTimeout(ops.pollTimer);
+          ops.pollTimer = null;
+        }
+        ops.stopping = false;
+        ops.sending = false;
+        await loadOpsContext();
+      } else {
+        renderOpsChat();
       }
-      options.body = JSON.stringify(payload);
-    }
-    try {
-      const result = await accountScopedApi(context, "/api/ops/plans/" + encodeURIComponent(plan.id) + suffix, options);
+    } catch (err) {
       if (!valid()) return;
-      if (result?.id !== plan.id || !Object.hasOwn(OPS_STATUSES, result.status) || !Array.isArray(result.items)) throw new ApiError("计划响应无效，请刷新结果核对");
-      ops.currentPlan = result;
-      formMessage("#opsPlanMessage", OPS_STATUSES[opsPlanStatus(result)] || "请核对执行状态", result.status === "succeeded" || result.status === "cancelled");
-      if (result.status === "succeeded") closeDialog("opsDiffModal");
-    } catch (error) {
-      if (valid()) {
-        formMessage("#opsPlanMessage", error.message || "操作结果尚未确认，请刷新查询；不要重复生成相同修改");
-        formMessage("#opsDiffMessage", error.message || "请刷新方案核对结果");
-      }
-    } finally {
-      if (opsContextMatches(ops, context)) {
-        ops[field] = false;
-        renderOpsPlan();
-      }
+      ops.stopping = false;
+      showToast(err.message || "停止请求失败", "error");
+      renderOpsChat();
     }
   }
 
-  async function confirmOpsPlan() { return runOpsPlanAction("confirm"); }
-  async function cancelOpsPlan() { return runOpsPlanAction("cancel"); }
-  async function refreshOpsPlan() { return runOpsPlanAction("refresh"); }
+  async function retryOpsRun(runId) {
+    const ops = state.ops;
+    const context = captureAccountContext();
+    const sessionId = ops.session?.id || "";
+    const gen = ops.loadGeneration;
+    if (!runId || ops.sending || ops.stopping) return;
+    if (ops.activeRun && (ops.activeRun.id === runId || ops.activeRun.run_id === runId) && ops.activeRun.recoverable !== true) return;
+
+    const requestId = newOpsRequestId();
+    ops.sending = true;
+    ops.error = null;
+    renderOpsChat();
+
+    const valid = () => opsContextMatches(ops, context) && ops.loadGeneration === gen && (ops.session?.id || "") === sessionId;
+
+    try {
+      const res = await accountScopedApi(context, "/api/ops/runs/" + encodeURIComponent(runId) + "/retry", {
+        method: "POST",
+        headers: { "Idempotency-Key": requestId },
+        body: JSON.stringify({ request_id: requestId }),
+      });
+      if (!valid()) return;
+      const newRunId = res?.run_id || runId;
+      ops.activeRun = {
+        id: newRunId,
+        run_id: newRunId,
+        session_id: sessionId,
+        status: res?.status || "queued",
+      };
+      ops.runEvents = [];
+      renderOpsChat();
+      startOpsRunPolling(ops, context, sessionId, newRunId, gen);
+    } catch (err) {
+      if (!valid()) return;
+      ops.sending = false;
+      showToast(err.message || "重试失败", "error");
+      renderOpsChat();
+    }
+  }
+
+  function renderOpsChat() {
+    const ops = state.ops;
+    const shopBadge = $("#opsCurrentShopBadge");
+    if (shopBadge) {
+      const current = currentAccount();
+      const shopName = current?.name || state.activeAccountKey || "默认店铺";
+      shopBadge.textContent = "当前店铺：" + shopName;
+    }
+
+    const sendBtn = $("#opsSendBtn");
+    const stopBtn = $("#opsStopBtn");
+    const newSessionBtn = $("#opsNewSessionBtn");
+
+    const isActiveRun = Boolean(ops.activeRun && ["queued", "running", "cancel_requested"].includes(ops.activeRun.status));
+    const isBusy = ops.loading || ops.sending || isActiveRun;
+
+    if (sendBtn) {
+      sendBtn.disabled = isBusy;
+    }
+    if (newSessionBtn) {
+      newSessionBtn.disabled = isBusy;
+    }
+    if (stopBtn) {
+      stopBtn.hidden = !isActiveRun;
+      stopBtn.disabled = ops.stopping || ops.activeRun?.status === "cancel_requested";
+      const stopTextNode = stopBtn.querySelector("span");
+      if (stopTextNode) {
+        stopTextNode.textContent = ops.stopping || ops.activeRun?.status === "cancel_requested" ? "正在请求停止…" : "停止执行";
+      }
+    }
+
+    const container = $("#opsChatHistory");
+    if (!container) return;
+
+    if (!ops.messages.length && !ops.loading && !isActiveRun && !ops.error) {
+      container.innerHTML = `
+        <div class="ops-empty-panel">
+          <div class="ops-empty-icon">
+            <svg class="icon"><use href="/xianyu-saas/assets/icons.svg?v=20260908-02#sparkles"></use></svg>
+          </div>
+          <h3>智能运维 Agent 已就绪</h3>
+          <p>请在下方输入自然语言指令。Agent 将分析您的意图，自动安全地配置客服知识库、回复规则或发货策略。</p>
+          <div class="ops-empty-tips">
+            <strong>支持的运维领域：</strong>
+            <ul>
+              <li><strong>知识库维护：</strong>新增、更新常见问答与咨询知识</li>
+              <li><strong>规则管理：</strong>关键词匹配、欢迎语、自动回复规则</li>
+              <li><strong>发货策略：</strong>绑定已有网盘链接或卡密池库存，自动化履约</li>
+            </ul>
+          </div>
+        </div>
+      `;
+      return;
+    }
+
+    let html = "";
+
+    if (ops.loading && !ops.messages.length) {
+      html += `
+        <div class="ops-msg-wrap ops-msg-assistant">
+          <div class="ops-bubble-assistant ops-run-progress">
+            <svg class="icon spin"><use href="/xianyu-saas/assets/icons.svg?v=20260908-02#refresh-cw"></use></svg>
+            <span>正在加载运维历史记录…</span>
+          </div>
+        </div>
+      `;
+    }
+
+    // Render messages: MUST prioritize kind === "tool" over role === "assistant"
+    for (const msg of ops.messages) {
+      if (msg.kind === "tool" || msg.role === "tool") {
+        const isSucceeded = msg.status === "succeeded";
+        const isFailed = msg.status === "failed";
+        const statusBadgeClass = isSucceeded ? "badge-green" : isFailed ? "badge-red" : "badge-amber";
+        const statusBadgeText = isSucceeded ? "执行成功" : isFailed ? "执行失败" : "部分完成";
+        const title = msg.summary || "执行回执";
+        const targets = Array.isArray(msg.targets) && msg.targets.length ? `<div class="ops-receipt-targets">目标: ${msg.targets.map((t) => `<code>${escapeHtml(String(t))}</code>`).join(" ")}</div>` : "";
+        const bodyContent = msg.content && msg.content !== title ? `<p>${escapeHtml(msg.content)}</p>` : "";
+        const errorContent = msg.error ? renderErrorDetails(msg.error) : "";
+
+        html += `
+          <div class="ops-msg-wrap ops-msg-receipt">
+            <details open class="ops-receipt-card">
+              <summary class="ops-receipt-summary">
+                <span class="ops-receipt-icon ${isFailed ? 'is-error' : 'is-success'}"></span>
+                <span class="ops-receipt-title">${escapeHtml(title)}</span>
+                <span class="badge ${statusBadgeClass}">${statusBadgeText}</span>
+              </summary>
+              <div class="ops-receipt-body">
+                ${targets}
+                ${bodyContent}
+                ${errorContent}
+              </div>
+            </details>
+          </div>
+        `;
+      } else if (msg.kind === "status") {
+        html += `
+          <div class="ops-msg-wrap ops-msg-assistant">
+            <div class="ops-bubble-assistant ops-bubble-status">${escapeHtml(msg.content || msg.summary || "")}</div>
+          </div>
+        `;
+      } else if (msg.role === "user") {
+        html += `
+          <div class="ops-msg-wrap ops-msg-user">
+            <div class="ops-bubble-user">${escapeHtml(msg.content)}</div>
+          </div>
+        `;
+      } else if (msg.role === "assistant") {
+        html += `
+          <div class="ops-msg-wrap ops-msg-assistant">
+            <div class="ops-bubble-assistant">${escapeHtml(msg.content)}</div>
+          </div>
+        `;
+      }
+    }
+
+    // Render live active run events if currently running
+    if (isActiveRun) {
+      if (Array.isArray(ops.runEvents)) {
+        for (const ev of ops.runEvents) {
+          if (ev.kind === "tool") {
+            const isSucceeded = ev.status === "succeeded";
+            const isFailed = ev.status === "failed";
+            const statusBadgeClass = isSucceeded ? "badge-green" : isFailed ? "badge-red" : "badge-amber";
+            const statusBadgeText = isSucceeded ? "执行成功" : isFailed ? "执行失败" : "执行中";
+            const targets = Array.isArray(ev.targets) && ev.targets.length ? `<div class="ops-receipt-targets">目标: ${ev.targets.map((t) => `<code>${escapeHtml(String(t))}</code>`).join(" ")}</div>` : "";
+            html += `
+              <div class="ops-msg-wrap ops-msg-receipt">
+                <details open class="ops-receipt-card">
+                  <summary class="ops-receipt-summary">
+                    <span class="ops-receipt-icon ${isFailed ? 'is-error' : 'is-success'}"></span>
+                    <span class="ops-receipt-title">${escapeHtml(ev.summary || "正在执行操作")}</span>
+                    <span class="badge ${statusBadgeClass}">${statusBadgeText}</span>
+                  </summary>
+                  <div class="ops-receipt-body">
+                    ${targets}
+                    ${ev.error ? renderErrorDetails(ev.error) : ""}
+                  </div>
+                </details>
+              </div>
+            `;
+          } else if (ev.kind === "assistant" && ev.content) {
+            html += `
+              <div class="ops-msg-wrap ops-msg-assistant">
+                <div class="ops-bubble-assistant">${escapeHtml(ev.content)}</div>
+              </div>
+            `;
+          }
+        }
+      }
+
+      const status = ops.activeRun.status;
+      const progressText = status === "cancel_requested"
+        ? "已请求停止；正在处理当前步骤，后续操作将被中止…"
+        : status === "queued"
+        ? "任务已保存，正在排队等待执行…"
+        : "正在执行运维任务…";
+
+      html += `
+        <div class="ops-msg-wrap ops-msg-assistant">
+          <div class="ops-bubble-assistant ops-run-progress">
+            <svg class="icon spin"><use href="/xianyu-saas/assets/icons.svg?v=20260908-02#refresh-cw"></use></svg>
+            <span>${escapeHtml(progressText)}</span>
+          </div>
+        </div>
+      `;
+    }
+
+    // Terminal run summary & retry button if recoverable
+    if (ops.activeRun && !isActiveRun) {
+      const r = ops.activeRun;
+      const isTerminalFailure = ["failed", "partial_failed", "cancelled"].includes(r.status);
+      const isRecoverable = r.recoverable === true;
+      const changedCount = Number(r.changed_count || 0);
+      const failedCount = Number(r.failed_count || 0);
+
+      let summaryMeta = `<span>生效配置: <strong>${changedCount}</strong> 项</span> · <span>失败: <strong>${failedCount}</strong> 项</span>`;
+      let retryBtn = "";
+      if (isTerminalFailure && isRecoverable) {
+        const runId = r.id || r.run_id;
+        retryBtn = `<button type="button" class="button button-secondary button-compact ops-retry-btn" data-retry-run="${escapeHtml(runId)}"><svg class="icon"><use href="/xianyu-saas/assets/icons.svg?v=20260908-02#refresh-cw"></use></svg><span>重试失败任务</span></button>`;
+      }
+
+      html += `
+        <div class="ops-run-summary-bar">
+          <div class="ops-run-summary-info">${summaryMeta}</div>
+          ${retryBtn}
+        </div>
+      `;
+
+      if (r.error) {
+        html += `<div class="ops-msg-wrap ops-msg-error">${renderErrorDetails(r.error)}</div>`;
+      }
+    }
+
+    if (ops.error) {
+      html += `<div class="ops-msg-wrap ops-msg-error">${renderErrorDetails(ops.error)}</div>`;
+    }
+
+    container.innerHTML = html;
+    container.scrollTop = container.scrollHeight;
+  }
 
   async function bootstrap() {
     state.accountEpoch += 1;
@@ -6706,7 +7677,7 @@
     renderOverview();
     void loadVersionInfo().catch(() => {});
     void loadUnifiedAiConnection().catch(() => {});
-    await Promise.all([loadProducts({ force: true, catalogStatus }), loadAutomation().catch(() => {}), loadAiConfig().catch(() => {}), loadOverviewSignals(epoch)]);
+    await Promise.all([loadProducts({ force: true, catalogStatus }), loadProductDeliveryStatus().catch(() => {}), loadAutomation().catch(() => {}), loadAiConfig().catch(() => {}), loadOverviewSignals(epoch)]);
     await Promise.all([loadMessages().catch(() => {}), loadOrders().catch(() => {}), loadQuickReplies().catch(() => {})]);
     $("#authScreen").hidden = true;
     $("#workspace").hidden = false;
@@ -6771,13 +7742,21 @@
       node.classList.toggle("is-active", active);
       node.setAttribute("aria-selected", String(active));
     });
+    if (view === "home") {
+      void loadOverviewSignals();
+      void loadShopResources({ silent: true });
+    }
     if (view === "shops") {
       renderAccountSwitcher();
       loadAccounts().catch((error) => {
         if (error?.status !== 404) showToast(error.message || "店铺列表暂时无法读取", "error");
       });
+      void loadShopResources({ silent: true });
     }
-    if (view === "goods") loadProducts({ force: true }).catch((error) => showToast(error.message, "error"));
+    if (view === "goods") {
+      loadProducts({ force: true }).catch((error) => showToast(error.message, "error"));
+      void loadProductDeliveryStatus();
+    }
     if (view === "auto-reply") loadAutomation().catch((error) => showToast(error.message, "error"));
     if (view === "ai-config") loadAiConfig().catch((error) => showToast(error.message || "AI 配置读取失败", "error"));
     if (view === "chat") {
@@ -6793,6 +7772,9 @@
     }
     if (view === "ops") {
       void loadOpsContext();
+    } else if (state.ops?.pollTimer) {
+      clearTimeout(state.ops.pollTimer);
+      state.ops.pollTimer = null;
     }
     if (view === "templates") {
       loadTemplates().catch((error) => showToast(error.message, "error"));
@@ -6802,6 +7784,7 @@
     if (view === "analytics") loadAnalytics().catch((error) => showToast(error.message, "error"));
     setSidebarOpen(false);
     syncMerchantPolling();
+    syncResourcePolling();
   }
 
   async function refreshState() {
@@ -6820,9 +7803,14 @@
     renderAccount();
     renderSettings();
     renderOverview();
+    if (["home", "shops"].includes(state.view)) {
+      await loadShopResources({ silent: true });
+      if (!refreshContextMatches(context)) return false;
+    }
     void loadVersionInfo().catch(() => {});
     void loadUnifiedAiConnection().catch(() => {});
     await loadProducts({ force: true, catalogStatus });
+    await loadProductDeliveryStatus().catch(() => {});
     if (!refreshContextMatches(context)) return false;
     await loadAutomation().catch(() => {});
     if (!refreshContextMatches(context)) return false;
@@ -6847,6 +7835,7 @@
       void loadOpsContext();
     }
     syncMerchantPolling();
+    syncResourcePolling();
     return true;
   }
 
@@ -7575,10 +8564,17 @@
     $("#authForm").addEventListener("submit", submitAuth);
     $("#passwordChangeForm").addEventListener("submit", changeCurrentPassword);
     $("#platformSettingsForm").addEventListener("submit", savePlatformSettings);
-    $("#refreshVersionButton").addEventListener("click", () => { state.docs.pollAttempts = 0; void loadDocsData({ force: true }); });
+    $("#resourceSettingsForm")?.addEventListener("submit", saveResourceSettings);
+    $("#reloadResourceSettings")?.addEventListener("click", () => void reloadResourceSettings());
+    ["resourceMaxShops", "resourceMaxWorkers", "resourceMemoryMiB"].forEach((id) => {
+      const el = $("#" + id);
+      if (el) {
+        el.addEventListener("input", onResourceInputChange);
+        el.addEventListener("change", onResourceInputChange);
+      }
+    });
     $("#refreshAdminUsers").addEventListener("click", () => loadDocsData({ force: true }));
     $("#refreshAuditButton").addEventListener("click", () => loadDocsData({ force: true }));
-    $("#checkUpdateButton")?.addEventListener("click", checkPlatformUpdate);
     $("#versionBadgeButton")?.addEventListener("click", (e) => {
       e.stopPropagation();
       toggleVersionBadgePopover();
@@ -7590,11 +8586,6 @@
     $("#versionBadgeRefresh")?.addEventListener("click", (e) => {
       e.stopPropagation();
       void checkPlatformUpdate();
-    });
-    $("#versionBadgeDetails")?.addEventListener("click", () => {
-      closeVersionBadgePopover();
-      showView("settings");
-      setSettingsTab("version");
     });
     document.addEventListener("click", (event) => {
       const container = event.target.closest(".version-badge-container");
@@ -7612,36 +8603,39 @@
       showView("settings");
       setSettingsTab(button.dataset.settingsGo);
     }));
-    $("#settingsAiLegacySelect")?.addEventListener("change", handleLegacySourceSelect);
-    $("#settingsLegacySource")?.addEventListener("change", handleLegacySourceSelect);
-    $("#settingsImportLegacy")?.addEventListener("click", handleLegacySourceImport);
 
-    $("#opsShopSelect")?.addEventListener("change", handleOpsShopSelectChange);
-    $("#opsProductSelect")?.addEventListener("change", handleOpsProductSelectChange);
-    $("#opsRuleSelect")?.addEventListener("change", handleOpsRuleSelectChange);
-    $("#opsPromptInput")?.addEventListener("input", handleOpsPromptInput);
-    $("#opsMessageInput")?.addEventListener("input", handleOpsPromptInput);
-    $("#opsPromptForm")?.addEventListener("submit", sendOpsChat);
-    $("#opsChatForm")?.addEventListener("submit", sendOpsChat);
-    $("#opsPlanViewDiffBtn")?.addEventListener("click", openOpsDiffModal);
-    $("#opsPlanRefreshBtn")?.addEventListener("click", refreshOpsPlan);
-    $("#opsPlanRefresh")?.addEventListener("click", refreshOpsPlan);
-    $("#opsPlanConfirmBtn")?.addEventListener("click", confirmOpsPlan);
-    $("#opsPlanConfirm")?.addEventListener("click", confirmOpsPlan);
-    $("#opsPlanCancelBtn")?.addEventListener("click", cancelOpsPlan);
-    $("#opsPlanCancel")?.addEventListener("click", cancelOpsPlan);
-    $("#opsDiffConfirmBtn")?.addEventListener("click", confirmOpsPlan);
+    // Ops Agent events
+    $("#opsPromptForm").addEventListener("submit", sendOpsChat);
+    $("#opsPromptInput").addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && !e.shiftKey) {
+        e.preventDefault();
+        void sendOpsChat();
+      }
+    });
+    $("#opsPromptInput").addEventListener("input", (e) => {
+      const target = e.target;
+      target.style.height = "auto";
+      target.style.height = Math.min(target.scrollHeight, 180) + "px";
+    });
+    $("#opsStopBtn").addEventListener("click", cancelOpsRun);
+    $("#opsNewSessionBtn").addEventListener("click", createNewOpsSession);
+    document.addEventListener("click", (e) => {
+      const chip = e.target.closest(".ops-chip-mini");
+      if (chip && chip.dataset.fill) {
+        const input = $("#opsPromptInput");
+        if (input) {
+          input.value = chip.dataset.fill;
+          input.focus();
+          input.style.height = "auto";
+          input.style.height = Math.min(input.scrollHeight, 180) + "px";
+        }
+      }
+      const retryBtn = e.target.closest(".ops-retry-btn");
+      if (retryBtn && retryBtn.dataset.retryRun) {
+        void retryOpsRun(retryBtn.dataset.retryRun);
+      }
+    });
 
-    $("#downloadUpdateButton").addEventListener("click", downloadPlatformUpdate);
-    $("#applyUpdateButton").addEventListener("click", () => {
-      const version = state.docs.stagedVersion;
-      if (version) void confirmAdminUpdate("apply", version).catch((error) => formMessage("#updateActionMessage", error.message || "更新申请失败"));
-    });
-    $("#rollbackUpdateButton").addEventListener("click", () => {
-      const version = $("#rollbackVersionSelect").value;
-      if (version) void confirmAdminUpdate("rollback", version).catch((error) => formMessage("#updateActionMessage", error.message || "回滚申请失败"));
-    });
-    $("#rollbackVersionSelect").addEventListener("change", () => renderVersionPanel());
     $$('[data-docs-tab]').forEach((button) => button.addEventListener("click", () => setDocsTab(button.dataset.docsTab)));
     $$('[data-docs-go]').forEach((button) => button.addEventListener("click", () => {
       if (["home", "chat", "goods", "orders", "shops"].includes(button.dataset.docsGo)) showView(button.dataset.docsGo);
@@ -7708,6 +8702,31 @@
       renderQrLogin();
     });
     $("#refreshProducts").addEventListener("click", syncShop);
+    $("#productViewCards")?.addEventListener("click", () => setGoodsViewMode("cards"));
+    $("#productViewList")?.addEventListener("click", () => setGoodsViewMode("list"));
+    $("#productSearch")?.addEventListener("input", (e) => {
+      state.goodsSearch = e.target.value;
+      state.goodsPage = 1;
+      renderProducts();
+    });
+    $("#productStatusFilter")?.addEventListener("change", (e) => {
+      state.goodsStatusFilter = e.target.value;
+      state.goodsPage = 1;
+      renderProducts();
+    });
+    $("#productPageSize")?.addEventListener("change", (e) => {
+      setGoodsPageSize(e.target.value);
+    });
+    $("#productPrevPage")?.addEventListener("click", () => {
+      if (state.goodsPage > 1) {
+        state.goodsPage -= 1;
+        renderProducts();
+      }
+    });
+    $("#productNextPage")?.addEventListener("click", () => {
+      state.goodsPage += 1;
+      renderProducts();
+    });
     $("#checkCookieButton").addEventListener("click", syncShop);
     $("#replyRuleForm").addEventListener("submit", saveReplyRule);
     $("#cancelReplyRuleEdit").addEventListener("click", () => resetReplyRuleForm({ focus: true }));
@@ -7776,9 +8795,20 @@
       if (key && key !== state.activeAccountKey) void switchShopAccount(key);
     });
     $$("#analyticsPeriod [data-period]").forEach((button) => button.addEventListener("click", () => {
-      void loadAnalytics(Number(button.dataset.period || 1)).catch((error) => showToast(error.message, "error"));
+      void loadTrendAnalytics(Number(button.dataset.period || 7)).catch((error) => showToast(error.message, "error"));
     }));
-    document.addEventListener("visibilitychange", syncMerchantPolling);
+    document.addEventListener("visibilitychange", () => {
+      syncMerchantPolling();
+      syncResourcePolling();
+      if (!document.hidden && shouldPollResources()) {
+        void loadShopResources({ silent: true });
+      }
+    });
+    $("#refreshShopResources")?.addEventListener("click", () => {
+      void loadShopResources().then((data) => {
+        if (data) showToast("店铺运行资源已更新");
+      }).catch((error) => showToast(error.message, "error"));
+    });
     $("#conversationSearch").addEventListener("input", (event) => {
       state.inbox.search = String(event.currentTarget.value || "").slice(0, 120);
       persistInboxPreferences();
@@ -8172,6 +9202,7 @@
   }
 
   async function init() {
+    loadGoodsPreferences();
     bindEvents();
     syncSidebarAccessibility();
     installProductImageFallback();

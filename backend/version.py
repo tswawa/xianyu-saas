@@ -11,7 +11,8 @@ from pathlib import Path
 
 # Must match package.json; image builds validate this before publication.
 VERSION = "0.1.0"
-ASSET_VERSION = "20260908-01"
+ASSET_VERSION = "20260909-01"
+RELEASE_CHANNEL = "release"
 ROOT = Path(__file__).resolve().parents[1]
 BUILD_INFO_FILE = Path(__file__).with_name("build-info.json")
 
@@ -54,7 +55,8 @@ def deployment_kind() -> str:
     return "systemd" if configured == "systemd" else "source"
 
 
-def version_payload(channel: str) -> dict:
+def version_payload(channel: str = RELEASE_CHANNEL) -> dict:
+    # The optional argument is retained for installed artifact readers, not a UI setting.
     return {
         "version": VERSION,
         "commit": BUILD_COMMIT,
@@ -62,7 +64,6 @@ def version_payload(channel: str) -> dict:
         "build_dirty": BUILD_DIRTY,
         "deployment": deployment_kind(),
         "asset_version": ASSET_VERSION,
-        "update_channel": str(channel or "stable"),
     }
 
 

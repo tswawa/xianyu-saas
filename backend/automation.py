@@ -7,6 +7,7 @@ helpers keep the on-disk representation strict and bounded.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import re
@@ -218,8 +219,8 @@ def normalise_deliveries(value, snapshot: dict | None) -> list[dict]:
     """Validate simple fixed-material deliveries against the shop snapshot."""
     if value is None:
         return []
-    if not isinstance(value, list) or len(value) > MAX_DELIVERIES:
-        raise AutomationValidationError(f"最多设置 {MAX_DELIVERIES} 个商品")
+    if not isinstance(value, list):
+        raise AutomationValidationError("自动发货配置必须是列表")
     allowed = _snapshot_ids(snapshot)
     result = []
     seen: set[str] = set()
@@ -253,8 +254,8 @@ def normalise_deliveries(value, snapshot: dict | None) -> list[dict]:
 
 def normalise_material_batch(item_ids, material, enabled, snapshot: dict | None) -> list[dict]:
     """Validate one simple, account-local batch material operation."""
-    if not isinstance(item_ids, list) or not item_ids or len(item_ids) > MAX_BATCH_ITEMS:
-        raise AutomationValidationError(f"商品数量必须是 1-{MAX_BATCH_ITEMS} 个")
+    if not isinstance(item_ids, list) or not item_ids:
+        raise AutomationValidationError("请至少指定一个商品")
     if not isinstance(enabled, bool):
         raise AutomationValidationError("商品资料开关格式无效")
     if not enabled:
@@ -341,16 +342,34 @@ def material_batch_preview(
     }
 
 
+def _material_product_entry(source, item_id, material, enabled, snapshot):
+    """Copy a single target's metadata, splitting shared bindings only as needed."""
+    source = source or {}
+    ids = source.get("item_ids")
+    if not isinstance(ids, list):
+        ids = [source["item_id"]] if source.get("item_id") is not None else []
+    result = copy.deepcopy(source)
+    identifier = source.get("id") if len(ids) == 1 else None
+    result.update(id=identifier or f"basic-{item_id}", name=source.get("name") or _product_title(snapshot, item_id),
+                  item_ids=[item_id], delivery="material", enabled=enabled, payload=material)
+    for field in ("item_id", "material", "resource_match"):
+        result.pop(field, None)
+    return result
+
+
 def merge_material_product_updates(
     existing: object,
     updates: list[dict],
     snapshot: dict | None,
 ) -> dict:
     """Apply selected material updates while preserving all other mappings."""
+    if existing is not None and not isinstance(existing, dict):
+        raise AutomationValidationError("商品配置文件格式无效，未重置原文件")
     existing_types = existing.get("types", []) if isinstance(existing, dict) else []
     if not isinstance(existing_types, list):
-        existing_types = []
+        raise AutomationValidationError("商品配置 types 格式无效，未重置原文件")
     by_id = {item["item_id"]: item for item in updates}
+    sources = {}
     retained = []
     for raw in existing_types:
         if not isinstance(raw, dict):
@@ -367,6 +386,9 @@ def merge_material_product_updates(
         if not selected_ids:
             retained.append(raw)
             continue
+        for item_id in selected_ids:
+            if by_id[item_id]["enabled"] or raw.get("delivery") == "material":
+                sources.setdefault(item_id, raw)
         # Disable only existing material mappings. A selected redeem/pan ID
         # remains in place even when it shares a legacy group with a material
         # ID that is being changed.
@@ -377,10 +399,10 @@ def merge_material_product_updates(
             or (not by_id[item_id]["enabled"] and raw.get("delivery") != "material")
         ]
         if preserved:
-            copy = dict(raw)
-            copy["item_ids"] = preserved
-            copy.pop("item_id", None)
-            retained.append(copy)
+            remainder = copy.deepcopy(raw)
+            remainder["item_ids"] = preserved
+            remainder.pop("item_id", None)
+            retained.append(remainder)
     existing_material = {
         item["item_id"]: item
         for item in deliveries_from_products(existing, snapshot)
@@ -390,28 +412,13 @@ def merge_material_product_updates(
             current = existing_material.get(update["item_id"])
             if current is None:
                 continue
-            retained.append(
-                {
-                    "id": f"basic-{update['item_id']}",
-                    "name": _product_title(snapshot, update["item_id"]),
-                    "item_ids": [update["item_id"]],
-                    "delivery": "material",
-                    "enabled": False,
-                    "payload": current["material"],
-                }
-            )
+            source = sources.get(update["item_id"], {})
+            payload = source.get("payload", source.get("material", current["material"]))
+            retained.append(_material_product_entry(source, update["item_id"], payload, False, snapshot))
             continue
-        retained.append(
-            {
-                "id": f"basic-{update['item_id']}",
-                "name": _product_title(snapshot, update["item_id"]),
-                "item_ids": [update["item_id"]],
-                "delivery": "material",
-                "enabled": True,
-                "payload": update["material"],
-            }
-        )
-    return {"version": 1, "types": retained}
+        retained.append(_material_product_entry(sources.get(update["item_id"]), update["item_id"], update["material"], True, snapshot))
+    return {**{key: value for key, value in (existing or {}).items() if key != "_ops_receipt"},
+            "version": (existing or {}).get("version", 1), "types": retained}
 
 
 def _product_title(snapshot: dict | None, item_id: str) -> str:
@@ -424,32 +431,42 @@ def _product_title(snapshot: dict | None, item_id: str) -> str:
 
 def merge_material_products(existing: object, deliveries: list[dict], snapshot: dict | None) -> dict:
     """Replace only simple material entries and retain member-only legacy types."""
+    if existing is not None and not isinstance(existing, dict):
+        raise AutomationValidationError("商品配置文件格式无效，未重置原文件")
     existing_types = existing.get("types", []) if isinstance(existing, dict) else []
     if not isinstance(existing_types, list):
-        existing_types = []
+        raise AutomationValidationError("商品配置 types 格式无效，未重置原文件")
     retained = []
+    sources = {}
     material_ids = {item["item_id"] for item in deliveries}
     for raw in existing_types:
         if not isinstance(raw, dict):
-            continue
+            raise AutomationValidationError("商品配置条目格式无效，未重置原文件")
         delivery = raw.get("delivery")
-        ids = raw.get("item_ids") if isinstance(raw.get("item_ids"), list) else []
+        ids = raw.get("item_ids")
+        if not isinstance(ids, list):
+            ids = [raw["item_id"]] if raw.get("item_id") is not None else []
         ids = [str(item).strip() for item in ids]
-        if delivery == "material" or any(item in material_ids for item in ids):
+        for item_id in ids:
+            if item_id in material_ids:
+                sources.setdefault(item_id, raw)
+        if delivery == "material":
+            # This is the manual full material-list save: omitted material
+            # bindings are removed, but unrelated advanced bindings are not.
+            continue
+        if any(item in material_ids for item in ids):
+            preserved = [item_id for item_id in ids if item_id not in material_ids]
+            if preserved:
+                remainder = copy.deepcopy(raw)
+                remainder["item_ids"] = preserved
+                remainder.pop("item_id", None)
+                retained.append(remainder)
             continue
         retained.append(raw)
     for item in deliveries:
-        retained.append(
-            {
-                "id": f"basic-{item['item_id']}",
-                "name": _product_title(snapshot, item["item_id"]),
-                "item_ids": [item["item_id"]],
-                "delivery": "material",
-                "enabled": item["enabled"],
-                "payload": item["material"],
-            }
-        )
-    return {"version": 1, "types": retained}
+        retained.append(_material_product_entry(sources.get(item["item_id"]), item["item_id"], item["material"], item["enabled"], snapshot))
+    return {**{key: value for key, value in (existing or {}).items() if key != "_ops_receipt"},
+            "version": (existing or {}).get("version", 1), "types": retained}
 
 
 def deliveries_from_products(products: object, snapshot: dict | None) -> list[dict]:

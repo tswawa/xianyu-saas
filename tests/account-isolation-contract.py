@@ -23,6 +23,9 @@ os.environ.update(
     {
         "SAAS_DB": str(RUN_DIR / "saas.db"),
         "SAAS_TENANTS_DIR": str(RUN_DIR / "tenants"),
+        # Keep synthetic login fixtures from spawning an installed live Worker
+        # inside a test container before this suite seeds its own record schema.
+        "SAAS_BOT_ROOT": str(RUN_DIR / "worker-not-installed"),
         "SAAS_COOKIE_SECURE": "0",
         "SAAS_RESTORE_WORKERS": "0",
         "SAAS_TESTING": "1",

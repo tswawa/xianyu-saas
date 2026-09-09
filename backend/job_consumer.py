@@ -1,10 +1,9 @@
 """Durable control-plane job consumer.
 
-The first consumer owns only ``shop_sync`` refresh jobs.  It reads the
-already-verified Cookie from the account's private directory; job payloads may
-contain a fingerprint and flags, but never credential material.  Keeping the
-consumer as a separate module/process prevents long platform requests from
-occupying API request workers.
+The consumer owns ``shop_sync`` and ``ops_run`` jobs on separate bounded lanes.
+Sync reads the already-verified Cookie; operations payloads contain only a run
+identifier. Neither queue carries credentials or business conversation text.
+No API module is imported, and long model calls cannot block the sync lane.
 """
 
 from __future__ import annotations
@@ -13,7 +12,9 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import signal
+import sqlite3
 import threading
 import time
 from collections.abc import Callable
@@ -60,7 +61,7 @@ def _safe_write(storage: AccountStorage, user_id: int, name: str, value: str, ac
 class JobConsumer:
     """One-process consumer with bounded polling and lease heartbeats."""
 
-    SUPPORTED_KINDS = ("shop_sync",)
+    SUPPORTED_KINDS = ("shop_sync", "ops_run")
 
     def __init__(
         self,
@@ -73,6 +74,7 @@ class JobConsumer:
         poll_seconds: float = POLL_SECONDS,
         lease_seconds: float = LEASE_SECONDS,
         owner: str | None = None,
+        operations_service=None,
     ):
         self.db = db or DB()
         self.sync_func = sync_func
@@ -83,6 +85,7 @@ class JobConsumer:
         self.lease_seconds = max(float(SYNC_MAX_SECONDS + 120), min(float(lease_seconds), 3600.0))
         self.owner = owner or f"consumer:{os.getpid()}:{time.time_ns()}"
         self.stop_event = threading.Event()
+        self.operations_service = operations_service
 
     def stop(self) -> None:
         self.stop_event.set()
@@ -141,10 +144,16 @@ class JobConsumer:
             raise ValueError("invalid job payload")
         return payload
 
-    def _heartbeat(self, job_id: int, done: threading.Event) -> None:
+    def _heartbeat(self, job_id: int, done: threading.Event, lost: threading.Event | None = None) -> None:
         interval = max(5.0, min(self.lease_seconds / 3.0, 30.0))
         while not done.wait(interval):
-            if not self.db.renew_job(job_id, self.owner, lease_seconds=self.lease_seconds):
+            try:
+                owned = self.db.renew_job(job_id, self.owner, lease_seconds=self.lease_seconds)
+            except sqlite3.Error:
+                owned = False
+            if not owned:
+                if lost is not None:
+                    lost.set()
                 return
 
     def _fail(
@@ -163,8 +172,96 @@ class JobConsumer:
             retry_delay_seconds=retry_delay_seconds,
         )
 
+    def _operations(self):
+        if self.operations_service is None:
+            # Construct the services against this consumer's DB and storage.
+            # Importing app here would create a second API/watchdog instance.
+            from ai_customer_service import AIService
+            from operations import OperationsService
+            from user_ai_connection import UserAIConnections
+
+            ai_service = AIService(self.storage.root)
+            ai_service.user_connections = UserAIConnections(self.db, ai_service)
+            self.operations_service = OperationsService(self.db, ai_service)
+        return self.operations_service
+
+    def _process_ops(self, row) -> str:
+        from operations import OperationsError
+
+        job_id = int(row["id"])
+        try:
+            payload = self._payload(row)
+            run_id = payload.get("run_id")
+            if (set(payload) != {"run_id"} or not isinstance(run_id, str)
+                    or not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", run_id)):
+                raise ValueError("invalid operations payload")
+            service = self._operations()
+            with self.db._lock:
+                run = self.db.con.execute(
+                    "SELECT * FROM ops_runs WHERE id = ?", (run_id,),
+                ).fetchone()
+            if (run is None or int(run["user_id"]) != int(row["user_id"])
+                    or int(run["shop_account_id"]) != int(row["account_id"])):
+                raise ValueError("invalid operations scope")
+            if int(run["job_id"]) != job_id:
+                # A durable explicit retry owns a new job; an old attempt can
+                # be acknowledged but cannot dispatch the new attempt.
+                return "completed" if self.db.complete_job(job_id, self.owner) else "lease_lost"
+        except (ValueError, KeyError, TypeError):
+            self._fail(row, "invalid_payload", "运维任务标识或归属无效")
+            return "failed"
+
+        done, lost = threading.Event(), threading.Event()
+
+        def ensure_job():
+            current = self.db.get_job(job_id)
+            if (lost.is_set() or current is None or current["status"] != "running"
+                    or current["lease_owner"] != self.owner
+                    or float(current["lease_until"] or 0) <= time.time()):
+                raise OperationsError("job_lease_lost", 409)
+            if self.stop_event.is_set():
+                raise OperationsError("runner_interrupted", 503)
+            return current
+
+        heartbeat = threading.Thread(
+            target=self._heartbeat, args=(job_id, done, lost),
+            daemon=True, name=f"ops-job-lease-{job_id}",
+        )
+        heartbeat.start()
+        try:
+            result = service.process_run(run_id, ensure_job=ensure_job)
+            if lost.is_set():
+                return "lease_lost"
+            status = result.get("status") if isinstance(result, dict) else None
+            if status in {"queued", "running", "cancel_requested"}:
+                deferred = self.db.defer_job(job_id, self.owner, self.poll_seconds)
+                return "deferred" if deferred else "lease_lost"
+            if status not in {"waiting_user", "succeeded", "partial_failed", "failed",
+                              "cancelled", "needs_review"}:
+                raise ValueError("invalid operations result")
+            # Business/model failures are already durable visible run results.
+            # Complete this dispatch so the queue cannot silently retry a model.
+            return "completed" if self.db.complete_job(job_id, self.owner) else "lease_lost"
+        except OperationsError as error:
+            if error.code in {"runner_interrupted", "job_lease_lost"}:
+                deferred = self.db.defer_job(job_id, self.owner, self.poll_seconds)
+                return "deferred" if deferred else "lease_lost"
+            self._fail(row, "operations_unavailable", "运维任务处理暂时不可用")
+            return "failed"
+        except (OSError, sqlite3.Error, RuntimeError, ValueError, TypeError):
+            self._fail(row, "operations_unavailable", "运维任务处理暂时不可用")
+            return "failed"
+        finally:
+            done.set()
+            heartbeat.join(timeout=1.0)
+
     def process(self, row) -> str:
         """Process one claimed row and return its terminal action."""
+        if row["kind"] == "ops_run":
+            return self._process_ops(row)
+        if row["kind"] != "shop_sync":
+            self._fail(row, "unsupported_job", "该任务类型暂不由后台消费者处理")
+            return "failed"
         job_id = int(row["id"])
         user_id = int(row["user_id"])
         account = self._resolve_account(row)
@@ -278,22 +375,40 @@ class JobConsumer:
             return "lease_lost"
         return "completed"
 
-    def run_once(self, *, now: float | None = None) -> int:
+    def run_once(self, *, now: float | None = None, kinds=None) -> int:
         rows = self.db.claim_jobs(
             self.owner,
             limit=1,
             lease_seconds=self.lease_seconds,
             now=now,
-            kinds=self.SUPPORTED_KINDS,
+            kinds=self.SUPPORTED_KINDS if kinds is None else kinds,
         )
         for row in rows:
             self.process(row)
         return len(rows)
 
-    def run_forever(self) -> None:
+    def _run_lane(self, kinds) -> None:
         while not self.stop_event.is_set():
-            if self.run_once() == 0:
+            try:
+                processed = self.run_once(kinds=kinds)
+            except (OSError, sqlite3.Error):
+                # A transient store failure must not silently kill a lane.
+                # The existing lease recovers an interrupted claimed job.
+                processed = 0
+            if processed == 0:
                 self.stop_event.wait(self.poll_seconds)
+
+    def run_forever(self) -> None:
+        ops_lane = threading.Thread(
+            target=self._run_lane, args=(("ops_run",),),
+            name="operations-consumer", daemon=True,
+        )
+        ops_lane.start()
+        try:
+            self._run_lane(("shop_sync",))
+        finally:
+            self.stop()
+            ops_lane.join(timeout=2.0)
 
 
 def main() -> int:

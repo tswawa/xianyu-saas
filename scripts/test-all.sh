@@ -18,6 +18,7 @@ npm run test:syntax
 npm run test:auth
 npm run test:update
 npm run test:settings
+npm run test:resources
 npm run test:api
 npm run test:p0
 npm run test:ai

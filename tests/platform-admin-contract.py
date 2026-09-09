@@ -107,12 +107,12 @@ def main() -> None:
     channel = admin_client.put(
         "/api/admin/settings", json={"update_channel": "beta"}
     )
-    assert channel.status_code == 200
-    assert channel.json()["update_channel"] == "beta"
+    assert channel.status_code == 422
+    assert "update_channel" not in admin_client.get("/api/admin/settings").json()
     invalid_channel = admin_client.put(
         "/api/admin/settings", json={"update_channel": "attacker-controlled"}
     )
-    assert invalid_channel.status_code == 400
+    assert invalid_channel.status_code == 422
 
     users = admin_client.get("/api/admin/users?limit=1")
     assert users.status_code == 200
@@ -249,24 +249,26 @@ def main() -> None:
     assert old_id not in ids
     assert recent_id in ids
     # Check results are durable and must never replace installation records.
-    channel = app.db.get_platform_setting("update_channel", "stable")
+    channel = app.RELEASE_CHANNEL
+    # Existing installation metadata and obsolete settings must not choose the feed.
+    app.db.set_platform_setting("update_channel", "beta")
     payload = {"status": "available", "available": True, "version": "0.2.0",
                "current_version": "0.1.0", "channel": channel, "release_notes": "candidate"}
     app.db.upsert_platform_update("0.2.0", channel, "staged", candidate_path="/isolated/candidate",
                                   manifest_sha256="a" * 64, release_notes="verified")
     before = dict(app.db.get_platform_update("0.2.0", channel))
-    with patch.object(app, "inspect_releases", return_value=(payload, None)):
+    with patch.object(app, "inspect_public_releases", return_value=payload):
         for _ in range(2):
             checked = promoted_client.post("/api/admin/updates/check")
             assert checked.status_code == 200, checked.text
             assert checked.json()["status"] == "available" and checked.json()["checked_at"] > 0
     assert dict(app.db.get_platform_update("0.2.0", channel)) == before
-    for status in ("no_release", "current", "incomplete"):
-        result = {**payload, "status": status, "available": status == "incomplete"}
-        with patch.object(app, "inspect_releases", return_value=(result, None)):
+    for status in ("no_release", "current"):
+        result = {**payload, "status": status, "available": False}
+        with patch.object(app, "inspect_public_releases", return_value=result):
             assert promoted_client.post("/api/admin/updates/check").json()["status"] == status
         assert promoted_client.get("/api/admin/updates").json()["update_check"]["status"] == status
-    with patch.object(app, "inspect_releases", side_effect=app.PlatformUpdateError("update_source_failed")):
+    with patch.object(app, "inspect_public_releases", side_effect=app.PlatformUpdateError("update_source_failed")):
         assert promoted_client.post("/api/admin/updates/check").status_code == 502
     assert app.db.get_platform_update_check(channel)["status"] == "error"
     assert dict(app.db.get_platform_update("0.2.0", channel)) == before
@@ -290,7 +292,7 @@ def main() -> None:
         })
         assert applied.status_code == 202, applied.text
         assert app.db.get_platform_update("0.2.0", channel)["status"] == "apply_requested"
-        with patch.object(app, "inspect_releases", return_value=(payload, None)):
+        with patch.object(app, "inspect_public_releases", return_value=payload):
             assert promoted_client.post("/api/admin/updates/check").status_code == 200
         assert app.db.get_platform_update("0.2.0", channel)["status"] == "apply_requested"
         assert promoted_client.post("/api/admin/updates/download", json={"version": "0.3.0"}).status_code == 409

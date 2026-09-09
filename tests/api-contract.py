@@ -23,6 +23,9 @@ os.environ.update(
     {
         "SAAS_DB": DB_PATH,
         "SAAS_TENANTS_DIR": TENANTS_PATH,
+        # Do not inherit an installed live Worker from a QA container. Process
+        # supervision has its own injected Popen fixtures below.
+        "SAAS_BOT_ROOT": str(Path(RUN_DIR) / "worker-not-installed"),
         "SAAS_COOKIE_SECURE": "0",
         "SAAS_ADMIN_TOKEN": "contract-admin",
         "SAAS_PLATFORM_AI_BASE_URL": "http://127.0.0.1:19991/v1",
@@ -493,9 +496,10 @@ def main():
     version_payload = version.json()
     assert version_payload["version"] == VERSION
     assert version_payload["asset_version"] == ASSET_VERSION
-    assert version_payload["update_channel"] == "stable"
+    assert "update_channel" not in version_payload
+    assert version_payload["update_check"]["channel"] == "release"
     assert set(version_payload) == {
-        "version", "commit", "build_time", "asset_version", "update_channel",
+        "version", "commit", "build_time", "asset_version",
         "release_notes", "latest_update", "build_dirty", "deployment", "update_check", "capabilities",
     }
     assert ".git" not in json.dumps(version_payload, ensure_ascii=False)
@@ -629,7 +633,7 @@ def main():
             headers=browser_write_headers,
             json={"cookies": "unb=123456; _m_h5_tk=contract-token_abc; sid=contract"},
         )
-    assert cookie_response.status_code == 200
+    assert cookie_response.status_code == 200, cookie_response.text
     assert cookie_response.json()["shop_name"] == "合同店铺"
     assert cookie_response.json()["product_count"] == 2
     # The block above deliberately runs with ``SAAS_TESTING=0`` to exercise the
