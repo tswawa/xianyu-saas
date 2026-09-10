@@ -1,100 +1,180 @@
 # 生产部署指南
 
-本文档介绍如何在服务器上部署 xianyu-saas，支持 **Docker Compose（推荐，最省心）** 与 **Linux systemd 原生服务** 两种部署方式。
+本文档介绍如何在服务器或本地主机上部署 xianyu-saas，支持 **Docker Compose（推荐部署方式）**、**Linux systemd 原生服务** 以及 **Windows 原生环境**。
 
-## 方式一：Docker Compose 部署（推荐）
+## 部署方式一：Docker Compose（推荐）
 
-适用于各类 Linux 服务器、本地开发或轻量云主机，无需手动配置 Python/Node 环境。
+该方式适用于各类 Linux 服务器与本地容器环境，环境依赖自包含，升级与维护流程清晰。
 
-### 1. 准备环境
-- 安装 Docker 20.10+ 与 Docker Compose v2。
+### 1. 基础环境
+- 安装 Docker 20.10+ 及 Docker Compose v2。
 
-### 2. 克隆仓库并配置
+### 2. 获取代码与配置环境
 ```bash
-git clone https://github.com/tswawa/xianyu-saas.git
-cd xianyu-saas
+git clone https://github.com/tswawa/xianyu-saas.git /srv/xianyu-saas
+cd /srv/xianyu-saas
 
-# 复制环境变量模板
+# 复制生产环境变量模板
 cp config/saas.env.docker.example config/saas.env
 ```
 
-根据实际情况修改 `config/saas.env`：
-- `SAAS_PUBLIC_ORIGIN`：本机访问保持模板的 `http://127.0.0.1:4173`；通过反向代理发布时改为浏览器实际来源（例如 `https://xianyu.example.com`，包含协议和端口、不含路径），并同步 `SAAS_TRUSTED_HOSTS` 中的实际 Host；
-- `SAAS_COOKIE_SECURE`：如果启用了 HTTPS，设为 `1`；纯 HTTP 调试设为 `0`；
-- `SAAS_AI_MASTER_KEY`：设置一个高强度的随机密钥（用于加密各店铺配置的 API Key）。
+根据实际网络拓扑编辑 `config/saas.env`：
+- `SAAS_PUBLIC_ORIGIN`：本机测试使用 `http://127.0.0.1:4173`。经由 Nginx 等反向代理对外提供服务时，填写浏览器实际访问的完整来源（例如 `https://xianyu.example.com`，包含协议与端口，不带末尾路径）；
+- `SAAS_TRUSTED_HOSTS`：填写允许的 Host 列表，多个以英文逗号分隔（例如 `127.0.0.1:4173,xianyu.example.com`）；
+- `SAAS_COOKIE_SECURE`：对外启用 HTTPS 时设置为 `1`；纯 HTTP 内部调试设置为 `0`；
+- `SAAS_AI_MASTER_KEY`：填写用于服务端加密保存 API Key 的主密钥（32 字节随机值做标准 Base64 编码，编码后长度 44 字符，可通过命令 `python3 -c "import secrets, base64; print(base64.b64encode(secrets.token_bytes(32)).decode())"` 生成）；
 
-### 3. 构建并启动
+### 3. 构建与启动容器
 ```bash
 docker compose up -d --build
 ```
 
-- **管理后台访问**：`http://127.0.0.1:4173/xianyu-saas/`
-- **健康检查地址**：`http://127.0.0.1:8096/health`
-- **数据持久化**：SQLite 数据库、店铺配置及卡密库存保存在本地 `./data` 目录，容器重启或重建镜像数据不丢失。
+- **Web 控制台访问入口**：`http://127.0.0.1:4173/xianyu-saas/`
+- **控制面健康检查接口**：`http://127.0.0.1:8096/health`
+- **业务数据持久化**：SQLite 数据库、店铺会话、配置文件与卡密库存统一挂载在宿主机 `./data` 目录，容器更新与镜像重建不丢失数据。
 
-以上地址用于宿主机本地访问（Compose 默认绑定回环地址）；远程访问应通过受控隧道或已配置的反向代理，并保持浏览器来源与配置一致，不能只把地址替换为服务器 IP。来源不匹配时应修正配置，不要放宽 CSRF 检查。
+服务默认绑定宿主机回环地址。如果需要远程访问，请通过受控反向代理（如 Nginx）暴露服务，并确保反代配置透传真实的 Host 与 Origin 请求头，浏览器访问地址必须与 `SAAS_PUBLIC_ORIGIN` 完全一致。
 
-查看日志或停止：
+### 4. 日志查看与停止服务
 ```bash
+# 查看实时日志
 docker compose logs -f
+
+# 停止容器运行
 docker compose down
 ```
 
 ---
 
-## 方式二：Linux systemd 原生服务部署
+## 部署方式二：Linux systemd 原生守护进程
 
-适用于需要与宿主机 systemd 深度集成、使用独立守护进程管理的生产环境。
+适用于需要由宿主机 systemd 直接接管进程生命周期、集中采集日志的生产环境。
 
-### 1. 系统依赖
-- 操作系统：Ubuntu 22.04+ 或 Debian 12
-- Python 3.10+（包含 `python3-venv`）、Git 2.40+、Nginx
-- 前端由 Nginx 直接提供静态文件；生产部署无需 Node.js/npm、Playwright 或 Chromium。
+### 1. 系统要求与运行环境
+- 操作系统：Ubuntu 22.04 LTS / 24.04 LTS 或 Debian 12；
+- 软件要求：Python 3.10+（包含 `python3-venv`）、Git 2.40+、Nginx；
+- 前端静态文件直接由 Nginx 分发，生产运行时无需安装 Node.js、npm 或 Chromium。
 
-### 2. 初始化环境
+### 2. 版本化路径布局与虚拟环境
+
+仓库中 `deploy/systemd/` 下的服务单元模板采用版本化目录布局规范（通过 `current` 软链接指向活动版本代码、独立的运行环境目录及系统持久状态目录）。部署时须按照模板规范建立对应目录结构与虚拟环境映射，不能将普通开发目录直接套用模板：
+
 ```bash
-git clone https://github.com/tswawa/xianyu-saas.git
-cd xianyu-saas
+set -euo pipefail
 
-python3 -m venv backend/.venv
-backend/.venv/bin/python -m pip install -r backend/requirements.txt
-python3 -m venv worker/.venv
-worker/.venv/bin/python -m pip install -r worker/requirements.txt
+# 在已检出的 Git 仓库根目录执行，获取选定 commit 的完整哈希作为部署标识
+DEPLOY_ID="$(git rev-parse HEAD)"
+RELEASE_DIR="/srv/xianyu-saas/releases/${DEPLOY_ID}"
+
+# 仅适用于首次全新部署：检查发布目录不存在，避免意外覆盖已有版本
+if [ -e "${RELEASE_DIR}" ]; then
+  echo "发布目录已存在: ${RELEASE_DIR}" >&2
+  exit 1
+fi
+mkdir -p "${RELEASE_DIR}" /srv/xianyu-saas/runtime
+
+# 仅导出 Git 跟踪的源码至发布目录，避免带入本地配置、未跟踪文件或构建产物
+git archive --format=tar HEAD | tar -x -C "${RELEASE_DIR}"
+
+# 首次全新部署建立当前版本软链接（确认 current 既不存在实体也不存在软链接，不使用 -f 强行覆盖）
+CURRENT_LINK="/srv/xianyu-saas/current"
+if [ -e "${CURRENT_LINK}" ] || [ -L "${CURRENT_LINK}" ]; then
+  echo "现役软链接或路径已存在: ${CURRENT_LINK}，请勿在运行期间直接覆盖" >&2
+  exit 1
+fi
+ln -s "${RELEASE_DIR}" "${CURRENT_LINK}"
+
+# 创建后端生产运行虚拟环境并安装依赖
+python3 -m venv /srv/xianyu-saas/runtime/backend-venv
+/srv/xianyu-saas/runtime/backend-venv/bin/python -m pip install -r /srv/xianyu-saas/current/backend/requirements.txt
+
+# 创建 Worker 生产运行虚拟环境并安装依赖
+python3 -m venv /srv/xianyu-saas/runtime/worker-venv
+/srv/xianyu-saas/runtime/worker-venv/bin/python -m pip install -r /srv/xianyu-saas/current/worker/requirements.txt
+
+# 建立与控制面和 Worker 运行预期一致的 .venv 软链接
+ln -sfn /srv/xianyu-saas/runtime/backend-venv /srv/xianyu-saas/current/backend/.venv
+ln -sfn /srv/xianyu-saas/runtime/worker-venv /srv/xianyu-saas/current/worker/.venv
 ```
 
-生产环境只安装上述运行依赖，不执行 `scripts/bootstrap-dev.sh`、`npm test` 等开发测试命令。已有部署沿用当前服务的虚拟环境和数据目录。
+生产运行仅安装上述运行依赖，不要在生产服务器执行 `scripts/bootstrap-dev.sh` 或全量前端测试命令。
 
-### 3. 配置服务
-参考 `deploy/systemd/` 和 `deploy/nginx/` 中的模板配置控制面、任务消费者与静态页面服务；模板内路径须与实际安装位置一致。
+### 3. 配置 systemd 服务与 Nginx 反代
+
+参考仓库中的模板完成服务配置：
+- `deploy/systemd/` 提供了控制面 API、任务处理守护单元与更新监听模板；服务单元中的 `WorkingDirectory`、`ExecStart`、`EnvironmentFile` 与状态目录须与实际安装路径保持严格一致，并在环境配置中指定 `SAAS_BOT_ROOT=/srv/xianyu-saas/current/worker`；
+- `deploy/nginx/` 提供了静态资源托管与 API 反向代理配置模板；
+- 各种部署模式下的业务数据与加密密钥位置均以实际配置文件与环境挂载为准。
 
 ---
 
-## 版本信息与更新方式
+## 部署方式三：Windows 环境部署
 
-- 网页显示的是已安装代码的版本、构建信息和最近一次发布检查结果。尚无 Release、未发现更高版本、制品缺失与网络失败会分别显示；CHANGELOG 中其他版本的条目不代表当前已安装版本。
-- **Docker 源码构建**：网页只检查发布信息，不控制宿主机 Docker。先备份实际数据挂载、取得并核对目标源码，再使用原 Compose 文件及本地覆盖配置执行 `up -d --build --wait`。例如有 `.local/docker-compose.local.yml` 时，必须继续使用 `docker compose -f docker-compose.yml -f .local/docker-compose.local.yml up -d --build --wait`，不要丢弃原端口或数据卷配置，也不要执行 `down -v`。当前源码构建方式不依赖公共预构建镜像，不能用 `docker compose pull` 代替源码更新。
-- **构建信息**：Docker 构建时写入时间并校验 `package.json` 与后端版本一致。可通过构建环境变量 `SAAS_BUILD_COMMIT` 和 `SAAS_BUILD_DIRTY=true/false` 提供真实提交号与本地修改状态；未提供时明确显示未知，不在运行时读取 Git。
-- **systemd 签名部署**：API/消费者模板标记 `SAAS_DEPLOYMENT_MODE=systemd`，但这本身不代表已启用在线更新。必须配置可信的版本目录与 `current` 链接、签名公钥、可写的 staging/intent 目录，以及已加载的 `xianyu-saas-updater.service` 和活动的 `xianyu-saas-updater.path`；监听路径须与 `SAAS_UPDATE_INTENT_FILE` 一致。页面仅在这些条件可核验时开放安装，并仍要求签名校验和管理员二次确认。普通源码部署不应伪装成签名发布安装。
+在 Windows 系统上，请使用 Docker Desktop 运行：
 
-## 统一模型连接与本地网络
+- **Docker Desktop Compose 运行（推荐方式）**：安装 Windows 版 Docker Desktop 并启用 Docker Compose v2，按照方式一的 Docker Compose 流程启动与维护容器；
+- **运行限制说明**：Worker 进程依赖 Linux 的 `resource` 模块、`/proc` 状态接口、`setsid` 会话隔离与 `prlimit` 资源配额限制，Windows 原生 Python 环境无法完整运行生产 Worker 栈，请使用容器化方案运行。
 
-- 模型连接统一在「设置」管理，按登录用户隔离。服务端加密存储与主密钥、SQLite 数据库应一起备份。旧店铺连接不会自动迁移，需用户明确选择并测试确认；共享连接删除后不会回退旧密钥。
-- 若连接测试提示 `dns_fake_ip`，说明本地代理返回了 `198.18.0.0/15` Fake-IP。应在代理 DNS 配置中排除对应模型域名，或仅在本地 Compose 覆盖文件中使用经核实的域名解析；不要关闭私网地址保护、TLS 验证或改成任意目标代理。固定解析随服务 IP 变化需要重新核实。
-- 智能运维仅对所选店铺的客服资料和规则生成修改方案，确认后逐项执行。页面会区分待确认、成功、部分失败和需复核；不会执行系统命令、真实发货或库存扣减。
+---
 
-## 首次使用与账号初始化
+## 系统升级与版本维护
 
-默认 `SAAS_BOOTSTRAP_ENABLED=0` 时，全新数据库允许在登录页直接创建首位管理员，无需手工管理员命令或令牌，且不受 `SAAS_ALLOW_REGISTRATION=0` 对后续注册的限制。服务原子创建首位管理员与默认店铺，初始化 5 个 JSON 配置文件和 `ai_knowledge` 目录，成功后自动登录。
+### 版本识别规则
+控制台界面显示的是当前运行进程加载的代码版本、构建元数据以及从 GitHub Releases 查询到的最新发布信息。如果网络不可达、未发现更新版本或缺少发布制品，界面会给出对应提示。
 
-> **安全提示**：空站任何能访问者可抢先注册管理员，部署者应先注册再公开分享。
+### Docker 源码构建升级流程
+Web 界面只负责展示版本状态，不直接操纵宿主机 Docker 守护进程。管理员执行升级的标准步骤：
 
-后续网页注册仅创建 `owner`，必须同时打开 `SAAS_ALLOW_REGISTRATION=1` 和后台 `registration_open`。已显式启用 `SAAS_BOOTSTRAP_ENABLED=1` 的运维部署仍使用原令牌 bootstrap，不开放无令牌首次注册；初始化后应关闭开关并移除令牌。
+1. 对 `./data` 业务数据目录进行冷备份；
+2. 获取目标版本的源码；
+3. 使用项目原有的 Compose 文件（以及本地覆盖配置，例如 `.local/docker-compose.local.yml`）执行构建更新：
+   ```bash
+   docker compose up -d --build --wait
+   ```
+4. 如果存在本地覆盖配置文件，必须显式附加参数：
+   ```bash
+   docker compose -f docker-compose.yml -f .local/docker-compose.local.yml up -d --build --wait
+   ```
+5. **升级注意事项**：Docker 默认的 `./data` 属于宿主机目录绑定挂载（bind mount），但仍不建议在已有数据上随意执行带有 `-v` 删卷参数的清理命令；各种部署模式下的数据与密钥存储位置均以实际配置文件与挂载路径为准。由于镜像是基于本地源码构建生成的，不能使用 `docker compose pull` 来更新业务代码。
 
-已有 CLI 账号若创建时未传 `initializer`，仅在登录时确认默认店铺从未使用、现有文件为空默认配置后受限补缺，不覆盖业务或损坏文件，也不重置已使用店铺。实际用户 ID 与存储路径由服务确定，完整初始化边界见 [`ACCESS_MODEL.md`](ACCESS_MODEL.md)。
+### systemd 签名发布包升级
+若将部署模式标记为 `SAAS_DEPLOYMENT_MODE=systemd`，只有在满足以下全部前置条件时才开放管理界面升级流程：
+- 部署目录结构规范，存在受信任的版本目录与 `current` 软链接；
+- 预置有效的发布签名公钥；
+- 拥有可写的暂存目录（staging）与升级意图文件（intent file）；
+- 宿主机加载了 `xianyu-saas-updater.service` 并激活了 `xianyu-saas-updater.path` 监听。
 
-## 生产安全建议
+升级执行前必须通过签名公钥校验，并要求管理员在后台二次确认。普通源码部署切勿伪装为签名发布模式。
 
-1. **反向代理与 TLS**：强烈建议在前端挂载 Nginx 并配置 SSL 证书（HTTPS），仅将 443 端口对外暴露；
-2. **关闭后续公开注册**：私有部署保持 `SAAS_ALLOW_REGISTRATION=0`；这不阻止默认空站的首次注册，须先创建管理员再公开分享；
-3. **定期备份**：定期对 `./data` 目录进行冷备份，确保数据库和各店铺运行配置安全；
-4. **主密钥保护**：妥善保管 `SAAS_AI_MASTER_KEY`，切勿泄露或遗失。
+---
+
+## 本地网络代理、Ollama 与 Fake-IP 说明
+
+- **本地 Ollama 回环例外**：系统网络安全策略默认拦截私网 IP 与 HTTP 接口。仅当模型协议选择 `ollama_chat` 且配置了 `SAAS_AI_ALLOW_OLLAMA_LOCAL=1` 时，服务端放行运行服务视角的 `localhost` / `127.0.0.1` 回环地址并同时允许 HTTP 请求。普通私有网络地址仍被拦截，`SAAS_AI_ALLOW_HTTP_LOCAL=1` 仅允许 HTTP 协议而不改变地址拦截规则；容器运行时的回环地址属于容器网络命名空间，与宿主机环境相互独立，系统不放行局域网私网 IP 或 `host.docker.internal`。
+- **代理客户端 Fake-IP 拦截**：在配置统一模型连接时，若界面测试连接提示 `dns_fake_ip` 错误，说明本地代理返回了 `198.18.0.0/15` 网段的 Fake-IP 地址，触发了服务内置的安全拦截。应在代理客户端的 DNS 配置中将大模型域名加入直连或排除名单（fake-ip-filter），确保返回真实公网 IP 地址；或者在本地 Compose 覆盖配置中指定经核实的域名映射。
+- **安全底线**：切勿为了解决网络提示而关闭系统的私网防御或跳过 TLS 证书校验。
+
+---
+
+## 首次运行与账号初始化
+
+1. **默认无令牌注册（`SAAS_BOOTSTRAP_ENABLED=0`）**：
+   - 首次启动且数据库为空时，在前端登录界面直接点击「创建首个管理员账号」；
+   - 该操作不受 `SAAS_ALLOW_REGISTRATION=0` 限制，无需命令行介入；
+   - 系统原子创建首个 `admin` 账号及默认店铺基础配置目录；
+   - **安全提示**：空数据库部署完成后，任何可访问者都能注册首个管理员。请务必在完成部署后立即完成初始化注册，再将端口或反代向外部开放。
+2. **后续注册开关**：
+   - 首个管理员注册完毕后，后续注册用户仅具备普通店主（`owner`）角色；
+   - 必须同时开启环境变量布尔开关 `SAAS_ALLOW_REGISTRATION=1` 与管理后台「开放注册」开关，前端才会开放用户注册入口。
+3. **运维令牌模式（`SAAS_BOOTSTRAP_ENABLED=1`）**：
+   - 如需强制仅允许持有令牌的运维初始化，配置 `SAAS_BOOTSTRAP_TOKEN_FILE` 与受信 IP 限制；
+   - 在受信网络下通过特定令牌初始化，完成后关闭该开关并删除令牌。
+
+---
+
+## 生产安全加固清单
+
+1. **反向代理与 HTTPS**：使用 Nginx 等反向代理配置 SSL 证书（HTTPS），对外仅开放 443 端口；
+2. **控制公开注册**：初始化完成后保持 `SAAS_ALLOW_REGISTRATION=0`，按需在管理后台由管理员手动创建用户；
+3. **定期冷备份**：定期离线备份 SQLite 数据库文件（如 `saas.db`）、各店铺配置目录及运行数据；若主密钥来源（如环境配置文件 `config/saas.env` 或独立密钥文件）保存在挂载目录之外，必须一并单独离线备份；
+4. **妥善保管主密钥**：生产环境中的 `SAAS_AI_MASTER_KEY` 严禁泄露，丢失将导致所有已保存的 API Key 无法解密恢复。

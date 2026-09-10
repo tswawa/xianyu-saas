@@ -1,185 +1,243 @@
 # xianyu-saas
 
-> 闲鱼多店铺一站式自动化运营工作台：多账号进程隔离与商品同步，规则+AI双引擎客服（多风格人设/话术知识库/沙盘调优），官方双接口验单秒发虚拟卡密与网盘资源，配备多店统一工作台与可视化运营看板。
+闲鱼多店铺客服工作台与自动化履约系统。提供多账号进程隔离、商品与会话管理、关键词规则与大模型智能客服、虚拟商品自动发货以及基于授权工具的店铺助手。
 
 [![License: GPL-3.0-only](https://img.shields.io/badge/license-GPL--3.0--only-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
+[![Node.js](https://img.shields.io/badge/node-20%2B-green)](https://nodejs.org/)
+
+![工作台概览（演示数据）](docs/assets/readme/overview.png)
+*注：文档中展示的界面截图均为本地离线测试环境中的演示数据。*
 
 ---
 
-## 核心特性
+## 功能模块
 
-### 1. 规则 + AI 智能客服（多风格人设与知识库）
-- **多风格客服人设，自由定制**：
-  - 🎭 **开箱预设风格**：内置元气软萌、热情亲切、严谨专业等多种预设人格，适应不同商品品类与买家交流风格；
-  - 🛠️ **深度自由定制**：支持自由配置客服名称、买家称呼（“老板 / 亲 / 朋友”）、回复语气（活泼 / 克制 / 专业）、回复长短及表情频率，并可一键保存至模板库；
-  - 💡 **AI 智能提炼知识**：直接粘贴零散的商品介绍文案，点击“AI 帮我整理”，系统自动梳理为结构化的商品客服知识。
-- **双层规则匹配，精准优先**：
-  - **商品专属规则 > 全店通用规则**：买家从特定宝贝进店咨询时，优先匹配该商品的专属问答；未命中才退回全店通用规则；
-  - **三大响应策略（`AUTOMATION_STRATEGY`）**：
-    - `standard`（标准）：命中首个关键词规则即刻秒回；
-    - `conservative`（保守）：买家发来超过 240 字长文自动判定为复杂问题，跳过规则直接交由 AI 或人工，避免断章取义；
-    - `aggressive`（激进）：同时命中多条规则时，优先选用关键词最长（匹配度最高）的精准话术。
-- **拟人仿真与防封机制**：
-  - 随机回复延迟（0~60 秒），模拟真人打字节奏；
-  - 消息触发防刷冷却，防止短时间内被恶意买家连续刷屏触发平台风控；
-  - 支持营业时间限制（如 09:00 - 23:30），非工作时间自动静默休息。
-- **多模型接入与代码级安全门禁**：
-  - 原生支持 **OpenAI 兼容接口、Claude、Google Gemini、本地 Ollama**；
-  - 自动感知商品的**实时价格、库存、规格 SKU 与上下架状态**；
-  - **安全过滤硬闸门**：代码层内置敏感词拦截（严禁微信/QQ/电话等站外引流词，防封店）、防虚假发货承诺（严禁 AI 擅自承诺“已发货/已退款”），以及 90% 相似度防复读熔断；
-  - **内置连续对话沙盘**：在后台直接模拟买家多轮问答，实时查看引用的知识与回复决策后再上线。
+### 1. 多账号管理与店铺隔离
+- 每个闲鱼店铺由独立的 Python Worker 进程承载，各店铺采用独立进程和数据目录，共享宿主资源运行。
+- 店铺凭据、商品缓存、会话历史与配置目录独立存放，不同账号数据互不串扰。
+- 支持在工作台直接生成闲鱼授权二维码，使用闲鱼移动客户端扫码即可完成店铺登录与会话接入。
+- 提供运行状态监控，实时显示各店铺 Worker 进程的 CPU 占用、物理内存（RSS）与运行时间。
 
-### 2. 虚拟商品自动秒发货（官方双接口防骗验单）
-- **三大自动发货类型**：
-  - **兑换码 / 卡密池**：支持单笔拍下 1~50 件，按购买件数自动从库存池提取对应数量的卡密发放，事务加锁防超卖、防重发；
-  - **网盘资源**：买家付款后，自动私信下发百度网盘、阿里网盘等分享链接与提取码；
-  - **固定资料**：自动发送固定的安装教程、激活指南或下载说明。
-- **官方双接口交叉验单（防假截图与未付款诈骗）**：
-  - 绝不凭买家一句话就发货！系统监听到付款事件后，调用平台官方双接口核验：严格比对买家 ID、卖家身份、商品 ID 与订单真实状态（必须为待发货 `status == 2`）；
-  - 一旦出现库存不足或验单异常，立即拦截并自动转入后台人工审核待办。
+### 2. 智能客服与规则引擎
+- **双层规则匹配**：支持配置商品专属问答与全店通用问答。买家咨询特定商品时优先命中专属规则，未命中时回退到通用规则。所有规则仅采用关键词包含匹配，无独立的精确或模糊模式。
+- **三种匹配策略**：
+  - `standard`（标准）：命中首个关键词规则后，按已保存的打字延迟与随机抖动发送回复。
+  - `conservative`（保守）：买家发送超过 240 字的长消息时自动跳过规则，交由 AI 客服或人工处理。
+  - `aggressive`（激进）：同时命中多条规则时，优先选用关键词较长的话术。
+- **节奏控制与时间窗口**：可配置随机打字延迟与消息防刷冷却时间；支持设置营业时间段，非工作时间自动回复处于静默状态（不影响已核验订单的发货履约）。
+- **大模型客服引擎**：
+  - 支持 OpenAI 兼容接口、Anthropic Claude、Google Gemini 以及 Ollama 协议（本地私网与 HTTP 访问默认关闭，配置例外详见 [DEPLOYMENT.md](docs/DEPLOYMENT.md)）。
+  - 自动读取关联商品的标题、价格、简介与规格属性，作为上下文参考。
+  - 代码内置敏感词过滤（如站外导流词拦截）、发货与退款承诺拦截（防止模型擅自向买家做出交易承诺），以及重复内容熔断机制。
+  - 内置多轮对话沙盘，在上线前可直接输入测试语句验证模型回复与知识引用情况。
+- **人工接管机制**：人工客服在后台发送消息后进入接管保护倒计时，期间暂停该会话的自动回复链；已通过核验的订单履约独立执行，不受人工接管影响。倒计时结束后满足条件时恢复自动回复。支持一次性排队发送最多 8 张图片。
 
-### 3. 多店铺多账号物理隔离
-- **独立进程与数据沙盒**：每个闲鱼号拥有独立的运行态、凭据加密、本地数据库与专属 Worker 进程，单店掉线或异常绝不牵连其他店铺；
-- **官方扫码直连**：后台直接生成闲鱼官方授权二维码，手机闲鱼扫码即可快速绑定。
+### 3. 虚拟商品自动发货
+- **发货类型支持**：
+  - 兑换码与卡密池：根据买家拍下件数（支持 1-50 件）自动分配对应数量的可用卡密，使用数据库事务加锁防止重复发放。
+  - 网盘资源：待发货订单核验通过且资源配置有效时，下发网盘分享链接与提取码。
+  - 固定文字资料：仅支持单件订单自动发送固定的使用教程或文本材料；多件订单自动转入人工复核。
+- **双重订单状态核验**：监听到付款通知后，Worker 调用平台订单接口核验订单真实状态（必须处于待发货状态 `status == 2`）、商品 ID、买家 ID 与卖家身份，核验通过后执行发货动作。
+- **规则模式履约**：仅使用关键词规则模式时，发货流程同样正常执行，涵盖卡密池分发、网盘链接与固定文本资料发送。
+- **模板与卡密状态管理**：未绑定商品的模板处于草稿状态；新导入且未分发的卡密可用于初始绑定；卡密预留具备受控释放分支，已发放或已撤销的卡密不会被二次激活。
 
-### 4. 客服工作台与人工接管
-- **接管防抢话**：人工在后台发消息或输入接管指令后，系统进入**人工接管冷却倒计时**，期间机器人彻底静默，避免机器人与客服抢着插嘴；
-- **图片发送队列**：支持一次性粘贴或拖入最多 8 张图片；图片按顺序单张发送并确认协议 ACK，文字最后发送；发送中断时只重试失败的分段。
+### 4. 店铺助手（智能运维）
+- 在后台提供基于持久会话的店铺运维助手，针对当前选中的店铺进行配置管理。
+- 助手根据对话意图，直接调用受限的店铺配置工具，执行修改问答规则、补充知识条目、调整发货模板等操作。
+- 每次工具调用均返回执行回执，界面支持停止生成、重试以及继续追问。
+- 工具边界受到严格限制：仅能修改当前店铺的问答知识、回复规则与发货资料，不能执行操作系统 Shell 命令，不能发起退款，不能直接向买家发送消息，不能直接执行实际发货，也不能导出卡密内容。
+- **资源配额与权限隔离**：所有用户均可在设置中查看全局运行限制摘要，仅管理员可以修改全局限制；平台管理员也无权跨用户读取店铺业务数据（Cookie、订单、买家会话与知识库）。
 
 ---
 
 ## 界面预览
 
-| 运营概览 | 店铺管理 |
-|:---:|:---:|
-| ![运营概览](docs/assets/readme/overview.png) | ![店铺管理](docs/assets/readme/shops.png) |
+### 工作台概览与移动端适配
+![工作台桌面概览（演示数据）](docs/assets/readme/overview.png)
+*工作台桌面概览*
 
-| 客服会话工作台 | AI 设置与沙盘测试 |
-|:---:|:---:|
-| ![客服会话](docs/assets/readme/customer-service.png) | ![AI设置](docs/assets/readme/ai-config.png) |
+![工作台移动端概览（演示数据）](docs/assets/readme/overview-mobile.png)
+*移动端自适应概览*
 
-| 卡密库存池 | 订单与自动发货状态 |
-|:---:|:---:|
-| ![卡密库存池](docs/assets/readme/cards.png) | ![订单列表](docs/assets/readme/orders.png) |
+### 店铺管理与会话工作台
+![店铺管理（演示数据）](docs/assets/readme/shops.png)
+*店铺矩阵管理与独立 Worker 状态*
+
+![客服会话桌面端（演示数据）](docs/assets/readme/customer-service.png)
+*买家咨询列表与人工实时接管工作台*
+
+![客服会话移动端（演示数据）](docs/assets/readme/customer-service-mobile.png)
+*移动端客服会话界面*
+
+### 智能客服与统一模型设置
+![店铺 AI 客服设置与沙盘（演示数据）](docs/assets/readme/ai-config.png)
+*店铺 AI 客服人设、知识库条目与多轮对话沙盘*
+
+![统一模型连接设置（演示数据）](docs/assets/readme/settings.png)
+*用户统一模型连接配置与服务商连通性测试*
+
+### 商品与发货履约
+![商品管理（演示数据）](docs/assets/readme/goods.png)
+*在售商品同步与发货资料绑定状态*
+
+![卡密库存管理（演示数据）](docs/assets/readme/cards.png)
+*虚拟卡密池管理与库存使用统计*
+
+![订单列表与发货记录（演示数据）](docs/assets/readme/orders.png)
+*平台订单同步与自动发货状态跟踪*
+
+### 店铺助手与全局限制设置
+![店铺助手智能运维（演示数据）](docs/assets/readme/operations.png)
+*店铺助手对话配置与工具调用回执*
+
+![全局运行限制设置（演示数据）](docs/assets/readme/resources.png)
+*管理员全局运行限制设置（Worker 进程 CPU 与物理内存实时监控见概览页）*
 
 ---
 
 ## 快速上手
 
-### 方式一：Docker 一键部署（推荐）
+### 方式一：Docker Compose 部署（推荐）
+
+该方式适用于 Linux 服务器或本地环境，容器内已预装全部运行环境。
 
 ```bash
 git clone https://github.com/tswawa/xianyu-saas.git
 cd xianyu-saas
 
-# 复制配置文件
+# 复制容器环境变量文件
 cp config/saas.env.docker.example config/saas.env
 
-# 启动容器
+# 构建并启动服务
 docker compose up -d --build
 ```
 
-- **管理后台**：`http://127.0.0.1:4173/xianyu-saas/`
-- **数据持久化**：数据库与各店铺配置文件默认保存在本地 `./data` 目录。
+- **访问地址**：`http://127.0.0.1:4173/xianyu-saas/`
+- **数据目录**：SQLite 数据库与各店铺配置文件默认保存在项目根目录的 `./data` 目录中。
 
-查看日志或停止：
+管理容器命令：
 ```bash
 docker compose logs -f
 docker compose down
 ```
 
-### 方式二：Linux 本地源码开发（非生产部署）
+### 方式二：Linux 本地源码开发
 
-环境要求：Linux、Python 3.10+、Node.js 20+、npm 10+。
+适用于需要修改后端或前端源码的开发者。
+
+系统要求：Linux（Ubuntu 22.04+ 或 Debian 12）、Python 3.10+、Node.js 20+、npm 10+。
 
 ```bash
 git clone https://github.com/tswawa/xianyu-saas.git
 cd xianyu-saas
 
+# 初始化 Python 虚拟环境与前端开发环境
 ./scripts/bootstrap-dev.sh
-# 可选：仅在运行浏览器 UI 测试时安装 Chromium
+
+# 可选：仅在需要运行端到端浏览器测试时安装 Chromium
 npx playwright install --with-deps chromium
+
+# 启动全栈开发服务
 npm run dev
 ```
 
-生产部署请按 [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) 安装运行依赖并配置 systemd、Nginx；前端直接提供静态文件，无需安装 Node.js/npm、Playwright 或 Chromium。
+如需在 Linux 服务器上以独立守护进程模式部署生产环境，请参阅 [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) 配置 systemd 与 Nginx 服务。生产环境直接由 Nginx 承载静态资源，无需在服务器安装 Node.js 或 Chromium。
 
-### 首次使用：网页注册管理员
+### 方式三：Windows 环境部署
 
-默认配置（`SAAS_BOOTSTRAP_ENABLED=0`）下，全新数据库允许直接在登录页创建首位管理员，**无需终端命令或令牌**，也不受 `SAAS_ALLOW_REGISTRATION=0` 对后续注册的限制。
-
-1. 打开 `http://127.0.0.1:4173/xianyu-saas/`，在「创建首个管理员账号」页面自行设置账号和不少于 12 位的强密码；系统没有通用管理员账号或密码。
-2. 提交后，服务原子创建首位管理员与默认店铺，初始化 5 个 JSON 配置文件和 `ai_knowledge` 目录；成功后自动登录工作台。并发首次注册只会产生一位初始管理员。
-
-后续网页注册只能创建普通店主（`owner`），且必须同时启用 `SAAS_ALLOW_REGISTRATION=1` 和后台 `registration_open`。私有自用可保持环境变量为 `0`。
-
-> **安全提示**：空站任何能访问者可抢先注册管理员，部署者应先注册再公开分享。`SAAS_ALLOW_REGISTRATION=0` 不会阻止默认空站的首次注册。
-
-已显式启用 `SAAS_BOOTSTRAP_ENABLED=1` 的运维部署仍使用原令牌 bootstrap，不开放无令牌首次注册；这不是默认上手步骤。旧 CLI 账号的受限初始化补缺与兼容边界见 [`docs/ACCESS_MODEL.md`](docs/ACCESS_MODEL.md)。
+在 Windows 系统上，推荐使用 Docker Desktop 运行：
+- 安装 Windows 版 Docker Desktop（开启 Compose v2 支持），在 PowerShell 或 Git Bash 中执行前述 Docker Compose 命令启动容器。
+- Worker 进程依赖 Linux 的 `resource` 模块、`/proc` 状态接口、`setsid` 会话隔离与 `prlimit` 资源配额限制，Windows 环境请使用 Docker 容器运行。
 
 ---
 
-## 4 步日常使用流程
+## 首次使用与管理员注册
 
-1. **登录与绑定店铺**：首次使用通过登录页注册管理员并自动进入后台；进入「店铺管理」，添加店铺并通过闲鱼 App 扫码登录；
-2. **配置模型与客服**：在「设置 → 模型连接」测试并保存统一连接，供本人各店铺的 AI 客服、资料生成和智能运维使用；再到「智能客服」准备店铺内容并用沙盘验证；
-3. **设置高频规则**：添加商品专属或通用的问答规则。规则回复无需调用模型，发送延迟按已保存设置执行；
-4. **准备自动发货**：在「履约中心」配置资料、模板和库存并绑定商品。规则模式也可处理卡密与网盘发货，执行仍须核验平台订单、数量与库存。
+系统默认配置（`SAAS_BOOTSTRAP_ENABLED=0`）首次创建管理员流程如下：
 
-「智能运维」支持当前店铺的资料改写与规则调整：先选目标、对话生成方案、查看差异，再确认执行；不会直接运行系统命令、退款或发货。使用说明收纳在设置中的帮助弹窗，版本与发布检查从左上角版本号进入。
+1. **注册首位管理员**：首次启动后，访问 `http://127.0.0.1:4173/xianyu-saas/`，数据库为空时页面会自动显示「创建首个管理员账号」。在此处填写管理员用户名并设置不少于 12 位的密码。该首次注册不受 `SAAS_ALLOW_REGISTRATION=0` 的限制。
+2. **初始化数据**：提交后，服务原子性创建管理员账号、默认店铺结构以及初始配置文件。初始化成功后自动登录工作台。
+3. **安全提示**：空数据库允许首次访问者创建管理员。在将服务公开暴露到公网之前，必须先在本地或受信网络中完成首位管理员注册。
+4. **后续注册限制**：首位管理员创建完成后，后续公开注册默认关闭。若需允许其他用户注册，必须在环境变量中设置 `SAAS_ALLOW_REGISTRATION=1`，同时在工作台系统设置中打开注册开关。
+
+如果运维显式配置了 `SAAS_BOOTSTRAP_ENABLED=1`，系统将转为令牌引导模式，此时必须通过受信任来源和令牌文件进行初始化。具体规则见 [`docs/ACCESS_MODEL.md`](docs/ACCESS_MODEL.md)。
 
 ---
 
-## 核心环境变量说明
+## 日常配置流程
 
-编辑 `config/saas.env` 可定制系统行为：
+1. **登录与绑定店铺**：使用管理员账号登录工作台，进入「店铺管理」页面，点击添加店铺，使用手机端闲鱼 App 扫描屏幕二维码完成店铺接入。
+2. **配置统一模型连接**：在「系统设置 → 模型连接」页面输入大模型服务商的 API 地址、模型 ID 与 API Key。点击测试连接，确认可用后保存。该连接归属当前登录用户，供该用户旗下的所有店铺共用。
+3. **准备客服知识与沙盘验证**：在「智能客服」页面配置客服回复风格、客服称谓与营业时间。在知识库中添加常见问答，或粘贴宝贝说明使用知识提炼功能生成条目。在右侧沙盘中输入提问，检查回复准确度。
+4. **添加关键词回复规则**：针对高频问题配置包含匹配的关键词规则，设置命中后的回复文本与随机延迟。
+5. **配置发货模板与库存**：进入「履约中心」，创建发货模板并录入网盘链接或导入卡密数据。将模板绑定到对应商品，开启自动发货开关。
 
-| 变量名 | 说明 | 建议值/默认值 |
+---
+
+## 常用环境变量
+
+可在 `config/saas.env` 中调整以下核心运行参数：
+
+| 环境变量名 | 说明 | 默认值 / 示例 |
 | --- | --- | --- |
-| `SAAS_PUBLIC_ORIGIN` | 工作台对外访问域名或 IP | `http://127.0.0.1:4173` |
-| `SAAS_COOKIE_SECURE` | Cookie 是否强制 HTTPS | 本地设 `0`，线上生产环境设 `1` |
-| `SAAS_AI_MASTER_KEY` | 加密模型 API Key 的主密钥 | 生产环境务必填写强随机字符串 |
-| `SAAS_MAX_BOTS` | 允许同时运行的最大店铺 Worker 数 | 根据服务器性能调整（默认 10） |
-| `SAAS_ALLOW_REGISTRATION` | 后续网页注册上限，仍需后台 `registration_open` 打开；不限制默认空站首次注册 | 私有自用建议设为 `0` |
+| `SAAS_PUBLIC_ORIGIN` | 浏览器访问工作台的完整来源（协议、域名与端口） | `http://127.0.0.1:4173` |
+| `SAAS_COOKIE_SECURE` | 会话 Cookie 是否标记 Secure 属性（HTTPS 环境应设为 1） | `0`（本地测试）/ `1`（生产） |
+| `SAAS_AI_MASTER_KEY` | 用于加密存储模型 API Key 的服务端主密钥（32 字节随机值做标准 Base64 编码，编码后长度 44 字符） | 可通过 `python3 -c "import secrets, base64; print(base64.b64encode(secrets.token_bytes(32)).decode())"` 生成 |
+| `SAAS_MAX_BOTS` | 允许同时运行的最大店铺 Worker 数量（模板示例设为 3；代码缺省回退为 15，数据库保存设置可覆盖环境值） | `3` |
+| `SAAS_ALLOW_REGISTRATION` | 是否允许后续公开注册的布尔开关（0 为关闭，1 为允许；需配合系统设置开启） | `0` |
 
-完整模板见 [`config/saas.env.example`](config/saas.env.example) 和 [`config/saas.env.docker.example`](config/saas.env.docker.example)。
+完整配置项与说明请参考 [`config/saas.env.example`](config/saas.env.example)。
 
 ---
 
 ## 目录结构
 
 ```text
-frontend/             前端静态工作台（HTML/CSS/JS 单页）
-backend/              FastAPI 控制面、AI 客服引擎与任务调度
-worker/               闲鱼消息接入、多店铺独立 Worker 进程与自动发货
-config/               环境变量模板
-deploy/               Nginx、systemd 与更新器模板
-docker/               Docker 镜像入口与容器化脚本
-scripts/              开发初始化与本地启动脚本
-tests/                自动化回归测试与合规检查
-docs/                 架构设计与部署指南
+frontend/             前端静态单页应用（HTML、CSS 与原生 JavaScript）
+backend/              FastAPI 后端服务、AI 客服引擎与任务调度
+worker/               闲鱼长连接接入、消息规则处理与发货状态机进程
+config/               环境变量配置模板
+deploy/               Nginx、systemd 服务配置模板
+scripts/              本地开发初始化与调试脚本
+tests/                自动化回归测试与合规性检查脚本
+docs/                 部署指南、权限模型与系统架构设计文档
 ```
 
 ---
 
 ## 相关文档
 
-| 文档 | 说明 |
-| --- | --- |
-| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | 系统组件边界、数据流与架构设计 |
-| [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) | 生产环境部署（Docker / systemd） |
-| [`docs/NEW_UBUNTU_HANDOFF.md`](docs/NEW_UBUNTU_HANDOFF.md) | Ubuntu 开发环境完整配置指南 |
-| [`CONTRIBUTING.md`](CONTRIBUTING.md) | 参与贡献与本地代码门禁 |
-| [`SECURITY.md`](SECURITY.md) | 安全机制与漏洞报告 |
-| [`CHANGELOG.md`](CHANGELOG.md) | 版本更新日志 |
+### 安装与部署
+- [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md)：生产环境部署指南（Docker Compose 与 systemd 守护进程）。
+- [`docs/ACCESS_MODEL.md`](docs/ACCESS_MODEL.md)：账号角色、数据隔离与权限边界说明。
+- [`docs/NEW_UBUNTU_HANDOFF.md`](docs/NEW_UBUNTU_HANDOFF.md)：Ubuntu / Debian 源码开发环境搭建指南。
+
+### 架构与开发
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)：系统架构设计、进程模型与数据流说明。
+- [`docs/AI-CUSTOMER-SERVICE-REQUIREMENTS.md`](docs/AI-CUSTOMER-SERVICE-REQUIREMENTS.md)：AI 客服工程实现规范与上下文结构。
+- [`worker/README.md`](worker/README.md)：Worker 消息接入、发货状态机与协议运行时说明。
+- [`CONTRIBUTING.md`](CONTRIBUTING.md)：代码贡献规范与本地回归测试门禁。
+- [`.github/PULL_REQUEST_TEMPLATE.md`](.github/PULL_REQUEST_TEMPLATE.md)：Pull Request 提交模板与自查清单。
+
+### 历史与规划
+- [`CHANGELOG.md`](CHANGELOG.md)：版本变更与发布历史记录。
+- [`docs/PLAN.md`](docs/PLAN.md)：系统里程碑与功能演进计划。
+- [`docs/BACKEND-ROADMAP.md`](docs/BACKEND-ROADMAP.md)：后端核心能力演进路线。
+- [`docs/PUBLIC_RELEASE_CHECKLIST.md`](docs/PUBLIC_RELEASE_CHECKLIST.md)：开源发布前检查清单。
+
+### 社区与安全规范
+- [`SECURITY.md`](SECURITY.md)：安全政策与漏洞提报途径。
+- [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md)：开源社区行为准则。
+- [`LICENSING.md`](LICENSING.md)：代码许可证说明与依赖许可证合规清单。
+- [`worker/NOTICE.md`](worker/NOTICE.md)：Worker 组件上游代码来源与版权声明。
 
 ---
 
 ## 免责声明
 
-本项目仅供技术研究与学习交流，与阿里巴巴集团、淘宝或闲鱼官方无关。请遵守相关平台使用条款，在法律与平台规则允许的范围内合理使用。
+本项目为一个独立的第三方店铺管理工具，仅用于自用店铺的日常运维与学习研究，与阿里巴巴集团或闲鱼官方无商业关联。使用者应遵守相关法律法规及第三方平台服务协议，合理设置请求频次，自行承担使用过程中的账户与业务风险。
 
 ## 许可证
 
-本项目基于 [GPL-3.0-only](LICENSE) 发布。`worker/` 的上游来源与说明见 [`worker/NOTICE.md`](worker/NOTICE.md)。
+本项目基于 [GPL-3.0-only](LICENSE) 许可证发布。`worker/` 目录中包含的上游代码来源与说明详见 [`worker/NOTICE.md`](worker/NOTICE.md)。

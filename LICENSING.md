@@ -1,28 +1,27 @@
 # 许可证说明
 
-本文件说明仓库中的许可证边界，不构成法律意见。发布或再分发前，请确认代码、字体、图片和其他素材具有相应授权。
+本文档概述仓库中的许可证边界与第三方素材授权情况，仅供参考，不构成法律意见。分发前请确认代码、字体与相关素材的授权合规性。
 
-## 默认许可证
+## 原创代码许可证
 
-除文件另有明确说明外，本仓库原创代码、测试、文档和配置模板按 **GNU General Public License v3.0 only**（GPL-3.0-only）提供，完整文本见根目录 [`LICENSE`](LICENSE)。
+除特定文件另有说明外，本仓库原创代码、测试、文档与配置文件模板遵循 **GNU General Public License v3.0 only**（GPL-3.0-only）开源许可，许可证全文见根目录 [`LICENSE`](LICENSE)。
 
-根 `package.json` 的 `private: true` 只表示项目不应被误发布到 npm，不改变源码许可证。
+根目录 `package.json` 中标注的 `"private": true` 用于避免包误发布至 npm 公共源，不影响项目源码本身的开源许可协议。
 
-## `worker/` 的来源
+## `worker/` 组件来源与协议
 
-`worker/` 包含基于 [shaxiu/XianyuAutoAgent](https://github.com/shaxiu/XianyuAutoAgent) 修改的代码，继续遵循 GPL-3.0。上游许可证全文见 [`worker/LICENSE`](worker/LICENSE)，来源和修改范围见 [`worker/NOTICE.md`](worker/NOTICE.md)。
+`worker/` 目录中的代码基于开源项目 [shaxiu/XianyuAutoAgent](https://github.com/shaxiu/XianyuAutoAgent) 进行修改和重构，继续遵循 GPL-3.0 许可证。来源、修改范围与上游版权声明见 [`worker/NOTICE.md`](worker/NOTICE.md)，许可证文本见 [`worker/LICENSE`](worker/LICENSE)。
 
-## 第三方资产和依赖
+## 字体与第三方资产
 
-- `frontend/assets/OFL-NotoSansSC.txt` 与生成的 `ui-sans-generated.woff2` 按随附的 SIL Open Font License 1.1 处理。
-- 第三方依赖遵循各自上游许可证；发布前应审阅锁定版本的许可证和 NOTICE 要求。
-- 新增图片、字体、图标、示例数据或其他外部素材时，贡献者必须在 Pull Request 中说明来源、许可证和再分发条件。
-- 未明确获得授权的第三方素材不属于本项目的发布内容，不能作为示例或构建产物提交。
+- `frontend/assets/OFL-NotoSansSC.txt` 与字体文件 `frontend/assets/ui-sans-generated.woff2` 遵循 SIL Open Font License 1.1（OFL）许可证；
+- 第三方 Python 与 Node.js 运行时依赖遵循各自上游项目的开源许可证；
+- 贡献者提交外部素材时，应说明来源、许可证要求与再分发条件。
 
-## 贡献者责任
+## 贡献者要求
 
-提交内容的贡献者必须拥有相应权利，并同意该内容按本仓库适用的许可证再分发。贡献不得包含凭据、真实业务数据或未授权的第三方材料。
+贡献者提交的内容须拥有相应合法权利，并同意按本仓库适用的开源许可证进行分发。提交内容严禁包含私人凭据、商业密钥、真实业务数据或未经授权的第三方资产。
 
-## 平台与合规边界
+## 免责声明与平台合规
 
-本项目是第三方平台自动化工具，不代表闲鱼、淘宝、阿里巴巴或任何模型服务商。使用者应自行遵守平台规则、服务条款、隐私法规和数据保护要求，并负责评估账号安全与数据合规风险。
+本项目属于独立的第三方自动化工具，与闲鱼、淘宝、阿里巴巴集团或各模型服务商无任何官方关联或认证关系。使用者应自行遵守所在司法管辖区法律法规以及平台服务协议，并承担相关合规与使用责任。

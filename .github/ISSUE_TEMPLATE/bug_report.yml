@@ -5,7 +5,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        **安全提醒：不要粘贴 Cookie、Token、API Key、密码、真实订单号、买家昵称、聊天正文、库存或未经脱敏的日志。**
+        **安全提醒：不要粘贴 Cookie、Token、API Key、密码、真实订单号、买家昵称、聊天正文、库存明文或未经脱敏的日志。**
         请使用最小化的假数据，并在提交前运行仓库脱敏合同。
   - type: input
     id: version
@@ -19,7 +19,7 @@ body:
     id: reproduce
     attributes:
       label: 复现步骤
-      description: 请使用假账号、假订单和本地模拟数据描述最小复现。
+      description: 请使用假账号、假订单和本地模拟数据描述最小复现步骤。
     validations:
       required: true
   - type: textarea
@@ -38,4 +38,4 @@ body:
     id: checks
     attributes:
       label: 已运行的检查
-      description: 例如 npm test、专项合同或 git diff --check。
+      description: 例如 npm test、专项合同测试或 git diff --check。

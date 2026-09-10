@@ -6,7 +6,7 @@ body:
     attributes:
       value: |
         请先确认提议符合账号隔离、真实业务状态和平台合规边界。
-        不要提交 Cookie、Token、API Key、真实订单、买家信息、库存或生产日志。
+        不要提交 Cookie、Token、API Key、真实订单、买家信息、库存明文或生产日志。
   - type: textarea
     id: problem
     attributes:
@@ -18,7 +18,7 @@ body:
     id: proposal
     attributes:
       label: 建议方案
-      description: 说明数据来源、权限、失败路径、恢复方式和对六个业务域的影响。
+      description: 说明数据来源、权限、失败路径、恢复方式以及对现有功能模块与架构边界的影响。
     validations:
       required: true
   - type: textarea

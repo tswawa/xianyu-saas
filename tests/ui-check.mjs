@@ -16,7 +16,9 @@ const assetVersion = versionSource.match(/^ASSET_VERSION\s*=\s*["']([^"']+)["']\
 assert.match(assetVersion, /^[0-9]{8}-[0-9]{2}$/);
 const desktopSettingsOpsScope = ["settings", "ops", "dashboard", "goods", "resources", "popover", "home-alerts"].includes(process.env.SAAS_UI_SCOPE);
 const mockOnlyScope = process.env.SAAS_UI_SCOPE === "mock";
-const screenshotsEnabled = !desktopSettingsOpsScope && !mockOnlyScope && process.env.SAAS_UI_SCREENSHOTS !== "0";
+// Public documentation images are opt-in, never a side effect of a test scope.
+const docsCaptureScope = process.env.SAAS_UI_SCOPE === "docs-capture";
+const screenshotsEnabled = !docsCaptureScope && !desktopSettingsOpsScope && !mockOnlyScope && process.env.SAAS_UI_SCREENSHOTS !== "0";
 if (screenshotsEnabled) fs.mkdirSync(resultRoot, { recursive: true });
 for (const staleName of screenshotsEnabled ? [
   "local-live-desktop.png", "local-live-mobile.png", "shop-connector-missing-desktop.png",
@@ -2110,10 +2112,22 @@ async function checkOrderManagement(browser, baseUrl) {
 
 async function routeOfflineMock(page, baseUrl, externalRequests) {
   const origin = new URL(baseUrl).origin;
-  await page.route("**/*", (route) => {
-    const url = new URL(route.request().url());
+  // Context routing also covers an unexpected popup's first request. Docs do
+  // not use the regression-only CDN pixel, and WebSockets never connect out.
+  const router = docsCaptureScope ? page.context() : page;
+  if (docsCaptureScope) {
+    assert.equal(new URL(baseUrl).hostname, "127.0.0.1");
+    await router.routeWebSocket("**/*", (socket) => {
+      externalRequests.push(socket.url());
+      socket.close();
+    });
+  }
+  await router.route("**/*", (route) => {
+    const request = route.request();
+    const url = new URL(request.url());
+    if (docsCaptureScope) fixtures.docsCaptureRequests.push({ method: request.method(), url: url.href });
     if (url.origin === origin || ["data:", "blob:"].includes(url.protocol)) return route.continue();
-    if (url.hostname === "cdn.example") return route.fulfill({ status: 200, contentType: "image/png", body: Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", "base64") });
+    if (!docsCaptureScope && url.hostname === "cdn.example") return route.fulfill({ status: 200, contentType: "image/png", body: Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", "base64") });
     externalRequests.push(url.href);
     return route.abort();
   });
@@ -2130,8 +2144,8 @@ async function assertNoBusinessStorage(page, pattern) {
   assert.doesNotMatch(JSON.stringify(snapshot), pattern, "business messages and API keys must never enter browser storage, including transient writes");
 }
 
-async function desktopContractPage(browser, baseUrl) {
-  const page = await browser.newPage({ viewport: { width: 1440, height: 900 }, deviceScaleFactor: 1, serviceWorkers: "block" });
+async function desktopContractPage(browser, baseUrl, contextOptions = {}) {
+  const page = await browser.newPage({ viewport: { width: 1440, height: 900 }, deviceScaleFactor: 1, serviceWorkers: "block", ...contextOptions });
   page.setDefaultTimeout(8000);
   const evidence = { pageErrors: [], failedResponses: [], externalRequests: [], allowedFailures: [], confirmDialogs: [] };
   fixtures.desktopEvidence = evidence;
@@ -3288,6 +3302,252 @@ async function checkOpsDesktop(browser, baseUrl) {
   }
 }
 
+function seedDocsCaptureFixtures() {
+  assert.ok(docsCaptureScope, "documentation fixtures require the explicit capture scope");
+  fixtures.docsCaptureRequests = [];
+  fixtures.me = { ...fixtures.me, username: "docs-owner" };
+  fixtures.version = { ...fixtures.version, commit: "demo", build_dirty: false, release_notes: "演示工作台" };
+  const updatedAt = "2026-09-10T10:00:00+08:00";
+  fixtures.products = [
+    { ...productFixtures[0], title: "数字工具使用教程", description: "手机与电脑阅读说明，包含常见问题解答。", updated_at: updatedAt },
+    { ...productFixtures[1], title: "聊天表情素材包", description: "日常聊天素材，按商品配置交付。", price_display: "¥3.00", updated_at: updatedAt },
+    { ...productFixtures[2], title: "店铺运营指南", description: "店铺日常管理与商品整理参考资料。", updated_at: updatedAt },
+  ];
+  fixtures.shopAccounts = [
+    { ...fixtures.shopAccounts[0], name: "海风演示店", product_count: 3, last_verified_at: updatedAt, last_sync_at: updatedAt },
+    { ...fixtures.shopAccounts[0], id: 2, key: "docs-second", name: "资料演示店", product_count: 1, last_verified_at: updatedAt, last_sync_at: updatedAt },
+  ];
+  fixtures.bot = { ...fixtures.bot, shop_name: "海风演示店", running: true, desired_running: true,
+    running_total: 1, automation_mode: "rules_ai", product_count: 3, last_sync_at: updatedAt,
+    auth_code: "ok", auth_phase: "WS_REGISTERED", catalog_state: "ready" };
+  fixtures.config = { ...fixtures.config, bot_running: true };
+  fixtures.automation = { ...fixtures.automation, rules: [{ ...fixtures.automation.rules[0], reply: "资料支持手机和电脑阅读，下载问题请在会话留言。" }],
+    deliveries: [{ item_id: "100001", enabled: true, delivery: "material", material: "请按随商品发送的使用说明阅读资料。" }] };
+  fixtures.templates = [
+    { ...fixtures.templates[0], name: "表情素材卡密发货", delivery: "redeem", item_ids: ["100002"], item_count: 1 },
+    { ...fixtures.templates[1], name: "运营指南网盘发货", item_ids: ["100003"], item_count: 1 },
+  ];
+  fixtures.deliveryStatusByAccount.default = { available: true, items: [
+    { item_id: "100001", delivery: "material", configured: true, enabled: true, template_id: null },
+    { item_id: "100002", delivery: "redeem", configured: true, enabled: true, template_id: "tpl-1" },
+    { item_id: "100003", delivery: "pan", configured: true, enabled: true, template_id: "tpl-2" },
+  ] };
+  fixtures.accountData["docs-second"] = {
+    bot: { ...fixtures.bot, shop_name: "资料演示店", running: false, desired_running: false, product_count: 1 },
+    products: [fixtures.products[2]], automation: { ...fixtures.automation, rules: [], deliveries: [] }, conversations: [], orders: [],
+  };
+  fixtures.resourceRowsByUser[fixtures.me.username] = [
+    resourceRow(fixtures.shopAccounts[0], { mode: "rules_ai", cpu_percent: 2.8, rss_bytes: 86 * 1024 * 1024, vms_bytes: 168 * 1024 * 1024, uptime_seconds: 9360 }),
+    resourceRow(fixtures.shopAccounts[1], { worker_state: "stopped", metrics_state: "stopped", cpu_percent: 0, rss_bytes: 0, vms_bytes: 0, memory_limit_bytes: null, uptime_seconds: 0, message: "未运行" }),
+  ];
+  const totals = { buyer_messages_total: 12, messages_total: 20, auto_replies_total: 8, fulfillment_success_total: 3, fulfillment_failed_total: 0, unread_conversations_total: 1 };
+  const buckets = [7, 10, 8, 15, 11, 16, 12].map((count, index) => ({ date: `2026-09-${String(index + 4).padStart(2, "0")}`,
+    buyer_messages_total: count, auto_replies_total: [5, 7, 6, 11, 8, 12, 8][index] }));
+  fixtures.analyticsByPeriod = { 1: { totals, buckets: buckets.slice(-1) }, 7: { totals, buckets } };
+  fixtures.orders = ["delivered", "manual_review", "processing", "delivered", "delivered"].map((status, index) => {
+    const product = fixtures.products[index % 3];
+    const createdAt = `2026-09-10T${String(15 - index).padStart(2, "0")}:20:00+08:00`;
+    return { order_key: `DEMO-0910-${String(index + 1).padStart(3, "0")}`, platform_order_id: "", item_id: product.id,
+      item_title: product.title, buyer_id: `demo-buyer-${String(index + 1).padStart(2, "0")}`, buyer_nick: `演示买家 ${index + 1}`,
+      chat_id: index === 0 ? "chat-1" : "", conversation_available: index === 0,
+      quantity: 1, paid_amount: product.price_display.replace("¥", ""), status, created_at: createdAt,
+      verified_at: createdAt, delivered_at: status === "delivered" ? createdAt : "",
+      delivery_type_label: ["资料", "卡密", "网盘"][index % 3], platform_status_label: status === "delivered" ? "已发货" : "待发货",
+      reason_code: status === "manual_review" ? "manual_confirmation" : "", reason_label: status === "manual_review" ? "规格需人工确认" : "" };
+  });
+  fixtures.attention = [{ id: "att_aaaaaaaaaaaaaaaaaaaaaaaa", kind: "order", code: "manual_review", title: "1 笔订单待人工确认",
+    message: "买家需要确认素材规格，请查看订单后回复。", action_label: "查看订单", action_view: "orders", severity: "warning", resolved: false }];
+  fixtures.summary = { messages_total: 20, orders_total: 5, delivered_total: 3, attention_total: 1, last_activity: "09-10 15:20" };
+  fixtures.messages = [
+    { role: "user", content: "教程支持手机阅读吗？", time: "2026-09-10 15:17", chat_id: "chat-1", item_id: "100001" },
+    { role: "assistant", content: "支持手机和电脑阅读。付款后按商品配置发送使用说明。", time: "2026-09-10 15:18", chat_id: "chat-1", item_id: "100001" },
+    { role: "user", content: "好的，谢谢。", time: "2026-09-10 15:19", chat_id: "chat-1", item_id: "100001" },
+    { role: "user", content: "这套素材包含哪些规格？", time: "2026-09-10 15:20", chat_id: "chat-2", item_id: "100002" },
+  ];
+  fixtures.conversations = [
+    { chat_id: "chat-2", item_id: "100002", buyer_label: "演示买家 2", preview: "这套素材包含哪些规格？", time: "2026-09-10 15:20", message_count: 1, unread: true, manual_mode: false },
+    { chat_id: "chat-1", item_id: "100001", buyer_label: "演示买家 1", preview: "好的，谢谢。", time: "2026-09-10 15:19", message_count: 3, unread: false, manual_mode: false },
+  ];
+  const storeConfig = { ...defaultAiStoreConfig, store_content: "本店提供数字学习资料与聊天素材。先回答商品使用问题；交付方式以当前商品配置为准。",
+    persona_name: "海风客服", buyer_address: "你好", emoji_level: "none",
+    forbidden_claims: "不编造库存、付款或发货状态；不承诺未说明的功能。", handoff_rules: "退款、规格争议及付款状态不确定时转人工。" };
+  // Only connection metadata is seeded. No API key, verification token, shop
+  // cookie, redeemable code, real buyer profile or external image is supplied.
+  const connection = { scope: "user", initialized: true, provider: "openai_chat_completions", base_url: "https://api.example.com/v1",
+    model: "example-chat-model", api_key_configured: true, connection_status: "verified", status: "verified", revision: 1, key_revision: 1, last_error_code: "" };
+  fixtures.userConnections.set(fixtures.me.username, connection);
+  fixtures.ai = { ...fixtures.ai, status: { enabled: true, running: true, connection_verified: true, error_code: "" }, connection,
+    config: { draft: storeConfig, published: { revision: 1, config: storeConfig }, status: "saved", revision: 1 },
+    products: fixtures.products.map((item) => ({ item_id: item.id, knowledge_status: "saved", snapshot_fingerprint: `demo-${item.id}`,
+      facts: { item_id: item.id, title: item.title, description: item.description, price: item.price_display, stock: "", status: "在售", skus: [] } })),
+    knowledge: Object.fromEntries(fixtures.products.map((item, index) => [item.id, { item_id: item.id, status: "saved", knowledge_status: "saved", revision: 1,
+      content: ["资料支持手机和电脑阅读。\n付款后按商品配置发送使用说明。\n下载与阅读问题请在会话留言。", "说明素材格式与使用方法，规格不清楚时请转人工确认。", "包含商品整理与日常管理参考，付款后按绑定模板交付。"][index] }])) };
+  const pool = { id: "pool-demo-1", name: "表情素材兑换池", note: "素材包交付批次 A", total: 120, available: 85, reserved: 3, used: 32, enabled: true };
+  fixtures.cards = { pool, pools: [pool, { id: "pool-demo-2", name: "备用素材兑换池", note: "素材包交付批次 B", total: 40, available: 25, reserved: 0, used: 15, enabled: true }],
+    stats: { pools: 2, total: 160, available: 110, reserved: 3, used: 47 } };
+  const session = createAgentSession(fixtures.me.username, "default");
+  agentMessage(session, "user", "只读检查当前店铺的商品与发货配置。", { kind: "message" });
+  agentMessage(session, "assistant", "资料、卡密、网盘各 1 项；卡密可用库存 110。没有修改配置。", { kind: "tool", summary: "已读取商品、发货配置与库存概要", status: "succeeded", targets: ["当前店铺的 3 个商品"] });
+  agentMessage(session, "assistant", "3 个商品均已配置发货，表情素材可用库存为 110。", { kind: "message" });
+  agentMessage(session, "user", "只更新数字工具使用教程的客服说明：支持手机和电脑阅读，付款后按商品配置发送使用说明。", { kind: "message" });
+  agentMessage(session, "assistant", "已保存 1 项，其他商品和发货配置未变。", { kind: "tool", summary: "已保存商品客服补充内容", status: "succeeded", targets: [fixtures.products[0].title] });
+  agentMessage(session, "assistant", "教程客服说明已生效。下载与阅读问题仍可在会话中咨询。", { kind: "message" });
+}
+
+async function captureDocs(browser, baseUrl) {
+  seedDocsCaptureFixtures();
+  const docsRoot = path.join(repoRoot, "docs", "assets", "readme");
+  assert.ok(fs.statSync(docsRoot).isDirectory(), "the public image directory must already exist");
+  const { page, evidence } = await desktopContractPage(browser, baseUrl, {
+    viewport: { width: 1440, height: 1000 }, locale: "zh-CN", timezoneId: "Asia/Shanghai", reducedMotion: "reduce",
+  });
+  const captures = [];
+  const desktopViewport = { width: 1440, height: 1000 };
+  const mobileViewport = { width: 390, height: 844 };
+  const visit = async (view, viewport = desktopViewport) => {
+    await page.setViewportSize(viewport);
+    await openView(page, view);
+    await page.evaluate(() => window.scrollTo(0, 0));
+  };
+  const capture = async (name, requiredInFrame = []) => {
+    await page.waitForLoadState("networkidle");
+    await page.evaluate(async () => {
+      await document.fonts.ready;
+      await Promise.all(Array.from(document.images).filter((image) => image.getClientRects().length).map((image) => image.decode()));
+    });
+    await page.mouse.move(1, 1);
+    await page.locator("#toastRegion .toast").last().waitFor({ state: "detached", timeout: 6000 });
+    await waitForPanelSettled(page);
+    await assertNoOverflow(page, `docs ${name}`);
+    for (const selector of requiredInFrame) {
+      const bounds = await page.locator(selector).boundingBox();
+      const viewport = page.viewportSize();
+      assert.ok(bounds && bounds.x >= 0 && bounds.y >= 0 && bounds.x + bounds.width <= viewport.width + 1 && bounds.y + bounds.height <= viewport.height + 1,
+        `${name}: ${selector} must fit in the image: ${JSON.stringify({ bounds, viewport })}`);
+    }
+    assert.equal(await page.locator('dialog[open], [aria-busy="true"]:visible, .spin:visible').count(), 0, `${name}: no dialog or busy indicator`);
+    assert.doesNotMatch(await page.locator('[data-panel]:not([hidden])').innerText(), /正在加载|正在读取|加载中|mock-user-verification|bootstrap-ui-contract|sk-[A-Za-z0-9]/);
+    assert.equal(await page.locator('input[type="password"]:visible').evaluateAll((inputs) => inputs.every((input) => input.value === "")), true, `${name}: sensitive fields must be empty`);
+    assertDesktopEvidence(evidence);
+    const buffer = await page.screenshot({ animations: "disabled", caret: "hide", fullPage: false });
+    const width = buffer.readUInt32BE(16), height = buffer.readUInt32BE(20);
+    assert.deepEqual({ width, height }, page.viewportSize());
+    captures.push({ name, width, height, bytes: buffer.length, buffer });
+  };
+  const readyHome = async () => page.waitForFunction(() => document.querySelectorAll("#homeProductGrid .home-product-card").length === 3
+    && document.querySelectorAll("#homeOrderList tr").length === 5 && document.querySelectorAll("#analyticsChart .chart-bar").length === 7
+    && document.querySelector("#homeResourceBody")?.textContent.includes("海风演示店") && document.querySelector("#homeStatCards")?.textContent.includes("12"));
+  const readyChat = async () => {
+    await page.waitForSelector('#conversationItems [data-chat-id="chat-1"]');
+    await page.click('#conversationItems [data-chat-id="chat-1"]');
+    await page.waitForFunction(() => document.querySelectorAll("#chatMessages .message-row").length === 3 && document.querySelector("#chatPinnedProductTitle")?.textContent.includes("数字工具使用教程"));
+  };
+  try {
+    await desktopLogin(page, fixtures.me.username);
+    await assertDesktopAssetVersion(page);
+    await visit("shops");
+    await page.waitForFunction(() => document.querySelectorAll("#shopAccountsPanelList .shop-card").length === 2 && document.querySelector("#shopResourcesBody")?.textContent.includes("86"));
+    await visit("home", { width: 1600, height: 1050 });
+    await readyHome();
+    await capture("overview.png", ["#homeStatCards", "#homeProductGrid", ".home-resources-card"]);
+
+    await visit("shops");
+    await page.waitForFunction(() => document.querySelectorAll("#shopAccountsPanelList .shop-card").length === 2 && document.querySelector("#shopResourcesBody")?.textContent.includes("86"));
+    await capture("shops.png", ["#shopAccountsPanelList", ".shop-resources-card"]);
+
+    await visit("chat");
+    await readyChat();
+    await desktopApiClick(page, "#toggleChatTakeover", "/api/bot/conversations/chat-1/takeover");
+    await page.waitForFunction(() => document.querySelector('#manualReplyForm button[type="submit"]')?.disabled === false);
+    assert.match(await page.locator("#chatAiStatus").innerText(), /AI 已开启/);
+    await capture("customer-service.png", [".chat-layout"]);
+
+    await visit("ai-config", { width: 1600, height: 1280 });
+    await page.waitForSelector('#aiProductList [data-ai-product="100001"]');
+    await page.click('#aiProductList [data-ai-product="100001"]');
+    await page.waitForFunction(() => document.querySelector("#aiKnowledgeContent")?.value.includes("资料支持手机和电脑阅读") && document.querySelector("#aiStoreContent")?.value.includes("数字学习资料"));
+    assert.match(await page.locator("#aiOverallStatus").innerText(), /AI 运行中/);
+    await capture("ai-config.png", [".ai-persona-card", ".ai-knowledge-card", ".ai-test-console"]);
+
+    await visit("goods", { width: 1440, height: 800 });
+    await page.waitForFunction(() => document.querySelectorAll("#productGrid [data-product-id]").length === 3 && document.querySelector("#productGrid")?.textContent.includes("网盘"));
+    assert.match(await page.locator('#productGrid [data-product-id="100002"]').innerText(), /卡密自动发货/);
+    await capture("goods.png", ["#productGrid", "#productPagination"]);
+
+    await visit("cards", { width: 1440, height: 800 });
+    await page.waitForFunction(() => document.querySelectorAll("#cardsList .cards-row").length === 2 && document.querySelector("#cardsStats")?.textContent.includes("160"));
+    await capture("cards.png", ["#cardsStats", "#cardsList", "#cardsCreateForm"]);
+
+    await visit("orders", { width: 1440, height: 900 });
+    await page.waitForFunction(() => document.querySelectorAll("#orderList [data-order-key]").length === 5 && !document.querySelector("#refreshOrders")?.disabled);
+    await capture("orders.png", [".orders-workbench"]);
+
+    await visit("settings", { width: 1440, height: 900 });
+    await page.click('[data-settings-tab="ai"]');
+    await page.waitForFunction(() => document.querySelector("#aiModel")?.value === "example-chat-model");
+    assert.equal(await page.inputValue("#aiApiKey"), "");
+    await capture("settings.png", ["#settingsAiPanel"]);
+
+    await visit("ops");
+    await page.waitForFunction(() => document.querySelectorAll("#opsChatHistory .ops-receipt-card").length === 2 && !document.querySelector("#opsSendBtn")?.disabled);
+    const history = await page.locator("#opsChatHistory").innerText();
+    // Reload the actual page to prove the image is backed by persisted session
+    // fixtures, not by injected DOM, browser history or an obsolete proposal UI.
+    await page.reload({ waitUntil: "networkidle" });
+    await visit("ops");
+    await page.waitForFunction(() => document.querySelectorAll("#opsChatHistory .ops-receipt-card").length === 2 && !document.querySelector("#opsSendBtn")?.disabled);
+    assert.equal(await page.locator("#opsChatHistory").innerText(), history);
+    assert.doesNotMatch(history, /审批|提案|正在|排队/);
+    await capture("operations.png", [".ops-container", ".ops-input-area"]);
+
+    await visit("home", mobileViewport);
+    await readyHome();
+    await capture("overview-mobile.png", ["#homeStatCards"]);
+
+    await visit("chat", mobileViewport);
+    await readyChat();
+    await waitForPanelSettled(page);
+    await page.locator(".chat-window").evaluate((node) => window.scrollTo(0, window.scrollY + node.getBoundingClientRect().top - 8));
+    await capture("customer-service-mobile.png", [".chat-head", "#manualReplyForm"]);
+
+    await page.setViewportSize({ width: 1440, height: 1000 });
+    await page.click("#headerLogoutButton");
+    await page.waitForSelector("#authScreen:not([hidden])");
+    const ownerName = fixtures.me.username;
+    fixtures.me = { ...fixtures.me, username: "docs-admin", role: "admin", role_label: "管理员", is_admin: true,
+      platform_permissions: ["platform.settings.manage", "platform.users.manage", "platform.audit.read", "platform.updates.manage"] };
+    fixtures.resourceRowsByUser[fixtures.me.username] = structuredClone(fixtures.resourceRowsByUser[ownerName]);
+    fixtures.userConnections.set(fixtures.me.username, structuredClone(fixtures.userConnections.get(ownerName)));
+    await desktopLogin(page, fixtures.me.username);
+    await visit("settings", { width: 1440, height: 900 });
+    await page.click('[data-settings-tab="resources"]');
+    await page.waitForFunction(() => document.querySelector("#resourceMemoryMiB")?.value === "400" && !document.querySelector("#saveResourceSettings")?.disabled);
+    assert.equal(await page.inputValue("#resourceMaxShops"), "20");
+    assert.equal(await page.inputValue("#resourceMaxWorkers"), "3");
+    await capture("resources.png", ["#settingsResourcesPanel"]);
+
+    assert.equal(captures.length, 12);
+    assert.equal(new Set(captures.map((item) => item.name)).size, 12);
+    const origin = new URL(baseUrl).origin;
+    assert.equal(fixtures.docsCaptureRequests.every((request) => new URL(request.url).origin === origin), true, "every captured HTTP request must use the loopback mock server");
+    assert.equal(fixtures.apiRequests.filter((request) => request.method !== "GET").every((request) => ["/api/auth/login", "/api/auth/logout", "/api/bot/conversations/chat-1/read", "/api/bot/conversations/chat-2/read", "/api/bot/conversations/chat-1/takeover"].includes(request.path)), true, "capture must not invoke model tests, platform probes or configuration writes");
+    assert.equal(fixtures.settingsRequests.some((request) => request.method !== "GET"), false);
+    assert.equal(fixtures.opsRequests.some((request) => request.method !== "GET"), false);
+    assert.equal(fixtures.cookieSaves + fixtures.qrStarts + fixtures.qrConnects + fixtures.shopActionRequests.length + fixtures.resourceSaveRequests.length + fixtures.opsWrites.length, 0);
+    assertDesktopEvidence(evidence);
+    // Publish only after every view and safety assertion has passed. Ordinary
+    // full/docs/settings/ops scopes never reach this public-image write path.
+    for (const { name, buffer } of captures) fs.writeFileSync(path.join(docsRoot, name), buffer);
+    console.log(JSON.stringify({ ok: true, scope: "docs-capture", screenshots: captures.map(({ buffer, ...item }) => ({ ...item, path: `docs/assets/readme/${item.name}` })),
+      safety: { localRequests: fixtures.docsCaptureRequests.length, apiRequests: fixtures.apiRequests.length, externalRequests: evidence.externalRequests.length,
+        pageErrors: evidence.pageErrors.length, unexpectedHttpErrors: evidence.failedResponses.length, authorizationHeaders: fixtures.authorizationHeaders.length,
+        modelTests: 0, platformActions: 0, configurationWrites: 0, persistedAgentReceipts: 2 } }));
+  } catch (error) {
+    await reportDesktopFailure(page, "docs-capture", error, evidence);
+    throw error;
+  } finally { await page.close(); }
+}
+
 async function run() {
   const server = createServer();
   const port = await listen(server);
@@ -3315,6 +3575,10 @@ async function run() {
   let expectedManualReplyNotFoundConsole = 0;
   let expectedManualReplyNotFoundResponses = 0;
   try {
+    if (docsCaptureScope) {
+      await captureDocs(browser, `http://127.0.0.1:${port}/xianyu-saas/`);
+      return;
+    }
     if (desktopSettingsOpsScope) {
       const check = { settings: checkSettingsDesktop, ops: checkOpsDesktop, dashboard: checkDashboardDesktop, goods: checkDashboardDesktop, resources: checkResourcesDesktop, popover: checkVersionPopover, "home-alerts": checkHomeAlerts }[process.env.SAAS_UI_SCOPE];
       await check(browser, `http://127.0.0.1:${port}/xianyu-saas/`);

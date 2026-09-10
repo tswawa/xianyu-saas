@@ -1332,21 +1332,21 @@
             <span class="docs-step-num">2</span>
             <div class="docs-step-body">
               <strong>准备资料与库存</strong>
-              <p>进入「履约中心」同步在售宝贝，为需要自动发货的商品绑定发货模板与卡密库存，并录入买家常问的规格说明。</p>
+              <p>进入「履约中心」同步在售宝贝，为需要自动发货的商品绑定发货模板与卡密库存，录入规格说明。网盘资源在待发货订单核验通过且资源有效后发送；固定文本资料仅支持单件订单。</p>
             </div>
           </div>
           <div class="docs-step-item">
             <span class="docs-step-num">3</span>
             <div class="docs-step-body">
-              <strong>配置回复并演练</strong>
-              <p>进入「智能客服」优先配置核心关键词规则（如价格、发货时效、售后政策），再按需启用 AI 客服并在沙盘中充分测试验证。</p>
+              <strong>配置客服与店铺助手</strong>
+              <p>在「系统设置」中配置个人统一模型连接，在「智能客服」中添加包含匹配的关键词规则（按已保存延迟发送）；AI 回复与知识引用可在沙盘中预览检查。需要维护配置时可在「店铺助手」通过单店持久会话由受限工具直接执行并输出回执。</p>
             </div>
           </div>
           <div class="docs-step-item">
             <span class="docs-step-num">4</span>
             <div class="docs-step-body">
               <strong>日常接待与人工复核</strong>
-              <p>查看咨询和订单处理结果；遇到议价、售后或异常情况，可点击“人工接管”暂停该会话的自动回复，亲自处理。</p>
+              <p>查看咨询和订单处理结果。遇到议价、售后或异常情况，可点击“人工接管”暂停该会话的自动回复链（已核验订单履约不受影响），亲自处理。</p>
             </div>
           </div>
         </div>
@@ -1361,28 +1361,28 @@
           <details class="docs-faq-item">
             <summary class="docs-faq-summary"><span>电脑关机或没有打开网页时，后台还能正常工作吗？</span></summary>
             <div class="docs-faq-content">
-              <p>只要宿主机（你的电脑或服务器）保持开机联网状态，且本地后台服务在运行，关闭浏览器不会影响后台服务。但如果宿主机关机、休眠或网络中断，服务将暂停，无法继续接收消息与发货。</p>
+              <p>只要宿主机（电脑或服务器）保持开机联网且本地后台服务在运行，关闭浏览器不会影响后台服务。宿主机关机、休眠或网络中断时服务暂停，无法继续接收消息或发货。</p>
             </div>
           </details>
 
           <details class="docs-faq-item">
             <summary class="docs-faq-summary"><span>自动发货会不会出错，或被买家在聊天中骗取卡密？</span></summary>
             <div class="docs-faq-content">
-              <p>自动发货以平台订单核验为依据，不以聊天文字、截图或 AI 的承诺作为授权。请核对商品与发货配置、库存以及异常记录；订单信息不一致时应先人工处理，不要绕过核验。</p>
+              <p>自动发货严格以官方双接口订单核验为准（确认处于待发货状态 status == 2 且商品与买家匹配），聊天文字或付款截图无法触发发货。网盘资源在待发货核验通过且资源有效后发送，固定文本仅支持单件；卡密预留具备受控释放机制，已使用卡密无法二次激活。</p>
             </div>
           </details>
 
           <details class="docs-faq-item">
             <summary class="docs-faq-summary"><span>AI 客服会不会随意答应买家大额低价或做出错误承诺？</span></summary>
             <div class="docs-faq-content">
-              <p>系统遵循确定性规则优先原则。建议优先设置精准的固定关键词规则；未命中时由 AI 结合商品资料回答，AI 无权擅自改价或发货。但大语言模型仍有理解偏差可能，重要规则请在沙盘中测试，并定期进行人工复核。</p>
+              <p>系统遵循确定性规则优先原则。命中关键词规则后按设置的打字延迟回复；未命中时由 AI 结合商品资料回答。AI 客服无权修改订单价格或直接发货。大模型回复可能存在理解偏差，可在沙盘中检查 AI 回复与知识引用情况，关键业务建议配置确定性规则并定期人工复核。</p>
             </div>
           </details>
 
           <details class="docs-faq-item">
-            <summary class="docs-faq-summary"><span>店铺凭据和数据是如何保存的？会泄露给第三方吗？</span></summary>
+            <summary class="docs-faq-summary"><span>店铺凭据和大模型密钥是如何保存的？会泄露给第三方吗？</span></summary>
             <div class="docs-faq-content">
-              <p>店铺凭据与业务数据保存在服务端，模型密钥加密保存。启用第三方模型时，会向对应服务发送必要的买家对话和商品上下文。请选择可信服务、控制账号访问权限，并妥善备份数据。</p>
+              <p>闲鱼 Cookie 与业务数据保存在服务端受文件系统与权限严格保护的私有目录中。大模型 API Key 经前端提交后由服务端主密钥加密保存，保存后不回显明文，浏览器不长期缓存。使用第三方模型时仅向对应服务商发送必要的对话上下文。</p>
             </div>
           </details>
         </div>
