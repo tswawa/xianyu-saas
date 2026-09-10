@@ -1,0 +1,108 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  publish:
+    needs: validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+      - name: Verify release version
+        id: metadata
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import re
+          from pathlib import Path
+          version = json.loads(Path("package.json").read_text())["version"]
+          if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?", version):
+              raise SystemExit("Invalid release version")
+          if os.environ["RELEASE_TAG"] != "v" + version:
+              raise SystemExit("Tag and package version differ")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write("version=" + version + "\n")
+          PY
+      - name: Install packaging dependencies
+        run: python -m pip install -r backend/requirements.txt
+      - name: Build signed packages
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+          RELEASE_COMMIT: ${{ github.sha }}
+          RELEASE_VERSION: ${{ steps.metadata.outputs.version }}
+        run: |
+          python scripts/build-release.py --ref "$RELEASE_COMMIT" --output ".local/releases/$RELEASE_VERSION"
+      - name: Retain validated packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ github.ref_name }}
+          path: .local/releases/${{ steps.metadata.outputs.version }}/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload draft and publish complete release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_VERSION: ${{ steps.metadata.outputs.version }}
+        run: |
+          set -euo pipefail
+          dir=".local/releases/$RELEASE_VERSION"
+          base="xianyu-saas-$RELEASE_VERSION"
+          assets=(
+            "$dir/$base.tar.gz"
+            "$dir/$base.manifest.json"
+            "$dir/$base.manifest.sig"
+            "$dir/$base-source.zip"
+            "$dir/$base.update-signing.pub"
+            "$dir/release-notes.md"
+            "$dir/artifacts.json"
+            "$dir/SHA256SUMS"
+          )
+          for asset in "${assets[@]}"; do
+            test -s "$asset"
+          done
+          prerelease=(--prerelease=false)
+          latest=(--latest)
+          if [[ "$RELEASE_VERSION" == *-* ]]; then
+            prerelease=(--prerelease)
+            latest=(--latest=false)
+          fi
+          if draft=$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null); then
+            if [[ "$draft" != "true" ]]; then
+              echo "Refusing to replace an already published release" >&2
+              exit 1
+            fi
+            gh release upload "$RELEASE_TAG" "${assets[@]}" --repo "$GITHUB_REPOSITORY" --clobber
+            gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --title "$RELEASE_TAG" --notes-file "$dir/release-notes.md"
+          else
+            gh release create "$RELEASE_TAG" "${assets[@]}" --repo "$GITHUB_REPOSITORY" --draft --verify-tag --title "$RELEASE_TAG" --notes-file "$dir/release-notes.md" "${prerelease[@]}"
+          fi
+          gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false "${prerelease[@]}" "${latest[@]}"

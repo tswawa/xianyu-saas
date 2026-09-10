@@ -1,0 +1,510 @@
+#!/usr/bin/env python3
+"""Build offline, reproducible signed OTA and complete source assets from Git blobs."""
+
+from __future__ import annotations
+
+import argparse
+import ast
+import base64
+import binascii
+import gzip
+import hashlib
+import io
+import json
+import os
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tarfile
+import tempfile
+import types
+import zipfile
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path, PurePosixPath
+
+from cryptography.exceptions import UnsupportedAlgorithm
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
+
+
+class BundleError(RuntimeError):
+    """Only stable codes, never Git output, environment values or secret bytes."""
+
+
+@dataclass(frozen=True)
+class Blob:
+    path: str
+    oid: str
+    size: int
+    executable: bool
+
+
+PRIVATE_PARTS = frozenset({
+    ".git", ".local", ".narrafork", ".venv", "venv", "env", "node_modules",
+    "__pycache__", "__pypackages__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
+    ".tox", ".nox", ".hypothesis", "test-results", "coverage", "htmlcov",
+    "runtime", "runtime-data", "runtime-state", "runtime_state", "data", "state",
+    "logs", "backups", "tenants", "current", "releases", "staging", "update-intents",
+    "credentials", "secrets", "cookies", ".ssh", ".aws", ".azure", ".tools", "tools",
+    ".lock", "handoff", ".idea", ".vscode", "dist", "build", "downloads",
+    "orders", "inventory", "netdisk", "卡密", "网盘", "订单",
+})
+PRIVATE_NAMES = frozenset({
+    "agents.md", "memory.md", "memory_operations.md", "competitor-analysis-plan.md",
+    "test-codes.txt", "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519", "intent.json",
+})
+PRIVATE_DATA = re.compile(
+    r"(?:^|[._-])(?:cookies?|tokens?|credentials?|secrets?|private[._-]?keys?|"
+    r"signing[._-]?keys?|redeem[._-](?:codes|sent)|trial[._-](?:codes|sent)|"
+    r"pan[._-](?:links|sent)|reply[._-]rules|legacy[._-]delivery[._-]ledger|"
+    r"products[._-]config|auth[._-]state|orders?|card[._-]codes|netdisk|卡密|网盘|订单)"
+    r"(?:[._-]|$)"
+)
+SOURCE_SUFFIXES = frozenset({
+    ".py", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".sh", ".md", ".pub",
+    ".html", ".css", ".svg", ".png", ".jpg", ".jpeg", ".webp", ".gif", ".avif",
+    ".woff", ".woff2", ".ttf", ".otf",
+})
+SECRET_PATTERNS = (
+    re.compile(rb"(?m)^-----BEGIN (?:[A-Z0-9]+ )?PRIVATE KEY-----\r?$"),
+    re.compile(rb"github_pat_[A-Za-z0-9_]{20,}"),
+    re.compile(rb"ghp_[A-Za-z0-9]{20,}"),
+    re.compile(rb"AKIA[0-9A-Z]{16}"),
+    re.compile(rb"sk-[A-Za-z0-9_-]{24,}"),
+)
+REQUIRED_LICENSES = ("LICENSE", "worker/LICENSE", "worker/NOTICE.md", "frontend/assets/OFL-NotoSansSC.txt")
+
+
+def git_environment() -> dict[str, str]:
+    # No signing key, API credentials, user Git config, filters or optional index writes.
+    allowed = {"PATH", "SYSTEMROOT", "WINDIR", "PATHEXT", "TEMP", "TMP", "TMPDIR", "LANG", "LC_ALL"}
+    env = {name: value for name, value in os.environ.items() if name.upper() in allowed}
+    env.update({
+        "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_OPTIONAL_LOCKS": "0", "GIT_NO_REPLACE_OBJECTS": "1", "GIT_NO_LAZY_FETCH": "1",
+        "GIT_TERMINAL_PROMPT": "0", "GIT_ATTR_NOSYSTEM": "1",
+        "GIT_CONFIG_COUNT": "2", "GIT_CONFIG_KEY_0": "core.fsmonitor", "GIT_CONFIG_VALUE_0": "false",
+        "GIT_CONFIG_KEY_1": "protocol.allow", "GIT_CONFIG_VALUE_1": "never",
+    })
+    return env
+
+
+def git(root: Path, *args: str, data: bytes | None = None, codes=(0,)) -> subprocess.CompletedProcess:
+    try:
+        result = subprocess.run(
+            ["git", *args], cwd=root, input=data, capture_output=True,
+            env=git_environment(), timeout=120, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        raise BundleError("release_git_failed") from None
+    if result.returncode not in codes:
+        raise BundleError("release_git_failed")
+    return result
+
+
+def canonical_path(path: str, *, max_length=500, max_component=240) -> None:
+    parts = path.split("/")
+    if (not path or len(path) > max_length or "\\" in path or ":" in path
+            or any(ord(char) < 32 or ord(char) == 127 for char in path)
+            or any(part in {"", ".", ".."} or len(part) > max_component
+                   or part.endswith((".", " ")) for part in parts)):
+        raise BundleError("release_path_invalid")
+    for part in parts:
+        if re.fullmatch(r"(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?", part, re.IGNORECASE):
+            raise BundleError("release_path_invalid")
+
+
+def private_path(path: str) -> None:
+    canonical_path(path)
+    parts = tuple(part.casefold() for part in path.split("/"))
+    name = parts[-1]
+    if any(part in PRIVATE_PARTS for part in parts) or name in PRIVATE_NAMES:
+        raise BundleError("release_private_path_rejected")
+    if path == "backend/build-info.json":
+        raise BundleError("release_generated_file_tracked")
+    # Examples remain subject to content scanning, and forbidden directories stay forbidden.
+    if name.endswith(".example"):
+        return
+    if (any(part.startswith(".env") for part in parts) or name.endswith((".env", ".local", ".secret", ".secrets", ".key", ".p12", ".pfx"))
+            or parts[0] == "config"
+            or re.search(r"\.(?:db|sqlite3?|log|pid|cookie|lock)(?:[.-].*)?$", name)
+            or name.endswith((".pyc", ".pyo"))):
+        raise BundleError("release_private_path_rejected")
+    if path == "worker/products_config.json":
+        return
+    if PurePosixPath(name).suffix not in SOURCE_SUFFIXES and PRIVATE_DATA.search(name):
+        raise BundleError("release_private_path_rejected")
+
+
+def read_tree(root: Path, commit: str) -> list[Blob]:
+    raw = git(root, "ls-tree", "-r", "-l", "-z", commit).stdout
+    blobs = []
+    seen = {}
+    for record in raw.split(b"\0"):
+        if not record:
+            continue
+        try:
+            metadata, encoded = record.split(b"\t", 1)
+            mode, kind, oid, size = metadata.split()
+            path = encoded.decode("utf-8", "strict")
+        except (ValueError, UnicodeError):
+            raise BundleError("release_tree_invalid") from None
+        if kind != b"blob" or mode not in {b"100644", b"100755"}:
+            raise BundleError("release_link_or_special_file_rejected")
+        private_path(path)
+        # Also reject differently-cased parent directories, not just leaf collisions.
+        parts = path.split("/")
+        for index in range(1, len(parts) + 1):
+            prefix = "/".join(parts[:index])
+            folded = prefix.casefold()
+            if folded in seen and seen[folded] != prefix:
+                raise BundleError("release_path_collision")
+            seen[folded] = prefix
+        blobs.append(Blob(path, oid.decode("ascii"), int(size), mode == b"100755"))
+    return sorted(blobs, key=lambda blob: blob.path)
+
+
+def load_protocol(source: bytes):
+    """Use the commit's exact pure updater definitions, without importing its runtime.
+
+    In particular, importing the whole Linux updater on Windows would import fcntl
+    and version.py would inspect local build-info. Neither is needed to build assets.
+    No verifier logic is copied, relaxed or replaced here.
+    """
+    constants = {
+        "RELEASE_ASSET_PREFIX", "MAX_MANIFEST_BYTES", "MAX_SIGNATURE_BYTES", "MAX_ARCHIVE_BYTES",
+        "MAX_UNPACKED_BYTES", "MAX_FILE_BYTES", "MAX_ARCHIVE_MEMBERS", "MAX_RELEASE_NOTES_CHARS",
+        "MAX_PATH_LENGTH", "MAX_PATH_COMPONENT", "SEMVER_RE", "SHA256_RE",
+        "ALLOWED_TOP_LEVEL_DIRS", "ALLOWED_ROOT_FILES", "FORBIDDEN_PATH_PARTS",
+    }
+    definitions = {
+        "PlatformUpdateError", "SemVer", "ReleaseAsset", "ReleaseInfo", "ManifestFile",
+        "_asset_names", "_validate_release_path", "_manifest_files", "parse_manifest",
+    }
+    tree = ast.parse(source, filename="backend/platform_update.py")
+    selected, found = [], set()
+    for node in tree.body:
+        if isinstance(node, ast.ImportFrom) and node.module == "__future__":
+            selected.append(node)
+        elif isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            name = node.targets[0].id
+            if name in constants:
+                selected.append(node)
+                found.add(name)
+        elif isinstance(node, (ast.ClassDef, ast.FunctionDef)) and node.name in definitions:
+            selected.append(node)
+            found.add(node.name)
+    if found != constants | definitions:
+        raise BundleError("release_protocol_unsupported")
+    module = types.ModuleType("_release_bundle_protocol")
+    module.__dict__.update(re=re, json=json, dataclass=dataclass, PurePosixPath=PurePosixPath)
+    sys.modules[module.__name__] = module
+    exec(compile(ast.Module(body=selected, type_ignores=[]), "backend/platform_update.py", "exec"), module.__dict__)
+    return module
+
+
+def read_blobs(root: Path, blobs: list[Blob], protocol) -> dict[str, tuple[bytes, bool]]:
+    if not blobs or len(blobs) + 1 > protocol.MAX_ARCHIVE_MEMBERS:
+        raise BundleError("release_too_many_files")
+    if any(blob.size > protocol.MAX_FILE_BYTES for blob in blobs) or sum(blob.size for blob in blobs) > protocol.MAX_UNPACKED_BYTES:
+        raise BundleError("release_too_large")
+    raw = git(root, "cat-file", "--batch", data=b"".join(blob.oid.encode() + b"\n" for blob in blobs)).stdout
+    stream = io.BytesIO(raw)
+    result = {}
+    for blob in blobs:
+        if stream.readline() != f"{blob.oid} blob {blob.size}\n".encode():
+            raise BundleError("release_blob_invalid")
+        payload = stream.read(blob.size)
+        if len(payload) != blob.size or stream.read(1) != b"\n":
+            raise BundleError("release_blob_invalid")
+        canonical_path(blob.path, max_length=protocol.MAX_PATH_LENGTH, max_component=protocol.MAX_PATH_COMPONENT)
+        result[blob.path] = (payload, blob.executable)
+    if stream.read(1):
+        raise BundleError("release_blob_invalid")
+    return result
+
+
+def json_bytes(value) -> bytes:
+    return (json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+
+
+def release_version(files: dict, protocol) -> str:
+    try:
+        package = json.loads(files["package.json"][0])
+        lock = json.loads(files["package-lock.json"][0])
+        versions = re.findall(r'^VERSION\s*=\s*["\']([^"\']+)["\']\s*$', files["backend/version.py"][0].decode("utf-8"), re.MULTILINE)
+        version = package["version"]
+        if not isinstance(version, str) or version != version.strip():
+            raise BundleError("release_version_invalid")
+        protocol.SemVer.parse(version)
+        if len(versions) != 1 or versions[0] != version or lock["version"] != version or lock["packages"][""]["version"] != version:
+            raise BundleError("release_version_mismatch")
+        canonical_path(f"xianyu-saas-{version}-source.zip", max_component=protocol.MAX_PATH_COMPONENT)
+        return version
+    except (KeyError, TypeError, ValueError, UnicodeError, protocol.PlatformUpdateError):
+        raise BundleError("release_version_invalid") from None
+
+
+def release_notes(files: dict, version: str, protocol) -> bytes:
+    try:
+        document = files["CHANGELOG.md"][0].decode("utf-8")
+    except (KeyError, UnicodeError):
+        raise BundleError("release_notes_missing") from None
+    headings = list(re.finditer(r"^##\s+\[?" + re.escape(version) + r"\]?(?=\s|$)[^\n]*\n", document, re.MULTILINE))
+    if len(headings) != 1:
+        raise BundleError("release_notes_missing")
+    section = document[headings[0].end():]
+    end = re.search(r"^##\s", section, re.MULTILINE)
+    body = section[:end.start() if end else len(section)].strip()
+    if not body or len(body) > protocol.MAX_RELEASE_NOTES_CHARS:
+        raise BundleError("release_notes_invalid")
+    return (body.replace("\r\n", "\n") + "\n").encode("utf-8")
+
+
+def signing_key(encoded: str | None) -> tuple[Ed25519PrivateKey, bytes]:
+    if not encoded:
+        raise BundleError("release_signing_key_missing")
+    try:
+        seed = base64.b64decode(encoded, validate=True)
+        if len(seed) != 32 or base64.b64encode(seed).decode("ascii") != encoded:
+            raise ValueError()
+        return Ed25519PrivateKey.from_private_bytes(seed), seed
+    except (ValueError, TypeError, binascii.Error):
+        raise BundleError("release_signing_key_invalid") from None
+
+
+def public_key(raw: bytes) -> bytes:
+    try:
+        value = raw.strip()
+        if not value or len(raw) > 4096:
+            raise ValueError()
+        if value.startswith(b"-----BEGIN"):
+            key = serialization.load_pem_public_key(value)
+            if not isinstance(key, Ed25519PublicKey):
+                raise ValueError()
+        else:
+            decoded = base64.b64decode(value, validate=True)
+            if len(decoded) != 32:
+                raise ValueError()
+            key = Ed25519PublicKey.from_public_bytes(decoded)
+        return key.public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    except (ValueError, TypeError, binascii.Error, UnsupportedAlgorithm):
+        raise BundleError("release_public_key_invalid") from None
+
+
+def scan_payloads(files: dict, seed: bytes, encoded: str) -> None:
+    markers = (seed, encoded.encode("ascii"))
+    for path, (payload, _) in files.items():
+        if any(marker in payload or marker in path.encode("utf-8") for marker in markers) or any(pattern.search(payload) for pattern in SECRET_PATTERNS):
+            raise BundleError("release_secret_content_rejected")
+        if path == "worker/products_config.json":
+            try:
+                if json.loads(payload) != {"types": []}:
+                    raise ValueError()
+            except (ValueError, TypeError, UnicodeError):
+                raise BundleError("release_products_template_invalid") from None
+
+
+def release_epoch(root: Path, commit: str) -> int:
+    value = os.environ.get("SOURCE_DATE_EPOCH")
+    if value is None:
+        value = git(root, "show", "-s", "--format=%ct", commit).stdout.decode("ascii").strip()
+    if not re.fullmatch(r"[0-9]{1,10}", value):
+        raise BundleError("release_timestamp_invalid")
+    epoch = int(value)
+    if epoch > 0xFFFFFFFF:
+        raise BundleError("release_timestamp_invalid")
+    return epoch
+
+
+def output_path(root: Path, supplied: str | None, version: str) -> Path:
+    candidate = Path(supplied) if supplied else Path(".local") / "releases" / version
+    if not candidate.is_absolute():
+        candidate = root / candidate
+    candidate = Path(os.path.abspath(candidate))
+    allowed = root / ".local" / "releases"
+    if allowed not in candidate.parents:
+        raise BundleError("release_output_not_ignored")
+    for path in (candidate, *candidate.parents):
+        if path == root:
+            break
+        if path.is_symlink() or (hasattr(path, "is_junction") and path.is_junction()):
+            raise BundleError("release_output_link_rejected")
+    relative = (candidate.relative_to(root) / ".bundle-probe").as_posix()
+    if git(root, "check-ignore", "--quiet", "--no-index", "--", relative, codes=(0, 1)).returncode != 0:
+        raise BundleError("release_output_not_ignored")
+    ensure_empty_output(candidate)
+    return candidate
+
+
+def ensure_empty_output(path: Path) -> None:
+    if path.is_symlink() or (path.exists() and (not path.is_dir() or any(path.iterdir()))):
+        raise BundleError("release_output_not_empty")
+
+
+def write_tar(path: Path, files: dict, epoch: int) -> None:
+    with path.open("xb") as target:
+        with gzip.GzipFile(filename="", mode="wb", fileobj=target, mtime=epoch, compresslevel=9) as compressed:
+            with tarfile.open(fileobj=compressed, mode="w", format=tarfile.PAX_FORMAT) as archive:
+                for name, (payload, executable) in sorted(files.items()):
+                    info = tarfile.TarInfo(name)
+                    info.size = len(payload)
+                    info.mode = 0o755 if executable else 0o644
+                    info.mtime = epoch
+                    info.uid = info.gid = 0
+                    info.uname = info.gname = ""
+                    archive.addfile(info, io.BytesIO(payload))
+
+
+def write_source_zip(path: Path, files: dict, version: str, epoch: int) -> None:
+    # DOS timestamps are UTC, rounded to two seconds and clamped at ZIP's 1980 floor.
+    stamp = datetime.fromtimestamp(max(epoch, 315532800), timezone.utc)
+    date_time = (stamp.year, stamp.month, stamp.day, stamp.hour, stamp.minute, stamp.second // 2 * 2)
+    with zipfile.ZipFile(path, "x", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
+        for name, (payload, executable) in sorted(files.items()):
+            info = zipfile.ZipInfo(f"xianyu-saas-{version}/{name}", date_time=date_time)
+            info.create_system = 3
+            info.external_attr = (stat.S_IFREG | (0o755 if executable else 0o644)) << 16
+            info.compress_type = zipfile.ZIP_DEFLATED
+            archive.writestr(info, payload, compress_type=zipfile.ZIP_DEFLATED, compresslevel=9)
+
+
+def asset_record(path: Path) -> dict:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(128 * 1024), b""):
+            digest.update(chunk)
+    return {"name": path.name, "size": path.stat().st_size, "sha256": digest.hexdigest()}
+
+
+def build(args, encoded: str | None) -> dict:
+    root = Path(git(Path.cwd(), "rev-parse", "--show-toplevel").stdout.decode("utf-8").strip()).resolve()
+    commit = git(root, "rev-parse", "--verify", "--end-of-options", f"{args.ref}^{{commit}}").stdout.decode("ascii").strip()
+    if not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", commit):
+        raise BundleError("release_commit_invalid")
+    head = git(root, "rev-parse", "--verify", "HEAD").stdout.decode("ascii").strip()
+    if commit == head and git(root, "status", "--porcelain=v1", "-z", "--untracked-files=no", "--ignore-submodules=none").stdout:
+        raise BundleError("release_worktree_dirty")
+    blobs = read_tree(root, commit)
+    by_path = {blob.path: blob for blob in blobs}
+    if "backend/platform_update.py" not in by_path:
+        raise BundleError("release_protocol_missing")
+    protocol_blob = by_path["backend/platform_update.py"]
+    if protocol_blob.size > 1024 * 1024:
+        raise BundleError("release_protocol_unsupported")
+    protocol = load_protocol(git(root, "cat-file", "blob", protocol_blob.oid).stdout)
+    files = read_blobs(root, blobs, protocol)
+    for required in REQUIRED_LICENSES:
+        if required not in files or not files[required][0].strip():
+            raise BundleError("release_license_missing")
+    version = release_version(files, protocol)
+    notes = release_notes(files, version, protocol)
+    key, seed = signing_key(encoded)
+    canonical_path(args.public_key_file)
+    if args.public_key_file not in files:
+        raise BundleError("release_public_key_missing")
+    public_raw = public_key(files[args.public_key_file][0])
+    derived = key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    if derived != public_raw:
+        raise BundleError("release_public_key_mismatch")
+    scan_payloads(files, seed, encoded)
+    epoch = release_epoch(root, commit)
+    files["backend/build-info.json"] = (json_bytes({
+        "version": version, "commit": commit, "dirty": False,
+        "build_time": datetime.fromtimestamp(epoch, timezone.utc).isoformat(timespec="seconds"),
+    }), False)
+    if sum(len(payload) for payload, _ in files.values()) > protocol.MAX_UNPACKED_BYTES:
+        raise BundleError("release_too_large")
+    ota = {}
+    for path, value in files.items():
+        try:
+            protocol._validate_release_path(path)
+        except protocol.PlatformUpdateError as exc:
+            if exc.code == "update_archive_path_invalid" or (exc.code == "update_runtime_path_rejected" and path.endswith(".example")):
+                continue
+            raise BundleError("release_private_path_rejected") from None
+        ota[path] = value
+    if any(path not in ota for path in REQUIRED_LICENSES):
+        raise BundleError("release_license_missing")
+    output = output_path(root, args.output, version)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    stage = Path(tempfile.mkdtemp(prefix=f".{version}-", dir=output.parent))
+    try:
+        artifact_name, manifest_name, signature_name = protocol._asset_names(version)
+        write_tar(stage / artifact_name, ota, epoch)
+        archive_record = asset_record(stage / artifact_name)
+        if archive_record["size"] > protocol.MAX_ARCHIVE_BYTES:
+            raise BundleError("release_too_large")
+        manifest = {
+            "schema": 1, "version": version, "artifact": artifact_name,
+            "artifact_sha256": archive_record["sha256"], "artifact_size": archive_record["size"],
+            "files": [{"path": path, "size": len(payload), "sha256": hashlib.sha256(payload).hexdigest(),
+                       "executable": executable} for path, (payload, executable) in sorted(ota.items())],
+        }
+        manifest_raw = json_bytes(manifest)
+        if len(manifest_raw) > protocol.MAX_MANIFEST_BYTES:
+            raise BundleError("release_manifest_too_large")
+        release = protocol.ReleaseInfo("offline", version, f"v{version}", "", "", bool(protocol.SemVer.parse(version).prerelease),
+                                       protocol.ReleaseAsset(1, artifact_name, archive_record["size"]),
+                                       protocol.ReleaseAsset(2, manifest_name, len(manifest_raw)),
+                                       protocol.ReleaseAsset(3, signature_name, 88))
+        protocol.parse_manifest(manifest_raw, release)
+        signature = base64.b64encode(key.sign(manifest_raw))
+        key.public_key().verify(base64.b64decode(signature, validate=True), manifest_raw)
+        if len(signature) > protocol.MAX_SIGNATURE_BYTES:
+            raise BundleError("release_signature_too_large")
+        (stage / manifest_name).write_bytes(manifest_raw)
+        (stage / signature_name).write_bytes(signature)
+        source_name = f"xianyu-saas-{version}-source.zip"
+        write_source_zip(stage / source_name, files, version, epoch)
+        if (stage / source_name).stat().st_size > protocol.MAX_ARCHIVE_BYTES:
+            raise BundleError("release_too_large")
+        (stage / f"xianyu-saas-{version}.update-signing.pub").write_bytes(files[args.public_key_file][0])
+        (stage / "release-notes.md").write_bytes(notes)
+        records = [asset_record(path) for path in sorted(stage.iterdir())]
+        result = {"schema": 1, "version": version, "commit": commit,
+                  "public_key_fingerprint": "sha256:" + hashlib.sha256(public_raw).hexdigest(), "files": records}
+        (stage / "artifacts.json").write_bytes(json_bytes(result))
+        # The index describes six content assets. Checksums cover those plus the index;
+        # neither metadata file pretends it can contain its own recursive hash.
+        checksummed = sorted([*records, asset_record(stage / "artifacts.json")], key=lambda entry: entry["name"])
+        (stage / "SHA256SUMS").write_bytes("".join(f'{entry["sha256"]}  {entry["name"]}\n' for entry in checksummed).encode("utf-8"))
+        ensure_empty_output(output)
+        if output.exists():
+            output.rmdir()
+        os.rename(stage, output)
+        return result
+    finally:
+        if stage.exists():
+            shutil.rmtree(stage)
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--ref", default="HEAD", help="Git commit or ref; never package worktree contents")
+    parser.add_argument("--output", help="Ignored directory below .local/releases/ (default: version)")
+    parser.add_argument("--signing-key-env", default="RELEASE_SIGNING_KEY", help="Environment variable holding a standard Base64 32-byte Ed25519 seed")
+    parser.add_argument("--public-key-file", default="deploy/update-signing.pub", help="Public key path inside the selected commit")
+    args = parser.parse_args(argv)
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", args.signing_key_env):
+        print("release_signing_key_env_invalid", file=sys.stderr)
+        return 1
+    encoded = os.environ.pop(args.signing_key_env, None)
+    try:
+        result = build(args, encoded)
+    except BundleError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    except Exception:
+        # Do not print exception repr/tracebacks: dependencies may include input values.
+        print("release_build_failed", file=sys.stderr)
+        return 1
+    print(json.dumps(result, ensure_ascii=True, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

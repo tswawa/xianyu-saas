@@ -17,6 +17,7 @@ npm run test:repository
 npm run test:syntax
 npm run test:auth
 npm run test:update
+npm run test:release
 npm run test:settings
 npm run test:resources
 npm run test:api

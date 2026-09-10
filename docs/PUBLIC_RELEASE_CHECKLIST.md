@@ -32,3 +32,11 @@
 - [ ] 容器启动后健康检查正常响应：`GET /health` 返回 200；
 - [ ] 挂载数据卷 `./data` 能持久化数据库与各店铺配置文件；
 - [ ] Windows 部署说明明确使用原生 Docker 容器部署。
+
+## 6. 版本发布与制品完整性检查
+- [ ] 版本号一致性：`package.json`、`package-lock.json` 与 `backend/version.py` 版本号一致（如 `0.2.0`）；
+- [ ] 签名密钥分离：签名私钥由 GitHub Actions secret `RELEASE_SIGNING_KEY` 托管，公钥保存于 `deploy/update-signing.pub`，严禁将私钥打入任何安装包或源码；
+- [ ] 自动化打包工作流：推送 `v*` 标签触发 `.github/workflows/release.yml`，全套 CI 通过后自动执行 `scripts/build-release.py` 并生成发布草稿；
+- [ ] 发行资产齐全（共 8 项）：`xianyu-saas-0.2.0.tar.gz`、`xianyu-saas-0.2.0.manifest.json`、`xianyu-saas-0.2.0.manifest.sig`、`xianyu-saas-0.2.0-source.zip`、`xianyu-saas-0.2.0.update-signing.pub`、`release-notes.md`、`artifacts.json`、`SHA256SUMS`；
+- [ ] 资产用途明确：`source.zip` 包含完整安全源码，用于 Docker 或手动部署；`tar.gz` + `manifest.json` + `manifest.sig` 专供签名 systemd 更新器；
+- [ ] 校验和与公钥指纹：`SHA256SUMS` 覆盖全部制品文件；`artifacts.json` 中的 `public_key_fingerprint` 为原始 32 字节 Ed25519 公钥二进制的 SHA-256 摘要（带 `sha256:` 前缀，与直接计算 PEM 文本哈希不同）。

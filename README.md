@@ -98,6 +98,8 @@
 
 ## 快速上手
 
+项目源码可通过 `git clone` 获取，也可从 [GitHub Releases](https://github.com/tswawa/xianyu-saas/releases) 下载包含完整构建文件与文档的官方源码包 `xianyu-saas-0.2.0-source.zip`（供 Docker 构建与手动部署；GitHub 自动生成的源码包缺少部分构建校验，建议优先使用官方附件）。
+
 ### 方式一：Docker Compose 部署（推荐）
 
 该方式适用于 Linux 服务器或本地环境，容器内已预装全部运行环境。
@@ -225,6 +227,7 @@ docs/                 部署指南、权限模型与系统架构设计文档
 - [`docs/PLAN.md`](docs/PLAN.md)：系统里程碑与功能演进计划。
 - [`docs/BACKEND-ROADMAP.md`](docs/BACKEND-ROADMAP.md)：后端核心能力演进路线。
 - [`docs/PUBLIC_RELEASE_CHECKLIST.md`](docs/PUBLIC_RELEASE_CHECKLIST.md)：开源发布前检查清单。
+- [`docs/RELEASING.md`](docs/RELEASING.md)：版本发布与构建维护指南。
 
 ### 社区与安全规范
 - [`SECURITY.md`](SECURITY.md)：安全政策与漏洞提报途径。

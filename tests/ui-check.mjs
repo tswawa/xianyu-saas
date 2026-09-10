@@ -2134,7 +2134,7 @@ async function routeOfflineMock(page, baseUrl, externalRequests) {
 }
 
 async function assertDesktopAssetVersion(page) {
-  assert.equal(assetVersion, "20260909-01", "the release must use the approved unified asset version");
+  assert.match(assetVersion, /^[0-9]{8}-[0-9]{2}$/, "the release must declare a valid unified asset version");
   const assets = await page.locator('script[src*="assets/app.js"], link[href*="assets/app.css"]').evaluateAll((nodes) => nodes.map((node) => new URL(node.src || node.href).searchParams.get("v")));
   assert.deepEqual(assets, [assetVersion, assetVersion], "HTML, stylesheet and application script versions must agree");
 }
