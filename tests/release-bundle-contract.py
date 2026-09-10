@@ -139,9 +139,15 @@ class Repository:
         }
         for name, payload in self.files.items():
             self.write(name, payload)
+        executables = ("scripts/check.sh", "docker/entrypoint.sh")
+        # --chmod changes only the index. POSIX worktree modes must match it;
+        # Windows still needs the explicit index flag to preserve executable bits.
+        for name in executables:
+            (self.root / name).chmod(0o755)
         self.git("add", "--all")
-        self.git("add", "--chmod=+x", "--", "scripts/check.sh", "docker/entrypoint.sh")
+        self.git("add", "--chmod=+x", "--", *executables)
         self.commit = self.commit_changes()
+        assert not self.git("status", "--porcelain=v1", "--untracked-files=no"), "new release fixture must have a clean tracked worktree"
 
     def git(self, *args: str, data=None):
         result = subprocess.run(["git", *args], cwd=self.root, input=data, capture_output=True, env=clean_environment(), timeout=30)
@@ -486,6 +492,11 @@ def privacy_contract(run: Path):
 
 def dirty_and_atomic_contract(run: Path):
     repo = Repository(run / "dirty")
+    if os.name != "nt":
+        executable = repo.root / "scripts/check.sh"
+        executable.chmod(0o644)
+        assert_rejected(repo, "release_worktree_dirty")
+        executable.chmod(0o755)
     repo.write("README.md", b"uncommitted\n")
     assert_rejected(repo, "release_worktree_dirty")
     repo.git("add", "--", "README.md")
