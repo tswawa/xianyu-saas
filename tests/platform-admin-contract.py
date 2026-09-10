@@ -35,6 +35,8 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 import app  # noqa: E402
 from db import AUDIT_RETENTION_SECONDS  # noqa: E402
+from platform_update import SemVer  # noqa: E402
+from version import VERSION  # noqa: E402
 
 
 ADMIN_PASSWORD = "Admin-Contract-123!"
@@ -249,20 +251,25 @@ def main() -> None:
     assert old_id not in ids
     assert recent_id in ids
     # Check results are durable and must never replace installation records.
+    # Derive fixture versions so a new project release cannot invalidate its own cache test.
+    installed = SemVer.parse(VERSION)
+    target_version = f"{installed.major}.{installed.minor + 1}.0"
+    unknown_version = f"{installed.major}.{installed.minor + 2}.0"
+    assert SemVer.parse(target_version).compare(installed) > 0
     channel = app.RELEASE_CHANNEL
     # Existing installation metadata and obsolete settings must not choose the feed.
     app.db.set_platform_setting("update_channel", "beta")
-    payload = {"status": "available", "available": True, "version": "0.2.0",
-               "current_version": "0.1.0", "channel": channel, "release_notes": "candidate"}
-    app.db.upsert_platform_update("0.2.0", channel, "staged", candidate_path="/isolated/candidate",
+    payload = {"status": "available", "available": True, "version": target_version,
+               "current_version": VERSION, "channel": channel, "release_notes": "candidate"}
+    app.db.upsert_platform_update(target_version, channel, "staged", candidate_path="/isolated/candidate",
                                   manifest_sha256="a" * 64, release_notes="verified")
-    before = dict(app.db.get_platform_update("0.2.0", channel))
+    before = dict(app.db.get_platform_update(target_version, channel))
     with patch.object(app, "inspect_public_releases", return_value=payload):
         for _ in range(2):
             checked = promoted_client.post("/api/admin/updates/check")
             assert checked.status_code == 200, checked.text
             assert checked.json()["status"] == "available" and checked.json()["checked_at"] > 0
-    assert dict(app.db.get_platform_update("0.2.0", channel)) == before
+    assert dict(app.db.get_platform_update(target_version, channel)) == before
     for status in ("no_release", "current"):
         result = {**payload, "status": status, "available": False}
         with patch.object(app, "inspect_public_releases", return_value=result):
@@ -271,12 +278,12 @@ def main() -> None:
     with patch.object(app, "inspect_public_releases", side_effect=app.PlatformUpdateError("update_source_failed")):
         assert promoted_client.post("/api/admin/updates/check").status_code == 502
     assert app.db.get_platform_update_check(channel)["status"] == "error"
-    assert dict(app.db.get_platform_update("0.2.0", channel)) == before
+    assert dict(app.db.get_platform_update(target_version, channel)) == before
     other_channel = "stable" if channel == "beta" else "beta"
     assert app.db.get_platform_update_check(other_channel)["status"] == "unchecked"
     with patch("platform_update.deployment_kind", return_value="docker"), patch.object(app, "write_update_intent") as intent:
         for action in ("download", "apply", "rollback"):
-            data = {"version": "0.2.0"}
+            data = {"version": target_version}
             if action != "download":
                 data["confirmation_token"] = "unused-confirmation-token"
             unsupported = promoted_client.post("/api/admin/updates/" + action, json=data)
@@ -288,14 +295,14 @@ def main() -> None:
     }), patch.object(app, "validate_candidate"), patch.object(app, "write_update_intent", return_value={"queued": True}):
         confirmation = promoted_client.post("/api/admin/confirm", json={"password": OWNER_PASSWORD, "action": "update.apply"})
         applied = promoted_client.post("/api/admin/updates/apply", json={
-            "version": "0.2.0", "confirmation_token": confirmation.json()["confirmation_token"],
+            "version": target_version, "confirmation_token": confirmation.json()["confirmation_token"],
         })
         assert applied.status_code == 202, applied.text
-        assert app.db.get_platform_update("0.2.0", channel)["status"] == "apply_requested"
+        assert app.db.get_platform_update(target_version, channel)["status"] == "apply_requested"
         with patch.object(app, "inspect_public_releases", return_value=payload):
             assert promoted_client.post("/api/admin/updates/check").status_code == 200
-        assert app.db.get_platform_update("0.2.0", channel)["status"] == "apply_requested"
-        assert promoted_client.post("/api/admin/updates/download", json={"version": "0.3.0"}).status_code == 409
+        assert app.db.get_platform_update(target_version, channel)["status"] == "apply_requested"
+        assert promoted_client.post("/api/admin/updates/download", json={"version": unknown_version}).status_code == 409
     print("platform admin contract: ok")
 
 
