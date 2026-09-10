@@ -484,7 +484,7 @@ class PlatformMessageRejected(ConnectionError):
 
 
 class AuthenticationUnavailableError(ConnectionError):
-    ALLOWED_CODES = frozenset({"session_expired", "risk_control", "token_unavailable"})
+    ALLOWED_CODES = frozenset({"session_expired", "risk_control", "verification_required", "token_unavailable"})
 
     def __init__(self, code="token_unavailable"):
         if code not in self.ALLOWED_CODES:
@@ -1038,12 +1038,9 @@ class XianyuLive:
 
     def _write_auth_status(self, code, reauthorization_required):
         """兼容旧调用点，同时始终写入 v2 脱敏状态。"""
-        required = bool(reauthorization_required) and code in {
-            "session_expired",
-            "risk_control",
-        }
+        required = bool(reauthorization_required) and code in XianyuAuthenticationError.ALLOWED_CODES
         if required:
-            session_state = "SECURITY_CHECK" if code == "risk_control" else "EXPIRED"
+            session_state = {"risk_control": "UNKNOWN", "verification_required": "SECURITY_CHECK"}.get(code, "EXPIRED")
             state = self.auth_state_store.update(
                 phase="NEEDS_HUMAN",
                 session=session_state,
@@ -1285,11 +1282,14 @@ class XianyuLive:
                 config["id"] = str(material_id).strip()
                 config["payload"] = material_payload.strip()
             item_ids = config.get("item_ids")
-            if not isinstance(item_ids, list) or not item_ids:
+            if not isinstance(item_ids, list) or (not item_ids and config["delivery"] == "material"):
                 raise RuntimeError("自动发货商品必须配置明确 item_ids")
+            # The template API permits explicitly unbound redeem/pan drafts.
+            # An empty list authorizes no item and must not load any inventory;
+            # missing/invalid scopes and private material remain fail-closed.
             for item_id in item_ids:
-                item_key = str(item_id).strip()
-                if not item_key or not item_key.isdigit():
+                item_key = self._numeric_identifier(item_id.strip() if isinstance(item_id, str) else item_id)
+                if item_key is None:
                     raise RuntimeError("products_config.json 包含无效 item_id")
                 if item_key in by_item:
                     raise RuntimeError("products_config.json 存在重复 item_id")
@@ -2014,7 +2014,7 @@ class XianyuLive:
         try:
             return await asyncio.to_thread(operation, *args)
         except XianyuAuthenticationError as exc:
-            if exc.code in {"session_expired", "risk_control"}:
+            if exc.code in XianyuAuthenticationError.ALLOWED_CODES:
                 await self._stop_for_auth_failure(exc.code)
                 raise AuthenticationUnavailableError(exc.code) from None
             raise
@@ -2037,8 +2037,8 @@ class XianyuLive:
         return refreshed_at + max(60.0, float(self.token_refresh_interval) + jitter)
 
     async def _stop_for_auth_failure(self, code):
-        if code not in {"session_expired", "risk_control"}:
-            raise ValueError("only confirmed auth failures can open the circuit")
+        if code not in XianyuAuthenticationError.ALLOWED_CODES:
+            raise ValueError("only protected auth failures can open the circuit")
         self.authentication_failure_code = code
         self.token_circuit_open = True
         self.connection_ready.clear()

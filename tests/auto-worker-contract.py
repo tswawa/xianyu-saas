@@ -266,19 +266,84 @@ def main() -> None:
             ),
             "failed-shop",
         )
-        risk_status = client.get("/api/bot/status", headers=failed_headers)
+        with patch.object(app, "bot_status", side_effect=app.worker_manager.status):
+            risk_status = client.get("/api/bot/status", headers=failed_headers)
         assert risk_status.status_code == 200
         assert risk_status.json()["auth_code"] == "risk_control"
         assert risk_status.json()["auth_phase"] == "NEEDS_HUMAN"
         assert risk_status.json()["account"]["status"] == "degraded"
         assert risk_status.json()["account"]["last_error_code"] == "risk_control"
         assert risk_status.json()["account"]["status"] != "restricted"
+        assert risk_status.json()["auth_layers"]["session"]["state"] == "UNKNOWN"
+        assert risk_status.json()["needs_human"] is True
+        assert risk_status.json()["cookie_status"]["label"] == "接口请求受限"
         listed_failed = next(
             item for item in client.get("/api/bot/accounts").json()["accounts"]
             if item["key"] == "failed-shop"
         )
         assert listed_failed["status"] == "degraded"
         assert listed_failed["last_error_code"] == "risk_control"
+
+        # A verified cache followed by a legacy risk marker must remain stale,
+        # protected and readable, not turn into an asserted App challenge.
+        cached_cookie = "unb=610002; _m_h5_tk=cached-token_tail"
+        app.write_secret(user_id, "cookies.txt", cached_cookie, "failed-shop")
+        cached_snapshot = fake_shop_sync(cached_cookie)
+        cached_snapshot["products"] = [{"id": "1001", "title": "缓存商品"}]
+        cached_snapshot["product_count"] = 1
+        shop_sync.save_snapshot(user_id, cached_snapshot, "failed-shop")
+        shop_sync.save_sync_state(user_id, "verified", account_key="failed-shop")
+        for version, code, nested in ((1, "risk_control", False), (2, "risk_control", False), (2, "risk_control", True), (2, "verification_required", False)):
+            legacy_auth = {
+                "version": version, "phase": "NEEDS_HUMAN", "code": code,
+                "failure_class": "NEEDS_HUMAN", "needs_human": True,
+                "reauthorization_required": True, "updated_at": 124.0,
+                "session": {"state": "SECURITY_CHECK", "updated_at": 124.0},
+                "mtop_token": {"state": "DEGRADED", "updated_at": 124.0},
+                "websocket": {"state": "DISCONNECTED", "updated_at": 124.0},
+                "message": "闲鱼App要求安全验证",
+            }
+            if nested:
+                legacy_auth["failure"] = {"code": legacy_auth.pop("code"), "class": "NEEDS_HUMAN", "count": 3}
+            encoded = json.dumps(legacy_auth, ensure_ascii=False)
+            app.write_secret(user_id, "auth_status.json", encoded, "failed-shop")
+            with patch.object(app, "bot_status", side_effect=app.worker_manager.status):
+                observed = client.get("/api/bot/status", headers=failed_headers)
+                alerts = client.get("/api/bot/attention", headers=failed_headers).json()["items"]
+            payload = observed.json()
+            assert payload["auth_code"] == code and payload["sync_status"] == code
+            assert payload["needs_human"] is True and payload["reauthorization_required"] is True
+            assert payload["runtime_state"] == "waiting_login"
+            assert payload["account"]["status"] == "degraded"
+            assert payload["connection_state"] == ("security_check" if code == "verification_required" else "degraded")
+            assert payload["auth_layers"]["session"]["state"] == ("SECURITY_CHECK" if code == "verification_required" else "UNKNOWN")
+            assert payload["connected"] is False and payload["catalog_state"] == "stale"
+            assert payload["product_count"] == 1 and payload["capabilities"]["view_products"] is True
+            assert payload["cookie_status"]["message"] == shop_sync.SYNC_STATUS_CATALOG[code]["message"]
+            assert "闲鱼App要求安全验证" not in observed.text
+            assert app.read_secret(user_id, "auth_status.json", "failed-shop") == encoded
+            assert any(item["code"] == code and item["title"] == shop_sync.SYNC_STATUS_CATALOG[code]["label"] for item in alerts)
+
+        # Display copy changes must not reopen an acknowledged alert or change
+        # its ID/fingerprint, even if the raw provider still supplies old text.
+        old_alert = {"code": "risk_control", "title": "需要安全验证", "message": "闲鱼App要求安全验证"}
+        with patch.object(app, "bot_status", return_value={"attention": [old_alert]}):
+            owner = app.db.get_user("auto-worker-owner")
+            before = next(item for item in app._attention_payload(owner, failed_account)["_items"] if item["code"] == "risk_control")
+            resolved = client.put(f"/api/bot/attention/{before['id']}", headers=failed_headers, json={"resolved": True})
+            assert resolved.status_code == 200
+            old_alert["title"] = "旧标题再次变化"
+            old_alert["message"] = "另一个旧App弹窗文案"
+            after = next(item for item in app._attention_payload(owner, failed_account)["_items"] if item["code"] == "risk_control")
+            assert after["id"] == before["id"] and after["_fingerprint"] == before["_fingerprint"]
+            assert after["resolved"] is True and after["resolved_at"] > 0
+            assert after["title"] == "接口请求受限"
+            assert after["message"] == shop_sync.SYNC_STATUS_CATALOG["risk_control"]["message"]
+        for code in ("risk_control", "risk_cooldown", "verification_required"):
+            for kind in ("shop_account", "worker"):
+                shown = app._attention_display({"kind": kind, "code": "degraded", "error_code": code, "title": "需要安全验证", "message": "闲鱼App要求安全验证"})
+                assert shown["title"] == shop_sync.SYNC_STATUS_CATALOG[code]["label"]
+                assert shown["message"] == shop_sync.SYNC_STATUS_CATALOG[code]["message"]
 
         failing_accounts.add("failed-shop")
         failed_cookie = "unb=610002; _m_h5_tk=failed-token_tail; sid=failed"

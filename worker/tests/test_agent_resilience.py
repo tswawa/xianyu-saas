@@ -622,6 +622,105 @@ class XianyuApiResilienceTests(unittest.TestCase):
         self.assertEqual(session.post.call_count, 1)
         self.assertEqual(sleeps, [])
 
+    def test_response_classification_uses_error_metadata_not_business_data(self):
+        cases = (
+            ({"ret": ["FAIL_SYS_BUSY::哎哟喂，被挤爆啦"]}, "platform_busy"),
+            ({"ret": ["UNKNOWN::被挤爆"]}, "platform_busy"),
+            ({"ret": ["RGV587_ERROR::被挤爆啦"]}, "risk_control"),
+            ({"ret": ["USER_VALIDATE"]}, "risk_control"),
+            ({"ret": ["LOGIN_CHECK"]}, "risk_control"),
+            ({"ret": ["CAPTCHA"]}, "verification_required"),
+            ({"ret": ["FAIL_SYS_SECURITY_CHECK"]}, "verification_required"),
+            ({"ret": ["RGV587_USER_VALIDATE::请先完成安全验证"]}, "verification_required"),
+            ({"content": {"success": False, "captchaRequired": True}}, "verification_required"),
+            ({"data": {"verificationRequired": True}}, "verification_required"),
+            ({"ret": ["FAIL_SYS_BUSY"], "data": {"title": "captcha RGV587 SECURITY_CHECK", "code": "CAPTCHA"}}, "platform_busy"),
+            ({"ret": ["UNKNOWN"], "data": {"description": "请先完成安全验证", "captchaRequired": "true"}}, "token_unavailable"),
+            ({"ret": ["FAIL_SYS_NOT_CAPTCHA_ERROR"]}, "token_unavailable"),
+            ({"ret": ["CAPTCHA_NOT_REQUIRED"]}, "token_unavailable"),
+            ({"ret": ["RGV587::不需要完成安全验证"]}, "risk_control"),
+            ({"ret": ["USER_VALIDATE::无需完成安全验证"]}, "risk_control"),
+            ({"ret": ["UNKNOWN::NO CAPTCHA REQUIRED"]}, "token_unavailable"),
+            ({"ret": ["UNKNOWN::NOT SECURITY CHECK REQUIRED"]}, "token_unavailable"),
+            ({"ret": ["FAIL_SYS_BUSY"], "content": {"secret": "CAPTCHA RGV587"}}, "platform_busy"),
+            ({"ret": ["FAIL_SYS_SESSION_EXPIRED"], "data": {"title": "CAPTCHA"}}, "session_expired"),
+            ({"ret": ["PUBLISH_FORBIDDEN"], "data": {"title": "CAPTCHA"}}, "account_restricted"),
+        )
+        for payload, expected in cases:
+            with self.subTest(payload=payload):
+                self.assertEqual(XianyuApis._response_error_code(payload), expected)
+
+    def test_success_requires_exact_ret_code_and_no_explicit_challenge(self):
+        for ret in ("NOT_SUCCESS::调用成功", "FAIL_WITH_SUCCESS::调用成功", "SUCCESSFUL::调用成功"):
+            with self.subTest(ret=ret):
+                self.assertFalse(XianyuApis._is_success_response({"ret": [ret]}))
+        self.assertFalse(XianyuApis._is_success_response({"ret": ["SUCCESS::调用成功", "CAPTCHA"]}))
+        self.assertFalse(XianyuApis._is_success_response({"ret": ["SUCCESS::调用成功"], "captchaRequired": True}))
+        self.assertTrue(XianyuApis._is_success_response({
+            "ret": ["SUCCESS::调用成功"], "data": {"title": "CAPTCHA RGV587 被挤爆"},
+        }))
+
+    def test_all_request_paths_keep_risk_and_explicit_verification_protected(self):
+        calls = (
+            lambda api: api.get_token("device"),
+            lambda api: api.hasLogin("device"),
+            lambda api: api.get_item_info("1001"),
+            lambda api: api.get_order_detail("5005"),
+        )
+        for ret, expected in (
+            ("RGV587_ERROR::被挤爆啦", "risk_control"), ("USER_VALIDATE", "risk_control"),
+            ("LOGIN_CHECK", "risk_control"), ("CAPTCHA", "verification_required"),
+            ("SECURITY_CHECK", "verification_required"),
+            ("USER_VALIDATE::请先完成安全验证", "verification_required"),
+        ):
+            for index, invoke in enumerate(calls):
+                with self.subTest(ret=ret, path=index):
+                    api, session, sleeps = self.make_api()
+                    session.post.return_value = json_response({"ret": [ret]})
+                    with self.assertRaises(XianyuAuthenticationError) as raised:
+                        invoke(api)
+                    self.assertEqual(raised.exception.code, expected)
+                    self.assertEqual(session.post.call_count, 1)
+                    self.assertEqual(sleeps, [])
+
+    def test_item_and_trade_busy_and_network_errors_have_finite_backoff(self):
+        for path in ("item", "trade"):
+            for failure, expected in (
+                (json_response({"ret": ["UNKNOWN::被挤爆啦"]}), "platform_busy"),
+                (json_response({"ret": ["FAIL_SYS_BUSY"]}), "platform_busy"),
+                (requests.ConnectionError("offline"), "network_error"),
+            ):
+                with self.subTest(path=path, code=expected):
+                    api, session, sleeps = self.make_api(item_max_attempts=3, trade_max_attempts=3)
+                    if isinstance(failure, Exception):
+                        session.post.side_effect = failure
+                    else:
+                        session.post.return_value = failure
+                    if path == "item":
+                        self.assertEqual(api.get_item_info("1001")["code"], expected)
+                    else:
+                        with self.assertRaises(XianyuApiError) as raised:
+                            api.get_order_detail("5005")
+                        self.assertEqual(raised.exception.code, expected)
+                        self.assertNotIsInstance(raised.exception, XianyuAuthenticationError)
+                    self.assertEqual(session.post.call_count, 3)
+                    self.assertEqual(sleeps, [0.5, 1.0])
+
+    def test_item_trade_and_login_session_and_account_limits_do_not_retry(self):
+        for invoke in (
+            lambda api: api.get_item_info("1001"), lambda api: api.get_order_detail("5005"),
+            lambda api: api.hasLogin("device"),
+        ):
+            for ret, expected in (("FAIL_SYS_SESSION_EXPIRED", "session_expired"), ("PUBLISH_FORBIDDEN", "account_restricted")):
+                with self.subTest(ret=ret):
+                    api, session, sleeps = self.make_api()
+                    session.post.return_value = json_response({"ret": [ret]})
+                    with self.assertRaises(XianyuApiError) as raised:
+                        invoke(api)
+                    self.assertEqual(raised.exception.code, expected)
+                    self.assertEqual(session.post.call_count, 1)
+                    self.assertEqual(sleeps, [])
+
     def test_token_response_errors_have_stable_distinct_codes(self):
         cases = (
             (json_response({"ret": ["FAIL_SYS_BUSY::temporary"]}), "platform_busy"),

@@ -31,6 +31,7 @@ FAILURE_CLASSES = frozenset({
 FAILURE_CODES = frozenset({
     "ok",
     "risk_control",
+    "verification_required",
     "session_expired",
     "platform_busy",
     "network_error",
@@ -39,7 +40,8 @@ FAILURE_CODES = frozenset({
     "cookie_invalid",
     "account_restricted",
 })
-NEEDS_HUMAN_CODES = frozenset({"risk_control", "session_expired", "cookie_invalid"})
+NEEDS_HUMAN_CODES = frozenset({"risk_control", "verification_required", "session_expired", "cookie_invalid"})
+PROTECTED_REQUEST_CODES = frozenset({"risk_control", "verification_required"})
 
 
 def _timestamp(value, default=0.0):
@@ -71,11 +73,13 @@ def default_auth_state(now=None):
 def _legacy_state(payload):
     state = default_auth_state(payload.get("updated_at", 0.0))
     code = payload.get("code") if payload.get("code") in FAILURE_CODES else "ok"
-    required = payload.get("reauthorization_required") is True and code in NEEDS_HUMAN_CODES
+    required = code in PROTECTED_REQUEST_CODES or (
+        payload.get("reauthorization_required") is True and code in NEEDS_HUMAN_CODES
+    )
     if required:
         state["phase"] = "NEEDS_HUMAN"
         state["session"]["state"] = (
-            "SECURITY_CHECK" if code == "risk_control" else "EXPIRED"
+            {"risk_control": "UNKNOWN", "verification_required": "SECURITY_CHECK"}.get(code, "EXPIRED")
         )
         state["mtop_token"]["state"] = "DEGRADED"
         state["code"] = code
@@ -100,9 +104,16 @@ def normalize_auth_state(payload):
         return _legacy_state(payload)
 
     state = default_auth_state(payload.get("updated_at", 0.0))
+    failure = payload.get("failure")
+    known_code = failure.get("code") if isinstance(failure, dict) else payload.get("code")
+    # Incomplete legacy metadata must not erase an already recorded request hold.
+    fallback = (
+        _legacy_state({"code": known_code, "updated_at": payload.get("updated_at", 0.0)})
+        if known_code in PROTECTED_REQUEST_CODES else default_auth_state(0.0)
+    )
     phase = payload.get("phase")
     if phase not in PHASES:
-        return default_auth_state(0.0)
+        return fallback
     state["phase"] = phase
 
     for key, allowed in (
@@ -112,7 +123,7 @@ def normalize_auth_state(payload):
     ):
         raw = payload.get(key)
         if not isinstance(raw, dict) or raw.get("state") not in allowed:
-            return default_auth_state(0.0)
+            return fallback
         state[key] = {
             "state": raw["state"],
             "updated_at": _timestamp(raw.get("updated_at")),
@@ -131,7 +142,7 @@ def normalize_auth_state(payload):
         raw_count = payload.get("failure_count")
         raw_next_retry_at = payload.get("next_retry_at")
     if code not in FAILURE_CODES or failure_class not in FAILURE_CLASSES:
-        return default_auth_state(0.0)
+        return fallback
     try:
         count = int(raw_count or 0)
     except (TypeError, ValueError, OverflowError):
@@ -140,7 +151,13 @@ def normalize_auth_state(payload):
     state["failure_class"] = failure_class
     state["failure_count"] = max(0, min(count, 1_000_000))
     state["next_retry_at"] = _timestamp(raw_next_retry_at)
-    needs_human = payload.get("needs_human") is True or phase == "NEEDS_HUMAN"
+    needs_human = (
+        payload.get("needs_human") is True or payload.get("reauthorization_required") is True
+        or phase == "NEEDS_HUMAN" or code in PROTECTED_REQUEST_CODES
+    )
+    if code in PROTECTED_REQUEST_CODES:
+        state["phase"] = "NEEDS_HUMAN"
+        state["session"]["state"] = "SECURITY_CHECK" if code == "verification_required" else "UNKNOWN"
     if needs_human and code not in NEEDS_HUMAN_CODES:
         return default_auth_state(0.0)
     state["needs_human"] = needs_human

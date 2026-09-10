@@ -359,6 +359,26 @@ def main() -> None:
         assert reauth_update["state"] == "waiting_login"
         assert reauth_update["last_error"] == "session_expired"
 
+        for protected_code in ("risk_control", "verification_required"):
+            protected_db = FakeDB({"user_id": 6, "account_id": 1, "pid": None, "mode": "rules", "state": "degraded"})
+            with (
+                patch.object(app, "db", protected_db),
+                patch.object(app, "_read_auth_status", return_value={
+                    "code": protected_code, "reauthorization_required": True,
+                    "needs_human": True, "updated_at": 100.0,
+                }),
+                patch.object(app, "bot_status", return_value={"connected": True}),
+                patch.object(app, "bot_adopt") as protected_adopt,
+                patch.object(app, "bot_start") as protected_start,
+            ):
+                app.restore_desired_workers()
+            protected_adopt.assert_not_called()
+            protected_start.assert_not_called()
+            protected_update = protected_db.updates[-1][2]
+            assert protected_update["desired_state"] == "running"
+            assert protected_update["state"] == "waiting_login"
+            assert protected_update["last_error"] == protected_code
+
         adopted_db = FakeDB(
             {"user_id": 7, "account_id": 1, "pid": 7001, "mode": "rules"}
         )

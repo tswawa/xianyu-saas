@@ -98,6 +98,7 @@ from platform_update import (
 )
 import records
 from shop_sync import (
+    CANONICAL_STATUS_CODES,
     ShopSyncError,
     load_verified_snapshot,
     parse_cookie_header,
@@ -1268,7 +1269,7 @@ def _shop_account_payload(row, user_id: int | None = None):
     if user_id is not None:
         auth_state = _read_auth_status(user_id, str(row["account_key"]))
         if auth_state["needs_human"]:
-            status = "degraded" if auth_state["code"] == "risk_control" else "expired"
+            status = "degraded" if auth_state["code"] in {"risk_control", "verification_required"} else "expired"
             last_error_code = auth_state["code"]
     return {
         "id": int(row["id"]),
@@ -1338,12 +1339,15 @@ AUTH_STATUS_CODES = {
     "ok",
     "session_expired",
     "risk_control",
+    "verification_required",
+    "cookie_invalid",
+    "account_restricted",
     "token_unavailable",
     "network_error",
     "platform_busy",
     "response_invalid",
 }
-AUTH_REAUTHORIZE_CODES = {"session_expired", "risk_control"}
+AUTH_REAUTHORIZE_CODES = {"session_expired", "risk_control", "verification_required"}
 
 
 def _read_auth_status(user_id: int, account_key: str = DEFAULT_ACCOUNT_ID) -> dict:
@@ -2030,6 +2034,7 @@ def _shop_sync_http_error(error: ShopSyncError) -> HTTPException:
         "risk_cooldown": 429,
         "platform_busy": 429,
         "risk_control": 422,
+        "verification_required": 422,
         "cookie_expired": 422,
         "profile_missing": 422,
         "sync_busy": 429,
@@ -3045,7 +3050,7 @@ def get_bot_status(
         # A security challenge is not the same as a platform capability ban.
         # Only an explicit account_restricted result may use "restricted".
         result["account"]["status"] = (
-            "degraded" if auth_state["code"] == "risk_control" else "expired"
+            "degraded" if auth_state["code"] in {"risk_control", "verification_required"} else "expired"
         )
         result["account"]["last_error_code"] = auth_state["code"]
     if not has_permission(user, "fulfillment.manage"):
@@ -3287,6 +3292,10 @@ def _attention_display(item: dict) -> dict:
         severity = severity or fallback_severity
         kind = "shop_account"
 
+    display_code = effective_code if effective_code in CANONICAL_STATUS_CODES else error_code
+    if display_code in CANONICAL_STATUS_CODES:
+        status = sync_status_payload(display_code)
+        title, message = status["label"], status["message"]
     safe_severity = "error" if severity == "error" else "warning"
     return {
         "kind": kind,

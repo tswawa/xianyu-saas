@@ -3,13 +3,20 @@
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import tempfile
+import urllib.error
+from pathlib import Path
+from unittest.mock import patch
 
 
 RUN_DIR = tempfile.mkdtemp(prefix="xianyu-shop-sync-contract-")
 os.environ["SAAS_TENANTS_DIR"] = os.path.join(RUN_DIR, "tenants")
+os.environ["SAAS_DB"] = os.path.join(RUN_DIR, "saas.db")
+os.environ["SAAS_BOT_ROOT"] = os.path.join(RUN_DIR, "worker-not-installed")
+os.environ["SAAS_TESTING"] = "1"
 os.environ["SAAS_SHOP_SYNC_COOLDOWN_SECONDS"] = "1"
 
 import sys
@@ -24,7 +31,106 @@ def success(data):
     return {"ret": ["SUCCESS::调用成功"], "data": data}
 
 
+def classification_contract():
+    import bot_manager
+
+    cases = (
+        ({"ret": ["FAIL_SYS_BUSY::被挤爆啦"]}, "platform_busy"),
+        ({"ret": ["UNKNOWN::被挤爆"]}, "platform_busy"),
+        ({"ret": ["RGV587_ERROR::被挤爆啦"]}, "risk_control"),
+        ({"ret": ["USER_VALIDATE"]}, "risk_control"),
+        ({"ret": ["LOGIN_CHECK"]}, "risk_control"),
+        ({"ret": ["CAPTCHA"]}, "verification_required"),
+        ({"ret": ["FAIL_SYS_SECURITY_CHECK"]}, "verification_required"),
+        ({"ret": ["RGV587_USER_VALIDATE::请先完成安全验证"]}, "verification_required"),
+        ({"content": {"success": False, "captchaRequired": True}}, "verification_required"),
+        ({"data": {"verificationRequired": True}}, "verification_required"),
+        ({"ret": ["FAIL_SYS_BUSY"], "data": {"title": "captcha SECURITY_CHECK RGV587", "code": "CAPTCHA"}}, "platform_busy"),
+        ({"ret": ["UNKNOWN"], "data": {"description": "请先完成安全验证", "captchaRequired": "true"}}, "platform_error"),
+        ({"ret": ["FAIL_SYS_NOT_CAPTCHA_ERROR"]}, "platform_error"),
+        ({"ret": ["CAPTCHA_NOT_REQUIRED"]}, "platform_error"),
+        ({"ret": ["RGV587::不需要完成安全验证"]}, "risk_control"),
+        ({"ret": ["USER_VALIDATE::无需完成安全验证"]}, "risk_control"),
+        ({"ret": ["UNKNOWN::NO CAPTCHA REQUIRED"]}, "platform_error"),
+        ({"ret": ["UNKNOWN::NOT SECURITY CHECK REQUIRED"]}, "platform_error"),
+        ({"ret": ["NOT_SUCCESS::调用成功"]}, "platform_error"),
+        ({"ret": ["FAIL_WITH_SUCCESS::调用成功"]}, "platform_error"),
+        ({"ret": ["SUCCESS::调用成功", "CAPTCHA"]}, "verification_required"),
+        ({"ret": ["FAIL_SYS_SESSION_EXPIRED"], "data": {"title": "CAPTCHA"}}, "cookie_expired"),
+        ({"ret": ["PUBLISH_FORBIDDEN"], "data": {"title": "CAPTCHA"}}, "account_restricted"),
+    )
+    for payload, expected in cases:
+        with patch.object(shop_sync, "_trip_circuit") as trip:
+            try:
+                shop_sync._classify_response(payload)
+            except shop_sync.ShopSyncError as error:
+                assert error.code == expected, (payload, error.code)
+            else:
+                raise AssertionError((payload, "failure was accepted"))
+            assert trip.call_count == int(expected in {"risk_control", "verification_required"})
+    business = {"title": "CAPTCHA RGV587 被挤爆", "description": "请先完成安全验证"}
+    assert shop_sync._classify_response(success(business)) == business
+
+    # An HTTP JSON error body is still an envelope, not searchable business data.
+    for payload, expected in (
+        ({"data": {"title": "CAPTCHA RGV587"}}, "platform_busy"),
+        ({"ret": ["RGV587_USER_VALIDATE::被挤爆啦"]}, "risk_control"),
+        ({"ret": ["CAPTCHA"]}, "verification_required"),
+    ):
+        failure = urllib.error.HTTPError("https://mock.invalid", 429, "mock", {}, io.BytesIO(json.dumps(payload).encode()))
+        with (
+            patch.object(shop_sync, "_circuit_until", return_value=0),
+            patch.object(shop_sync, "_trip_circuit"),
+            patch.object(shop_sync.time, "sleep"),
+            patch.object(shop_sync.urllib.request, "urlopen", side_effect=failure) as request,
+        ):
+            try:
+                shop_sync._request("mock", {"_m_h5_tk": "mock_1"}, "mock", {}, "mock")
+            except shop_sync.ShopSyncError as error:
+                assert error.code == expected
+            else:
+                raise AssertionError("HTTP failure must not succeed")
+            assert request.call_count == 1
+
+    with (
+        patch.object(shop_sync, "_circuit_until", return_value=float("inf")),
+        patch.object(shop_sync.urllib.request, "urlopen") as request,
+    ):
+        try:
+            shop_sync._request("mock", {"_m_h5_tk": "mock_1"}, "mock", {}, "mock")
+        except shop_sync.ShopSyncError as error:
+            assert error.code == "risk_cooldown"
+            assert str(error) == shop_sync.SYNC_STATUS_CATALOG["risk_cooldown"]["message"]
+        else:
+            raise AssertionError("local cooldown must keep requests paused")
+        request.assert_not_called()
+
+    for code in ("risk_control", "risk_cooldown", "verification_required"):
+        expected = shop_sync.SYNC_STATUS_CATALOG[code]
+        status = shop_sync.sync_status_payload(code, "闲鱼App要求安全验证")
+        assert status["message"] == expected["message"]
+        root = Path(shop_sync._account_root(99, create=True))
+        state_path = root / shop_sync.SYNC_STATE_NAME
+        legacy = {"version": 1, "code": code, "message": "闲鱼App要求安全验证", "checked_at": "old", "account_ref": "mock"}
+        state_path.write_text(json.dumps(legacy), encoding="utf-8")
+        original = state_path.read_bytes()
+        loaded = shop_sync.load_sync_state(99)
+        assert loaded["message"] == expected["message"]
+        assert state_path.read_bytes() == original
+        assert loaded["checked_at"] == "old" and loaded["account_ref"] == "mock"
+        for snapshot in (None, {"products": [{"id": "1"}]}):
+            view = bot_manager._status_view(code, True, snapshot, int(snapshot is not None))
+            assert view["connection_state"] == ("security_check" if code == "verification_required" else "degraded")
+            assert view["catalog_state"] == ("stale" if snapshot else "blocked")
+            assert view["capabilities"]["view_products"] == (snapshot is not None)
+            assert view["attention"][0]["title"] == expected["label"]
+    shop_sync.save_sync_state(99, "verification_required", "old", account_ref_value="mock")
+    assert shop_sync.load_sync_state(99)["code"] == "verification_required"
+    assert "verification_required" in shop_sync.PERSISTED_SYNC_CODES
+
+
 def main():
+    classification_contract()
     calls = []
 
     def fake_request(api, data, spm):

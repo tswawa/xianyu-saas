@@ -2,6 +2,7 @@ import time
 import hashlib
 import json
 import os
+import re
 import threading
 
 import requests
@@ -15,6 +16,7 @@ class XianyuApiError(RuntimeError):
 
     ALLOWED_CODES = frozenset({
         "risk_control",
+        "verification_required",
         "session_expired",
         "platform_busy",
         "network_error",
@@ -31,9 +33,9 @@ class XianyuApiError(RuntimeError):
 
 
 class XianyuAuthenticationError(XianyuApiError):
-    """A confirmed authentication failure requiring a bounded recovery decision."""
+    """A request restriction or session failure requiring protected recovery."""
 
-    ALLOWED_CODES = frozenset({"session_expired", "risk_control"})
+    ALLOWED_CODES = frozenset({"session_expired", "risk_control", "verification_required"})
 
     def __init__(self, code):
         if code not in self.ALLOWED_CODES:
@@ -137,54 +139,73 @@ class XianyuApis:
     def _validate_order_id(cls, order_id):
         return cls._validate_numeric_id(order_id, "order_id", 64)
 
-    @staticmethod
-    def _is_success_response(payload):
+    @classmethod
+    def _is_success_response(cls, payload):
         if not isinstance(payload, dict):
             return False
         ret_value = payload.get("ret", [])
         if isinstance(ret_value, str):
             ret_value = [ret_value]
-        return any("SUCCESS::调用成功" in str(value) for value in ret_value)
+        return bool(
+            isinstance(ret_value, (list, tuple)) and ret_value
+            and all(isinstance(value, str) and value.partition("::")[0].strip().upper() == "SUCCESS" for value in ret_value)
+            and cls._response_error_code(payload) == "token_unavailable"
+        )
 
     @staticmethod
     def _response_error_code(payload, status_code=None):
-        """Map public platform signals to one stable, non-secret error code."""
+        """Classify error metadata, never product data or arbitrary code substrings."""
         if not isinstance(payload, dict):
             return "response_invalid"
-        ret_value = payload.get("ret", [])
-        if isinstance(ret_value, str):
-            ret_value = [ret_value]
-        try:
-            payload_text = json.dumps(
-                payload, ensure_ascii=False, separators=(",", ":")
-            )[:8192]
-        except (TypeError, ValueError):
-            payload_text = ""
-        text = (" ".join(str(value) for value in ret_value) + " " + payload_text).upper()
+        nodes = [payload]
+        if isinstance(payload.get("content"), dict):
+            nodes.append(payload["content"])
+        texts = []
+        for node in nodes:
+            for key in (
+                "ret", "code", "errorCode", "error_code", "retCode", "status", "statusCode",
+                "status_code", "message", "msg", "errorMsg", "errorMessage",
+            ):
+                value = node.get(key)
+                values = value[:16] if isinstance(value, (list, tuple)) else [value]
+                for text in values:
+                    if isinstance(text, str) and text.partition("::")[0].strip().upper() != "SUCCESS":
+                        texts.append(text[:4096].upper())
+        text = " ".join(texts)
         if any(signal in text for signal in (
-            "RGV587",
-            "USER_VALIDATE",
-            "SECURITY_CHECK",
-            "CAPTCHA",
-            "被挤爆啦",
+            "ACCOUNT_BANNED", "USER_BANNED", "PUBLISH_FORBIDDEN", "ITEM_PUBLISH_FORBIDDEN",
+            "VIOLATION", "违规", "限制发布", "禁止发布",
+        )):
+            return "account_restricted"
+        verification_codes = {
+            "CAPTCHA", "CAPTCHA_REQUIRED", "FAIL_SYS_CAPTCHA", "FAIL_SYS_CAPTCHA_REQUIRED",
+            "SECURITY_CHECK", "SECURITY_CHECK_REQUIRED", "FAIL_SYS_SECURITY_CHECK",
+            "FAIL_SYS_SECURITY_CHECK_REQUIRED",
+        }
+        flag_nodes = nodes + ([payload["data"]] if isinstance(payload.get("data"), dict) else [])
+        if (
+            any(part.strip() in verification_codes for value in texts for part in value.split("::"))
+            or any(re.search(
+                r"(?<![不无未])(?:请|需要|必须)(?:先)?(?:完成|进行)(?:安全验证|人机验证|滑块验证|验证码验证)"
+                r"|(?<!NO )(?<!NOT )\b(?:CAPTCHA|SECURITY CHECK) (?:IS )?REQUIRED\b", value
+            ) for value in texts)
+            or any(node.get(key) is True for node in flag_nodes for key in (
+                "captchaRequired", "needCaptcha", "securityCheckRequired", "verificationRequired",
+            ))
+        ):
+            return "verification_required"
+        if any(signal in text for signal in (
+            "RGV587", "USER_VALIDATE", "USER_VALID", "LOGIN_CHECK", "/PUNISH",
         )):
             return "risk_control"
         if any(signal in text for signal in (
-            "FAIL_SYS_SESSION_EXPIRED",
-            "NOT_LOGIN",
-            "AUTH_EXPIRED",
+            "SESSION_EXPIRED", "SESSION INVALID", "TOKEN_EX", "TOKEN_EMPTY", "ILLEGAL_ACCESS",
+            "LOGIN_EXPIRED", "NOT_LOGIN", "AUTH_EXPIRED", "AUTH_INVALID",
         )):
             return "session_expired"
         if any(signal in text for signal in (
-            "ACCOUNT_BANNED",
-            "PUBLISH_FORBIDDEN",
-        )):
-            return "account_restricted"
-        if any(signal in text for signal in (
-            "FAIL_SYS_BUSY",
-            "SYSTEM_BUSY",
-            "TOO_MANY_REQUEST",
-            "TRAFFIC_LIMIT",
+            "FAIL_SYS_BUSY", "SYSTEM_BUSY", "SERVER_BUSY", "TOO_MANY_REQUEST", "RATE_LIMIT",
+            "FREQUENCY_LIMIT", "TRAFFIC_LIMIT", "被挤爆",
         )) or status_code in {409, 412, 429, 503}:
             return "platform_busy"
         return "token_unavailable"
@@ -216,6 +237,7 @@ class XianyuApis:
         """Issue one signed request with a finite retry budget on the shared session."""
         data_val = json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
         data = {"data": data_val}
+        last_error_code = "token_unavailable"
         for attempt in range(attempts):
             params = {
                 "jsv": "2.7.2",
@@ -237,15 +259,10 @@ class XianyuApis:
                 with self._session_lock:
                     token = self.session.cookies.get("_m_h5_tk", "").split("_")[0]
                     params["sign"] = generate_sign(params["t"], token, data_val)
-                    response = self.session.post(
-                        endpoint,
-                        params=params,
-                        data=data,
-                        timeout=self.request_timeout,
-                    )
-                    result = response.json()
+                    response, result = self._post_json(endpoint, params=params, data=data)
             except Exception as exc:
-                logger.warning("订单核验接口请求异常 error={}", type(exc).__name__)
+                last_error_code = exc.code if isinstance(exc, XianyuApiError) else "network_error"
+                logger.warning("订单核验接口请求异常 code={}", last_error_code)
                 self._wait_before_retry(
                     attempt, attempts, self.request_backoff
                 )
@@ -254,22 +271,18 @@ class XianyuApis:
             if self._is_success_response(result):
                 return result
 
-            ret_value = result.get("ret", []) if isinstance(result, dict) else []
-            if isinstance(ret_value, str):
-                ret_value = [ret_value]
-            ret_text = " ".join(str(value) for value in ret_value)
-            if "RGV587_ERROR" in ret_text or "被挤爆啦" in ret_text:
-                logger.error("订单核验接口触发平台风控")
-                raise XianyuAuthenticationError("risk_control")
-            if "FAIL_SYS_SESSION_EXPIRED" in ret_text:
-                logger.error("订单核验会话已过期")
-                raise XianyuAuthenticationError("session_expired")
+            last_error_code = self._response_error_code(result, getattr(response, "status_code", None))
+            if last_error_code in XianyuAuthenticationError.ALLOWED_CODES:
+                logger.error("订单核验接口请求受保护 code={}", last_error_code)
+                raise XianyuAuthenticationError(last_error_code)
+            if last_error_code == "account_restricted":
+                raise XianyuApiError(last_error_code)
             if "Set-Cookie" in getattr(response, "headers", {}):
                 self.clear_duplicate_cookies()
             logger.warning("订单核验接口调用失败")
             self._wait_before_retry(attempt, attempts, self.request_backoff)
 
-        raise XianyuApiError("token_unavailable")
+        raise XianyuApiError(last_error_code)
 
     def get_message_head_info(self, session_id, item_id, session_type=1):
         """Return the platform-owned order header for a chat session and item."""
@@ -418,16 +431,16 @@ class XianyuApis:
                 params=params,
                 data=data,
             )
-        content = res_json.get('content')
-        if isinstance(content, dict) and content.get('success') is True:
-            self.clear_duplicate_cookies()
-            logger.debug("Login恢复成功")
-            return True
         error_code = self._response_error_code(
             res_json, getattr(response, "status_code", None)
         )
-        if error_code == "risk_control":
-            raise XianyuAuthenticationError("risk_control")
+        content = res_json.get('content')
+        if isinstance(content, dict) and content.get('success') is True and error_code == "token_unavailable":
+            self.clear_duplicate_cookies()
+            logger.debug("Login恢复成功")
+            return True
+        if error_code in XianyuAuthenticationError.ALLOWED_CODES:
+            raise XianyuAuthenticationError(error_code)
         if error_code in {"platform_busy", "account_restricted"}:
             raise XianyuApiError(error_code)
         logger.warning("Login恢复未确认有效")
@@ -519,6 +532,7 @@ class XianyuApis:
             {"itemId": item_id}, ensure_ascii=True, separators=(",", ":")
         )
         data = {'data': data_val}
+        last_error_code = "token_unavailable"
 
         for attempt in range(start_attempt, self.item_max_attempts):
             params = {
@@ -539,37 +553,27 @@ class XianyuApis:
                 with self._session_lock:
                     token = self.session.cookies.get('_m_h5_tk', '').split('_')[0]
                     params['sign'] = generate_sign(params['t'], token, data_val)
-                    response = self.session.post(
+                    response, res_json = self._post_json(
                         'https://h5api.m.goofish.com/h5/mtop.taobao.idle.pc.detail/1.0/',
                         params=params,
                         data=data,
-                        timeout=self.request_timeout,
                     )
-                    res_json = response.json()
             except Exception as exc:
-                logger.error(f"商品信息API请求异常: {type(exc).__name__}")
+                last_error_code = exc.code if isinstance(exc, XianyuApiError) else "network_error"
+                logger.error("商品信息API请求异常 code={}", last_error_code)
                 self._wait_before_retry(attempt, self.item_max_attempts, self.request_backoff)
                 continue
 
-            if not isinstance(res_json, dict):
-                logger.error("商品信息API返回格式异常")
-                self._wait_before_retry(attempt, self.item_max_attempts, self.request_backoff)
-                continue
-
-            ret_value = res_json.get('ret', [])
-            if isinstance(ret_value, str):
-                ret_value = [ret_value]
-            ret_text = [str(ret) for ret in ret_value]
-            if any('SUCCESS::调用成功' in ret for ret in ret_text):
+            if self._is_success_response(res_json):
                 item_ref = hashlib.sha256(str(item_id).encode("utf-8")).hexdigest()[:10]
                 logger.debug("商品信息获取成功 item={}", item_ref)
                 return res_json
-            if any('RGV587_ERROR' in ret or '被挤爆啦' in ret for ret in ret_text):
-                logger.error("商品信息API触发平台风控")
-                raise XianyuAuthenticationError("risk_control")
-            if any('FAIL_SYS_SESSION_EXPIRED' in ret for ret in ret_text):
-                logger.error("商品信息API会话已过期")
-                raise XianyuAuthenticationError("session_expired")
+            last_error_code = self._response_error_code(res_json, getattr(response, "status_code", None))
+            if last_error_code in XianyuAuthenticationError.ALLOWED_CODES:
+                logger.error("商品信息API请求受保护 code={}", last_error_code)
+                raise XianyuAuthenticationError(last_error_code)
+            if last_error_code == "account_restricted":
+                raise XianyuApiError(last_error_code)
 
             logger.warning("商品信息API调用失败")
             if 'Set-Cookie' in response.headers:
@@ -578,4 +582,4 @@ class XianyuApis:
             self._wait_before_retry(attempt, self.item_max_attempts, self.request_backoff)
 
         logger.error("获取商品信息失败，已用完尝试预算")
-        return {"error": "获取商品信息失败，重试次数过多"}
+        return {"error": "获取商品信息失败，重试次数过多", "code": last_error_code}

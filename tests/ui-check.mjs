@@ -14,7 +14,7 @@ const resultRoot = path.join(repoRoot, "test-results");
 const versionSource = fs.readFileSync(path.join(repoRoot, "backend", "version.py"), "utf8");
 const assetVersion = versionSource.match(/^ASSET_VERSION\s*=\s*["']([^"']+)["']\s*$/m)?.[1] || "";
 assert.match(assetVersion, /^[0-9]{8}-[0-9]{2}$/);
-const desktopSettingsOpsScope = ["settings", "ops", "dashboard", "goods", "resources"].includes(process.env.SAAS_UI_SCOPE);
+const desktopSettingsOpsScope = ["settings", "ops", "dashboard", "goods", "resources", "popover", "home-alerts"].includes(process.env.SAAS_UI_SCOPE);
 const mockOnlyScope = process.env.SAAS_UI_SCOPE === "mock";
 const screenshotsEnabled = !desktopSettingsOpsScope && !mockOnlyScope && process.env.SAAS_UI_SCREENSHOTS !== "0";
 if (screenshotsEnabled) fs.mkdirSync(resultRoot, { recursive: true });
@@ -288,7 +288,8 @@ const fixtures = {
   botStartModes: [],
   botStops: [],
   botStatusRequests: 0,
-  botStatusResponseDelays: [],
+  botStatusResponseGates: [],
+  pendingBotStatusGates: new Set(),
   authorizationHeaders: [],
   cookieSaves: 0,
   qrLoginCounter: 0,
@@ -342,6 +343,20 @@ function json(res, value, status = 200, headers = {}) {
   const body = JSON.stringify(value);
   res.writeHead(status, { "content-type": "application/json", "content-length": Buffer.byteLength(body), ...headers });
   res.end(body);
+}
+
+function holdNextBotStatus() {
+  let release;
+  const gate = {
+    promise: new Promise((resolve) => { release = resolve; }),
+    release() {
+      release();
+      fixtures.pendingBotStatusGates.delete(gate);
+    },
+  };
+  fixtures.botStatusResponseGates.push(gate);
+  fixtures.pendingBotStatusGates.add(gate);
+  return gate;
 }
 
 function scopedFixture(req, key, fallback) {
@@ -1039,9 +1054,9 @@ function createServer() {
         const requestNumber = ++fixtures.botStatusRequests;
         const response = { ...bot, shop_name: account.name || bot.shop_name, account: { ...account, name: account.name || bot.shop_name }, account_id: account.id };
         const headers = { "x-ui-bot-status-request": String(requestNumber) };
-        const delay = Number(fixtures.botStatusResponseDelays.shift() || 0);
-        if (delay > 0) {
-          setTimeout(() => json(res, response, 200, headers), delay);
+        const gate = fixtures.botStatusResponseGates.shift();
+        if (gate) {
+          void gate.promise.then(() => { if (!res.destroyed) json(res, response, 200, headers); });
           return;
         }
         return json(res, response, 200, headers);
@@ -2187,8 +2202,76 @@ async function assertUnifiedVersionLink(page) {
   assert.equal(await page.locator('#versionBadgePopover a[href="https://github.com/tswawa/xianyu-saas/releases"]').count(), 1, "merge duplicate release/details buttons into one link");
 }
 
+async function assertVersionPopoverBounds(page, label) {
+  const result = await page.evaluate(() => {
+    const popover = document.querySelector('#versionBadgePopover');
+    const bounds = popover.getBoundingClientRect();
+    const selector = '.version-popover-actions > .button, .version-popover-val, .version-popover-status';
+    return { left: bounds.left, right: bounds.right, viewport: innerWidth,
+      clientWidth: popover.clientWidth, scrollWidth: popover.scrollWidth,
+      children: [...popover.querySelectorAll(selector)].filter((node) => !node.hidden && node.getClientRects().length).map((node) => {
+        const rect = node.getBoundingClientRect();
+        return { id: node.id, left: rect.left, right: rect.right, clientWidth: node.clientWidth, scrollWidth: node.scrollWidth };
+      }) };
+  });
+  assert.ok(result.left >= 7 && result.right <= result.viewport - 7, `${label}: popover stays inside the viewport: ${JSON.stringify(result)}`);
+  assert.ok(result.scrollWidth <= result.clientWidth + 1, `${label}: popover must not scroll horizontally`);
+  for (const node of result.children) {
+    assert.ok(node.left >= result.left && node.right <= result.right + 1, `${label}: ${node.id} extends outside its popover: ${JSON.stringify(node)}`);
+    assert.ok(node.scrollWidth <= node.clientWidth + 1, `${label}: ${node.id} must wrap rather than clip text`);
+  }
+}
+
+async function checkVersionPopover(browser, baseUrl) {
+  fixtures.me = { ...fixtures.me, username: 'popover-admin', role: 'admin', is_admin: true,
+    platform_permissions: ['platform.settings.manage', 'platform.users.manage', 'platform.audit.read', 'platform.updates.manage'] };
+  const { page, evidence } = await desktopContractPage(browser, baseUrl);
+  const cases = [];
+  try {
+    await desktopLogin(page, fixtures.me.username);
+    for (const width of [1440, 1280, 768, 640, 390, 320]) {
+      await page.setViewportSize({ width, height: 900 });
+      for (const scale of [1, 1.5, 2]) {
+        if (!await page.locator('#versionBadgePopover').isVisible()) await page.click('#versionBadgeButton');
+        await page.evaluate((factor) => {
+          const popover = document.querySelector('#versionBadgePopover');
+          const nodes = [...popover.querySelectorAll('.version-popover-header, .version-popover-row, .version-popover-label, .version-popover-val, .version-popover-status, .version-popover-actions > .button')];
+          nodes.forEach((node) => { node.style.fontSize = ''; });
+          const sizes = nodes.map((node) => parseFloat(getComputedStyle(node).fontSize));
+          nodes.forEach((node, index) => { node.style.fontSize = `${sizes[index] * factor}px`; });
+        }, scale);
+        await assertVersionPopoverBounds(page, `${width}px/${scale}x text`);
+        await page.evaluate(() => {
+          document.querySelector('#versionBadgeCurrent').textContent = 'v0.1.0-beta.1234567890+build.abcdefghijklmnopqrstuvwxyz';
+          document.querySelector('#versionBadgeStatus').textContent = '检查失败：暂时无法连接发布服务，请稍后重试';
+        });
+        await assertVersionPopoverBounds(page, `${width}px/${scale}x long version`);
+        await page.evaluate(() => {
+          document.querySelector('#versionBadgeCurrent').textContent = 'v0.1.0';
+          document.querySelector('#versionBadgeStatus').textContent = '尚未检查';
+        });
+        await page.click('#versionBadgeClose');
+        assert.equal(await page.locator('#versionBadgePopover').isHidden(), true);
+        assert.equal(await page.locator('#versionBadgeButton').getAttribute('aria-expanded'), 'false');
+        cases.push(`${width}/${scale}`);
+      }
+    }
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.evaluate(() => document.querySelectorAll('#versionBadgePopover [style]').forEach((node) => { node.style.fontSize = ''; }));
+    await assertUnifiedVersionLink(page);
+    await checkUpdateFromBadge(page);
+    assert.equal(await page.locator('#versionBadgeButton').getAttribute('aria-expanded'), 'false');
+    assertDesktopEvidence(evidence);
+    console.log(JSON.stringify({ ok: true, scope: 'popover', cases, longText: true, checksAndExternalLink: true }));
+  } catch (error) {
+    await reportDesktopFailure(page, 'popover', error, evidence);
+    throw error;
+  } finally { await page.close(); }
+}
+
 async function checkUpdateFromBadge(page) {
   if (!(await page.locator("#versionBadgePopover").isVisible())) await page.click("#versionBadgeButton");
+  await assertVersionPopoverBounds(page, 'version update actions');
   const result = await desktopApiClick(page, "#versionBadgeRefresh", "/api/admin/updates/check");
   await page.waitForFunction(() => document.querySelector("#versionBadgeRefresh")?.disabled === false);
   await page.click("#versionBadgeClose");
@@ -2343,6 +2426,162 @@ function resourceRow(account, values = {}) {
     rss_bytes: 64 * 1024 * 1024, vms_bytes: 120 * 1024 * 1024, uptime_seconds: 3661,
     memory_limit_bytes: 400 * 1024 * 1024, configured_memory_limit_bytes: 400 * 1024 * 1024,
     pending_restart: false, sampled_at: Date.now() / 1000, message: "", ...values };
+}
+
+async function checkHomeAlerts(browser, baseUrl) {
+  const baseBot = structuredClone(fixtures.bot);
+  const missingPrice = { ...productFixtures[0], title: "测试用商品超长标题ABCDEFGHIJKLMNOPQRSTUVWXYZ不应挤压价格", price_display: "", image_url: "https://cdn.example/home-product.png" };
+  fixtures.products = [missingPrice];
+  fixtures.bot = { ...baseBot, product_count: 1 };
+  const { page, evidence } = await desktopContractPage(browser, baseUrl);
+  const cases = [];
+  const reloadHome = async () => {
+    await page.reload({ waitUntil: "networkidle" });
+    await page.waitForSelector("#workspace:not([hidden])");
+    await openView(page, "home");
+    await page.waitForFunction((count) => document.querySelectorAll("#homeProductGrid .home-product-card").length === count, Math.min(fixtures.products.length, 6));
+  };
+  const checkLayout = async (count) => {
+    for (const width of [1440, 1280, 980, 768, 640, 390, 320]) {
+      await page.setViewportSize({ width, height: 1000 });
+      for (const scale of [1, 1.5, 2]) {
+        await page.evaluate((factor) => {
+          const nodes = [...document.querySelectorAll("#homeProductGrid .home-product-card, #homeProductGrid .home-product-name, #homeProductGrid .home-product-price, #homeProductGrid .badge")];
+          nodes.forEach((node) => { node.style.fontSize = ""; });
+          const sizes = nodes.map((node) => parseFloat(getComputedStyle(node).fontSize));
+          nodes.forEach((node, index) => { node.style.fontSize = `${sizes[index] * factor}px`; });
+        }, scale);
+        const result = await page.locator("#homeProductGrid").evaluate((grid) => {
+          const bounds = grid.getBoundingClientRect();
+          return { width: bounds.width, left: bounds.left, right: bounds.right, clientWidth: grid.clientWidth, scrollWidth: grid.scrollWidth,
+            cards: [...grid.querySelectorAll(".home-product-card")].map((card) => {
+              const rect = card.getBoundingClientRect();
+              const price = card.querySelector(".home-product-price");
+              const title = card.querySelector(".home-product-name");
+              const thumb = card.querySelector(".home-product-thumb").getBoundingClientRect();
+              const style = getComputedStyle(price);
+              return { width: rect.width, left: rect.left, right: rect.right, price: price.textContent,
+                priceWidth: price.clientWidth, priceScrollWidth: price.scrollWidth, priceHeight: price.getBoundingClientRect().height,
+                priceLineHeight: parseFloat(style.lineHeight), priceWeight: Number(style.fontWeight), priceColor: style.color,
+                pending: price.classList.contains("is-pending"), titleHeight: title.getBoundingClientRect().height,
+                titleLineHeight: parseFloat(getComputedStyle(title).lineHeight), ratio: thumb.width / thumb.height };
+            }) };
+        });
+        const label = `${count} products / ${width}px / ${scale}x`;
+        assert.equal(result.cards.length, count, label);
+        assert.ok(result.scrollWidth <= result.clientWidth + 1, `${label}: grid cannot overflow`);
+        for (const card of result.cards) {
+          assert.ok(card.width >= Math.min(160, result.width) - 1, `${label}: card is too narrow: ${JSON.stringify(card)}`);
+          assert.ok(card.left >= result.left - 1 && card.right <= result.right + 1, `${label}: card must fit its panel`);
+          assert.ok(card.priceScrollWidth <= card.priceWidth + 1, `${label}: price cannot be clipped: ${JSON.stringify(card)}`);
+          assert.ok(card.priceHeight <= card.priceLineHeight + 1, `${label}: price stays on one line`);
+          assert.ok(card.titleHeight <= card.titleLineHeight * 2 + 1, `${label}: long title stays within two lines`);
+          assert.ok(Math.abs(card.ratio - 1.6) < 0.03, `${label}: thumbnail retains 16:10 ratio`);
+          if (card.pending) {
+            assert.equal(card.price, "价格待同步");
+            assert.ok(card.priceWeight <= 500, `${label}: missing price is neutral copy, not an amount`);
+          }
+        }
+        assert.equal(result.cards[0].pending, true, `${label}: missing price has a distinct style`);
+        if (count > 1) {
+          assert.equal(result.cards[1].price, "¥0", `${label}: actual zero price must not become missing`);
+          assert.equal(result.cards[1].pending, false);
+          assert.notEqual(result.cards[0].priceColor, result.cards[1].priceColor);
+        } else if (result.width >= 340) {
+          assert.ok(result.cards[0].width < result.width * 0.7, `${label}: a single preview must not stretch across the whole panel`);
+        }
+        await assertNoOverflow(page, label);
+        cases.push(label);
+      }
+    }
+  };
+  const setAlert = (code, { legacy = false, reauth = false, kind = "shop_account", errorCode = "" } = {}) => {
+    fixtures.bot = { ...baseBot, product_count: 1, connected: false,
+      sync_status: reauth ? "verified" : code, auth_code: reauth ? code : "ok", reauthorization_required: reauth,
+      connection_state: legacy || code === "verification_required" ? "security_check" : "degraded", catalog_state: "stale",
+      capabilities: { view_products: true, sync_products: code !== "risk_cooldown", publish_products: false },
+      cookie_status: { code, label: legacy ? "需要安全验证" : "待确认", message: "旧消息：闲鱼要求安全验证，请先在闲鱼 App 完成安全验证" } };
+    fixtures.attention = [{ id: "att_aaaaaaaaaaaaaaaaaaaaaaaa", kind, code: errorCode ? "degraded" : code, error_code: errorCode,
+      title: legacy ? "需要安全验证" : ({ platform_busy: "闲鱼请求繁忙", account_restricted: "账号受限", session_expired: "登录会话已失效" }[code] || "旧告警"),
+      message: legacy ? "闲鱼要求安全验证，请先在闲鱼 App 或浏览器完成安全验证" : "接口返回的状态需要确认。",
+      action_label: "查看店铺", action_view: "shops", severity: "warning", resolved: false }];
+  };
+  try {
+    await desktopLogin(page, fixtures.me.username);
+    await assertDesktopAssetVersion(page);
+    await page.waitForSelector("#homeProductGrid .home-product-card");
+    await page.locator("#homeProductGrid img").scrollIntoViewIfNeeded();
+    await page.waitForFunction(() => { const img = document.querySelector("#homeProductGrid img"); return img?.complete && img.naturalWidth > 0; });
+    await checkLayout(1);
+    fixtures.products = [missingPrice, { ...productFixtures[1], price_display: "¥0" }, ...productFixtures.slice(2, 6)];
+    fixtures.bot.product_count = 6;
+    await reloadHome();
+    await checkLayout(6);
+    await page.setViewportSize({ width: 1440, height: 1000 });
+    await page.locator("#homeProductGrid .home-product-card").first().click();
+    await page.waitForSelector('[data-panel="goods"]:not([hidden])');
+    assert.match(await page.locator("#productGrid").innerText(), /测试用商品/);
+    fixtures.products = [missingPrice];
+
+    // Legacy titles, worker auth state and saved messages are not evidence of
+    // a current App verification prompt. Normalize copy without losing IDs.
+    setAlert("risk_control", { legacy: true, reauth: true, errorCode: "risk_control" });
+    await reloadHome();
+    assert.equal(await page.locator("#attentionList strong").innerText(), "接口请求受限");
+    assert.match(await page.locator("#attentionList p").innerText(), /尚不能确认/);
+    assert.doesNotMatch(await page.locator("#attentionList").innerText(), /闲鱼要求安全验证|请先在闲鱼 App/);
+    await page.locator('[data-attention-toggle="att_aaaaaaaaaaaaaaaaaaaaaaaa"]').click();
+    await page.waitForFunction(() => document.querySelector("#attentionCount")?.textContent === "0");
+    await reloadHome();
+    assert.equal(await page.locator('[data-attention-toggle]').getAttribute("aria-pressed"), "true", "processed status survives copy normalization and reload");
+    await page.locator('[data-attention-toggle]').click();
+    await page.waitForFunction(() => document.querySelector("#attentionCount")?.textContent === "1");
+    await page.locator('#attentionList [data-view="shops"]').click();
+    await page.waitForSelector('[data-panel="shops"]:not([hidden])');
+    assert.equal(await page.locator("#cookieStatusTitle").innerText(), "接口请求受限");
+    assert.equal(await page.locator("#shopConnectionTitle").innerText(), "店铺连接需要确认");
+    assert.match(await page.locator("#shopAccountsPanelList").innerText(), /接口请求受限/);
+    assert.equal(await page.locator("#checkCookieButton").isEnabled(), true);
+
+    for (const [code, label, title] of [
+      ["verification_required", "接口要求验证", "自动连接接口要求验证"],
+      ["risk_cooldown", "请求保护冷却中", "店铺连接需要确认"],
+      ["platform_busy", "闲鱼请求繁忙", "店铺连接需要确认"],
+    ]) {
+      setAlert(code, { legacy: code === "risk_cooldown", reauth: code === "verification_required" });
+      await reloadHome();
+      assert.equal(await page.locator("#attentionList strong").innerText(), label);
+      if (code === "verification_required") assert.match(await page.locator("#attentionList p").innerText(), /明确的验证要求.*App 不一定弹窗/);
+      if (code === "risk_cooldown") assert.match(await page.locator("#attentionList p").innerText(), /系统因之前的受限请求/);
+      for (const width of [1280, 640, 390, 320]) {
+        await page.setViewportSize({ width, height: 1000 });
+        await assertNoOverflow(page, `${code} attention ${width}px`);
+      }
+      await page.setViewportSize({ width: 1440, height: 1000 });
+      await page.locator('#attentionList [data-view="shops"]').click();
+      await page.waitForSelector('[data-panel="shops"]:not([hidden])');
+      assert.equal(await page.locator("#shopConnectionTitle").innerText(), title);
+      assert.equal(await page.locator("#checkCookieButton").isDisabled(), code === "risk_cooldown");
+      assert.equal(await page.locator("#homeProductGrid .home-product-card").count(), 1, "blocked connection retains cached products");
+    }
+    for (const [code, label] of [["account_restricted", "账号受限"], ["session_expired", "登录会话已失效"]]) {
+      setAlert(code, { reauth: code === "session_expired" });
+      await reloadHome();
+      assert.equal(await page.locator("#attentionList strong").innerText(), label, "unrelated errors retain their original meaning");
+    }
+    fixtures.bot = { ...baseBot, product_count: 1 };
+    fixtures.attention = [];
+    await reloadHome();
+    assert.match(await page.locator("#attentionList").innerText(), /当前没有需要处理的事项/);
+    assert.equal(await page.locator("#attentionCount").innerText(), "0");
+    assert.equal(fixtures.shopActionRequests.length, 0, "view and acknowledgement actions cannot trigger shop probes");
+    assert.equal(fixtures.cookieSaves + fixtures.botStartModes.length + fixtures.qrStarts + fixtures.qrConnects, 0, "display fixes must not reauthorize or restart workers");
+    assertDesktopEvidence(evidence);
+    console.log(JSON.stringify({ ok: true, scope: "home-alerts", layoutCases: cases.length, alertCases: ["legacy-worker-risk", "resolved-history", "explicit-verification", "local-cooldown", "platform-busy", "account-restricted", "session-expired", "recovered"], noPlatformRequests: true }));
+  } catch (error) {
+    await reportDesktopFailure(page, "home-alerts", error, evidence);
+    throw error;
+  } finally { await page.close(); }
 }
 
 async function checkDashboardDesktop(browser, baseUrl) {
@@ -3077,7 +3316,7 @@ async function run() {
   let expectedManualReplyNotFoundResponses = 0;
   try {
     if (desktopSettingsOpsScope) {
-      const check = { settings: checkSettingsDesktop, ops: checkOpsDesktop, dashboard: checkDashboardDesktop, goods: checkDashboardDesktop, resources: checkResourcesDesktop }[process.env.SAAS_UI_SCOPE];
+      const check = { settings: checkSettingsDesktop, ops: checkOpsDesktop, dashboard: checkDashboardDesktop, goods: checkDashboardDesktop, resources: checkResourcesDesktop, popover: checkVersionPopover, "home-alerts": checkHomeAlerts }[process.env.SAAS_UI_SCOPE];
       await check(browser, `http://127.0.0.1:${port}/xianyu-saas/`);
       return;
     }
@@ -3583,6 +3822,8 @@ async function run() {
     // Refresh generation is assigned synchronously at invocation. An older
     // false status arriving after a newer true refresh must be ignored before
     // it can write state, register a catalog token, or start another products GET.
+    // Gate the old response explicitly: fixed delays do not guarantee reverse
+    // ordering when the browser or test runner is under load.
     const reverseBotSnapshot = structuredClone(fixtures.bot);
     const reverseProductsSnapshot = fixtures.products;
     const reverseTemplateSnapshot = structuredClone(fixtures.templates.find((item) => item.id === "tpl-1"));
@@ -3595,7 +3836,7 @@ async function run() {
       productCatalog: reverseProductsSnapshot.concat([{ id: reverseOutsideId, title: "反序截断目录合法商品" }]),
     };
     fixtures.bot.products_truncated = false;
-    fixtures.botStatusResponseDelays.push(900, 0);
+    const reverseStatusGate = holdNextBotStatus();
     const reverseStatusBase = fixtures.botStatusRequests;
     const reverseProductBase = fixtures.productGetRequests.length;
     const reverseOldStatusRequest = page.waitForRequest((request) => request.url().endsWith("/api/bot/status") && request.headers()["x-shop-account"] === "default");
@@ -3607,7 +3848,8 @@ async function run() {
     const reverseNewProductResponse = waitProductRequestNumber(reverseProductBase + 1);
     await page.click("#refreshButton");
     await Promise.all([reverseNewStatusResponse, reverseNewProductResponse]);
-    await reverseOldStatusResponse;
+    reverseStatusGate.release();
+    await (await reverseOldStatusResponse).finished();
     await page.waitForTimeout(60);
     assert.equal(fixtures.productGetRequests.length, reverseProductBase + 1, "a late older false status must not register a token or start a follow-up after the newer true refresh");
     await page.waitForSelector('[data-template-edit="tpl-1"]');
@@ -3639,7 +3881,7 @@ async function run() {
     const cacheTrueProducts = page.waitForResponse((response) => response.url().includes("/api/bot/products?limit=500") && response.request().headers()["x-shop-account"] === "default");
     await page.click("#refreshButton");
     await Promise.all([cacheTrueStatus, cacheTrueProducts]);
-    fixtures.botStatusResponseDelays.push(900, 0);
+    const equalReverseStatusGate = holdNextBotStatus();
     const equalReverseStatusBase = fixtures.botStatusRequests;
     const equalReverseProductBase = fixtures.productGetRequests.length;
     const equalReverseOldRequest = page.waitForRequest((request) => request.url().endsWith("/api/bot/status") && request.headers()["x-shop-account"] === "default");
@@ -3651,7 +3893,8 @@ async function run() {
     const equalReverseNewProducts = waitProductRequestNumber(equalReverseProductBase + 1);
     await page.click("#refreshButton");
     await Promise.all([equalReverseNewResponse, equalReverseNewProducts]);
-    await equalReverseOldResponse;
+    equalReverseStatusGate.release();
+    await (await equalReverseOldResponse).finished();
     await page.waitForTimeout(60);
     assert.equal(fixtures.productGetRequests.length, equalReverseProductBase + 1, "a late same-boolean status must not create another catalog token or products request");
     await page.waitForFunction(() => document.querySelector("#productGrid :is(.product-title, .product-card-title)")?.textContent === "同布尔反序新刷新商品");
@@ -5181,6 +5424,7 @@ async function run() {
     }
     throw error;
   } finally {
+    for (const gate of fixtures.pendingBotStatusGates) gate.release();
     await browser.close();
     await close(server);
   }

@@ -401,7 +401,9 @@
       ready: "已连接",
       restricted: "部分能力受限",
       account_restricted: "部分能力受限",
-      risk_control: "需要安全验证",
+      risk_control: "接口请求受限",
+      risk_cooldown: "请求保护冷却中",
+      verification_required: "接口要求验证",
       session_expired: "已断开 · 登录失效",
       cookie_expired: "已断开 · 登录失效",
       cookie_invalid: "已断开 · 登录无效",
@@ -424,8 +426,8 @@
   function accountStatusClass(account) {
     const code = accountHealthCode(account);
     if (code === "ready") return "is-ready";
-    if (["restricted", "account_restricted", "risk_control", "session_expired", "cookie_expired", "cookie_invalid", "cookie_incomplete", "expired"].includes(code)) return "is-error";
-    if (["degraded", "sync_cooldown", "sync_busy", "network_error", "platform_busy", "platform_error", "profile_missing", "sync_error"].includes(code)) return "is-warning";
+    if (["restricted", "account_restricted", "verification_required", "session_expired", "cookie_expired", "cookie_invalid", "cookie_incomplete", "expired"].includes(code)) return "is-error";
+    if (["risk_control", "risk_cooldown", "degraded", "sync_cooldown", "sync_busy", "network_error", "platform_busy", "platform_error", "profile_missing", "sync_error"].includes(code)) return "is-warning";
     return "is-muted";
   }
 
@@ -477,7 +479,7 @@
     const visibleAccounts = enabledAccounts.slice(start, start + pageSize);
     const markup = visibleAccounts.length ? visibleAccounts.map((account) => {
       const active = account.key === state.activeAccountKey;
-      const liveAuthCode = active && ["risk_control", "session_expired"].includes(String(state.bot?.auth_code || ""))
+      const liveAuthCode = active && ["risk_control", "verification_required", "session_expired"].includes(String(state.bot?.auth_code || ""))
         ? String(state.bot.auth_code)
         : "";
       const liveSyncCode = active && COOKIE_BLOCKING_CODES.has(String(state.bot?.sync_status || ""))
@@ -493,11 +495,11 @@
       const deleteLabel = account.key === "default" ? "默认店铺不可删除" : "断开" + label;
       const switchLabel = active ? "当前店铺" : "切换到" + label;
       const healthCode = accountHealthCode(effectiveAccount);
-      const isError = ["expired", "session_expired", "cookie_expired", "cookie_invalid", "cookie_incomplete", "restricted", "account_restricted", "risk_control"].includes(healthCode);
-      const isWarning = ["degraded", "sync_cooldown", "sync_busy", "network_error", "platform_busy", "platform_error", "profile_missing", "sync_error"].includes(healthCode);
+      const isError = ["expired", "session_expired", "cookie_expired", "cookie_invalid", "cookie_incomplete", "restricted", "account_restricted", "verification_required"].includes(healthCode);
+      const isWarning = ["risk_control", "risk_cooldown", "degraded", "sync_cooldown", "sync_busy", "network_error", "platform_busy", "platform_error", "profile_missing", "sync_error"].includes(healthCode);
       const statusBadge = isError ? "badge-red" : healthCode === "ready" ? "badge-green" : isWarning ? "badge-amber" : "badge-muted";
       const toneClass = isError ? " is-expired" : healthCode === "ready" ? " is-ready" : " is-unconfigured";
-      const needsReconnect = ["expired", "session_expired", "cookie_expired", "cookie_invalid", "cookie_incomplete", "restricted", "account_restricted", "risk_control", "degraded", "waiting_login"].includes(healthCode);
+      const needsReconnect = ["expired", "session_expired", "cookie_expired", "cookie_invalid", "cookie_incomplete", "restricted", "account_restricted", "verification_required", "degraded", "waiting_login"].includes(healthCode);
       return '<article class="shop-card' + (active ? " is-current" : "") + toneClass + '" data-account-key="' + esc(account.key) + '">' +
         '<button class="shop-card-main" type="button" data-account-switch="' + esc(account.key) + '" aria-label="' + esc(switchLabel) + '" title="' + esc(switchLabel) + '"' + (active ? ' aria-current="true"' : "") + '>' +
         '<span class="shop-card-avatar">' + esc(label.slice(0, 1)) + '</span><span class="shop-card-copy"><strong>' + esc(label) + '</strong><small>' + esc(account.key === "default" ? "默认账号" : "已绑定账号") + '</small></span></button>' +
@@ -1983,8 +1985,9 @@
   }
 
   const COOKIE_ERROR_COPY = {
-    risk_control: "闲鱼需要安全验证，请在已打开的官方页面完成。完成后会继续连接。",
-    risk_cooldown: "闲鱼安全验证冷却中，请稍后再试。",
+    risk_control: "最近一次自动连接请求未通过接口校验或被限制，尚不能确认是否需要安全验证。",
+    verification_required: "自动连接接口返回了明确的验证要求，请在对应的闲鱼官方页面按提示处理；App 不一定弹窗。",
+    risk_cooldown: "系统因之前的受限请求暂停了检测，请等待冷却结束后再试。",
     cookie_expired: "登录会话已失效，请使用闲鱼 App 重新扫码授权。",
     cookie_invalid: "登录信息无效，请重新登录闲鱼并连接。",
     cookie_incomplete: "登录信息不完整，请重新登录闲鱼并连接。",
@@ -2006,8 +2009,9 @@
     unconfigured: "未连接",
     pending: "待检测",
     verified: "已验证",
-    risk_control: "需要安全验证",
-    risk_cooldown: "安全验证冷却中",
+    risk_control: "接口请求受限",
+    verification_required: "接口要求验证",
+    risk_cooldown: "请求保护冷却中",
     cookie_expired: "登录已失效",
     cookie_invalid: "需要重新登录",
     cookie_incomplete: "需要重新登录",
@@ -2015,8 +2019,9 @@
   };
 
   const COOKIE_STATUS_ACTIONS = {
-    risk_control: "请在闲鱼官方页面完成验证",
-    risk_cooldown: "等待冷却结束后重新连接",
+    risk_control: "稍后重新检测；仅在闲鱼明确提示时处理验证",
+    verification_required: "在对应的闲鱼官方页面按提示验证后重新检测",
+    risk_cooldown: "等待本地请求保护冷却结束后重新检测",
     cookie_expired: "重新扫码授权后自动恢复服务",
     cookie_invalid: "重新登录闲鱼后自动连接",
     cookie_incomplete: "重新登录闲鱼后自动连接",
@@ -2024,7 +2029,7 @@
   };
 
   const COOKIE_BLOCKING_CODES = new Set([
-    "risk_control", "risk_cooldown", "cookie_expired", "cookie_invalid", "cookie_incomplete", "account_restricted",
+    "risk_control", "risk_cooldown", "verification_required", "cookie_expired", "cookie_invalid", "cookie_incomplete", "account_restricted",
   ]);
 
   function cookieErrorMessage(error) {
@@ -2032,8 +2037,8 @@
   }
 
   function cookieStatusInfo(bot) {
-    const authCode = bot?.auth_code === "risk_control"
-      ? "risk_control"
+    const authCode = ["risk_control", "verification_required"].includes(bot?.auth_code)
+      ? bot.auth_code
       : bot?.auth_code === "session_expired"
         ? "cookie_expired"
         : "";
@@ -2056,18 +2061,20 @@
     const cookie = cookieStatusInfo(bot);
     const code = cookie.code;
     const blocking = COOKIE_BLOCKING_CODES.has(code);
-    const connection = bot.connection_state || (
+    // Legacy risk states did not distinguish an interface rejection from a
+    // real verification challenge. Keep them blocked without asserting one.
+    const connection = ["risk_control", "risk_cooldown"].includes(code) ? "degraded" : bot.connection_state || (
       !bot.cookies_set ? "unconfigured" :
         code === "account_restricted" ? "connected" :
           code === "verified" && bot.connected !== false ? "connected" :
             code === "pending" ? "checking" :
-              code === "risk_control" || code === "risk_cooldown" ? "security_check" :
+              code === "verification_required" ? "security_check" :
                 code === "cookie_expired" || code === "cookie_invalid" || code === "cookie_incomplete" ? "reauth_required" :
                   bot.connected ? "connected" : "degraded"
     );
     const productCount = Number(bot.product_count || 0);
     const catalog = bot.catalog_state || (
-      code === "account_restricted" || code === "risk_control" || code === "risk_cooldown" ? (productCount ? "stale" : "blocked") :
+      code === "account_restricted" || code === "risk_control" || code === "risk_cooldown" || code === "verification_required" ? (productCount ? "stale" : "blocked") :
         code === "pending" ? "syncing" :
           code === "verified" ? (productCount ? "ready" : "empty") :
             !bot.cookies_set ? "not_started" : "unavailable"
@@ -2096,11 +2103,11 @@
         hint: restricted ? "请先在闲鱼官方页面处理账号通知，再重新检测。" : "需要更换账号时，可重新连接店铺。",
       },
       security_check: {
-        action: "完成安全验证",
-        title: "需要完成闲鱼安全验证",
-        description: "请在闲鱼官方页面完成验证，系统不会绕过平台限制。",
+        action: "按接口提示验证",
+        title: "自动连接接口要求验证",
+        description: "接口返回了明确的验证要求，请在对应的闲鱼官方页面处理；App 不一定弹窗。",
         button: "重新检测店铺",
-        hint: "完成官方验证后点击重新检测。",
+        hint: "按官方页面提示处理后重新检测，系统不会绕过平台限制。",
       },
       reauth_required: {
         action: "重新扫码授权",
@@ -3139,7 +3146,7 @@
     const count = state.products.length || view.productCount;
     const lastSync = bot.last_sync_at || (state.products[0] && state.products[0].updated_at);
     const statusLabel = view.restricted ? "部分能力受限" : connected ? (cookieStatus.label || "已验证") : cookieStatus.label || "需要处理";
-    const statusClass = connected && !view.restricted ? "badge-green" : COOKIE_BLOCKING_CODES.has(syncStatus) || view.restricted ? "badge-red" : "badge-muted";
+    const statusClass = connected && !view.restricted ? "badge-green" : ["risk_control", "risk_cooldown"].includes(syncStatus) ? "badge-amber" : COOKIE_BLOCKING_CODES.has(syncStatus) || view.restricted ? "badge-red" : "badge-muted";
     text("#shopAccountValue", shopName);
     text("#shopCookieState", connected ? "已验证" : statusLabel);
     text("#shopProductState", count ? count + " 个商品" : view.catalog === "empty" ? "暂无在售商品" : view.catalog === "blocked" ? "平台限制中" : view.connection === "checking" ? "正在整理" : "等待检测");
@@ -3164,7 +3171,7 @@
     if (notice) {
       const visible = Boolean(bot.cookies_set && (COOKIE_BLOCKING_CODES.has(syncStatus) || syncStatus === "pending" || view.connection === "degraded"));
       notice.hidden = !visible;
-      notice.className = "cookie-status-notice" + (syncStatus === "risk_control" || syncStatus === "risk_cooldown" || view.restricted ? " is-risk" : " is-expired");
+      notice.className = "cookie-status-notice" + (syncStatus === "risk_control" || syncStatus === "risk_cooldown" || syncStatus === "verification_required" || view.restricted ? " is-risk" : " is-expired");
       text("#cookieStatusTitle", cookieStatus.label);
       text("#cookieStatusMessage", cookieStatus.message);
       text("#cookieStatusAction", cookieStatus.action);
@@ -3348,10 +3355,13 @@
       homeGrid.innerHTML = featured.length ? featured.map((product) => {
         const info = getProductDeliveryInfo(product);
         const active = info.configured && info.enabled;
+        const hasPrice = Boolean(product.price_display && product.price_display !== "价格待同步");
+        const priceClass = hasPrice ? "home-product-price" : "home-product-price is-pending";
+        const priceText = product.price_display || "价格待同步";
         return '<a class="home-product-card" href="#" data-view="goods" aria-label="查看商品：' + esc(product.title || "未命名商品") + '">' +
           productThumb(product, "home") +
           '<strong class="home-product-name">' + esc(product.title || "未命名商品") + "</strong>" +
-          '<span class="home-product-price">' + esc(product.price_display || "价格待同步") + "</span>" +
+          '<span class="' + priceClass + '">' + esc(priceText) + "</span>" +
           '<span class="badge ' + (active ? "badge-green" : "badge-muted") + '">' + (active ? "已设置资料" : "未设置") + "</span></a>";
       }).join("") : '<div class="automation-empty">还没有商品，连接店铺后自动整理。</div>';
     }
@@ -3997,9 +4007,11 @@
   }
 
   function attentionCopy(item) {
+    const code = !item?.kind || item.kind === "shop_account" ? item?.error_code || item?.code : "";
+    const requestStatus = ["risk_control", "risk_cooldown", "verification_required"].includes(code);
     return {
-      title: String(item?.title || "需要处理"),
-      message: String(item?.message || "当前店铺有一项真实运行状态需要确认。"),
+      title: String((requestStatus && COOKIE_STATUS_LABELS[code]) || item?.title || "需要处理"),
+      message: String((requestStatus && COOKIE_ERROR_COPY[code]) || item?.message || "当前店铺有一项真实运行状态需要确认。"),
       action: String(item?.action_label || "查看店铺"),
       tone: item?.severity === "error" ? "error" : "warning",
       view: String(item?.action_view || "shops"),
@@ -7854,15 +7866,7 @@
       sync_status: code,
       cookie_status: {
         code,
-        label: {
-          risk_control: "需要安全验证",
-          risk_cooldown: "安全验证冷却中",
-          cookie_expired: "登录已失效",
-          cookie_invalid: "需要重新登录",
-          cookie_incomplete: "需要重新登录",
-    account_restricted: "部分能力受限",
-
-        }[code] || "需要处理",
+        label: COOKIE_STATUS_LABELS[code] || "需要处理",
         message: cookieErrorMessage(error),
         action: COOKIE_STATUS_ACTIONS[code] || "处理后重新检测",
       },

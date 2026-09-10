@@ -389,20 +389,52 @@ class AgentTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.api.token_calls, 1)
 
     async def test_restart_with_needs_human_status_makes_zero_platform_requests(self):
-        self.agent._write_auth_status("risk_control", True)
-        restarted_api = FakeApi()
+        for code in ("risk_control", "verification_required"):
+            with self.subTest(code=code):
+                self.agent._write_auth_status(code, True)
+                restarted_api = FakeApi()
+                with self.assertRaises(AuthenticationUnavailableError) as raised:
+                    XianyuLive(
+                        "unb=seller-test; token=not-a-secret",
+                        reply_bot=FakeBot(),
+                        api_client=restarted_api,
+                        data_dir=str(self.state_dir),
+                        products_config_path=str(self.products_path),
+                        automation_mode="rules_ai",
+                    )
+                self.assertEqual(raised.exception.code, code)
+                self.assertEqual(restarted_api.token_calls, 0)
 
+    async def test_explicit_verification_stops_refresh_and_persists_protection(self):
+        self.api.token_error = XianyuAuthenticationError("verification_required")
+        self.agent.ws = AsyncMock()
+        self.agent.connection_ready.set()
         with self.assertRaises(AuthenticationUnavailableError) as raised:
-            XianyuLive(
-                "unb=seller-test; token=not-a-secret",
-                reply_bot=FakeBot(),
-                api_client=restarted_api,
-                data_dir=str(self.state_dir),
-                products_config_path=str(self.products_path),
-                automation_mode="rules_ai",
-            )
-        self.assertEqual(raised.exception.code, "risk_control")
-        self.assertEqual(restarted_api.token_calls, 0)
+            await self.agent.refresh_token()
+        self.assertEqual(raised.exception.code, "verification_required")
+        state = self.agent._read_auth_status()
+        self.assertEqual(state["code"], "verification_required")
+        self.assertEqual(state["session"]["state"], "SECURITY_CHECK")
+        self.assertEqual(state["phase"], "NEEDS_HUMAN")
+        self.assertTrue(state["needs_human"])
+        self.assertTrue(state["reauthorization_required"])
+        self.assertTrue(self.agent.token_circuit_open)
+        self.assertFalse(self.agent.connection_ready.is_set())
+        self.agent.ws.close.assert_awaited_once()
+        with self.assertRaises(AuthenticationUnavailableError):
+            await self.agent.refresh_token()
+        self.assertEqual(self.api.token_calls, 1)
+
+    async def test_item_or_trade_verification_uses_the_same_stop_path(self):
+        self.agent.ws = AsyncMock()
+        operation = MagicMock(side_effect=XianyuAuthenticationError("verification_required"))
+        with self.assertRaises(AuthenticationUnavailableError) as raised:
+            await self.agent._call_xianyu_api(operation, "1001")
+        self.assertEqual(raised.exception.code, "verification_required")
+        operation.assert_called_once_with("1001")
+        self.agent.ws.close.assert_awaited_once()
+        self.assertTrue(self.agent.token_circuit_open)
+        self.assertEqual(self.agent._read_auth_status()["code"], "verification_required")
 
     async def test_rgv587_stops_timer_and_concurrent_followup_requests(self):
         self.api.token_error = XianyuAuthenticationError("risk_control")

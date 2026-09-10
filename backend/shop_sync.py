@@ -55,9 +55,14 @@ SYNC_STATUS_CATALOG = {
         "action": "可随时重新检测店铺商品",
     },
     "risk_control": {
-        "label": "需要安全验证",
-        "message": "闲鱼要求安全验证，请先在闲鱼 App 或浏览器完成安全验证",
-        "action": "完成安全验证后重新检测",
+        "label": "接口请求受限",
+        "message": "最近一次自动连接请求未通过接口校验或被限制，尚不能确认是否需要安全验证。",
+        "action": "稍后重新检测；仅在闲鱼明确提示时处理验证。",
+    },
+    "verification_required": {
+        "label": "接口要求验证",
+        "message": "自动连接接口返回了明确的验证要求，请在对应的闲鱼官方页面按提示处理；App 不一定弹窗。",
+        "action": "按官方页面提示处理后重新检测",
     },
     "account_restricted": {
         "label": "账号受限",
@@ -65,8 +70,8 @@ SYNC_STATUS_CATALOG = {
         "action": "请在闲鱼官方页面查看处理通知，处理后重新检测",
     },
     "risk_cooldown": {
-        "label": "安全验证冷却中",
-        "message": "闲鱼安全验证冷却中，请稍后再检测",
+        "label": "请求保护冷却中",
+        "message": "系统因之前的受限请求暂停了检测，请等待冷却结束后再试。此为本地保护，不是平台账号通知。",
         "action": "等待冷却结束后重新检测",
     },
     "cookie_expired": {
@@ -130,9 +135,12 @@ SYNC_STATUS_CATALOG = {
         "action": "请稍后重新检测",
     },
 }
+# Historical platform wording must not override these evidence-bounded labels.
+CANONICAL_STATUS_CODES = frozenset({"risk_control", "verification_required", "risk_cooldown"})
 PERSISTED_SYNC_CODES = frozenset(
     {
         "risk_control",
+        "verification_required",
         "account_restricted",
         "risk_cooldown",
         "cookie_expired",
@@ -156,11 +164,23 @@ RISK_CONTROL_MARKERS = (
     "USER_VALIDATE",
     "USER_VALID",
     "LOGIN_CHECK",
-    "SECURITY_CHECK",
-    "CAPTCHA",
     "/PUNISH",
-    "被挤爆",
 )
+# Exact codes, not arbitrary error-code substrings such as NOT_CAPTCHA_ERROR.
+VERIFICATION_CODES = frozenset({
+    "CAPTCHA", "CAPTCHA_REQUIRED", "FAIL_SYS_CAPTCHA", "FAIL_SYS_CAPTCHA_REQUIRED",
+    "SECURITY_CHECK", "SECURITY_CHECK_REQUIRED", "FAIL_SYS_SECURITY_CHECK",
+    "FAIL_SYS_SECURITY_CHECK_REQUIRED",
+})
+VERIFICATION_REQUEST = re.compile(
+    r"(?<![不无未])(?:请|需要|必须)(?:先)?(?:完成|进行)(?:安全验证|人机验证|滑块验证|验证码验证)"
+    r"|(?<!NO )(?<!NOT )\b(?:CAPTCHA|SECURITY CHECK) (?:IS )?REQUIRED\b"
+)
+ERROR_STATUS_FIELDS = (
+    "ret", "code", "errorCode", "error_code", "retCode", "status", "statusCode",
+    "status_code", "message", "msg", "errorMsg", "errorMessage",
+)
+VERIFICATION_FIELDS = ("captchaRequired", "needCaptcha", "securityCheckRequired", "verificationRequired")
 SESSION_EXPIRED_MARKERS = (
     "SESSION_EXPIRED",
     "SESSION INVALID",
@@ -176,9 +196,11 @@ PLATFORM_BUSY_MARKERS = (
     "FAIL_SYS_BUSY",
     "SYSTEM_BUSY",
     "SERVER_BUSY",
-    "TOO_MANY_REQUESTS",
+    "TOO_MANY_REQUEST",
     "RATE_LIMIT",
     "FREQUENCY_LIMIT",
+    "TRAFFIC_LIMIT",
+    "被挤爆",
 )
 
 _request_lock = threading.Lock()
@@ -218,6 +240,8 @@ def sync_status_payload(code: str, message: str | None = None, checked_at: str =
     candidate = str(code or "")
     normalized = candidate if re.fullmatch(r"[a-z][a-z0-9_]{1,48}", candidate) else "sync_error"
     catalog = SYNC_STATUS_CATALOG.get(normalized, SYNC_STATUS_CATALOG["sync_error"])
+    if normalized in CANONICAL_STATUS_CODES:
+        message = catalog["message"]
     return {
         "code": normalized,
         "label": catalog["label"],
@@ -584,6 +608,8 @@ def _failure_code_from_text(value: str) -> str:
     text = str(value or "").upper()
     if any(marker in text for marker in ACCOUNT_RESTRICTION_MARKERS):
         return "account_restricted"
+    if any(part.strip() in VERIFICATION_CODES for part in text.split("::")) or VERIFICATION_REQUEST.search(text):
+        return "verification_required"
     if any(marker in text for marker in RISK_CONTROL_MARKERS):
         return "risk_control"
     if any(marker in text for marker in SESSION_EXPIRED_MARKERS):
@@ -593,12 +619,35 @@ def _failure_code_from_text(value: str) -> str:
     return "platform_error"
 
 
+def _response_failure_code(raw: dict) -> str:
+    """Inspect only response error fields and explicit verification flags."""
+    nodes = [raw]
+    if isinstance(raw.get("content"), dict):
+        nodes.append(raw["content"])
+    codes = set()
+    for node in nodes:
+        for key in ERROR_STATUS_FIELDS:
+            value = node.get(key)
+            values = value[:16] if isinstance(value, (list, tuple)) else [value]
+            for text in values:
+                if isinstance(text, str) and text.partition("::")[0].strip().upper() != "SUCCESS":
+                    codes.add(_failure_code_from_text(text[:4096]))
+    # A named boolean requirement is evidence; product text/URLs are not.
+    flag_nodes = nodes + ([raw["data"]] if isinstance(raw.get("data"), dict) else [])
+    if any(node.get(key) is True for node in flag_nodes for key in VERIFICATION_FIELDS):
+        codes.add("verification_required")
+    for code in ("account_restricted", "verification_required", "risk_control", "cookie_expired", "platform_busy"):
+        if code in codes:
+            return code
+    return "platform_error"
+
+
 def _raise_classified_failure(code: str) -> None:
     if code == "account_restricted":
         raise ShopSyncError(code, "闲鱼限制了当前账号的部分操作，暂时不能发布商品")
-    if code == "risk_control":
+    if code in {"risk_control", "verification_required"}:
         _trip_circuit()
-        raise ShopSyncError(code, "闲鱼需要安全验证，请先在浏览器完成验证后再试")
+        raise ShopSyncError(code, SYNC_STATUS_CATALOG[code]["message"])
     if code == "cookie_expired":
         raise ShopSyncError(code, "Cookie 已失效，请重新登录闲鱼后复制完整 Cookie")
     if code == "platform_busy":
@@ -612,11 +661,13 @@ def _classify_response(raw) -> dict:
     ret = raw.get("ret") or []
     if isinstance(ret, str):
         ret = [ret]
-    ret_text = " ".join(str(item) for item in ret)
-    if "SUCCESS" not in ret_text.upper():
-        # The browser receives only a stable code and catalog copy, never the
-        # platform response text used for this classification.
-        _raise_classified_failure(_failure_code_from_text(ret_text))
+    code = _response_failure_code(raw)
+    if code != "platform_error" or not (
+        isinstance(ret, (list, tuple)) and ret
+        and all(isinstance(item, str) and item.partition("::")[0].strip().upper() == "SUCCESS" for item in ret)
+    ):
+        # Never accept NOT_SUCCESS or an error containing SUCCESS as success.
+        _raise_classified_failure(code)
     data = raw.get("data")
     if isinstance(data, str) and len(data) <= MAX_RESPONSE_BYTES:
         try:
@@ -629,7 +680,7 @@ def _classify_response(raw) -> dict:
 def _request(cookie_header: str, cookies: dict[str, str], api: str, data: dict, spm_cnt: str) -> dict:
     global _last_request_at
     if _circuit_until() > time.time():
-        raise ShopSyncError("risk_cooldown", "闲鱼安全验证冷却中，请稍后再试")
+        raise ShopSyncError("risk_cooldown", SYNC_STATUS_CATALOG["risk_cooldown"]["message"])
 
     data_value = json.dumps(data, ensure_ascii=True, separators=(",", ":"))
     timestamp = str(int(time.time() * 1000))
@@ -688,7 +739,12 @@ def _request(cookie_header: str, cookies: dict[str, str], api: str, data: dict, 
             error_body = error.read(min(MAX_RESPONSE_BYTES, 64 * 1024)).decode("utf-8", errors="ignore")
         except (OSError, UnicodeError):
             error_body = ""
-        body_code = _failure_code_from_text(error_body)
+        try:
+            error_payload = json.loads(error_body)
+        except (TypeError, ValueError):
+            body_code = _failure_code_from_text(error_body)
+        else:
+            body_code = _response_failure_code(error_payload) if isinstance(error_payload, dict) else "platform_error"
         if body_code != "platform_error":
             _raise_classified_failure(body_code)
         if error.code in {401, 403}:

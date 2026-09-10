@@ -40,6 +40,7 @@ _DOMAIN_WORDS = {"knowledge": re.compile(r"知识|客服(?:内容|资料)|问答
                  "rules": re.compile(r"回复规则|规则|关键词|自动回复|reply\s*rule|keyword", re.I),
                  "delivery": re.compile(r"发货|履约|网盘|卡密|文字资料|发送资料|delivery|fulfillment|redeem|material", re.I)}
 _ALL_TARGETS = re.compile(r"全店|全部(?:的)?商品|所有(?:的)?商品|所有产品|整个店铺|\b(?:all|every)\s+(?:products?|items?)\b", re.I)
+_EXCLUDE_TARGET = re.compile(r"除了|除外|排除|不包括|不包含|不涉及|不要动|别动|\b(?:except|excluding)\b", re.I)
 _REPLACE = re.compile(r"替换|覆盖|改成|改为|换成|换为|replace|overwrite|switch", re.I)
 _MESSAGES = {"invalid_arguments": "工具参数格式无效或包含未允许字段", "tool_not_allowed": "当前请求没有授权该工具，未执行修改",
              "scope_invalid": "当前用户或店铺已失效，请重新打开店铺", "permission_denied": "当前用户缺少该操作所需权限",
@@ -83,6 +84,14 @@ def _directive_text(text):
     # Quoted business content is data, not a grant of additional write domains.
     text = re.sub(r'“[^”]*”|「[^」]*」|"[^"\n]*"', '（用户提供内容）', text)
     return re.split(r"(?:正文|内容|发送资料|文字资料)\s*(?:是|为)?\s*[:：]", text, maxsplit=1)[0]
+
+
+def _literal_target(expression):
+    named = re.match(r"^(?:名为|名称为|叫作)\s*(.*)$", expression, re.S)
+    value = named[1].strip() if named else expression
+    if re.fullmatch(r'“[^”]*”|「[^」]*」|"[^"\n]*"', value):
+        return value[1:-1]
+    return value if named else None
 
 
 def request_domains(message: str, prior_user_messages: list[str] = []) -> list[str]:
@@ -243,22 +252,60 @@ class OperationsTools:
         # intent_text is built by the runner exclusively from persisted user messages.
         return set(allowed).intersection(request_domains(message, [intent]))
 
+    @staticmethod
+    def _split_exclusion(clause):
+        # Keep quoted names available for resolution, but never interpret words
+        # inside quoted business content as exclusion operators or boundaries.
+        masked = re.sub(r'“[^”]*”|「[^」]*」|"[^"\n]*"', lambda match: "\ufffd" * len(match[0]), clause)
+        marker = _EXCLUDE_TARGET.search(masked)
+        if marker is None:
+            return clause, []
+        if marker[0] == "除外":
+            prefix = re.match(r"\s*(?:给|为|把|将|对)\s*", masked)
+            start = prefix.end() if prefix else 0
+            expression = clause[start:marker.start()]
+            end = marker.end() + (1 if masked[marker.end():].startswith("的") else 0)
+            clean = clause[:start] + clause[end:]
+        else:
+            rest = masked[marker.end():]
+            boundary = re.search(r"(?:之外|以外)(?:的)?|(?:的)?(?=(?:给|为|把|将|对)?\s*(?:" + _ALL_TARGETS.pattern + r"))", rest, re.I)
+            end = marker.end() + (boundary.start() if boundary else len(rest))
+            expression = clause[marker.end():end]
+            clean = clause[:marker.start()] + clause[marker.end() + boundary.end():] if boundary else clause[:marker.start()]
+        # Unparsed/nested exclusions fail closed rather than degrading to all.
+        return clean, [expression.strip()] + ([""] if _EXCLUDE_TARGET.search(_directive_text(clean)) else [])
+
     def _directive_records(self, run):
         def collect(text):
-            text = re.split(r"(?:正文|内容|发送资料|文字资料)\s*(?:是|为)?\s*[:：]", text, maxsplit=1)[0]
             masked = re.sub(r'“[^”]*”|「[^」]*」|"[^"\n]*"', lambda match: "\ufffd" * len(match[0]), text)
+            body = re.search(r"(?:正文|内容|发送资料|文字资料)\s*(?:是|为)?\s*[:：]", masked)
+            if body:
+                text, masked = text[:body.start()], masked[:body.start()]
             separators = re.finditer(r"[，,。；;\n]|然后|之后|并且|并(?=新增|修改|改写|更新|保存|启用|停用|禁用|配置|绑定|替换|参考|参照|查看|读取)", masked)
             clauses, start = [], 0
             for separator in separators:
-                clauses.append(text[start:separator.start()])
+                clauses.append((text[start:separator.start()], separator[0]))
                 start = separator.end()
-            clauses.append(text[start:])
-            records, last_targets, last_domains = [], [], []
-            for clause in clauses:
+            clauses.append((text[start:], ""))
+            records, last_targets, last_domains, exclusions = [], [], [], []
+            exclusion_list = False
+            for clause, separator in clauses:
+                continuation, exclusion_list = exclusion_list, False
                 clean = re.sub(r"^\s*(?:(?:请帮我|请|帮我|麻烦你|麻烦|我想|我要|需要|继续|再)\s*)*", "", clause).strip()
-                if not clean or re.match(r"参考|参照|根据|阅读|查看|读取|查询|分析|检查|解释|说明|介绍|关于|使用|用|现有|已有", clean):
+                if not clean:
                     continue
-                if not _WRITE_VERB.search(_directive_text(clean)):
+                clean, excluded = self._split_exclusion(clean)
+                directive = _directive_text(clean)
+                writes = bool(_WRITE_VERB.search(directive))
+                command = writes and (re.match(r"给|为|把|将|对", directive)
+                                      or (_WRITE_VERB.match(directive) and re.search(r"商品|产品|\b(?:products?|items?)\b", directive, re.I)))
+                if continuation and not excluded and not command:
+                    # Names such as 使用说明/参考教程/配置说明 are still list
+                    # targets here, not reference clauses or new write actions.
+                    clean, excluded, writes = "", [clean], False
+                exclusions.extend(excluded)
+                exclusion_list = bool(excluded) and not writes and separator in {",", "，"}
+                if not writes or re.match(r"参考|参照|根据|阅读|查看|读取|查询|分析|检查|解释|说明|介绍|关于|使用|用|现有|已有", clean):
                     continue
                 domains = [domain for domain, pattern in _DOMAIN_WORDS.items() if pattern.search(_directive_text(clean))]
                 if not domains and "客服" in clean:
@@ -266,16 +313,29 @@ class OperationsTools:
                 domains = domains or last_domains
                 targets = self._target_expressions(clean) or last_targets
                 for domain in domains:
-                    records.append({"domain": domain, "text": clean, "targets": targets})
+                    records.append({"domain": domain, "text": clean, "targets": targets, "exclusions": exclusions})
                 if targets:
                     last_targets = targets
                 if domains:
                     last_domains = domains
-            return records
+            # Conservatively retain every explicit exclusion for this request,
+            # including standalone clauses before/after a batch directive.
+            return records, exclusions
         message = str(run.get("message") or "")
-        records = collect(message)
+        if _readonly(message):
+            return []
+        records, current_exclusions = collect(message)
         if not records or ("继续" in message and not any(row["targets"] for row in records)):
-            records = collect(self._intent(run))
+            intent = self._intent(run)
+            records, _ = collect(intent)
+            masked = re.sub(r'“[^”]*”|「[^」]*」|"[^"\n]*"', lambda match: "\ufffd" * len(match[0]), intent)
+            body = re.search(r"(?:正文|内容|发送资料|文字资料)\s*(?:是|为)?\s*[:：]", masked)
+            if body and "\n" in intent[body.end():]:
+                # Flattened history cannot distinguish later user restrictions
+                # from multiline business data after a body marker. Require a
+                # self-contained request rather than silently losing exclusions.
+                current_exclusions.append("")
+            records = [{**row, "exclusions": row["exclusions"] + current_exclusions} for row in records]
             if re.fullmatch(r"\s*\d{1,64}\s*", message):
                 records = [{**row, "targets": [message.strip()]} for row in records]
         return records
@@ -283,7 +343,7 @@ class OperationsTools:
     def _action_modes(self, run, domain, target=None, products=None, selector=""):
         modes = set()
         for row in self._directive_records(run):
-            if row["domain"] != domain or (target is not None and not self._matches_targets(row["targets"], target, products, selector)):
+            if row["domain"] != domain or (target is not None and not self._matches_directive(row, target, products, selector)):
                 continue
             text = _directive_text(row["text"])
             if re.search(r"新增|新建|添加|创建|生成|补充|改写|修改|更新|保存|绑定|替换|覆盖|改成|改为|\b(?:add|create|rewrite|modify|update|save|bind|replace)\b", text, re.I):
@@ -297,9 +357,21 @@ class OperationsTools:
     def _check_action(self, run, name, arguments):
         domain = REGISTRY[name][2]
         row = self._get_ref(run, arguments["target_ref"], "product")
-        modes = self._action_modes(run, domain, row["target"], self._products(run)[1], json.loads(row["details_json"]).get("selector", ""))
+        products, selector = self._products(run)[1], json.loads(row["details_json"]).get("selector", "")
+        modes = self._action_modes(run, domain, row["target"], products, selector)
         if not modes:
             raise OperationsToolError("clarification_required", message="用户未授权为该商品执行此类配置操作")
+        if name == "delivery_configure" and arguments.get("replace_existing"):
+            for directive in self._directive_records(run):
+                text = _directive_text(directive["text"])
+                if (directive["domain"] == "delivery" and self._matches_directive(directive, row["target"], products, selector)
+                        and _REPLACE.search(text) and not any(pattern.search(text) for key, pattern in _DOMAIN_WORDS.items() if key != "delivery")
+                        # A compound clause may associate different verbs with
+                        # different targets. Never share its replacement grant.
+                        and len(re.findall(_WRITE_VERB.pattern + "|" + _REPLACE.pattern, text, re.I)) == 1):
+                    break
+            else:
+                raise OperationsToolError("clarification_required", message="用户尚未明确授权替换该商品原有发货类型，请明确目标和替换操作")
         if None in modes:
             return None
         if (len(modes) != 1 or name in {"knowledge_save", "rule_upsert"} or arguments.get("enabled") not in modes):
@@ -383,10 +455,18 @@ class OperationsTools:
     def _target_expressions(message):
         # Only the syntactic target, not action/domain words or supplied body,
         # can authorize a product. Quoted product names may contain those words.
-        text = re.split(r"(?:正文|内容|发送资料|文字资料)\s*(?:是|为)?\s*[:：]", message, maxsplit=1)[0]
+        masked = re.sub(r'“[^”]*”|「[^」]*」|"[^"\n]*"', lambda match: "\ufffd" * len(match[0]), message)
+        body = re.search(r"(?:正文|内容|发送资料|文字资料)\s*(?:是|为)?\s*[:：]", masked)
+        text = message[:body.start()] if body else message
+        masked = masked[:len(text)]
+        clauses, start = [], 0
+        for separator in re.finditer(r"[，,。；;！？\n]", masked):
+            clauses.append(text[start:separator.start()])
+            start = separator.end()
+        clauses.append(text[start:])
         domain = re.compile(r"(?:的)?(?:售前|售后)?(?:客服知识|知识|客服配置|客服|回复规则|自动回复|规则|关键词|(?:文字|文本|网盘|卡密)?发货|履约|文字资料|发送资料)|\b(?:knowledge|faq|reply\s*rules?|delivery|fulfillment)\b", re.I)
         expressions = []
-        for clause in re.split(r"[，,。；;！？\n]", text):
+        for clause in clauses:
             clause = re.sub(r"^\s*(?:(?:请帮我|请|帮我|麻烦你|麻烦|我想|我要|需要|继续|然后|并且|再)\s*)*", "", clause).strip()
             if not clause or re.search(r"排除|除了|不包括|不包含|不涉及|\b(?:except|excluding)\b", clause, re.I):
                 continue
@@ -399,27 +479,47 @@ class OperationsTools:
             prefix = re.match(r"(?:给|为|把|将|对|就是|选择)\s*", masked) or _WRITE_VERB.match(masked)
             if not _WRITE_VERB.search(masked):
                 continue
-            for match in re.finditer(r"(?:商品\s*(?:ID|编号)?|\b(?:item|product)\s+id)\s*(?:是|为|[:：=#])?\s*([0-9]{1,64})(?![0-9])", masked, re.I):
-                expressions.append(match[1])
             start = prefix.end() if prefix else 0
             ends = [match.start() for pattern in (domain, _WRITE_VERB) if (match := pattern.search(masked, start))]
             expression = clause[start:min(ends) if ends else len(clause)].strip()
-            expression = re.sub(r"^(?:(?:本店|当前店铺)的?)?(?:名为|名称为|叫作)?\s*", "", expression)
-            expression = re.sub(r"(?:的|这个商品)$", "", expression).strip(" \t“”「」\"")
-            if expression:
-                expressions.append(expression)
-            # English domain-first directives identify the target after for/on.
-            for match in re.finditer(r"\b(?:for|on)\s+(.+?)(?=\s+(?:using|with|to)\b|$)", clause, re.I):
-                expressions.append(match[1].strip(" \t\""))
+            expression = re.sub(r"^(?:(?:本店|当前店铺)的?)?\s*", "", expression)
+            expression = re.sub(r"(?:的|这个商品)$", "", expression).strip()
+            targets = [expression] if expression else []
+            # Preserve literal-name markers in both syntaxes. A quoted title may
+            # itself contain for/on, IDs or words such as 全部商品/all products.
+            for match in re.finditer(r"\b(?:for|on)\s+(.+?)(?=\s+(?:using|with|to)\b|$)", masked, re.I):
+                targets.append(clause[match.start(1):match.end(1)].strip())
+            if not any(_literal_target(value) is not None for value in targets):
+                for match in re.finditer(r"(?:商品\s*(?:ID|编号)?|\b(?:item|product)\s+id)\s*(?:是|为|[:：=#])?\s*([0-9]{1,64})(?![0-9])", masked, re.I):
+                    expressions.append(match[1])
+            expressions.extend(targets)
         return expressions
 
     def _matches_targets(self, expressions, target, products, selector=""):
         titles = {key: str(product.get("title") or product.get("name") or "").strip().casefold() for key, product in products.items()}
         for expression in expressions:
             expression = expression.casefold()
+            literal = _literal_target(expression)
+            if literal is not None:
+                # Quoting/naming selects a name, never a numeric ID, a list or a
+                # wildcard. Only the existing unique user-supplied fragment rule
+                # may resolve a literal that has no exact title match.
+                matches = [key for key, title in titles.items() if literal and title == literal]
+                if not matches and len(literal) >= 2 and selector.casefold() == literal:
+                    matches = [key for key, title in titles.items() if literal in title]
+                if len(matches) > 1:
+                    raise OperationsToolError("clarification_required", message="商品名称匹配多个结果，请补充要操作的商品ID")
+                if matches == [target]:
+                    return True
+                continue
             identifiers = re.sub(r"商品|编号|\b(?:product|item|id)\b", "", expression).strip()
-            if re.fullmatch(r"[0-9\s、和及与]+", identifiers) and target in re.findall(r"[0-9]{1,64}", identifiers):
-                return True
+            item_ids = re.findall(r"[0-9]+", identifiers)
+            if item_ids and re.fullmatch(r"[0-9\s、和及与]+", identifiers):
+                if target in item_ids:
+                    return True
+                # An explicit ID/list cannot grant a different item's title,
+                # even when that title happens to contain the same digits.
+                continue
             if _ALL_TARGETS.fullmatch(expression):
                 return True
             mentions = [(key, match.start(), match.end()) for key, title in titles.items() if title
@@ -442,8 +542,44 @@ class OperationsTools:
                     raise OperationsToolError("clarification_required", message="商品名称匹配多个结果，请补充要操作的商品ID")
         return False
 
+    def _matches_directive(self, row, target, products, selector=""):
+        if not self._matches_targets(row["targets"], target, products, selector):
+            return False
+        if not row["exclusions"]:
+            return True
+        excluded = set()
+        titles = {key: re.sub(r"\s+", "", str(product.get("title") or product.get("name") or "")).casefold()
+                  for key, product in products.items()}
+        for expression in row["exclusions"]:
+            masked = re.sub(r'“[^”]*”|「[^」]*」|"[^"\n]*"', lambda match: "\ufffd" * len(match[0]), expression)
+            parts, start = [], 0
+            for separator in re.finditer(r"[、和及与]|\band\b", masked, re.I):
+                parts.append(expression[start:separator.start()])
+                start = separator.end()
+            parts.append(expression[start:])
+            if len(parts) > 1 and re.sub(r"\s+", "", expression).casefold() in titles.values():
+                # An unquoted name can also be a list of other product names.
+                # Do not silently choose either interpretation of the exclusion.
+                parts = [""]
+            for part in parts:
+                quoted = re.fullmatch(r'“[^”]*”|「[^」]*」|"[^"\n]*"', part.strip())
+                value = re.sub(r"\s+", "", part.strip(" \t“”「」\"")).casefold()
+                identifier = None if quoted else re.fullmatch(r"(?:(?:商品|产品)(?:id|编号)?|(?:product|item)(?:id)?|id|编号)?[:：=#]?([0-9]{1,64})", value)
+                if identifier:
+                    matches = [identifier[1]] if identifier[1] in products else []
+                else:
+                    matches = [key for key, title in titles.items() if title == value] if value else []
+                    if not matches and len(value) >= 2:
+                        matches = [key for key, title in titles.items() if value in title]
+                # Resolve against the entire shop, not the model's query/ref.
+                # An unknown or ambiguous exclusion cannot leave a wildcard grant.
+                if len(matches) != 1:
+                    raise OperationsToolError("clarification_required", message="排除的商品无法唯一确定，请提供明确商品ID，不会猜测批量修改范围")
+                excluded.update(matches)
+        return target not in excluded
+
     def _authorized_target(self, run, target, products, selector="", domain=None):
-        return any(self._matches_targets(row["targets"], target, products, selector)
+        return any(self._matches_directive(row, target, products, selector)
                    for row in self._directive_records(run) if domain is None or row["domain"] == domain)
 
     def _target(self, run, ref, *, write=False, domain=None):
@@ -668,7 +804,7 @@ class OperationsTools:
     def _check_rule_selection(self, run, target, product, rule, document, selector=""):
         products = self._products(run)[1]
         text = "，".join(row["text"] for row in self._directive_records(run) if row["domain"] == "rules"
-                        and self._matches_targets(row["targets"], target, products, selector))
+                        and self._matches_directive(row, target, products, selector))
         title = str(product.get("title") or product.get("name") or "")
         if title:
             text = text.replace(title, "")
@@ -804,8 +940,6 @@ class OperationsTools:
             material = arguments.get("material")
             if material is not None:
                 self._source_check(material, [intent], exact=True)
-            if arguments.get("replace_existing") and not _REPLACE.search(intent):
-                raise OperationsToolError("clarification_required", message="用户尚未明确授权替换原有发货类型")
             saved, configured = configure_target(raw, target, title, delivery, enabled=arguments["enabled"], stable_id="ops-delivery-" + stable_id,
                                                 material=material, resource=resource, replace_existing=arguments.get("replace_existing", False))
             file_kind, file_target = PRODUCTS_FILE, ""

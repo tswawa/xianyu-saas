@@ -38,3 +38,7 @@ npm run test:templates-cards
 npm run test:deploy
 npm run test:worker
 npm run test:ui
+SAAS_UI_SCOPE=home-alerts npm run test:ui
+SAAS_UI_SCOPE=popover npm run test:ui
+SAAS_UI_SCOPE=orders npm run test:ui
+SAAS_UI_SCOPE=mock npm run test:ui

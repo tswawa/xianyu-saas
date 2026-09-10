@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import copy
+from contextlib import closing
 import hashlib
 import json
 import os
@@ -26,6 +27,9 @@ from db import DB
 from fulfillment_config import (FulfillmentConfigError, configure_target, digest, normalise_template_input,
                                 template_public, upsert_template, validate_receipt, without_receipt)
 from operations_tools import OperationsTools, OperationsToolError, REGISTRY, request_domains
+
+sys.path.append(str(ROOT / "worker"))
+from delivery_store import DeliveryStore, DeliveryStoreError
 
 
 def no_network(*_args, **_kwargs):
@@ -953,6 +957,178 @@ class ToolContracts(unittest.TestCase):
         self.assertEqual(f.read("products_config.json"), updated)
         with self.assertRaises(FulfillmentConfigError):
             f.tools.fulfillment.write_products(1, "one", current, expected_revision="0" * 64)
+
+
+class FulfillmentInventoryContracts(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="fulfillment-inventory-")
+        self.f = Fixture(self.temp.name)
+        self.database = self.f.root / "delivery_state.db"
+        self.store = None
+
+    def tearDown(self):
+        self.f.db.con.close()
+        self.temp.cleanup()
+
+    def start_store(self, *, import_manifest=False):
+        self.store = DeliveryStore(str(self.database))
+        if import_manifest:
+            self.store.import_inventory(str(self.f.root / "redeem_codes.json"), "redeem")
+        return self.store
+
+    def business_files(self):
+        # A read-only SQLite connection can update WAL/SHM coordination data;
+        # ledger and manifest bytes must remain untouched. Do not use immutable
+        # reads, which could silently omit committed used-state in a live WAL.
+        return {path: value for path, value in self.f.files().items() if not path.endswith(("-wal", "-shm"))}
+
+    def resource(self):
+        before = self.business_files()
+        with patch.object(DeliveryStore, "import_inventory", side_effect=AssertionError("preview must not import inventory")):
+            rows = self.f.tools.fulfillment.resources(1, "one")
+        self.assertEqual(self.business_files(), before)
+        return next(row for row in rows if row["kind"] == "inventory")
+
+    def test_first_binding_uses_new_manifest_after_rules_created_empty_inventory(self):
+        f = self.f
+        # A rules-only Worker constructs this DB but does not import any codes.
+        f.write("products_config.json", {"version": 1, "types": []})
+        (f.root / "redeem_codes.json").unlink()
+        self.start_store()
+        self.assertEqual(self.store.inventory_counts(), {})
+        f.write("redeem_codes.json", [{"code": "FIRST-NEW-CODE", "used": False}])
+        resource = self.resource()
+        self.assertEqual(resource["count"], 1)
+        self.assertTrue(resource["available"])
+        before_manifest = (f.root / "redeem_codes.json").read_bytes()
+        before_db = self.database.read_bytes()
+        run = f.run("给Python教程配置卡密发货，使用现有资源")
+        target = f.target(run)
+        before = self.business_files()
+        listing = f.call(run, "delivery_resources_list", {"delivery": "redeem"})
+        self.assertEqual(self.business_files(), before)
+        self.assertNotIn("FIRST-NEW-CODE", json.dumps(listing))
+        ref = listing["data"]["resources"][0]["resource_ref"]
+        result = f.call(run, "delivery_configure", f.delivery_args(run, target, delivery="redeem", resource_ref=ref))
+        self.assertTrue(result["changed"])
+        self.assertEqual(f.read("products_config.json")["types"][0]["item_ids"], ["101"])
+        self.assertEqual(self.store.inventory_counts(), {})
+        self.assertEqual(self.database.read_bytes(), before_db)
+        self.assertEqual((f.root / "redeem_codes.json").read_bytes(), before_manifest)
+
+    def test_pending_manifest_counts_match_import_and_preserve_durable_states(self):
+        statuses = ("available", "used", "reserved", "legacy_used", "quarantined", "revoked")
+        old = [{"code": "CODE-" + status, "used": False} for status in statuses]
+        old.extend([{"code": "REMOVED", "used": False}, {"code": "NOW-USED", "used": False}])
+        self.f.write("redeem_codes.json", old)
+        self.start_store(import_manifest=True)
+        with closing(sqlite3.connect(self.database)) as con, con:
+            for status in statuses:
+                con.execute("UPDATE inventory SET status=? WHERE kind='redeem' AND secret=?", (status, "CODE-" + status))
+            # Inventory from a different kind is not stock in the redeem pool,
+            # and a matching secret there cannot override a used redeem code.
+            con.execute("INSERT INTO inventory(kind,secret,status,created_at,updated_at) VALUES('other','OTHER-POOL','available',0,0)")
+            con.execute("INSERT INTO inventory(kind,secret,status,created_at,updated_at) VALUES('other','CODE-used','available',0,0)")
+        manifest = [row for row in old if row["code"] != "REMOVED"]
+        manifest[-1]["used"] = True
+        manifest.extend([{"code": " NEW-A "}, {"code": "NEW-B", "used": False}, {"code": "NEW-USED", "used": True}])
+        self.f.write("redeem_codes.json", manifest)
+        before = self.resource()
+        self.assertEqual(before["count"], 3)
+        self.assertTrue(before["available"])
+        self.store.import_inventory(str(self.f.root / "redeem_codes.json"), "redeem")
+        self.assertEqual(self.store.inventory_counts()["redeem"]["available"], before["count"])
+        self.assertEqual(self.resource()["count"], before["count"])
+        with closing(sqlite3.connect(self.database)) as con, con:
+            actual = dict(con.execute("SELECT secret,status FROM inventory WHERE kind='redeem'"))
+        self.assertEqual(actual["REMOVED"], "quarantined")
+        self.assertEqual(actual["NOW-USED"], "legacy_used")
+        for status in statuses:
+            self.assertEqual(actual["CODE-" + status], status)
+
+    def test_deleted_and_reimported_codes_never_revive_under_new_pool_labels(self):
+        f = self.f
+        f.write("redeem_codes.json", [
+            {"code": "REMOVED-CODE", "used": False, "pool": "old", "tags": ["old"]},
+            {"code": "USED-CODE", "used": True},
+        ])
+        self.start_store(import_manifest=True)
+        f.write("redeem_codes.json", [])
+        self.assertEqual(self.resource()["count"], 0)
+        self.store.import_inventory(str(f.root / "redeem_codes.json"), "redeem")
+        f.write("card_pool.json", {"name": "改名后的卡池"})
+        f.write("redeem_codes.json", [
+            {"code": " REMOVED-CODE ", "used": False, "pool": "new", "tags": ["new"]},
+            {"code": "USED-CODE", "used": False, "pool": "new"},
+        ])
+        self.assertEqual(self.resource()["count"], 0)
+        self.assertFalse(self.resource()["available"])
+        self.store.import_inventory(str(f.root / "redeem_codes.json"), "redeem")
+        self.assertEqual(self.resource()["count"], 0)
+        self.assertEqual(self.store.inventory_counts()["redeem"], {"quarantined": 1, "legacy_used": 1})
+        f.write("redeem_codes.json", [*f.read("redeem_codes.json"), {"code": "TRULY-NEW", "used": False}])
+        self.assertEqual(self.resource()["count"], 1)
+        self.store.import_inventory(str(f.root / "redeem_codes.json"), "redeem")
+        self.assertEqual(self.store.inventory_counts()["redeem"]["available"], 1)
+
+    def test_invalid_or_duplicate_manifest_is_rejected_like_worker_import(self):
+        self.start_store()
+        invalid = (
+            [{"code": " "}], [{"code": "A", "used": "false"}], [{"code": "A", "used": None}],
+            [{"code": "A", "used": 0}], [{"code": 123}], [None],
+            [{"code": "A"}, {"code": "A"}], [{"code": " A ", "used": False}, {"code": "A", "used": True}],
+            [{"code": "A", "pool": "one", "tags": ["one"]}, {"code": "A", "pool": "two", "tags": ["two"]}],
+        )
+        for manifest in invalid:
+            with self.subTest(manifest=manifest):
+                self.f.write("redeem_codes.json", manifest)
+                before = self.f.files()
+                with self.assertRaises(FulfillmentConfigError) as caught:
+                    self.f.tools.fulfillment.resources(1, "one")
+                self.assertEqual(caught.exception.code, "storage_unavailable")
+                self.assertEqual(self.f.files(), before)
+                with self.assertRaises(DeliveryStoreError):
+                    self.store.import_inventory(str(self.f.root / "redeem_codes.json"), "redeem")
+                self.assertEqual(self.store.inventory_counts(), {})
+
+    def test_absent_database_or_inventory_table_does_not_create_state(self):
+        self.f.write("redeem_codes.json", [{"code": "NEW"}, {"code": "USED", "used": True}])
+        self.assertEqual(self.resource()["count"], 1)
+        self.assertFalse(self.database.exists())
+        with closing(sqlite3.connect(self.database)) as con, con:
+            con.execute("CREATE TABLE unrelated (id INTEGER)")
+        self.assertEqual(self.resource()["count"], 1)
+        with closing(sqlite3.connect(self.database)) as con, con:
+            self.assertIsNone(con.execute("SELECT 1 FROM sqlite_master WHERE name='inventory'").fetchone())
+        self.database.write_bytes(b"corrupt DB must not permit JSON fallback")
+        with self.assertRaises(FulfillmentConfigError):
+            self.f.tools.fulfillment.resources(1, "one")
+
+    def test_committed_wal_used_state_remains_authoritative_during_preview(self):
+        self.f.write("redeem_codes.json", [{"code": "USED-IN-WAL"}])
+        self.start_store(import_manifest=True)
+        self.f.write("redeem_codes.json", [{"code": "USED-IN-WAL", "used": False}, {"code": "PENDING-NEW"}])
+        with closing(sqlite3.connect(self.database)) as con:
+            con.execute("PRAGMA wal_autocheckpoint = 0")
+            con.execute("UPDATE inventory SET status='used' WHERE secret='USED-IN-WAL'")
+            con.commit()
+            self.assertGreater(Path(str(self.database) + "-wal").stat().st_size, 0)
+            before = con.execute("SELECT secret,status FROM inventory").fetchall()
+            self.assertEqual(self.resource()["count"], 1)
+            self.assertEqual(con.execute("SELECT secret,status FROM inventory").fetchall(), before)
+
+    def test_resource_version_covers_secret_state_changes_not_only_totals(self):
+        self.f.write("redeem_codes.json", [{"code": "AVAILABLE"}])
+        self.start_store(import_manifest=True)
+        with closing(sqlite3.connect(self.database)) as con, con:
+            con.execute("INSERT INTO inventory(kind,secret,status,created_at,updated_at) VALUES('redeem','REMOVED','used',0,0)")
+        before = self.resource()
+        self.assertEqual(before["count"], 1)
+        with closing(sqlite3.connect(self.database)) as con, con:
+            con.execute("UPDATE inventory SET status=CASE secret WHEN 'AVAILABLE' THEN 'used' ELSE 'available' END WHERE kind='redeem'")
+        after = self.resource()
+        self.assertEqual(after["count"], 0)
+        self.assertNotEqual(after["version"], before["version"])
 
 
 if __name__ == "__main__":

@@ -339,11 +339,128 @@ class FreeAutomationTests(unittest.IsolatedAsyncioTestCase):
                 importer.assert_not_called()
                 self.assertEqual(agent.delivery_store.inventory_counts(), {})
 
-        write_json(self.products, {"types": [{"delivery": "redeem", "item_ids": []}]})
+    async def test_empty_advanced_templates_are_unbound_drafts_on_force_start(self):
+        drafts = [
+            {"id": "draft-redeem", "delivery": "redeem", "item_ids": []},
+            {"id": "draft-pan", "delivery": "pan", "item_ids": [], "resource_match": ["resource"]},
+        ]
+        bound = json.loads(self.products.read_text(encoding="utf-8"))["types"]
+        write_json(self.state / "redeem_codes.json", [{"code": "BOUND-CODE", "used": False}])
+        for mode in ("rules", "rules_ai"):
+            with self.subTest(mode=mode):
+                write_json(self.products, {"types": [drafts[0], *bound, drafts[1]]})
+                agent, _ = self.build_agent(mode=mode)
+                agent._refresh_runtime_config(force=True)
+                self.assertEqual(set(agent.products), {API_ITEM, PAN_ITEM, MATERIAL_ITEM})
+                self.assertEqual(agent.delivery_store.inventory_counts(), {"redeem": {"available": 1}})
+                self.assertIsNone(agent.classify_item("9999"))
+
+    async def test_only_advanced_drafts_never_import_inventory_or_authorize_delivery(self):
+        write_json(self.products, {"types": [
+            {"id": "draft-redeem", "delivery": "redeem", "item_ids": []},
+            {"id": "draft-pan", "delivery": "pan", "item_ids": [], "resource_match": ["resource"]},
+        ]})
+        write_json(self.state / "redeem_codes.json", [{"code": "UNBOUND-CODE", "used": False}])
+        # A draft must not even load unbound pan resources.
+        write_json(self.state / "pan_links.json", {"links": "unbound-invalid-input"})
         with patch("main.DeliveryStore.import_inventory") as importer:
-            with self.assertRaises(RuntimeError):
-                self.build_agent()
+            agent, _ = self.build_agent()
+            agent._refresh_runtime_config(force=True)
         importer.assert_not_called()
+        self.assertEqual(agent.products, {})
+        self.assertEqual(agent.pan_resources, [])
+        self.assertFalse(agent.redeem_inventory_available)
+        self.assertEqual(agent.delivery_store.inventory_counts(), {})
+        agent.delivery_store.record_chat_binding(CHAT_ID, BUYER_ID, MATERIAL_ITEM)
+        event = {"1": f"{CHAT_ID}@goofish", "2": 1,
+                 "3": {"redReminder": "等待卖家发货", "redReminderStyle": "1"},
+                 "4": int(time.time() * 1000)}
+        await agent.handle_paid_order(event)
+        agent.send_text_reliably.assert_not_awaited()
+        self.assertEqual(agent.delivery_store.inventory_counts(), {})
+
+    async def test_draft_creation_and_last_unbinding_preserve_other_live_products(self):
+        document = json.loads(self.products.read_text(encoding="utf-8"))
+        write_json(self.state / "redeem_codes.json", [{"code": "BOUND-CODE", "used": False}])
+        agent, _ = self.build_agent()
+        document["types"].extend([
+            {"id": "draft-redeem", "delivery": "redeem", "item_ids": []},
+            {"id": "draft-pan", "delivery": "pan", "item_ids": [], "resource_match": ["resource"]},
+        ])
+        write_json(self.products, document)
+        agent._refresh_runtime_config()
+        self.assertEqual(set(agent.products), {API_ITEM, PAN_ITEM, MATERIAL_ITEM})
+        document["types"][0]["item_ids"] = []
+        write_json(self.products, document)
+        # Revoking the last redeem binding does not import newly added codes.
+        write_json(self.state / "redeem_codes.json", [
+            {"code": "BOUND-CODE", "used": False}, {"code": "UNBOUND-CODE", "used": False},
+        ])
+        with patch.object(agent.delivery_store, "import_inventory") as importer:
+            agent._refresh_runtime_config()
+            agent._refresh_runtime_config(force=True)
+        importer.assert_not_called()
+        self.assertEqual(set(agent.products), {PAN_ITEM, MATERIAL_ITEM})
+        self.assertFalse(agent.redeem_inventory_available)
+        self.assertEqual(agent.delivery_store.inventory_counts(), {"redeem": {"available": 1}})
+        document["types"][1]["item_ids"] = []
+        write_json(self.products, document)
+        agent._refresh_runtime_config()
+        self.assertEqual(set(agent.products), {MATERIAL_ITEM})
+        self.assertEqual(agent.pan_resources, [])
+        self.assertIsNone(agent.classify_item(API_ITEM))
+        self.assertIsNone(agent.classify_item(PAN_ITEM))
+        for index, item_id in enumerate((API_ITEM, PAN_ITEM)):
+            revoked_chat = str(7000 + index)
+            agent.delivery_store.record_chat_binding(revoked_chat, BUYER_ID, item_id)
+            await agent.handle_paid_order({
+                "1": f"{revoked_chat}@goofish", "2": 1,
+                "3": {"redReminder": "等待卖家发货", "redReminderStyle": "1"},
+                "4": int(time.time() * 1000),
+            })
+        agent.send_text_reliably.assert_not_awaited()
+        self.assertEqual(agent.delivery_store.inventory_counts(), {"redeem": {"available": 1}})
+        agent.delivery_store.record_chat_binding(CHAT_ID, BUYER_ID, MATERIAL_ITEM)
+        event = {"1": f"{CHAT_ID}@goofish", "2": 1,
+                 "3": {"redReminder": "等待卖家发货", "redReminderStyle": "1"},
+                 "4": int(time.time() * 1000)}
+        self.assertTrue(await agent.handle_paid_order(event))
+        agent.send_text_reliably.assert_awaited_once()
+        self.assertEqual(agent.send_text_reliably.await_args.args[2], "material payload")
+
+    async def test_invalid_product_bindings_are_not_empty_drafts(self):
+        invalid_bindings = [
+            {}, {"item_ids": None}, {"item_ids": API_ITEM}, {"item_ids": {}},
+            *({"item_ids": [value]} for value in (None, True, 1.5, {}, [], "", "*", "abc", "-1", "１２", "1" * 65)),
+            {"item_ids": [API_ITEM, API_ITEM]}, {"item_ids": [API_ITEM, " " + API_ITEM]},
+        ]
+        for delivery in ("redeem", "pan", "material"):
+            for binding in invalid_bindings:
+                with self.subTest(delivery=delivery, binding=binding):
+                    write_json(self.products, {"types": [{"id": "invalid", "delivery": delivery,
+                               "payload": "private material", "resource_match": ["resource"], **binding}]})
+                    with patch("main.DeliveryStore.import_inventory") as importer:
+                        with self.assertRaises(RuntimeError):
+                            self.build_agent()
+                    importer.assert_not_called()
+        write_json(self.products, {"types": [
+            {"id": "one", "delivery": "redeem", "item_ids": [API_ITEM]},
+            {"id": "two", "delivery": "pan", "item_ids": [API_ITEM], "resource_match": ["resource"]},
+        ]})
+        with self.assertRaises(RuntimeError):
+            self.build_agent()
+
+    async def test_empty_material_scope_does_not_bypass_private_payload_validation(self):
+        material = {"id": "private", "delivery": "material", "item_ids": [], "payload": "private material"}
+        write_json(self.products, {"types": [material]})
+        with self.assertRaises(RuntimeError):
+            self.build_agent()
+        self.products.chmod(0o644)
+        with self.assertRaisesRegex(RuntimeError, "0600"):
+            self.build_agent()
+        write_json(self.products, {"types": [{**material, "payload": ""}]})
+        with self.assertRaises(RuntimeError):
+            self.build_agent()
 
     async def test_rules_redeem_inventory_hot_loads_without_ai_or_reimport_loop(self):
         agent, bot = self.build_agent()

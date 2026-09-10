@@ -361,18 +361,30 @@ class FulfillmentConfig:
             resources.append({"key": "pan:" + digest(tags), "kind": "pan", "delivery": "pan", "name": " / ".join(entry["remark"] for entry in entries),
                               "tags": list(tags), "available": True, "count": len(entries), "version": digest(entries)})
         codes = read_json(account_path(*root_args, "redeem_codes.json"))
-        if codes is not None and (not isinstance(codes, list) or any(not isinstance(row, dict) or not isinstance(row.get("code"), str) or not row["code"] for row in codes)):
-            raise FulfillmentConfigError("storage_unavailable", status_code=503)
+        manifest = {}
+        if codes is not None:
+            if not isinstance(codes, list):
+                raise FulfillmentConfigError("storage_unavailable", status_code=503)
+            for row in codes:
+                # Match DeliveryStore.import_inventory: redeem identity is the
+                # stripped code, not a label, payload, or card-pool display name.
+                if (not isinstance(row, dict) or not isinstance(row.get("code"), str) or not row["code"].strip()
+                        or ("used" in row and type(row["used"]) is not bool) or row["code"].strip() in manifest):
+                    raise FulfillmentConfigError("storage_unavailable", status_code=503)
+                manifest[row["code"].strip()] = row.get("used", False)
         meta = read_json(account_path(*root_args, "card_pool.json"))
         if meta is not None and (not isinstance(meta, dict) or not isinstance(meta.get("name", "兑换码池"), str)):
             raise FulfillmentConfigError("storage_unavailable", status_code=503)
         if codes is not None:
-            count = sum(not bool(row.get("used")) for row in codes)
-            counts = self._inventory_counts(user_id, account_key)
-            if counts is not None:
-                count = counts.get("available", 0)
+            states = self._inventory_states(user_id, account_key)
+            # Preview the next import without performing it. New unused codes
+            # are usable even before the first redeem binding; durable used,
+            # reserved, or revoked codes can never be revived by used:false.
+            # DB-only codes were removed from the manifest and are not stock.
+            count = sum(not used and states.get(secret, "available") == "available"
+                        for secret, used in manifest.items())
             resources.append({"key": "inventory:redeem", "kind": "inventory", "delivery": "redeem", "name": (meta or {}).get("name", "兑换码池"),
-                              "tags": [], "available": count > 0, "count": count, "version": digest([codes, counts, meta])})
+                              "tags": [], "available": count > 0, "count": count, "version": digest([codes, states, meta])})
         for position, row in enumerate(products["types"]):
             delivery = row["delivery"]
             resource = {"key": f"template:{position}", "kind": "template", "delivery": delivery, "name": row.get("name", "已有发货模板"),
@@ -391,18 +403,20 @@ class FulfillmentConfig:
             resources.append(resource)
         return resources
 
-    def _inventory_counts(self, user_id, account_key):
+    def _inventory_states(self, user_id, account_key):
         path = account_path(self.storage, user_id, account_key, "delivery_state.db")
         if not path.exists():
-            return None
+            return {}
         con = None
         try:
             # Read-only SQLite; never create/initialize the Worker's private DB.
+            # Keep WAL visibility: immutable reads could miss a used/reserved code.
             con = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)
+            con.execute("PRAGMA query_only = ON")
             exists = con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='inventory'").fetchone()
             if not exists:
-                return None
-            return {str(row[0]): int(row[1]) for row in con.execute("SELECT status,COUNT(*) FROM inventory WHERE kind='redeem' GROUP BY status")}
+                return {}
+            return {row[0]: row[1] for row in con.execute("SELECT secret,status FROM inventory WHERE kind='redeem'")}
         except sqlite3.Error as exc:
             raise FulfillmentConfigError("storage_unavailable", status_code=503) from exc
         finally:

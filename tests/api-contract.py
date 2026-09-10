@@ -1053,7 +1053,10 @@ def main():
     assert "安全验证" in risk_check.json()["detail"]["message"]
     risk_status = client.get("/api/bot/status").json()
     assert risk_status["sync_status"] == "risk_control"
-    assert risk_status["cookie_status"]["label"] == "需要安全验证"
+    assert risk_status["cookie_status"]["label"] == "接口请求受限"
+    assert risk_status["cookie_status"]["message"] == shop_sync.SYNC_STATUS_CATALOG["risk_control"]["message"]
+    assert risk_status["connection_state"] == "degraded"
+    assert risk_status["catalog_state"] == "stale"
     assert risk_status["connected"] is False
     assert bot_manager.read_secret(user_id, "cookies.txt") == previous_cookie
     busy_error = app._shop_sync_http_error(
@@ -1062,6 +1065,22 @@ def main():
     assert busy_error.status_code == 429
     assert busy_error.detail["code"] == "platform_busy"
     assert busy_error.detail["retryable"] is True
+    assert json.loads((tenant_dir / "shop_snapshot.json").read_text()) == previous_snapshot
+
+    app.sync_shop = lambda _cookie_header: (_ for _ in ()).throw(
+        shop_sync.ShopSyncError("verification_required", "历史不准确的App弹窗文案")
+    )
+    verification_check = client.post("/api/bot/shop/sync")
+    assert verification_check.status_code == 422
+    assert verification_check.json()["detail"]["code"] == "verification_required"
+    assert verification_check.json()["detail"]["message"] == shop_sync.SYNC_STATUS_CATALOG["verification_required"]["message"]
+    verification_status = client.get("/api/bot/status").json()
+    assert verification_status["sync_status"] == "verification_required"
+    assert verification_status["connection_state"] == "security_check"
+    assert verification_status["catalog_state"] == "stale"
+    assert verification_status["attention"][0]["code"] == "verification_required"
+    assert shop_sync.load_sync_state(user_id)["code"] == "verification_required"
+    assert bot_manager.read_secret(user_id, "cookies.txt") == previous_cookie
     assert json.loads((tenant_dir / "shop_snapshot.json").read_text()) == previous_snapshot
 
     app.sync_shop = lambda _cookie_header: (_ for _ in ()).throw(

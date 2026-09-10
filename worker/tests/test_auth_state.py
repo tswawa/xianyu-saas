@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from auth_state import AuthStateStore
+from auth_state import AuthStateStore, normalize_auth_state
 from private_auth_storage import PrivateAuthStorage
 from utils.xianyu_utils import generate_device_id
 
@@ -29,9 +29,54 @@ class AuthStateStoreTests(unittest.TestCase):
 
             self.assertEqual(state["version"], 2)
             self.assertEqual(state["phase"], "NEEDS_HUMAN")
-            self.assertEqual(state["session"]["state"], "SECURITY_CHECK")
+            self.assertEqual(state["session"]["state"], "UNKNOWN")
             self.assertEqual(state["code"], "risk_control")
             self.assertTrue(state["needs_human"])
+
+    def test_old_risk_state_keeps_protection_without_claiming_security_check(self):
+        for version in (1, 2):
+            for old_session in ("SECURITY_CHECK", "VALID"):
+                with self.subTest(version=version, session=old_session):
+                    payload = {
+                        "version": version, "phase": "NEEDS_HUMAN", "code": "risk_control",
+                        "failure_class": "NEEDS_HUMAN", "needs_human": True,
+                        "reauthorization_required": True, "updated_at": 123,
+                        "session": {"state": old_session, "updated_at": 123},
+                        "mtop_token": {"state": "DEGRADED", "updated_at": 123},
+                        "websocket": {"state": "DISCONNECTED", "updated_at": 123},
+                        "message": "闲鱼App要求安全验证", "title": "需要安全验证",
+                    }
+                    state = normalize_auth_state(payload)
+                    self.assertEqual(state["session"]["state"], "UNKNOWN")
+                    self.assertEqual(state["phase"], "NEEDS_HUMAN")
+                    self.assertEqual(state["code"], "risk_control")
+                    self.assertTrue(state["needs_human"])
+                    self.assertTrue(state["reauthorization_required"])
+                    self.assertNotIn("message", state)
+                    self.assertEqual(payload["session"]["state"], old_session)
+
+    def test_explicit_verification_state_survives_normalization_and_read(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "auth_status.json"
+            state = normalize_auth_state({"code": "verification_required", "updated_at": 123})
+            path.write_text(json.dumps(state), encoding="utf-8")
+            raw = path.read_bytes()
+            read = AuthStateStore(str(path)).read()
+            self.assertEqual(read, state)
+            self.assertEqual(read["phase"], "NEEDS_HUMAN")
+            self.assertEqual(read["session"]["state"], "SECURITY_CHECK")
+            self.assertTrue(read["needs_human"])
+            self.assertTrue(read["reauthorization_required"])
+            self.assertEqual(path.read_bytes(), raw)
+
+    def test_incomplete_v2_metadata_cannot_erase_an_existing_request_hold(self):
+        for code, session in (("risk_control", "UNKNOWN"), ("verification_required", "SECURITY_CHECK")):
+            with self.subTest(code=code):
+                state = normalize_auth_state({"version": 2, "code": code})
+                self.assertEqual(state["code"], code)
+                self.assertEqual(state["phase"], "NEEDS_HUMAN")
+                self.assertEqual(state["session"]["state"], session)
+                self.assertTrue(state["needs_human"])
 
     def test_flat_v2_clear_state_from_control_plane_is_accepted(self):
         with tempfile.TemporaryDirectory() as directory:

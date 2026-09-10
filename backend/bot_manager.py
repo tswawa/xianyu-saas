@@ -56,6 +56,9 @@ AUTH_STATUS_CODES = {
     "ok",
     "session_expired",
     "risk_control",
+    "verification_required",
+    "cookie_invalid",
+    "account_restricted",
     "token_unavailable",
     "network_error",
     "platform_busy",
@@ -646,14 +649,19 @@ def auth_status(
         return default
     if not isinstance(payload, dict):
         return default
-    code = str(payload.get("code") or "ok")
+    failure = payload.get("failure") if isinstance(payload.get("failure"), dict) else {}
+    code = str(failure.get("code") or payload.get("code") or "ok")
     if code not in AUTH_STATUS_CODES:
         return default
     phase = str(payload.get("phase") or "").strip().upper()
     legacy_required = payload.get("reauthorization_required") is True and code in {
         "session_expired",
         "risk_control",
+        "verification_required",
+        "cookie_invalid",
     }
+    if code in {"risk_control", "verification_required"}:
+        phase = "NEEDS_HUMAN"
     if phase not in AUTH_PHASES:
         if legacy_required:
             phase = "NEEDS_HUMAN"
@@ -662,20 +670,23 @@ def auth_status(
         else:
             phase = "DEGRADED"
     needs_human = phase == "NEEDS_HUMAN" or payload.get("needs_human") is True or legacy_required
-    failure_class = str(payload.get("failure_class") or ("NEEDS_HUMAN" if needs_human else "NONE"))
+    failure_class = str(failure.get("class") or payload.get("failure_class") or ("NEEDS_HUMAN" if needs_human else "NONE"))
     failure_class = failure_class.strip().upper()
     if not failure_class or len(failure_class) > 40 or not all(
         char.isalnum() or char == "_" for char in failure_class
     ):
         failure_class = "NEEDS_HUMAN" if needs_human else "NONE"
     try:
-        failure_count = max(0, min(int(payload.get("failure_count") or 0), 1_000_000))
+        failure_count = max(0, min(int(failure.get("count", payload.get("failure_count")) or 0), 1_000_000))
     except (TypeError, ValueError):
         failure_count = 0
     try:
         version = 2 if int(payload.get("version") or 1) >= 2 else 1
     except (TypeError, ValueError):
         version = 1
+    session = _safe_auth_layer(payload.get("session"), "UNKNOWN")
+    if code in {"risk_control", "verification_required"}:
+        session["state"] = "SECURITY_CHECK" if code == "verification_required" else "UNKNOWN"
     return {
         "version": version,
         "phase": phase,
@@ -684,9 +695,9 @@ def auth_status(
         "needs_human": needs_human,
         "reauthorization_required": needs_human,
         "updated_at": _safe_auth_timestamp(payload.get("updated_at")),
-        "next_retry_at": _safe_auth_timestamp(payload.get("next_retry_at")),
+        "next_retry_at": _safe_auth_timestamp(failure.get("next_retry_at", payload.get("next_retry_at"))),
         "failure_count": failure_count,
-        "session": _safe_auth_layer(payload.get("session"), "UNKNOWN"),
+        "session": session,
         "mtop_token": _safe_auth_layer(payload.get("mtop_token"), "ABSENT"),
         "websocket": _safe_auth_layer(payload.get("websocket"), "DISCONNECTED"),
     }
@@ -1133,7 +1144,9 @@ def logs(
 def _status_view(sync_status: str, cookies_set: bool, snapshot: dict | None, product_count: int) -> dict:
     """Build a bounded UI state without exposing platform or secret data."""
     reauth_codes = {"cookie_expired", "cookie_invalid", "cookie_incomplete"}
-    security_codes = {"risk_control", "risk_cooldown"}
+    security_codes = {"verification_required"}
+    limited_codes = {"risk_control", "risk_cooldown"}
+    blocked_codes = security_codes | limited_codes
     transient_codes = {
         "pending",
         "sync_error",
@@ -1156,6 +1169,8 @@ def _status_view(sync_status: str, cookies_set: bool, snapshot: dict | None, pro
         connection_state = "reauth_required"
     elif sync_status in security_codes:
         connection_state = "security_check"
+    elif sync_status in limited_codes:
+        connection_state = "degraded"
     elif sync_status == "verified" and snapshot is not None:
         connection_state = "connected"
     elif sync_status in {"pending", "sync_busy"}:
@@ -1170,7 +1185,7 @@ def _status_view(sync_status: str, cookies_set: bool, snapshot: dict | None, pro
         connection_state = "unconfigured"
 
     if snapshot is None:
-        if sync_status in {"account_restricted", *security_codes}:
+        if sync_status in {"account_restricted", *blocked_codes}:
             catalog_state = "blocked"
         elif sync_status in {"pending", "sync_busy"}:
             catalog_state = "syncing"
@@ -1180,7 +1195,7 @@ def _status_view(sync_status: str, cookies_set: bool, snapshot: dict | None, pro
             catalog_state = "not_started"
     elif sync_status == "verified":
         catalog_state = "ready" if product_count else "empty"
-    elif sync_status in {"account_restricted", *security_codes}:
+    elif sync_status in {"account_restricted", *blocked_codes}:
         catalog_state = "stale" if product_count else "blocked"
     else:
         catalog_state = "stale"
@@ -1200,7 +1215,7 @@ def _status_view(sync_status: str, cookies_set: bool, snapshot: dict | None, pro
                 "action": status["action"],
             }
         )
-    elif sync_status in reauth_codes or sync_status in security_codes:
+    elif sync_status in reauth_codes or sync_status in blocked_codes:
         attention.append(
             {
                 "code": sync_status,
@@ -1287,7 +1302,7 @@ def status(
         worker_auth["session"] = {"state": "MISSING", "updated_at": worker_auth["updated_at"]}
     if worker_auth["reauthorization_required"]:
         sync_status = (
-            "risk_control" if worker_auth["code"] == "risk_control" else "cookie_expired"
+            worker_auth["code"] if worker_auth["code"] in {"risk_control", "verification_required"} else "cookie_expired"
         )
 
     state_is_current = bool(state_matches and saved_state and sync_status == saved_state["code"])
