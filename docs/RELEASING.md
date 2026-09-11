@@ -23,7 +23,7 @@
 3. **主分支 CI 验证**：将代码提交并推送到 `main` 分支，等待 GitHub Actions 的 `ci.yml` 工作流完整执行通过；
 4. **推送版本标签**：确认主分支 CI 通过后，创建并推送对应的版本标签：
    ```bash
-   VERSION=0.2.1
+   VERSION=0.2.2
    git tag "v${VERSION}"
    git push origin "v${VERSION}"
    ```
@@ -55,7 +55,7 @@ GitHub Actions 工作流 [`.github/workflows/release.yml`](../.github/workflows/
 在维护者本地或离线环境中执行签名打包时，使用以下命令：
 
 ```bash
-VERSION=0.2.1
+VERSION=0.2.2
 python scripts/build-release.py --ref HEAD --output ".local/releases/${VERSION}"
 ```
 

@@ -122,26 +122,26 @@ ln -sfn /srv/xianyu-saas/runtime/worker-venv /srv/xianyu-saas/current/worker/.ve
 ### 版本识别规则与发布资产说明
 控制台界面显示当前运行进程加载的代码版本、构建元数据以及从 GitHub Releases 查询到的最新发布信息。网络不可达、未发现更新版本或缺少发布制品时，界面会给出对应状态提示。
 
-GitHub Releases 随新版本（例如 `v0.2.1`）自动发布 8 项官方附件：
-1. `xianyu-saas-0.2.1.tar.gz`：系统核心运行包，依据更新器白名单打包；
-2. `xianyu-saas-0.2.1.manifest.json`：发布清单文件，记录包内文件尺寸与哈希；
-3. `xianyu-saas-0.2.1.manifest.sig`：发布清单的 Ed25519 数字签名；
-4. `xianyu-saas-0.2.1-source.zip`：完整安全源码包（包含 Dockerfile、Compose 模板、文档与许可证），供容器构建或手动部署；
-5. `xianyu-saas-0.2.1.update-signing.pub`：本次发布对应的验证公钥副本；
+GitHub Releases 随新版本（例如 `v0.2.2`）自动发布 8 项官方附件：
+1. `xianyu-saas-0.2.2.tar.gz`：系统核心运行包，依据更新器白名单打包；
+2. `xianyu-saas-0.2.2.manifest.json`：发布清单文件，记录包内文件尺寸与哈希；
+3. `xianyu-saas-0.2.2.manifest.sig`：发布清单的 Ed25519 数字签名；
+4. `xianyu-saas-0.2.2-source.zip`：完整安全源码包（包含 Dockerfile、Compose 模板、文档与许可证），供容器构建或手动部署；
+5. `xianyu-saas-0.2.2.update-signing.pub`：本次发布对应的验证公钥副本；
 6. `release-notes.md`：版本发布说明；
 7. `artifacts.json`：资产元数据与签名公钥指纹；
 8. `SHA256SUMS`：包含 6 项内容资产与 `artifacts.json` 共 7 项文件的 SHA-256 校验和清单，不包含自身散列。
 
 **下载用途说明**：
-- 容器部署或手动部署请下载完整源码包 `xianyu-saas-0.2.1-source.zip`；
-- `xianyu-saas-0.2.1.tar.gz`、`.manifest.json` 与 `.manifest.sig` 专供配置了签名校验的 systemd 更新器自动验证与解压；
+- 容器部署或手动部署请下载完整源码包 `xianyu-saas-0.2.2-source.zip`；
+- `xianyu-saas-0.2.2.tar.gz`、`.manifest.json` 与 `.manifest.sig` 专供配置了签名校验的 systemd 更新器自动验证与解压；
 - GitHub 界面自动生成的源码压缩包（Source code zip/tar.gz）缺少上述构建校验元数据，建议优先使用官方附件。
 
 ### Docker 源码构建升级流程
 Web 界面仅用于展示新版本提示与更新摘要，无权操纵宿主机 Docker 守护进程，Docker 部署者无法直接在网页中点击完成容器升级。管理员执行升级的标准步骤：
 
 1. 对 `./data` 业务数据目录进行离线冷备份；
-2. 获取目标版本的源码（解压新的 `xianyu-saas-0.2.1-source.zip` 或拉取对应 Git 标签）；
+2. 获取目标版本的源码（解压新的 `xianyu-saas-0.2.2-source.zip` 或拉取对应 Git 标签）；
 3. 使用项目原有的 Compose 文件（以及本地覆盖配置，例如 `.local/docker-compose.local.yml`）执行本地构建与平滑重启：
    ```bash
    docker compose up -d --build --wait
@@ -156,7 +156,7 @@ Web 界面仅用于展示新版本提示与更新摘要，无权操纵宿主机 
 若将部署模式标记为 `SAAS_DEPLOYMENT_MODE=systemd`，只有在满足以下全部前置条件时才开放管理界面升级流程：
 - 部署目录结构规范，存在受信任的版本目录与 `current` 软链接；
 - 配置了受信发布公钥：首次使用签名更新前，须将项目公钥存放在服务端受保护的路径，并在环境配置中设置 `SAAS_UPDATE_PUBLIC_KEY_FILE` 的绝对路径。公钥文件属主应为 root 或服务运行用户，权限建议设为 `644` 或 `400`（禁止属组与其他用户写入）。签名私钥仅由发布端保管，绝不下发至安装端；
-- 公钥可取自仓库中的 `deploy/update-signing.pub` 或 Release 附件中的 `xianyu-saas-0.2.1.update-signing.pub`。公钥指纹可在 `artifacts.json` 中的 `public_key_fingerprint` 查看（该指纹基于原始 32 字节 Ed25519 公钥二进制计算 SHA-256 并带有 `sha256:` 前缀，直接对 PEM 文本文件计算哈希与该指纹不同）；全部下载文件可通过 `SHA256SUMS` 校验完整性；
+- 公钥可取自仓库中的 `deploy/update-signing.pub` 或 Release 附件中的 `xianyu-saas-0.2.2.update-signing.pub`。公钥指纹可在 `artifacts.json` 中的 `public_key_fingerprint` 查看（该指纹基于原始 32 字节 Ed25519 公钥二进制计算 SHA-256 并带有 `sha256:` 前缀，直接对 PEM 文本文件计算哈希与该指纹不同）；全部下载文件可通过 `SHA256SUMS` 校验完整性；
 - 拥有可写的暂存目录（staging）与升级意图文件（intent file）；
 - 宿主机加载了 `xianyu-saas-updater.service` 并激活了 `xianyu-saas-updater.path` 监听。
 

@@ -34,9 +34,9 @@
 - [ ] Windows 部署说明明确通过 Docker Linux 容器运行完整服务，不宣称 Windows 原生直接运行依赖 `fcntl` 等内核特性的全部服务。
 
 ## 6. 版本发布与制品完整性检查
-- [ ] 版本号一致性：`package.json`、`package-lock.json` 与 `backend/version.py` 版本号一致（如 `0.2.1`）；
+- [ ] 版本号一致性：`package.json`、`package-lock.json` 与 `backend/version.py` 版本号一致（如 `0.2.2`）；
 - [ ] 签名密钥分离：签名私钥由 GitHub Actions secret `RELEASE_SIGNING_KEY` 托管，公钥保存于 `deploy/update-signing.pub`，严禁将私钥打入任何安装包或源码；
 - [ ] 自动化打包工作流：明确 `main` 分支 CI 成功后方可推送版本标签（不能预先勾选成功或提前推签）；标签推送后触发 `.github/workflows/release.yml`，复用 CI 验证并自动执行 `scripts/build-release.py` 生成发布草稿；
-- [ ] 发行资产齐全（共 8 项）：`xianyu-saas-0.2.1.tar.gz`、`xianyu-saas-0.2.1.manifest.json`、`xianyu-saas-0.2.1.manifest.sig`、`xianyu-saas-0.2.1-source.zip`、`xianyu-saas-0.2.1.update-signing.pub`、`release-notes.md`、`artifacts.json`、`SHA256SUMS`；
+- [ ] 发行资产齐全（共 8 项）：`xianyu-saas-0.2.2.tar.gz`、`xianyu-saas-0.2.2.manifest.json`、`xianyu-saas-0.2.2.manifest.sig`、`xianyu-saas-0.2.2-source.zip`、`xianyu-saas-0.2.2.update-signing.pub`、`release-notes.md`、`artifacts.json`、`SHA256SUMS`；
 - [ ] 资产用途明确：`source.zip` 包含完整安全源码，用于 Docker 或手动部署；`tar.gz` + `manifest.json` + `manifest.sig` 专供签名 systemd 更新器；
 - [ ] 校验和与公钥指纹：`SHA256SUMS` 覆盖 6 项内容资产与 `artifacts.json` 共 7 项制品（不包含自身散列）；`artifacts.json` 中的 `public_key_fingerprint` 为原始 32 字节 Ed25519 公钥二进制的 SHA-256 摘要（带 `sha256:` 前缀，与直接计算 PEM 文本哈希不同）。

@@ -17,9 +17,10 @@ assert.match(assetVersion, /^[0-9]{8}-[0-9]{2}$/);
 const desktopSettingsOpsScope = ["settings", "ops", "dashboard", "goods", "resources", "popover", "home-alerts"].includes(process.env.SAAS_UI_SCOPE);
 const mockOnlyScope = process.env.SAAS_UI_SCOPE === "mock";
 const connectionFlowsScope = process.env.SAAS_UI_SCOPE === "connection-flows";
+const ruleDraftsScope = process.env.SAAS_UI_SCOPE === "rule-drafts";
 // Public documentation images are opt-in, never a side effect of a test scope.
 const docsCaptureScope = process.env.SAAS_UI_SCOPE === "docs-capture";
-const screenshotsEnabled = !docsCaptureScope && !desktopSettingsOpsScope && !mockOnlyScope && !connectionFlowsScope && process.env.SAAS_UI_SCREENSHOTS !== "0";
+const screenshotsEnabled = !docsCaptureScope && !desktopSettingsOpsScope && !mockOnlyScope && !connectionFlowsScope && !ruleDraftsScope && process.env.SAAS_UI_SCREENSHOTS !== "0";
 if (screenshotsEnabled) fs.mkdirSync(resultRoot, { recursive: true });
 for (const staleName of screenshotsEnabled ? [
   "local-live-desktop.png", "local-live-mobile.png", "shop-connector-missing-desktop.png",
@@ -292,7 +293,8 @@ const fixtures = {
   cardGetRequests: [],
   productGetRequests: [],
   automationPuts: [],
-  automationPutDelayMsByAccount: {},
+  automationResponseGates: {},
+  pendingAutomationGates: new Set(),
   botStartModes: [],
   botStops: [],
   botStatusRequests: 0,
@@ -1473,6 +1475,13 @@ function createServer() {
       }
       if (apiPath === "/api/automation" && req.method === "GET") {
         const scoped = scopedFixture(req, "automation", fixtures.automation);
+        const gate = fixtures.automationResponseGates[`GET:${scoped.accountKey}`]?.shift();
+        if (gate) {
+          const response = structuredClone(scoped.value);
+          gate.arrive();
+          gate.promise.then(() => json(res, response));
+          return;
+        }
         const delay = takeLoaderDelay("automation", scoped.accountKey);
         if (delay > 0) {
           setTimeout(() => json(res, scoped.value), delay);
@@ -1515,10 +1524,10 @@ function createServer() {
         automation.rules_set = automation.rules.length > 0;
         automation.deliveries_set = automation.deliveries.length > 0;
         const response = { ok: true, automation: structuredClone(automation) };
-        const delay = Number(fixtures.automationPutDelayMsByAccount[scoped.accountKey] || 0);
-        delete fixtures.automationPutDelayMsByAccount[scoped.accountKey];
-        if (delay > 0) {
-          setTimeout(() => json(res, response), delay);
+        const gate = fixtures.automationResponseGates[`PUT:${scoped.accountKey}`]?.shift();
+        if (gate) {
+          gate.arrive();
+          gate.promise.then(() => json(res, response));
           return;
         }
         return json(res, response);
@@ -2235,6 +2244,17 @@ async function desktopApiClick(page, selector, apiPath, method = "POST", expecte
   ]);
   assert.equal(result.status(), expectedStatus, `${method} ${apiPath}: ${await result.text()}`);
   return result.json();
+}
+
+function holdAutomationResponse(method, accountKey = "default") {
+  let arrive;
+  let resolve;
+  const started = new Promise((done) => { arrive = done; });
+  const promise = new Promise((done) => { resolve = done; });
+  const release = () => { fixtures.pendingAutomationGates.delete(release); resolve(); };
+  fixtures.pendingAutomationGates.add(release);
+  (fixtures.automationResponseGates[`${method}:${accountKey}`] ||= []).push({ arrive, promise });
+  return { started: () => waitForMockGate(started, `${method} automation ${accountKey}`), release };
 }
 
 async function waitForMockGate(promise, label) {
@@ -4125,6 +4145,137 @@ async function captureDocs(browser, baseUrl) {
   } finally { await page.close(); }
 }
 
+async function checkRuleDraftLoads(browser, baseUrl) {
+  const saved = { ...fixtures };
+  for (const [key, value] of Object.entries(fixtures)) {
+    if (Array.isArray(value)) fixtures[key] = structuredClone(value);
+  }
+  const rule = (name) => ({ name, item_id: "100001", enabled: true, keywords: [name], reply: `${name}原始回复` });
+  const originalRules = [rule("规则甲"), rule("规则乙")]; // No stable IDs: editing is index-based.
+  Object.assign(fixtures, {
+    me: structuredClone(saved.me), bot: structuredClone(saved.bot),
+    automation: { ...structuredClone(saved.automation), rules: [originalRules[0]], first_reply: "初始规则已加载" },
+    shopAccounts: [structuredClone(saved.shopAccounts[0]), { ...saved.shopAccounts[0], id: 92, key: "draft-first-load", name: "草稿首次加载店" }],
+    accountData: { "draft-first-load": { automation: { ...structuredClone(saved.automation), rules: [rule("新店已有规则")], first_reply: "首次GET已应用" } } },
+    automationResponseGates: {}, pendingAutomationGates: new Set(),
+  });
+  await fetch(`${baseUrl.replace(/\/$/, "")}/api/auth/logout`, { method: "POST" });
+  const { page, evidence } = await desktopContractPage(browser, baseUrl);
+  const fillDraft = async (name) => {
+    await page.fill("#replyRuleName", name);
+    await page.fill("#replyRuleItemId", "100002");
+    await page.fill("#replyRuleKeywords", "草稿,关键词");
+    await page.fill("#replyRuleReply", "未保存的草稿回复");
+    await page.uncheck("#replyRuleEnabled");
+  };
+  const assertDraft = async (name) => {
+    assert.equal(await page.inputValue("#replyRuleName"), name, "late GET must preserve the rule draft name");
+    assert.equal(await page.inputValue("#replyRuleItemId"), "100002");
+    assert.equal(await page.inputValue("#replyRuleKeywords"), "草稿,关键词");
+    assert.equal(await page.inputValue("#replyRuleReply"), "未保存的草稿回复");
+    assert.equal(await page.isChecked("#replyRuleEnabled"), false);
+  };
+  const holdReload = async (marker, rules) => {
+    fixtures.automation = { ...fixtures.automation, first_reply: marker, rules: structuredClone(rules) };
+    const gate = holdAutomationResponse("GET");
+    await openView(page, "auto-reply");
+    await gate.started();
+    return async () => {
+      gate.release();
+      // This rendered marker proves the GET was consumed, not just delivered.
+      await page.waitForFunction((value) => document.querySelector("#automationFirstReply")?.value === value, marker);
+    };
+  };
+  const save = async () => {
+    await desktopApiClick(page, "#saveReplyRuleButton", "/api/automation", "PUT");
+    await page.waitForFunction(() => !document.querySelector("#saveReplyRuleButton")?.disabled && document.querySelector("#replyRuleName")?.value === "");
+    assert.equal(await page.locator("#cancelReplyRuleEdit").isVisible(), false, "successful saves explicitly reset the editor");
+    return fixtures.automationPuts.at(-1).payload.rules;
+  };
+  try {
+    await desktopLogin(page, "rule-draft-owner");
+    await page.waitForLoadState("networkidle");
+    await openView(page, "shops");
+    await page.waitForSelector('#accountTabs [data-account-switch="draft-first-load"]');
+    await openView(page, "auto-reply");
+    await page.waitForLoadState("networkidle");
+    assert.equal(await page.locator("#replyRuleList .rule-row").count(), 1);
+
+    const finishCreateLoad = await holdReload("新建草稿迟到GET", originalRules);
+    await fillDraft("新建未保存草稿");
+    await finishCreateLoad();
+    await assertDraft("新建未保存草稿");
+    assert.equal(await page.locator("#replyRuleList .rule-row").count(), 2, "draft protection must still load existing server rules");
+    const created = await save();
+    assert.deepEqual(created.slice(0, 2), originalRules, "creating a draft must not delete rules returned by the GET");
+    assert.equal(created[2].name, "新建未保存草稿");
+
+    const finishEditLoad = await holdReload("编辑期间重排GET", [created[1], created[0], created[2]]);
+    await page.locator("#replyRuleList [data-edit-rule]").nth(0).click();
+    await fillDraft("规则甲修改草稿");
+    await finishEditLoad();
+    await assertDraft("规则甲修改草稿");
+    assert.equal(await page.locator("#cancelReplyRuleEdit").isVisible(), true, "late GET must preserve edit mode");
+    assert.match(await page.locator("#saveReplyRuleButton").textContent(), /保存修改/);
+    const edited = await save();
+    assert.equal(edited.length, 3, "saving an edit must not append a duplicate rule");
+    assert.equal(edited[0].name, "规则甲修改草稿");
+    assert.deepEqual(edited[1], originalRules[1], "a reordered GET must not redirect the edit to another rule");
+    assert.deepEqual(edited[2], created[2]);
+
+    await page.locator("#replyRuleList [data-edit-rule]").nth(0).click();
+    const reordered = [edited[1], edited[0], edited[2]];
+    const finishCancelledLoad = await holdReload("取消后迟到GET", reordered);
+    await fillDraft("必须丢弃的编辑");
+    await page.click("#cancelReplyRuleEdit");
+    assert.equal(await page.inputValue("#replyRuleName"), "", "explicit cancel must reset immediately");
+    await finishCancelledLoad();
+    assert.equal(await page.inputValue("#replyRuleName"), "", "late GET must not resurrect a cancelled edit");
+    assert.equal(await page.locator("#cancelReplyRuleEdit").isVisible(), false);
+    assert.equal(await page.locator("#replyRuleList .rule-name strong").first().textContent(), "规则乙", "cancelled editor must allow subsequent lists to load");
+
+    await page.locator("#replyRuleList [data-edit-rule]").nth(0).click();
+    const finishReplacementLoad = await holdReload("取消后新草稿GET", reordered);
+    await page.click("#cancelReplyRuleEdit");
+    await fillDraft("取消后新建草稿");
+    await finishReplacementLoad();
+    await assertDraft("取消后新建草稿");
+    const replacement = await save();
+    assert.deepEqual(replacement.slice(0, 3), reordered, "new draft after cancel must append, not retain the cancelled edit index");
+    assert.equal(replacement[3].name, "取消后新建草稿");
+
+    // Switching starts both showView and refreshState GETs. Hold both so this
+    // draft predates even the first loaded rules array in the new account.
+    const firstViewGate = holdAutomationResponse("GET", "draft-first-load");
+    const firstRefreshGate = holdAutomationResponse("GET", "draft-first-load");
+    await fillDraft("切店必须丢弃");
+    await page.selectOption("#automationShopSelect", "draft-first-load");
+    await Promise.all([firstViewGate.started(), firstRefreshGate.started()]);
+    assert.equal(await page.inputValue("#replyRuleName"), "", "shop switch must explicitly reset the draft");
+    assert.equal(await page.locator("#replyRuleList .rule-row").count(), 0);
+    await fillDraft("首次加载前草稿");
+    firstViewGate.release();
+    firstRefreshGate.release();
+    await page.waitForFunction(() => document.querySelector("#automationFirstReply")?.value === "首次GET已应用");
+    await assertDraft("首次加载前草稿");
+    assert.equal(await page.locator("#replyRuleList .rule-row").count(), 1, "first GET must load server rules even when a new draft exists");
+    const firstLoadSaved = await save();
+    assert.equal(firstLoadSaved.length, 2);
+    assert.deepEqual(firstLoadSaved[0], rule("新店已有规则"), "saving after the first GET must retain the server's existing rules");
+    assert.equal(firstLoadSaved[1].name, "首次加载前草稿");
+    await fillDraft("退出必须丢弃");
+    await desktopApiClick(page, "#logoutButton", "/api/auth/logout");
+    await page.waitForSelector("#workspace", { state: "hidden" });
+    assert.equal(await page.inputValue("#replyRuleName"), "", "logout must explicitly reset the draft");
+    assertDesktopEvidence(evidence);
+    console.log(JSON.stringify({ ok: true, scope: "rule-drafts", cases: ["late-get-new-draft", "load-existing-rules-before-create", "late-get-edit-reorder", "cancel-before-get", "new-draft-after-cancel", "successful-save-reset", "first-get-keeps-server-rules", "shop-and-logout-reset"] }));
+  } finally {
+    for (const release of fixtures.pendingAutomationGates) release();
+    await page.close();
+    Object.assign(fixtures, saved);
+  }
+}
+
 async function run() {
   const server = createServer();
   const port = await listen(server);
@@ -4134,6 +4285,7 @@ async function run() {
       await checkSettingsOpsMock(`http://127.0.0.1:${port}/xianyu-saas`);
       mockBrowser = await chromium.launch({ headless: true });
       await checkConnectionFlows(mockBrowser, `http://127.0.0.1:${port}/xianyu-saas/`);
+      await checkRuleDraftLoads(mockBrowser, `http://127.0.0.1:${port}/xianyu-saas/`);
     } finally {
       if (mockBrowser) await mockBrowser.close();
       await close(server);
@@ -4172,8 +4324,13 @@ async function run() {
       await checkOrderManagement(browser, `http://127.0.0.1:${port}/xianyu-saas/`);
       return;
     }
+    if (ruleDraftsScope) {
+      await checkRuleDraftLoads(browser, `http://127.0.0.1:${port}/xianyu-saas/`);
+      return;
+    }
     await checkConnectionFlows(browser, `http://127.0.0.1:${port}/xianyu-saas/`);
     if (connectionFlowsScope) return;
+    await checkRuleDraftLoads(browser, `http://127.0.0.1:${port}/xianyu-saas/`);
     const bootstrapToken = "bootstrap-ui-contract-token-0123456789abcdef";
     fixtures.authCapabilities = { registration_enabled: false, bootstrap_available: true, password_min_length: 12 };
     const bootstrapPage = await browser.newPage({ viewport: { width: 1440, height: 900 }, deviceScaleFactor: 1, serviceWorkers: "block" });
@@ -5335,7 +5492,7 @@ async function run() {
     await page.fill("#replyRuleItemId", "100003");
     await page.fill("#replyRuleKeywords", "延迟");
     await page.fill("#replyRuleReply", "这条规则会延迟返回。");
-    fixtures.automationPutDelayMsByAccount["shop-ui-2"] = 900;
+    const slowRuleGate = holdAutomationResponse("PUT", "shop-ui-2");
     const slowRulePutCount = fixtures.automationPuts.length;
     const slowRuleRequest = page.waitForRequest((request) => request.url().endsWith("/api/automation")
       && request.method() === "PUT"
@@ -5345,6 +5502,7 @@ async function run() {
       && response.request().headers()["x-shop-account"] === "shop-ui-2");
     await page.click("#saveReplyRuleButton");
     await slowRuleRequest;
+    await slowRuleGate.started();
     assert.equal(await page.locator("#saveReplyRuleButton").isDisabled(), true, "the rules submit button must stay disabled during a rules PUT");
     assert.equal(await page.locator("#replyRuleList [data-edit-rule], #replyRuleList [data-remove-rule]").evaluateAll((buttons) => buttons.every((button) => button.disabled)), true, "same-type rule actions must stay disabled during a rules PUT");
     await page.locator("#replyRuleForm").evaluate((form) => {
@@ -5358,18 +5516,22 @@ async function run() {
     await page.selectOption("#automationShopSelect", "default");
     await defaultAutomationLoad;
     await page.waitForFunction(() => document.querySelector("#accountTabs .account-tab.is-active .account-tab-name")?.textContent === "海风数字店");
-    const defaultPanelLoad = page.waitForResponse((response) => response.url().endsWith("/api/automation")
-      && response.request().method() === "GET"
-      && response.request().headers()["x-shop-account"] === "default");
-    await openView(page, "auto-reply");
-    await defaultPanelLoad;
     await page.waitForFunction(() => document.querySelector("#replyRuleList")?.textContent.includes("默认店规则"));
+    await page.waitForFunction(() => document.querySelector("#toastRegion")?.textContent.includes("已切换到「海风数字店」"));
+    defaultAutomation.first_reply = "默认店首次回复（已刷新）";
+    const lateDefaultGate = holdAutomationResponse("GET", "default");
+    await openView(page, "auto-reply");
+    await lateDefaultGate.started();
     await page.fill("#replyRuleName", "默认店未保存草稿");
+    lateDefaultGate.release();
+    await page.waitForFunction(() => document.querySelector("#automationFirstReply")?.value === "默认店首次回复（已刷新）");
+    assert.equal(await page.inputValue("#replyRuleName"), "默认店未保存草稿", "the late GET must not clear the new shop's rule form");
+    slowRuleGate.release();
     const completedSlowRuleResponse = await slowRuleResponse;
     await completedSlowRuleResponse.finished();
-    await page.waitForTimeout(20);
+    await waitForPanelSettled(page);
     assert.equal(await page.inputValue("#automationShopSelect"), "default", "the late shop-ui-2 response must not switch the active automation account");
-    assert.equal(await page.inputValue("#automationFirstReply"), "默认店首次回复", "the late shop-ui-2 response must not replace default settings");
+    assert.equal(await page.inputValue("#automationFirstReply"), "默认店首次回复（已刷新）", "the late shop-ui-2 response must not replace default settings");
     assert.match(await page.locator("#replyRuleList").textContent(), /默认店规则/);
     assert.doesNotMatch(await page.locator("#replyRuleList").textContent(), /备用店慢规则|备用店延迟保存规则/);
     assert.equal(await page.inputValue("#replyRuleName"), "默认店未保存草稿", "the late response must not clear the new shop's rule form");
@@ -6275,6 +6437,7 @@ async function run() {
     throw error;
   } finally {
     for (const gate of fixtures.pendingBotStatusGates) gate.release();
+    for (const release of fixtures.pendingAutomationGates) release();
     await browser.close();
     await close(server);
   }

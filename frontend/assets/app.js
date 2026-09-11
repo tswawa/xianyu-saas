@@ -4,7 +4,7 @@
 
   const API_PREFIX = "/xianyu-saas";
   const QR_LOGIN_POLL_MS = 1500;
-  const ASSET_VERSION = "20260910-03";
+  const ASSET_VERSION = "20260911-01";
   const AI_TEXT_PLACEHOLDERS = new Set(["无", "暂无", "没有", "未填写", "待填写", "待补充", "占位", "n/a", "na", "none", "null", "todo", "tbd"]);
   const ICONS = API_PREFIX + "/assets/icons.svg?v=" + ASSET_VERSION + "#";
   // 旧版视图 key → 新版视图 key（历史会话/书签兜底）。
@@ -5961,10 +5961,13 @@
       || generation !== state.automationLoadGeneration
       || Object.values(state.automationMutations).some(Boolean)
     ) return;
+    // Rule edits address the displayed array by index, so keep that snapshot
+    // until an explicit reset. New drafts must still receive existing rules.
+    const editingRules = state.automationEditor?.type === "rule" ? state.automation.rules : null;
     state.automation = data || { rules: [], deliveries: [], running: false, strategy: "standard", enabled: true };
-    state.automationEditor = { type: "", index: -1 };
+    if (editingRules) state.automation.rules = editingRules;
     renderAutomation();
-    resetReplyRuleForm();
+    // Loading is not an editor reset: a same-account GET can finish after typing.
     renderProducts();
   }
 

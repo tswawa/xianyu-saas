@@ -98,7 +98,7 @@
 
 ## 快速上手
 
-项目源码可通过 `git clone` 获取，也可从 [GitHub Releases](https://github.com/tswawa/xianyu-saas/releases) 下载包含完整构建文件与文档的官方源码包 `xianyu-saas-0.2.1-source.zip`（供 Docker 构建与手动部署；GitHub 自动生成的源码包缺少部分构建校验，建议优先使用官方附件）。
+项目源码可通过 `git clone` 获取，也可从 [GitHub Releases](https://github.com/tswawa/xianyu-saas/releases) 下载包含完整构建文件与文档的官方源码包 `xianyu-saas-0.2.2-source.zip`（供 Docker 构建与手动部署；GitHub 自动生成的源码包缺少部分构建校验，建议优先使用官方附件）。
 
 ### 方式一：Docker Compose 部署（推荐）
 
