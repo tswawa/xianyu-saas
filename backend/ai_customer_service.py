@@ -759,8 +759,27 @@ class AIService:
         ).derive(master)
         return encryption, signing
 
+    def _read_account_path(self, scope: tuple[int, int, str], *parts: str) -> Path:
+        """Resolve read paths without creating directories or changing their modes."""
+        path = self.storage.account_dir(scope[0], scope[2]).joinpath(*parts)
+        try:
+            relative = path.parent.relative_to(self.storage.root)
+            current = self.storage.root
+            for part in (None, *relative.parts):
+                if part is not None:
+                    current = current / part
+                try:
+                    info = os.lstat(current)
+                except FileNotFoundError:
+                    continue
+                if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+                    raise OSError("unsafe account directory")
+        except (OSError, ValueError) as exc:
+            raise AIServiceError("credential_unavailable", 503) from exc
+        return path
+
     def _read_root_json(self, scope: tuple[int, int, str], name: str, default: Any) -> Any:
-        path = self._account_dir(scope) / name
+        path = self._read_account_path(scope, name)
         try:
             payload = _private_path_read(path)
         except FileNotFoundError:
@@ -1073,7 +1092,8 @@ class AIService:
             allow_loopback=allow_loopback,
         )
         if status_code in {401, 403}:
-            raise AIServiceError("authentication_failed", 401)
+            # Provider credentials are independent of the browser login session.
+            raise AgentProviderError("authentication_failed", upstream_status=status_code)
         if status_code == 404:
             raise AIServiceError("model_not_found", 400)
         if status_code == 429:
@@ -1756,7 +1776,7 @@ class AIService:
         scope = self._scope(user_id, shop_account_id, account_key)
         product = self.product(*scope, item_id)
         selected = _safe_item_id(item_id)
-        path = self._knowledge_path(scope, selected)
+        path = self._read_account_path(scope, KNOWLEDGE_DIR, f"{selected}.json")
         try:
             payload = _private_path_read(path)
         except FileNotFoundError:
@@ -2079,6 +2099,7 @@ class AIService:
         store_config_override: dict | None,
         knowledge_override: dict | None,
         require_enabled: bool,
+        allow_sandbox_defaults: bool = False,
     ) -> tuple[dict, dict | None, dict | None, str, int, str, int | None]:
         settings = self.get_config(*scope)
         published = settings.get("published") if isinstance(settings.get("published"), dict) else None
@@ -2091,9 +2112,12 @@ class AIService:
         elif published and isinstance(published.get("config"), dict):
             store_config = published["config"]
             config_source = "published"
+        elif allow_sandbox_defaults and not require_enabled:
+            store_config = empty_store_config()
+            config_source = "sandbox_defaults"
         else:
             raise AIServiceError("ai_unconfigured", 409, "当前店铺尚未保存有效客服内容")
-        if not store_config_has_content(store_config):
+        if not store_config_has_content(store_config) and (require_enabled or not allow_sandbox_defaults):
             if store_config_override is not None:
                 raise AIServiceError("invalid_payload", 409, "当前店铺尚未保存有效客服内容")
             raise AIServiceError("ai_unconfigured", 409, "当前店铺尚未保存有效客服内容")
@@ -2122,15 +2146,16 @@ class AIService:
                 facts = product_facts({**item_context, "id": item_id})
             else:
                 facts = trusted_facts
-            current = self.get_knowledge(*scope, item_id)
             if knowledge_override is not None:
                 knowledge = normalize_knowledge(knowledge_override)
                 knowledge_status = "draft_override" if knowledge_has_content(knowledge) else "unconfigured"
-            elif current["status"] == "published":
-                knowledge = current["published"]["knowledge"]
-                knowledge_status = "published"
             else:
-                knowledge_status = current["status"]
+                current = self.get_knowledge(*scope, item_id)
+                if current["status"] == "published":
+                    knowledge = current["published"]["knowledge"]
+                    knowledge_status = "published"
+                else:
+                    knowledge_status = current["status"]
         return store_config, facts, knowledge, knowledge_status, live_config_revision, config_source, candidate_revision
 
     def reply(
@@ -2198,6 +2223,7 @@ class AIService:
             store_config_override=store_config_override,
             knowledge_override=knowledge_override,
             require_enabled=False,
+            allow_sandbox_defaults=True,
         )
         compiled = self.compile_effective_context(
             current_message=buyer_message,
@@ -2207,6 +2233,14 @@ class AIService:
             product_knowledge=knowledge,
             knowledge_status=knowledge_status,
         )
+        if not store_config_has_content(store_config):
+            # The shared compiler historically always reports store_content.
+            # An empty sandbox has a persona, not evidence about this shop.
+            compiled["sources"] = [value for value in compiled["sources"] if value != "store_content"]
+            compiled["messages"][0]["content"] += (
+                "当前未提供店铺客服内容；可以按设定身份介绍自己或普通问候，"
+                "但不得编造店铺、商品、价格或履约事实。"
+            )
         decision = self.generate_reply_decision(scope, compiled, store_config, recent_assistant_replies)
         sources = decision.get("sources") if isinstance(decision.get("sources"), list) else []
         result = {

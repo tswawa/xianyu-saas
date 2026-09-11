@@ -18,7 +18,10 @@ from shop_sync import (
     PERSISTED_SYNC_CODES,
     SYNC_COOLDOWN_SECONDS,
     SYNC_MAX_SECONDS,
+    REQUEST_INTERVAL,
     ShopSyncError,
+    _circuit_until,
+    check_sync_circuit,
     account_ref,
     parse_cookie_header,
     reserve_sync,
@@ -37,7 +40,103 @@ class ShopSyncPersistenceError(RuntimeError):
         super().__init__(message)
 
 
-def run_shop_sync_inner(
+def control_lease_error(db, key, result) -> ShopSyncError:
+    row = db.get_control_lease(key)
+    deadline = max(float(row["lease_until"] or 0), float(row["cooldown_until"] or 0)) if row else 0
+    code = "sync_cooldown" if result == "cooldown" else "sync_busy"
+    return ShopSyncError(code, "店铺检测暂时等待，请稍后再试", max(1, deadline - time.time()))
+
+
+class ShopConnectionCoordinator:
+    """Persistent per-shop QR ownership; no lock/transaction spans platform I/O."""
+
+    def __init__(self, db):
+        self.db = db
+
+    def acquire(self, user_id, account_key, owner, seconds):
+        account = self.db.get_shop_account(user_id, account_key=account_key)
+        if account is None or not account["enabled"]:
+            raise ShopSyncPersistenceError("店铺账号已停用")
+        lease = {
+            "key": f"shop-connect:{int(user_id)}:{int(account['id'])}",
+            "sync_key": f"shop-sync:{int(user_id)}:{int(account['id'])}",
+            "owner": owner, "user_id": int(user_id), "account_id": int(account["id"]),
+            "generation": int(account["generation"] or 0),
+        }
+        result = self.db.reserve_shop_connection(
+            lease["key"], owner, lease["sync_key"], lease_seconds=seconds,
+            risk_until=_circuit_until(),
+        )
+        if result["code"] != "acquired":
+            raise ShopSyncError(result["code"], "店铺连接暂时等待，请稍后再试", result["retry_after"])
+        return lease
+
+    def renew(self, lease, seconds):
+        if not self.db.account_is_current(lease["user_id"], lease["account_id"], lease["generation"]):
+            raise ShopSyncPersistenceError("店铺账号已变更，请重新扫码")
+        if not self.db.renew_control_lease(lease["key"], lease["owner"], seconds):
+            raise ShopSyncPersistenceError("扫码连接租约已失效，请重新扫码")
+
+    def release(self, lease):
+        self.db.release_control_lease(lease["key"], lease["owner"])
+
+    def before_request(self, lease, seconds):
+        check_sync_circuit()
+        # Only this HTTP request holds global egress, never the user's scan.
+        result = self.db.acquire_control_lease(
+            "shop-sync:egress", lease["owner"], lease_seconds=seconds,
+            cooldown_seconds=REQUEST_INTERVAL,
+        )
+        if result == "cooldown":
+            row = self.db.get_control_lease("shop-sync:egress")
+            remaining = float(row["cooldown_until"] or 0) - time.time() if row else 0
+            if 0 < remaining <= REQUEST_INTERVAL:
+                # The bounded rate interval is not a retry loop; no lock or
+                # reservation is held while waiting between QR HTTP calls.
+                time.sleep(remaining)
+                result = self.db.acquire_control_lease(
+                    "shop-sync:egress", lease["owner"], lease_seconds=seconds,
+                    cooldown_seconds=REQUEST_INTERVAL,
+                )
+        if result != "acquired":
+            raise control_lease_error(self.db, "shop-sync:egress", result)
+        try:
+            check_sync_circuit()
+        except Exception:
+            self.after_request(lease)
+            raise
+
+    def after_request(self, lease):
+        self.db.release_control_lease("shop-sync:egress", lease["owner"])
+
+
+def run_shop_sync_inner(*, connection_lease=None, **kwargs) -> dict:
+    """Keep per-shop ownership through validation AND durable persistence."""
+    db, user_id = kwargs["db"], kwargs["user_id"]
+    account = kwargs.get("account") or db.ensure_default_shop_account(user_id)
+    if account is None:
+        raise ShopSyncPersistenceError()
+    kwargs["account"] = account
+    coordinator = ShopConnectionCoordinator(db)
+    owned_here = connection_lease is None
+    lease = connection_lease or coordinator.acquire(
+        user_id, str(account["account_key"]),
+        f"sync:{os.getpid()}:{threading.get_ident()}:{time.time_ns()}", SYNC_MAX_SECONDS + 120,
+    )
+    try:
+        if (lease["user_id"] != int(user_id) or lease["account_id"] != int(account["id"])
+                or lease["generation"] != int(account["generation"] or 0)):
+            raise ShopSyncPersistenceError("店铺账号已变更，请重新扫码")
+        coordinator.renew(lease, SYNC_MAX_SECONDS + 120)
+        return _run_shop_sync_owned(
+            **kwargs, ensure_connection=lambda: coordinator.renew(lease, SYNC_MAX_SECONDS + 120),
+        )
+    finally:
+        if owned_here:
+            coordinator.release(lease)
+
+
+def _run_shop_sync_owned(
     *,
     db,
     read_secret: Callable,
@@ -52,6 +151,7 @@ def run_shop_sync_inner(
     reserve_sync_func: Callable = reserve_sync,
     lease_owner_prefix: str = "sync",
     before_replace_persist: Callable | None = None,
+    ensure_connection: Callable = lambda: None,
 ) -> dict:
     """Verify a Cookie and atomically persist the account snapshot.
 
@@ -76,6 +176,7 @@ def run_shop_sync_inner(
         account_generation = 0
 
     def ensure_account_current() -> None:
+        ensure_connection()
         try:
             current = db.get_shop_account(user_id, account_id=account_id)
             current_generation = int(current["generation"] or 0) if current is not None else -1
@@ -111,28 +212,21 @@ def run_shop_sync_inner(
     egress_lease_key = ""
     try:
         normalized, _ = parse_cookie_header(cookie_header)
+        if not replace_cookie:
+            saved, _ = parse_cookie_header(read_secret(user_id, "cookies.txt", account_key))
+            if saved != normalized:
+                raise ShopSyncPersistenceError("店铺登录信息已更新，请重新检测")
         try:
             _, attempted_cookies = parse_cookie_header(normalized)
             attempted_account_ref = account_ref(attempted_cookies)
         except ShopSyncError:
             pass
 
+        check_sync_circuit()
         sync_lease_key = f"shop-sync:{int(user_id)}:{int(account['id'])}"
         sync_lease_owner = (
             f"{lease_owner_prefix}:{os.getpid()}:{threading.get_ident()}:{time.time_ns()}"
         )
-        cooldown = 0 if os.environ.get("SAAS_TESTING") == "1" else SYNC_COOLDOWN_SECONDS
-        lease_result = db.acquire_control_lease(
-            sync_lease_key,
-            sync_lease_owner,
-            lease_seconds=SYNC_MAX_SECONDS + 120,
-            cooldown_seconds=cooldown,
-        )
-        if lease_result == "busy":
-            raise ShopSyncError("sync_busy", "已有店铺同步正在进行，请稍后再试")
-        if lease_result == "cooldown":
-            raise ShopSyncError("sync_cooldown", "操作太频繁，请稍后再试")
-
         # The in-process gate in ``shop_sync`` cannot coordinate the API and
         # the separate consumer. A short-lived persistent egress lease keeps
         # platform requests serialized across processes and machines sharing
@@ -145,8 +239,16 @@ def run_shop_sync_inner(
             cooldown_seconds=0,
         )
         if egress_result != "acquired":
-            raise ShopSyncError("sync_busy", "已有店铺同步正在进行，请稍后再试")
+            raise control_lease_error(db, egress_lease_key, egress_result)
 
+        check_sync_circuit()
+        cooldown = 0 if os.environ.get("SAAS_TESTING") == "1" else SYNC_COOLDOWN_SECONDS
+        lease_result = db.acquire_control_lease(
+            sync_lease_key, sync_lease_owner,
+            lease_seconds=SYNC_MAX_SECONDS + 120, cooldown_seconds=cooldown,
+        )
+        if lease_result != "acquired":
+            raise control_lease_error(db, sync_lease_key, lease_result)
         ensure_account_current()
         if account_key == "default":
             reserve_sync_func(user_id)
@@ -158,7 +260,7 @@ def run_shop_sync_inner(
         # A failed replacement must not make a still-valid previous account
         # look broken. Checks against a saved Cookie do persist a blocking
         # result so the next status request can explain what needs attention.
-        if error.code in PERSISTED_SYNC_CODES and not (replace_cookie and previous_snapshot is not None):
+        if error.code in PERSISTED_SYNC_CODES and not replace_cookie:
             try:
                 ensure_account_current()
                 save_sync_state(

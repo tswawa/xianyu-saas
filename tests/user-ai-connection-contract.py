@@ -472,6 +472,32 @@ class UserConnectionContracts(unittest.TestCase):
         self.assertFalse(self.shared.initialized(1))
         self.assertFalse((self.root / "tenants").exists())
 
+    def test_provider_auth_failure_is_retryable_without_persisting_credentials(self):
+        # Exercise the real HTTP-status mapping instead of a successful requester.
+        self.ai.requester = None
+        before = self.shared.read(1)
+        for status in (401, 403):
+            with self.subTest(upstream_status=status), patch.object(
+                self.ai, "_request_pinned", return_value=(
+                    status, json.dumps({"error": {"message": CONFIG["api_key"]}}).encode(),
+                ),
+            ) as request:
+                with self.assertRaises(AIServiceError) as caught:
+                    self.shared.test(1, **CONFIG, expected_revision=0)
+                self.assertEqual(caught.exception.code, "authentication_failed")
+                self.assertEqual(caught.exception.status_code, 502)
+                self.assertEqual(caught.exception.public_detail()["source"], "provider")
+                self.assertEqual(caught.exception.public_detail()["upstream_status"], status)
+                self.assertNotIn(CONFIG["api_key"], json.dumps(caught.exception.public_detail()))
+                request.assert_called_once()
+            self.assertEqual(self.shared.read(1), before)
+            self.assertFalse((self.root / "tenants").exists())
+
+        self.ai.requester = self.requester
+        saved = self.saved()
+        self.assertEqual(saved["connection_status"], "verified")
+        self.assertEqual(saved["revision"], 1)
+
     def test_private_dns_blocked_deepseek_disabled_and_responses_budget(self):
         self.ai.resolver = lambda host, port, type=None: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", port))]
         self.error("address_unsafe", lambda: self.shared.test(1, **CONFIG, expected_revision=0), 400)

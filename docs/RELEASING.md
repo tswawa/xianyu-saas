@@ -23,7 +23,7 @@
 3. **主分支 CI 验证**：将代码提交并推送到 `main` 分支，等待 GitHub Actions 的 `ci.yml` 工作流完整执行通过；
 4. **推送版本标签**：确认主分支 CI 通过后，创建并推送对应的版本标签：
    ```bash
-   VERSION=0.2.0
+   VERSION=0.2.1
    git tag "v${VERSION}"
    git push origin "v${VERSION}"
    ```
@@ -55,7 +55,7 @@ GitHub Actions 工作流 [`.github/workflows/release.yml`](../.github/workflows/
 在维护者本地或离线环境中执行签名打包时，使用以下命令：
 
 ```bash
-VERSION=0.2.0
+VERSION=0.2.1
 python scripts/build-release.py --ref HEAD --output ".local/releases/${VERSION}"
 ```
 
@@ -88,6 +88,6 @@ python scripts/build-release.py --ref HEAD --output ".local/releases/${VERSION}"
 ## 7. 运行端更新与环境约束
 
 - **systemd 部署模式**：运行端首次配置并显式信任公钥（`deploy/update-signing.pub`）后，方可启用带签名校验的自动更新服务；
-- **Docker 部署模式**：当前 Docker 运行模式仅提供新版本检测与后台提示，容器更新需由管理员在宿主机通过 `docker compose build` 与 `docker compose up -d` 完成，工作台网页不提供接管宿主机升级容器的功能；
+- **Docker 部署模式**：当前 Docker 运行模式仅提供新版本检测与后台提示，容器更新需由管理员在宿主机通过 `docker compose build` 与 `docker compose up -d` 完成，升级过程保留原有数据卷与挂载，工作台网页不接管宿主机升级容器；
 - **生产环境验收**：代码与打包阶段的离线测试不能代替真实闲鱼账号会话、真实第三方大模型接口以及真实订单履约流程的现场验证；
 - **部署与权限参考**：完整的生产环境配置、数据卷挂载及权限要求参见 [`docs/DEPLOYMENT.md`](DEPLOYMENT.md)。

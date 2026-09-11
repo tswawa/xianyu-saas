@@ -71,12 +71,12 @@ SAAS_UI_SCOPE=docs-capture node tests/ui-check.mjs
 
 项目遵循语义化版本规范，新版本通过 GitHub Actions 自动化流水线签名并发布：
 
-- **版本号统一**：发布新版本前，须同步更新 `package.json`、`package-lock.json` 与 `backend/version.py` 中的版本号（例如 `0.2.0`），确保版本标识全局一致；
+- **版本号统一**：发布新版本前，须同步更新 `package.json`、`package-lock.json` 与 `backend/version.py` 中的版本号（例如 `0.2.1`），确保版本标识全局一致；
 - **本地打包验证**：可通过仓库内置脚本针对选定的 Git 提交进行离线打包演练（打包过程严格基于 Git 跟踪对象，不收录未跟踪的本地文件与私有配置）：
   ```bash
   python3 scripts/build-release.py --ref HEAD --output .local/releases/test-build
   ```
-- **自动化发布工作流**：向仓库推送 `v*` 格式版本标签（例如 `v0.2.0`）会触发 `.github/workflows/release.yml`。工作流首先执行全套 CI 测试门禁，校验通过后使用 GitHub Actions secret `RELEASE_SIGNING_KEY` 托管的私钥对发布清单进行数字签名，生成包含 8 项正式资产的发布草稿并自动发布；
+- **自动化发布工作流**：必须在 `main` 分支 CI 完整执行通过后，方可向仓库推送 `v*` 格式版本标签（例如 `v0.2.1`）；不能预先推签或提前假设通过。推送标签后触发 `.github/workflows/release.yml`，工作流复用 CI 门禁并调用打包脚本生成带数字签名的 8 项正式资产草稿，校验无误后正式发布；
 - **公钥与私钥分离**：签名公钥保存于 `deploy/update-signing.pub`，签名私钥仅由服务端 Actions Secret 托管，严禁将私钥以任何形式提交至代码仓库或打入分发包。
 
 ## 提交信息与 PR 规范
@@ -84,5 +84,5 @@ SAAS_UI_SCOPE=docs-capture node tests/ui-check.mjs
 - 推荐使用常规提交信息格式（Conventional Commits），例如：
   - `feat(worker): 支持根据商品规格选择不同回复话术`
   - `fix(backend): 修复并发创建管理员时的死锁问题`
-  - `docs(readme): 补充 Windows 环境原生运行说明`
+  - `docs(readme): 补充 Windows 环境容器运行说明`
 - 提交 PR 时请完整填写 Pull Request 模板，详细说明变更原因、影响模块以及本地测试验证情况。

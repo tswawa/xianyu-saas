@@ -145,6 +145,39 @@ class Fixture:
             client.close()
 
 
+def connection_auth_failure_contract(f):
+    paths = ("/api/settings/ai/connection/test", "/api/bot/ai/connection/test")
+    before = files(f.ai.storage.root)
+    metadata = result(f.owner.get("/api/settings/ai/connection"))
+    for path in paths:
+        for upstream_status in (401, 403):
+            body = json.dumps({"error": {"message": CONNECTION["api_key"]}}).encode()
+            with patch.object(f.ai, "requester", new=None), patch.object(
+                f.ai, "_request_pinned", return_value=(upstream_status, body),
+            ) as request:
+                detail = result(f.send("POST", path, CONNECTION), 502, "authentication_failed")["detail"]
+                assert detail["source"] == "provider" and detail["upstream_status"] == upstream_status
+                request.assert_called_once()
+            result(f.owner.get("/api/me"))
+            assert result(f.owner.get("/api/settings/ai/connection")) == metadata
+            assert files(f.ai.storage.root) == before
+
+        # The same browser session can correct its key and retry without login.
+        body = json.dumps({"choices": [{"message": {"content": "OK"}}]}).encode()
+        with patch.object(f.ai, "requester", new=None), patch.object(f.ai, "_request_pinned", return_value=(200, body)):
+            retry = result(f.send("POST", path, {**CONNECTION, "api_key": "synthetic-corrected-key"}))
+            assert retry["ok"] and retry["status"] == "verified" and retry["verification_token"]
+        assert files(f.ai.storage.root) == before
+        assert result(f.owner.get("/api/settings/ai/connection")) == metadata
+        result(f.send("POST", path, CONNECTION, client=f.guest), 401)
+
+    # Keep the HTTP boundary safe for a legacy/injected service error as well.
+    from ai_customer_service import AIServiceError
+    with patch.object(f.app.user_ai_connections, "test", side_effect=AIServiceError("authentication_failed", 401)):
+        result(f.send("POST", paths[0], CONNECTION), 502, "authentication_failed")
+    result(f.owner.get("/api/me"))
+
+
 def settings_contract(f):
     for path in ("/api/settings/ai/connection", "/api/ops/sessions/current"):
         result(f.guest.get(path), 401)
@@ -553,6 +586,8 @@ def main():
             fixture = Fixture(app)
             resolver = lambda host, port, type=None: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", port))]
             with patch.object(fixture.ai, "requester", new=fixture.fake_agent_request), patch.object(fixture.ai, "resolver", new=resolver):
+                connection_auth_failure_contract(fixture)
+                print("settings/ops API: model authentication failures preserve login and allow retry ok")
                 settings_contract(fixture)
                 print("settings/ops API: shared settings and durable missing-connection failure ok")
                 session_id = sessions_contract(fixture)

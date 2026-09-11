@@ -31,7 +31,7 @@ from shop_sync import (
     reserve_sync,
     sync_shop,
 )
-from shop_sync_service import ShopSyncPersistenceError, run_shop_sync_inner
+from shop_sync_service import ShopConnectionCoordinator, ShopSyncPersistenceError, run_shop_sync_inner
 
 
 POLL_SECONDS = max(
@@ -256,6 +256,31 @@ class JobConsumer:
             heartbeat.join(timeout=1.0)
 
     def process(self, row) -> str:
+        """Reserve before reading the saved Cookie, including malformed old logins."""
+        if row["kind"] != "shop_sync":
+            return self._process(row)
+        account = self._resolve_account(row)
+        if account is None:
+            return self._process(row)
+        coordinator = ShopConnectionCoordinator(self.db)
+        try:
+            lease = coordinator.acquire(
+                int(row["user_id"]), str(account["account_key"]),
+                f"consumer-connect:{os.getpid()}:{threading.get_ident()}:{time.time_ns()}",
+                SYNC_MAX_SECONDS + 120,
+            )
+        except ShopSyncError as error:
+            deferred = self.db.defer_job(int(row["id"]), self.owner, error.retry_after or SYNC_COOLDOWN_SECONDS)
+            return "deferred" if deferred else "lease_lost"
+        except ShopSyncPersistenceError as error:
+            self._fail(row, error.code, str(error))
+            return "failed"
+        try:
+            return self._process(row, connection_lease=lease)
+        finally:
+            coordinator.release(lease)
+
+    def _process(self, row, connection_lease=None) -> str:
         """Process one claimed row and return its terminal action."""
         if row["kind"] == "ops_run":
             return self._process_ops(row)
@@ -329,19 +354,15 @@ class JobConsumer:
                 sync_func=self.sync_func,
                 reserve_sync_func=self.reserve_sync_func,
                 lease_owner_prefix="consumer",
+                connection_lease=connection_lease,
             )
         except ShopSyncError as error:
-            if error.code == "sync_cooldown":
-                # A cooldown is a scheduling condition, not a failed shop
-                # check. Defer beyond the platform window instead of burning
-                # all attempts in a few seconds and reporting dead_letter.
-                self._fail(
-                    row,
-                    error.code,
-                    str(error),
-                    retry_delay_seconds=SYNC_COOLDOWN_SECONDS + 1,
+            if error.code in {"sync_cooldown", "sync_busy", "risk_cooldown"}:
+                # Local protection is scheduling, not a failed platform call.
+                deferred = self.db.defer_job(
+                    job_id, self.owner, error.retry_after or SYNC_COOLDOWN_SECONDS,
                 )
-                return "deferred"
+                return "deferred" if deferred else "lease_lost"
             self._fail(row, error.code, str(error))
             return "failed"
         except ShopSyncPersistenceError as error:

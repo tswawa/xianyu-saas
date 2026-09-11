@@ -152,13 +152,14 @@ def main() -> None:
     def cooldown_reserve(*_args):
         if cooldown_once["value"]:
             cooldown_once["value"] = False
-            raise ShopSyncError("sync_cooldown", "操作太频繁，请稍后再试")
+            raise ShopSyncError("sync_cooldown", "操作太频繁，请稍后再试", retry_after=2)
 
     consumer.reserve_sync_func = cooldown_reserve
     assert consumer.run_once() == 1
     cooldown_row = db.get_job(cooldown_job["id"])
     assert cooldown_row["status"] == "retry"
-    assert cooldown_row["last_error_code"] == "sync_cooldown"
+    assert not cooldown_row["last_error_code"]
+    assert cooldown_row["attempts"] == 0
     assert float(cooldown_row["available_at"]) - float(cooldown_row["updated_at"]) >= 1.9
     assert db.get_shop_account(user_id, account_id=default["id"])["status"] == "ready"
     assert consumer.run_once(now=cooldown_row["available_at"] - 0.01) == 0

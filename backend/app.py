@@ -12,6 +12,7 @@ import hashlib
 import hmac
 import ipaddress
 import json
+import logging
 import os
 import re
 import secrets
@@ -108,11 +109,11 @@ from shop_sync import (
     SYNC_MAX_SECONDS,
     sync_status_payload,
 )
-from shop_sync_service import ShopSyncPersistenceError, run_shop_sync_inner
+from shop_sync_service import ShopConnectionCoordinator, ShopSyncPersistenceError, run_shop_sync_inner
 from version import RELEASE_CHANNEL, local_release_notes, version_payload
 from user_ai_connection import UserAIConnections
 from operations import OperationsService, OperationsError
-from xianyu_login import XianyuLoginError, qr_logins
+from xianyu_login import XianyuLoginError, XianyuLoginManager
 from runtime_settings import RuntimeSettings, RuntimeSettingsError
 from shop_resources import ShopResources
 import bot_manager as worker_manager
@@ -222,6 +223,14 @@ def _acquire_api_process_lock():
 
 _api_process_lock = _acquire_api_process_lock()
 db = DB()
+_qr_connections = ShopConnectionCoordinator(db)
+qr_logins = XianyuLoginManager(
+    acquire_hook=_qr_connections.acquire,
+    renew_hook=_qr_connections.renew,
+    release_hook=_qr_connections.release,
+    before_request_hook=_qr_connections.before_request,
+    after_request_hook=_qr_connections.after_request,
+)
 user_ai_connections = UserAIConnections(db, ai_service)
 ai_service.user_connections = user_ai_connections
 operations_service = OperationsService(db, ai_service)
@@ -1226,10 +1235,12 @@ def _public_ai_knowledge(payload: dict) -> dict:
 
 
 def _raise_ai_error(error: AIServiceError):
-    raise HTTPException(
-        error.status_code,
-        detail={"code": error.code, "message": str(error)},
-    ) from error
+    public = getattr(error, "public_detail", None)
+    detail = public() if callable(public) else {"code": error.code, "message": str(error)}
+    # Only Auth may expire a browser session. Upstream AI authentication errors
+    # must leave it intact so the user can correct the connection and retry.
+    status = 502 if error.status_code == 401 else error.status_code
+    raise HTTPException(status, detail=detail) from error
 
 
 def _require_ai_reply_ready(user, account) -> None:
@@ -2049,7 +2060,11 @@ def _shop_sync_http_error(error: ShopSyncError) -> HTTPException:
         "cookie_expired",
         "account_restricted",
     }
-    return HTTPException(status, detail=detail)
+    headers = None
+    if error.retry_after is not None:
+        detail["retry_after"] = int(error.retry_after)
+        headers = {"Retry-After": str(error.retry_after)}
+    return HTTPException(status, detail=detail, headers=headers)
 
 
 def _cookie_http_error(code: str, message: str, status: int) -> HTTPException:
@@ -2091,14 +2106,12 @@ def _xianyu_login_http_error(error: XianyuLoginError) -> HTTPException:
         "platform_error": 502,
     }
     code = error.code
-    return HTTPException(
-        statuses.get(code, 502),
-        detail={
-            "code": code,
-            "message": error.message,
-            "retryable": code not in {"invalid_request"},
-        },
-    )
+    detail = {"code": code, "message": error.message, "retryable": code not in {"invalid_request"}}
+    headers = None
+    if error.retry_after is not None:
+        detail["retry_after"] = int(error.retry_after)
+        headers = {"Retry-After": str(error.retry_after)}
+    return HTTPException(statuses.get(code, 502), detail=detail, headers=headers)
 
 
 def _run_shop_sync_inner(
@@ -2107,6 +2120,7 @@ def _run_shop_sync_inner(
     replace_cookie: bool,
     account=None,
     before_replace_persist=None,
+    connection_lease=None,
 ) -> dict:
     try:
         return run_shop_sync_inner(
@@ -2125,6 +2139,7 @@ def _run_shop_sync_inner(
             reserve_sync_func=reserve_sync,
             lease_owner_prefix="api",
             before_replace_persist=before_replace_persist,
+            connection_lease=connection_lease,
         )
     except ShopSyncError as error:
         raise _shop_sync_http_error(error) from None
@@ -2138,6 +2153,7 @@ def _run_shop_sync(
     replace_cookie: bool,
     account=None,
     before_replace_persist=None,
+    connection_lease=None,
 ) -> dict:
     """Run one sync through a durable, account-scoped idempotent job."""
     try:
@@ -2151,6 +2167,8 @@ def _run_shop_sync(
     fingerprint = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:24]
     if replace_cookie:
         idempotency_key = f"replace:{fingerprint}"
+        if connection_lease is not None:
+            idempotency_key += f":login:{connection_lease['owner']}"
     else:
         bucket = int(time.time() // max(SYNC_COOLDOWN_SECONDS, 1))
         # Include the verified Cookie fingerprint so a replacement created in
@@ -2207,8 +2225,12 @@ def _run_shop_sync(
     if claimed is None:
         current = db.get_job(job["id"])
         if current is not None and current["status"] == "retry":
-            raise _shop_sync_http_error(ShopSyncError("sync_cooldown", "操作太频繁，请稍后再试"))
-        raise _shop_sync_http_error(ShopSyncError("sync_busy", "已有店铺同步正在进行，请稍后再试"))
+            raise _shop_sync_http_error(ShopSyncError(
+                "sync_cooldown", "操作太频繁，请稍后再试",
+                max(1, float(current["available_at"] or 0) - time.time()),
+            ))
+        remaining = max(1, float(current["lease_until"] or 0) - time.time()) if current is not None else None
+        raise _shop_sync_http_error(ShopSyncError("sync_busy", "已有店铺同步正在进行，请稍后再试", remaining))
     try:
         snapshot = _run_shop_sync_inner(
             user_id,
@@ -2216,10 +2238,14 @@ def _run_shop_sync(
             replace_cookie,
             account,
             before_replace_persist=before_replace_persist,
+            connection_lease=connection_lease,
         )
     except HTTPException as error:
         detail = error.detail if isinstance(error.detail, dict) else {}
-        db.fail_job(job["id"], owner, detail.get("code", "sync_error"))
+        if detail.get("code") in {"sync_cooldown", "sync_busy", "risk_cooldown"}:
+            db.defer_job(job["id"], owner, detail.get("retry_after") or SYNC_COOLDOWN_SECONDS)
+        else:
+            db.fail_job(job["id"], owner, detail.get("code", "sync_error"))
         raise
     except Exception:
         db.fail_job(job["id"], owner, "sync_error")
@@ -2545,6 +2571,12 @@ def _discard_new_account_storage(user_id: int, account_key: str = DEFAULT_ACCOUN
         return False
 
 
+def _discard_new_user_storage(user_id: int) -> bool:
+    return db.discard_unregistered_storage(
+        user_id, lambda value: _discard_new_account_storage(value, DEFAULT_ACCOUNT_ID)
+    )
+
+
 def _validate_password(password: str) -> None:
     password = str(password or "")
     if not (PASSWORD_MIN_LENGTH <= len(password) <= 1024):
@@ -2573,15 +2605,36 @@ def _validate_new_credentials(username: str, password: str) -> str:
 
 def _new_user_initializer(holder: dict):
     def initialize(user_id: int) -> None:
-        from bot_manager import ensure_dir as ensure_bot_dir
+        from bot_manager import initialize_new_user_storage
 
-        ensure_bot_dir(user_id, DEFAULT_ACCOUNT_ID, initialize=True)
-        # Failed initialization cleans its own newly created directory. Only a
-        # successfully created directory belongs to this request's compensation;
-        # never delete a pre-existing directory after ensure_dir refuses it.
-        holder["user_id"] = int(user_id)
+        created = initialize_new_user_storage(user_id)
+        # A recovered empty/default-only directory predates this transaction.
+        # Even a later database failure must not give us ownership to delete it.
+        if created:
+            holder["user_id"] = int(user_id)
 
     return initialize
+
+
+def _account_initialization_failure(error: BaseException) -> HTTPException:
+    from bot_manager import account_initialization_reason
+
+    reason = account_initialization_reason(error)
+    messages = {
+        "storage_permission_denied": "账号初始化失败：服务无法写入数据目录，请管理员检查目录归属和写入权限后重试。",
+        "storage_read_only": "账号初始化失败：数据目录为只读，请管理员检查挂载设置后重试。",
+        "storage_full": "账号初始化失败：存储空间或配额不足，请管理员检查可用空间后重试。",
+        "storage_conflict": "账号初始化失败：目标目录已有非初始数据或路径冲突。为保护数据，系统未覆盖，请管理员核对数据库与数据目录。",
+        "storage_error": "账号初始化失败，请管理员检查服务日志与数据目录；不要删除已有数据或修改账号密码。",
+    }
+    if reason not in messages:
+        reason = "storage_error"
+    # Deliberately omit exception text/traceback: it may contain a path or secret.
+    logging.getLogger("uvicorn.error").warning("Account initialization failed reason=%s", reason)
+    return HTTPException(
+        503,
+        detail={"code": "account_initialization_failed", "reason": reason, "message": messages[reason]},
+    )
 
 
 def _registration_disabled() -> HTTPException:
@@ -2655,14 +2708,12 @@ def bootstrap_admin(
             409,
             detail={"code": "bootstrap_consumed", "message": "初始化已完成"},
         ) from exc
-    except (OSError, sqlite3.Error) as exc:
+    except (OSError, AccountStorageError, sqlite3.Error) as exc:
         if holder.get("user_id") is not None:
-            _discard_new_account_storage(holder["user_id"], DEFAULT_ACCOUNT_ID)
-        _audit("auth.bootstrap_failed", request, outcome="failed", metadata={"code": "storage"})
-        raise HTTPException(
-            503,
-            detail={"code": "account_initialization_failed", "message": "账号初始化失败，请稍后重试"},
-        ) from exc
+            _discard_new_user_storage(holder["user_id"])
+        failure = _account_initialization_failure(exc)
+        _audit("auth.bootstrap_failed", request, outcome="failed", metadata={"code": failure.detail["reason"]})
+        raise failure from exc
     _audit(
         "auth.bootstrap_succeeded",
         request,
@@ -2698,14 +2749,12 @@ def register(body: RegisterIn, request: Request):
             409,
             detail={"code": "username_unavailable", "message": "账号名称不可用"},
         ) from exc
-    except (OSError, sqlite3.Error) as exc:
+    except (OSError, AccountStorageError, sqlite3.Error) as exc:
         if holder.get("user_id") is not None:
-            _discard_new_account_storage(holder["user_id"], DEFAULT_ACCOUNT_ID)
-        _audit("auth.registration_failed", request, outcome="failed", metadata={"code": "storage"})
-        raise HTTPException(
-            503,
-            detail={"code": "account_initialization_failed", "message": "账号初始化失败，请稍后重试"},
-        ) from exc
+            _discard_new_user_storage(holder["user_id"])
+        failure = _account_initialization_failure(exc)
+        _audit("auth.registration_failed", request, outcome="failed", metadata={"code": failure.detail["reason"]})
+        raise failure from exc
     role = str(db.get_user_by_id(user_id)["role"])
     _audit(
         "auth.registration_succeeded",
@@ -4205,6 +4254,10 @@ def start_xianyu_login(
             return qr_logins.start(user["id"])
         qr_logins.clear_user(user["id"], preserve_cooldown=True, account_key=account_key)
         return qr_logins.start(user["id"], account_key=account_key)
+    except ShopSyncError as error:
+        raise _shop_sync_http_error(error) from None
+    except ShopSyncPersistenceError as error:
+        raise HTTPException(409, detail={"code": "login_expired", "message": str(error)}) from None
     except XianyuLoginError as error:
         raise _xianyu_login_http_error(error) from None
 
@@ -4253,8 +4306,43 @@ def xianyu_login_status(
         if result.get("status") == "error":
             raise XianyuLoginError(str(result.get("code") or "platform_error"))
         return result
+    except ShopSyncError as error:
+        raise _shop_sync_http_error(error) from None
     except XianyuLoginError as error:
         raise _xianyu_login_http_error(error) from None
+
+
+def _qr_complete_http_error(error, user_id, login_id, account_key):
+    if isinstance(error, XianyuLoginError):
+        error = _xianyu_login_http_error(error)
+    elif isinstance(error, ShopSyncError):
+        error = _shop_sync_http_error(error)
+    elif not isinstance(error, HTTPException):
+        error = HTTPException(503, detail={"code": "login_complete_failed", "message": "保存登录失败，请重新扫码"})
+    detail = dict(error.detail) if isinstance(error.detail, dict) else {"message": str(error.detail)}
+    retry_state = getattr(qr_logins, "retry_state", None)
+    state = retry_state(user_id, login_id, account_key) if callable(retry_state) else {
+        "login_expires_in": 0, "can_retry_login": False,
+    }
+    delay = detail.get("retry_after")
+    temporary = detail.get("code") in {"sync_cooldown", "risk_cooldown", "sync_busy"}
+    state["can_retry_login"] = bool(
+        temporary and state["can_retry_login"] and type(delay) is int
+        and 0 <= delay < state["login_expires_in"]
+    )
+    detail.update(state)
+    if not temporary and detail.get("code") not in {
+        "login_busy", "login_not_confirmed", "network_error", "platform_error",
+        "platform_busy", "sync_timeout",
+    }:
+        try:
+            if account_key == "default":
+                qr_logins.cancel(user_id, login_id)
+            else:
+                qr_logins.cancel(user_id, login_id, account_key)
+        except XianyuLoginError:
+            pass
+    return HTTPException(error.status_code, detail=detail, headers=error.headers)
 
 
 @app.post("/api/bot/login/complete")
@@ -4269,8 +4357,12 @@ def complete_xianyu_login(
 
     def pause_worker_after_verification():
         nonlocal worker_paused
+        if callable(getattr(qr_logins, "connection_lease", None)):
+            qr_logins.connection_lease(user["id"], body.login_id, account_key)
         _pause_account_worker_for_login_replace(user["id"], account)
         worker_paused = True
+        if callable(getattr(qr_logins, "connection_lease", None)):
+            qr_logins.connection_lease(user["id"], body.login_id, account_key)
 
     try:
         cookie_header = (
@@ -4279,17 +4371,20 @@ def complete_xianyu_login(
             else qr_logins.begin_consume(user["id"], body.login_id, account_key)
         )
     except XianyuLoginError as error:
-        raise _xianyu_login_http_error(error) from None
+        raise _qr_complete_http_error(error, user["id"], body.login_id, account_key) from None
 
     try:
+        lease_reader = getattr(qr_logins, "connection_lease", None)
+        lease = lease_reader(user["id"], body.login_id, account_key) if callable(lease_reader) else None
         snapshot = _run_shop_sync(
             user["id"],
             cookie_header,
             replace_cookie=True,
             account=account,
             before_replace_persist=pause_worker_after_verification,
+            connection_lease=lease,
         )
-    except Exception:
+    except Exception as error:
         if worker_paused:
             _autostart_account_worker(user["id"], account)
         try:
@@ -4299,7 +4394,7 @@ def complete_xianyu_login(
                 qr_logins.finish_consume(user["id"], body.login_id, False, account_key)
         except XianyuLoginError:
             pass
-        raise
+        raise _qr_complete_http_error(error, user["id"], body.login_id, account_key) from None
 
     try:
         if account_key == "default":

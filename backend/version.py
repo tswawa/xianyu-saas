@@ -10,8 +10,8 @@ from pathlib import Path
 
 
 # Must match package.json; image builds validate this before publication.
-VERSION = "0.2.0"
-ASSET_VERSION = "20260910-01"
+VERSION = "0.2.1"
+ASSET_VERSION = "20260910-03"
 RELEASE_CHANNEL = "release"
 ROOT = Path(__file__).resolve().parents[1]
 BUILD_INFO_FILE = Path(__file__).with_name("build-info.json")

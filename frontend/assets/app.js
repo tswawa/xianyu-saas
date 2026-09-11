@@ -4,7 +4,7 @@
 
   const API_PREFIX = "/xianyu-saas";
   const QR_LOGIN_POLL_MS = 1500;
-  const ASSET_VERSION = "20260910-01";
+  const ASSET_VERSION = "20260910-03";
   const AI_TEXT_PLACEHOLDERS = new Set(["无", "暂无", "没有", "未填写", "待填写", "待补充", "占位", "n/a", "na", "none", "null", "todo", "tbd"]);
   const ICONS = API_PREFIX + "/assets/icons.svg?v=" + ASSET_VERSION + "#";
   // 旧版视图 key → 新版视图 key（历史会话/书签兜底）。
@@ -76,6 +76,7 @@
       knowledgeRequestGeneration: 0,
       extractionGeneration: 0,
       previewGeneration: 0,
+      previewBusy: false,
       generatedKnowledge: null,
       previewHistory: [],
       dirty: { connection: false, config: false, knowledge: false },
@@ -179,6 +180,12 @@
       generation: 0,
       failures: 0,
       pollAttempts: 0,
+      retryTimer: 0,
+      retryAt: 0,
+      expiresAt: 0,
+      retryAction: "start",
+      operation: "",
+      polling: false,
     },
   };
 
@@ -680,6 +687,7 @@
       knowledgeRequestGeneration: 0,
       extractionGeneration: 0,
       previewGeneration: 0,
+      previewBusy: false,
       generatedKnowledge: null,
       previewHistory: [],
       dirty: { connection: false, config: false, knowledge: false },
@@ -1158,10 +1166,11 @@
     const textarea = $("#aiKnowledgeContent");
     const disabled = !product;
     if (textarea) textarea.disabled = disabled;
-    ["#aiSaveKnowledge", "#aiDisableKnowledge", "#aiExtractKnowledge", "#aiRunPreview"].forEach((selector) => {
+    ["#aiSaveKnowledge", "#aiDisableKnowledge", "#aiExtractKnowledge"].forEach((selector) => {
       const button = $(selector);
       if (button) button.disabled = disabled;
     });
+    if ($("#aiRunPreview")) $("#aiRunPreview").disabled = !state.me || Boolean(state.ai.previewBusy);
     text("#aiKnowledgeProductTitle", product ? aiProductTitle(product) : "尚未选择商品");
     renderAiProductFacts(product);
     const status = aiKnowledgeStatus(product, state.ai.knowledge);
@@ -1698,6 +1707,7 @@
   function clearAiPreview() {
     state.ai.previewGeneration += 1;
     state.ai.previewHistory = [];
+    state.ai.previewBusy = false;
     setBusy($("#aiRunPreview"), false);
     if ($("#aiPreviewInput")) $("#aiPreviewInput").value = "";
     if ($("#aiPreviewOutput")) $("#aiPreviewOutput").innerHTML = "<span>回复后会显示实际回复、使用资料、内容状态与安全状态。</span>";
@@ -1705,9 +1715,9 @@
   }
 
   async function runAiPreview() {
+    if (!state.me || state.ai.previewBusy) return;
     const itemId = String(state.ai.selectedItemId || "");
     const question = String($("#aiPreviewInput")?.value || "").trim();
-    if (!itemId) return;
     if (!hasMeaningfulText(question)) {
       showToast("请输入当前买家问题", "warning");
       return;
@@ -1717,26 +1727,47 @@
     const scope = captureAiProductScope(itemId);
     const generation = ++state.ai.previewGeneration;
     const history = (state.ai.previewHistory || []).slice(-6).map((message) => ({ role: message.role, content: message.content }));
+    const storeConfig = aiStoreFormValue();
+    const payload = { buyer_message: question, store_config: storeConfig, history };
+    if (itemId) {
+      payload.item_id = itemId;
+      payload.knowledge = { content: String($("#aiKnowledgeContent")?.value || "").trim() };
+    }
+    state.ai.previewBusy = true;
     setBusy(button, true);
-    output.innerHTML = "<span>正在生成实际回复，不会发送闲鱼消息…</span>";
+    output.innerHTML = "<span>正在使用当前草稿模拟回复，不会保存配置或发送闲鱼消息…</span>";
     try {
       const result = await accountScopedApi(scope.account, "/api/bot/ai/preview", {
         method: "POST",
-        body: JSON.stringify({ buyer_message: question, item_id: itemId, history }),
+        body: JSON.stringify(payload),
       });
       if (!aiProductScopeMatches(scope) || generation !== state.ai.previewGeneration) return;
+      if (result?.sent !== false) throw new ApiError("沙盘响应无效，请稍后重试");
       const reply = String(result?.reply?.content || result?.reply || result?.answer || "").trim();
+      if (!reply && result?.decision === "no_reply") {
+        const reason = String(result.reason_code || "");
+        const message = {
+          connection_unconfigured: "请先在设置中测试并保存统一模型连接。",
+          connection_unverified: "模型连接尚未验证，请在设置中重新测试并保存。",
+          dns_fake_ip: "模型域名被解析为 Fake-IP，请先修正 DNS。",
+          revision_conflict: "模型连接已变更，请重新测试。",
+        }[reason] || AI_CONNECTION_STATUS_COPY[reason]?.[2];
+        if (message) throw new ApiError(message, 0, reason);
+      }
       const sources = previewSources(result);
       const knowledgeStatus = String(result?.knowledge_status || result?.content_status || aiKnowledgeStatus(null, state.ai.knowledge));
       const safety = String(result?.safety_status || result?.safety?.status || result?.safety || "已通过安全检查");
       state.ai.previewHistory = history.concat([{ role: "user", content: question }, ...(reply ? [{ role: "assistant", content: reply }] : [])]).slice(-6);
-      $("#aiPreviewInput").value = "";
+      if (String($("#aiPreviewInput").value).trim() === question) $("#aiPreviewInput").value = "";
       renderAiPreviewHistory();
       output.innerHTML = '<div class="ai-preview-answer"><strong>实际回复</strong><div>' + esc(reply || "本次未生成可发送回复，请转人工处理") + '</div></div><div class="ai-preview-details"><div><strong>使用资料</strong><span>' + esc(sources.length ? sources.join("、") : "未标明") + '</span></div><div><strong>内容状态</strong><span>' + esc(aiKnowledgeStatusInfo(knowledgeStatus)[0]) + '</span></div><div><strong>安全状态</strong><span>' + esc(safety) + "</span></div></div>";
     } catch (error) {
       if (aiProductScopeMatches(scope) && generation === state.ai.previewGeneration) output.innerHTML = '<span>沙盘测试失败：' + esc(error.message || "请稍后重试") + "</span>";
     } finally {
-      if (aiProductScopeMatches(scope) && generation === state.ai.previewGeneration) setBusy(button, false);
+      if (aiProductScopeMatches(scope) && generation === state.ai.previewGeneration) {
+        state.ai.previewBusy = false;
+        setBusy(button, false);
+      }
     }
   }
 
@@ -2280,8 +2311,60 @@
     if (image) image.src = objectUrl;
   }
 
+  function qrRemaining(deadline) {
+    return Math.max(0, Math.ceil((Number(deadline || 0) - Date.now()) / 1000));
+  }
+
+  function clearQrLoginClock() {
+    if (state.qrLogin.retryTimer) window.clearTimeout(state.qrLogin.retryTimer);
+    state.qrLogin.retryTimer = 0;
+  }
+
+  function recordQrExpiry(seconds) {
+    if (typeof seconds === "number" && Number.isFinite(seconds)) {
+      state.qrLogin.expiresAt = Date.now() + Math.max(0, Math.min(seconds, 600)) * 1000;
+    }
+  }
+
+  function applyQrLoginError(error, action) {
+    const login = state.qrLogin;
+    const detail = error?.detail && typeof error.detail === "object" ? error.detail : {};
+    clearQrLoginPoll();
+    recordQrExpiry(detail.login_expires_in);
+    const delay = typeof detail.retry_after === "number" && Number.isFinite(detail.retry_after)
+      ? Math.max(0, Math.min(Math.ceil(detail.retry_after), 86400)) : 0;
+    const remaining = qrRemaining(login.expiresAt);
+    const reusable = Boolean(login.loginId && remaining > delay && (
+      action === "poll" || (action === "complete" && detail.can_retry_login === true)
+    ));
+    login.retryAction = reusable ? action : "start";
+    login.message = cookieErrorMessage(error);
+    login.retryAt = delay > 0 ? Date.now() + delay * 1000 : 0;
+    if (delay > 0) login.status = "cooldown";
+    else if (error?.status === 404 || error?.status === 410 || error?.code === "login_expired") login.status = "expired";
+    else login.status = action === "complete" ? "sync_error" : "error";
+    if (action !== "poll" || !reusable) clearQrLoginImage();
+    reflectCookieError(error);
+  }
+
   function renderQrLogin() {
     const login = state.qrLogin;
+    clearQrLoginClock();
+    const wait = qrRemaining(login.retryAt);
+    const remaining = qrRemaining(login.expiresAt);
+    if (login.loginId && login.expiresAt && !remaining && !["starting", "syncing", "connected"].includes(login.status)) {
+      login.retryAction = "start";
+      clearQrLoginPoll();
+      clearQrLoginImage();
+      if (!wait) {
+        login.status = "expired";
+        login.message = "本次扫码会话已过期，请重新生成二维码。";
+      }
+    }
+    if (login.status === "cooldown" && !wait) {
+      login.status = login.retryAction === "complete" ? "sync_error" : login.retryAction === "poll" ? "paused" : "ready";
+      login.message = "";
+    }
     const connected = shopStateView(state.bot || {}).connection === "connected";
     const statusCopy = {
       idle: [connected ? "重新连接店铺" : "连接闲鱼店铺", "请使用闲鱼 App 扫码"],
@@ -2289,26 +2372,46 @@
       waiting: ["请使用闲鱼 App 扫码", "打开闲鱼 App，扫描上方二维码"],
       scanned: ["已扫码", "请在手机上确认登录"],
       syncing: ["登录成功", "正在识别店铺和商品"],
-      sync_error: ["店铺识别未完成", "登录仍然有效，可以直接重试"],
+      sync_error: ["店铺识别未完成", login.retryAction === "complete" ? "冷却已结束，可以重试本次店铺识别。" : "请重新扫码后再连接店铺。"],
+      cooldown: ["连接暂时等待", login.retryAction === "start" ? `请等待 ${wait} 秒后再生成二维码。` : `请等待 ${wait} 秒后再继续，本次会话剩余 ${remaining} 秒。`],
+      ready: ["可以开始连接", "等待已结束，请生成二维码后扫码。"],
+      paused: ["可以继续检查", "等待已结束，可以继续检查扫码状态。"],
       connected: ["店铺连接成功", "商品已经自动整理"],
-      expired: ["二维码已过期", "刷新后重新扫码"],
-      error: ["暂时无法登录", "请刷新二维码后重试"],
+      expired: ["扫码会话已过期", "请重新生成二维码"],
+      error: ["暂时无法登录", "请重新生成二维码后再试"],
     };
     const copy = statusCopy[login.status] || statusCopy.error;
     text("#xianyuLoginTitle", connected ? "重新连接店铺" : "连接闲鱼店铺");
     text("#xianyuLoginStatus", copy[0]);
-    text("#xianyuLoginMessage", login.message || copy[1]);
+    text("#xianyuLoginMessage", login.status === "cooldown" ? copy[1] : login.message || copy[1]);
     const refresh = $("#refreshXianyuLogin");
     if (refresh) {
-      refresh.hidden = !["expired", "error", "sync_error"].includes(login.status);
-      text(refresh.querySelector("span"), login.status === "sync_error" ? "重试连接" : "刷新二维码");
+      refresh.hidden = !["expired", "error", "sync_error", "cooldown", "ready", "paused"].includes(login.status);
+      refresh.disabled = wait > 0 || Boolean(login.operation);
+      refresh.classList.toggle("is-loading", Boolean(login.operation));
+      text(refresh.querySelector("span"), wait ? `等待 ${wait} 秒` : login.retryAction === "complete" ? "重试连接" : login.retryAction === "poll" ? "继续检查" : "生成二维码");
     }
+    const image = $("#xianyuQrImage");
+    const showQr = ["waiting", "scanned", "paused"].includes(login.status) && Boolean(login.objectUrl);
+    if (image) image.hidden = !showQr;
     const placeholder = $("#qrLoginPlaceholder");
-    if (placeholder) placeholder.hidden = ["waiting", "scanned"].includes(login.status) && !$("#xianyuQrImage")?.hidden;
+    if (placeholder) {
+      placeholder.hidden = showQr;
+      placeholder.classList.toggle("is-working", ["starting", "syncing"].includes(login.status));
+      const icon = placeholder.querySelector("use");
+      if (icon) icon.setAttribute("href", ICONS + (wait ? "clock" : "refresh-cw"));
+    }
+    if (wait || (remaining && ["waiting", "scanned", "sync_error", "cooldown", "paused"].includes(login.status))) {
+      const generation = login.generation;
+      login.retryTimer = window.setTimeout(() => {
+        if (state.qrLogin.generation === generation) renderQrLogin();
+      }, 1000);
+    }
   }
 
   function resetQrLogin() {
     clearQrLoginPoll();
+    clearQrLoginClock();
     clearQrLoginImage();
     const placeholder = $("#qrLoginPlaceholder");
     if (placeholder) placeholder.hidden = false;
@@ -2322,6 +2425,12 @@
       generation: state.qrLogin.generation + 1,
       failures: 0,
       pollAttempts: 0,
+      retryTimer: 0,
+      retryAt: 0,
+      expiresAt: 0,
+      retryAction: "start",
+      operation: "",
+      polling: false,
     };
     renderQrLogin();
   }
@@ -2393,11 +2502,16 @@
   }
 
   async function completeQrLogin(generation) {
-    const loginId = state.qrLogin.loginId;
-    const accountKey = state.qrLogin.accountKey;
-    if (!loginId || !accountKey || state.qrLogin.generation !== generation) return;
-    state.qrLogin.status = "syncing";
-    state.qrLogin.message = "";
+    const login = state.qrLogin;
+    const loginId = login.loginId;
+    const accountKey = login.accountKey;
+    if (!loginId || !accountKey || login.generation !== generation || login.operation || qrRemaining(login.retryAt)) return;
+    if (login.expiresAt && !qrRemaining(login.expiresAt)) { renderQrLogin(); return; }
+    login.operation = "complete";
+    login.status = "syncing";
+    login.message = "";
+    clearQrLoginPoll();
+    clearQrLoginImage();
     renderQrLogin();
     try {
       const result = await api("/api/bot/login/complete", qrLoginRequestOptions(accountKey, {
@@ -2411,23 +2525,23 @@
       }
       await finishQrLogin(generation, result);
     } catch (error) {
-      if (state.qrLogin.generation !== generation) return;
-      if (error?.status === 404 || error?.status === 410 || error?.code === "login_expired") {
-        state.qrLogin.status = "expired";
-        state.qrLogin.message = "";
-      } else {
-        state.qrLogin.status = "sync_error";
-        state.qrLogin.message = cookieErrorMessage(error);
-        reflectCookieError(error);
+      if (state.qrLogin !== login) return;
+      applyQrLoginError(error, "complete");
+    } finally {
+      if (state.qrLogin === login) {
+        login.operation = "";
+        renderQrLogin();
       }
-      renderQrLogin();
     }
   }
 
   async function pollQrLogin(generation) {
-    const loginId = state.qrLogin.loginId;
-    const accountKey = state.qrLogin.accountKey;
-    if (!loginId || !accountKey || state.qrLogin.generation !== generation) return;
+    const login = state.qrLogin;
+    const loginId = login.loginId;
+    const accountKey = login.accountKey;
+    if (!loginId || !accountKey || login.generation !== generation || login.polling || login.operation || qrRemaining(login.retryAt)) return;
+    if (login.expiresAt && !qrRemaining(login.expiresAt)) { renderQrLogin(); return; }
+    login.polling = true;
     try {
       const result = await api(
         "/api/bot/login/" + encodeURIComponent(loginId) + "/status",
@@ -2436,6 +2550,8 @@
       if (state.qrLogin.generation !== generation) return;
       if (!loginResponseIsSafe(result)) throw new ApiError("登录响应包含了不安全数据，已中止连接");
       const status = String(result?.status || "").toLowerCase();
+      recordQrExpiry(result?.expires_in);
+      state.qrLogin.retryAt = 0;
       state.qrLogin.failures = 0;
       if (status === "connected") {
         await finishQrLogin(generation);
@@ -2465,22 +2581,11 @@
         scheduleQrLoginPoll(generation, delay);
       }
     } catch (error) {
-      if (state.qrLogin.generation !== generation) return;
-      if (error?.status === 404 || error?.status === 410 || error?.code === "login_expired") {
-        state.qrLogin.status = "expired";
-        state.qrLogin.message = "";
-      } else if ((!error?.status || error?.code === "login_busy" || error?.code === "network_error") && state.qrLogin.failures < 3) {
-        state.qrLogin.failures += 1;
-        state.qrLogin.message = "连接不稳定，正在重试";
-        renderQrLogin();
-        scheduleQrLoginPoll(generation, Math.min(6000, QR_LOGIN_POLL_MS * (2 ** state.qrLogin.failures)));
-        return;
-      } else {
-        state.qrLogin.status = "error";
-        state.qrLogin.message = cookieErrorMessage(error);
-        reflectCookieError(error);
-      }
+      if (state.qrLogin !== login) return;
+      applyQrLoginError(error, "poll");
       renderQrLogin();
+    } finally {
+      if (state.qrLogin === login) login.polling = false;
     }
   }
 
@@ -2512,25 +2617,37 @@
       showToast("请先登录工作台", "warning");
       return;
     }
+    if (state.qrLogin.operation) return;
+    if (qrRemaining(state.qrLogin.retryAt)) {
+      openQrLoginDialog();
+      renderQrLogin();
+      return;
+    }
     try {
       await ensureConnectionAccount();
     } catch (error) {
       showToast(error.message || "无法创建新的店铺连接", "error");
       return;
     }
+    if (!state.me || state.qrLogin.operation) return;
     const accountKey = String(state.activeAccountKey || "default");
-    await cancelQrLogin(true, false);
+    const previousId = state.qrLogin.loginId;
+    const previousAccount = state.qrLogin.accountKey;
+    resetQrLogin();
+    const login = state.qrLogin;
+    login.accountKey = accountKey;
+    login.operation = "start";
+    login.status = "starting";
+    const generation = login.generation;
     openQrLoginDialog();
-    state.qrLogin.accountKey = accountKey;
-    state.qrLogin.status = "starting";
-    state.qrLogin.message = "";
-    const generation = state.qrLogin.generation;
     renderQrLogin();
     try {
+      await cancelQrLoginId(previousId, previousAccount);
+      if (state.qrLogin !== login) return;
       const result = await api("/api/bot/login/start", qrLoginRequestOptions(accountKey, { method: "POST" }));
       const loginId = typeof result?.login_id === "string" ? result.login_id.trim() : "";
       const validLoginId = /^[A-Za-z0-9_-]{16,128}$/.test(loginId);
-      if (state.qrLogin.generation !== generation) {
+      if (state.qrLogin !== login) {
         if (validLoginId) await cancelQrLoginId(loginId, accountKey);
         return;
       }
@@ -2539,16 +2656,18 @@
         throw new ApiError("登录响应包含了不安全数据，已中止连接");
       }
       if (!validLoginId) throw new ApiError("登录会话无效，请重试");
-      state.qrLogin.loginId = loginId;
-      state.qrLogin.status = String(result?.status || "waiting").toLowerCase() === "scanned" ? "scanned" : "waiting";
+      login.loginId = loginId;
+      login.status = String(result?.status || "waiting").toLowerCase() === "scanned" ? "scanned" : "waiting";
+      recordQrExpiry(result?.expires_in);
       await loadQrLoginImage(generation);
-      renderQrLogin();
-      scheduleQrLoginPoll(generation);
+      if (state.qrLogin === login) scheduleQrLoginPoll(generation);
     } catch (error) {
-      if (state.qrLogin.generation !== generation) return;
-      state.qrLogin.status = "error";
-      state.qrLogin.message = error.message || "登录服务暂时不可用，请稍后重试";
-      renderQrLogin();
+      if (state.qrLogin === login) applyQrLoginError(error, "start");
+    } finally {
+      if (state.qrLogin === login) {
+        login.operation = "";
+        renderQrLogin();
+      }
     }
   }
 
@@ -2724,6 +2843,7 @@
     resetAiState();
     resetOpsState();
     state.settingsAi = { connection: null, verificationToken: "", testedFingerprint: "", draft: null };
+    setBusy($("#aiTestConnection"), false);
     if ($("#aiApiKey")) $("#aiApiKey").value = "";
     if ($("#aiModel")) $("#aiModel").value = "";
     if ($("#aiBaseUrl")) $("#aiBaseUrl").value = "";
@@ -2888,7 +3008,7 @@
     resetConversationCommands();
     resetAutomationMutations();
     persistAccountKey(key);
-    resetQrLogin();
+    void cancelQrLogin(true, true);
     ["quickRepliesDialog", "batchDeliveryDialog", "templateEditorDialog", "cardsEditorDialog", "confirmDialog"].forEach(closeDialog);
     state.confirmAction = null;
     state.config = null;
@@ -4031,7 +4151,7 @@
     const count = $("#attentionCount");
     if (count) count.className = "badge " + (pendingTotal ? "badge-red" : "badge-green");
     if (!items.length) {
-      list.innerHTML = '<div class="attention-empty"><svg class="icon"><use href="' + ICONS + 'circle-check"></use></svg><span>当前没有需要处理的事项</span></div>';
+      list.innerHTML = '<div class="attention-empty">当前没有需要处理的事项</div>';
       return;
     }
     list.innerHTML = items.map((item) => {
@@ -6956,6 +7076,11 @@
         badge.className = "badge badge-muted";
       }
     }
+    const testBtn = $("#aiTestConnection");
+    if (testBtn) {
+      setBusy(testBtn, state.settingsAi.operation === "test");
+      testBtn.disabled = Boolean(state.settingsAi.operation);
+    }
     const delBtn = $("#aiDeleteKey");
     if (delBtn) {
       delBtn.hidden = !conn?.initialized || (!conn?.api_key_configured && conn?.connection_status !== "verified");
@@ -7739,6 +7864,12 @@
     }
     if (state.view === "templates" && view !== "templates") {
       state.templateEditorOpenGeneration += 1;
+    }
+    if (state.view === "ai-config" && view !== "ai-config" && state.ai.previewBusy) {
+      state.ai.previewGeneration += 1;
+      state.ai.previewBusy = false;
+      setBusy($("#aiRunPreview"), false);
+      text("#aiPreviewOutput", "已离开沙盘，本次结果不再显示。");
     }
     state.view = view;
     $$("[data-panel]").forEach((node) => {
@@ -8682,11 +8813,12 @@
     $("#headerLogoutButton").addEventListener("click", logout);
     $("#xianyuConnectButton").addEventListener("click", startXianyuLogin);
     $("#refreshXianyuLogin").addEventListener("click", () => {
-      if (state.qrLogin.status === "sync_error" && state.qrLogin.loginId) {
-        void completeQrLogin(state.qrLogin.generation);
-      } else {
-        void startXianyuLogin();
-      }
+      const login = state.qrLogin;
+      if (login.operation || login.polling || qrRemaining(login.retryAt)) return;
+      if (login.retryAction !== "start" && login.expiresAt && !qrRemaining(login.expiresAt)) renderQrLogin();
+      if (login.retryAction === "complete" && login.loginId) void completeQrLogin(login.generation);
+      else if (login.retryAction === "poll" && login.loginId) void pollQrLogin(login.generation);
+      else void startXianyuLogin();
     });
     $("#closeXianyuLogin").addEventListener("click", () => { void cancelQrLogin(true, true); });
     $("#xianyuLoginDialog").addEventListener("cancel", (event) => {
@@ -8694,9 +8826,8 @@
       void cancelQrLogin(true, true);
     });
     $("#xianyuQrImage").addEventListener("load", (event) => {
-      if (!state.qrLogin.loginId) return;
-      event.currentTarget.hidden = false;
-      $("#qrLoginPlaceholder").hidden = true;
+      if (!state.qrLogin.loginId || !state.qrLogin.objectUrl) { event.currentTarget.hidden = true; return; }
+      renderQrLogin();
     });
     $("#xianyuQrImage").addEventListener("error", () => {
       if (!state.qrLogin.loginId) return;

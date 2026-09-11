@@ -22,6 +22,7 @@ from typing import Callable
 from urllib.parse import urlsplit
 
 from account_storage import DEFAULT_ACCOUNT_ID, normalize_account_key
+from shop_sync import ShopSyncError
 
 
 PASSPORT_HOST = "passport.goofish.com"
@@ -90,7 +91,8 @@ ERROR_MESSAGES = {
 class XianyuLoginError(RuntimeError):
     """A stable, browser-safe login failure without upstream response text."""
 
-    def __init__(self, code: str):
+    def __init__(self, code: str, retry_after: float | None = None):
+        self.retry_after = None if retry_after is None else max(0, math.ceil(retry_after))
         safe_code = code if code in ERROR_MESSAGES else "platform_error"
         self.code = safe_code
         self.message = ERROR_MESSAGES[safe_code]
@@ -118,7 +120,8 @@ class _Login:
     consuming: bool = False
     last_poll_at: float = 0.0
     session_closed: bool = False
-    lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    connection_lease: object = field(default=None, repr=False)
+    lease_released: bool = False
 
 
 def _new_requests_session():
@@ -356,7 +359,17 @@ class XianyuLoginManager:
         confirmed_ttl_seconds: int = DEFAULT_CONFIRMED_TTL_SECONDS,
         upstream_gate=None,
         sweep_interval_seconds: float = 1.0,
+        acquire_hook=None,
+        renew_hook=None,
+        release_hook=None,
+        before_request_hook=None,
+        after_request_hook=None,
     ):
+        self._acquire_hook = acquire_hook
+        self._renew_hook = renew_hook
+        self._release_hook = release_hook
+        self._before_request_hook = before_request_hook
+        self._after_request_hook = after_request_hook
         self._session_factory = session_factory
         self._qr_factory = qr_factory
         self._clock = clock
@@ -394,8 +407,7 @@ class XianyuLoginManager:
             pass
         item.session_closed = True
 
-    @staticmethod
-    def _cleanup(item: _Login) -> None:
+    def _cleanup(self, item: _Login) -> None:
         item.qr_url = ""
         item.qr_svg = b""
         item.query_token = ""
@@ -403,6 +415,15 @@ class XianyuLoginManager:
         item.login_token = ""
         item.cookie_header = ""
         XianyuLoginManager._close_session(item)
+        if item.connection_lease is not None and not item.lease_released:
+            try:
+                if self._release_hook is not None:
+                    self._release_hook(item.connection_lease)
+                item.lease_released = True
+            except Exception:
+                # Credentials are already destroyed. A transient DB outage
+                # fails closed; the bounded durable lease recovers on expiry.
+                pass
 
     @staticmethod
     def _scope(user_id, account_key=DEFAULT_ACCOUNT_ID) -> tuple[int, str]:
@@ -414,6 +435,7 @@ class XianyuLoginManager:
         return uid, key
 
     def _expire(self, item: _Login, now: float) -> None:
+        item.expires_at = min(item.expires_at, now)
         item.status = "expired"
         item.error_code = ""
         # A request owns the Session while in flight.  That request performs
@@ -428,7 +450,7 @@ class XianyuLoginManager:
         for login_id, item in list(self._items.items()):
             if item.expires_at <= now:
                 self._expire(item, now)
-            if item.status == "expired" and now >= item.expires_at + 30:
+            if item.status == "expired" and now >= item.expires_at + 30 and not item.in_flight and not item.consuming:
                 self._items.pop(login_id, None)
         for scope, started_at in list(self._last_start.items()):
             if scope not in self._by_user and now - started_at >= self._cooldown:
@@ -468,17 +490,38 @@ class XianyuLoginManager:
             payload.update({"code": code, "message": ERROR_MESSAGES[code]})
         return payload
 
+    def _renew(self, item: _Login, seconds: float) -> None:
+        if self._renew_hook is not None and item.connection_lease is not None:
+            try:
+                self._renew_hook(item.connection_lease, seconds)
+            except Exception:
+                raise XianyuLoginError("login_expired") from None
+
     def _call_json(self, item: _Login, method: str, url: str, **kwargs) -> dict:
+        with self._lock:
+            now = float(self._clock())
+            if self._items.get(item.login_id) is not item or now >= item.expires_at:
+                raise XianyuLoginError("login_expired")
+            self._renew(item, max(1, item.expires_at - now) + self._timeout + 10)
         kwargs.update(
             {"timeout": self._timeout, "allow_redirects": False, "stream": True}
         )
         if not self._upstream_gate.acquire(blocking=False):
             raise XianyuLoginError("login_busy")
         response = None
+        egress_owned = False
         try:
+            if self._before_request_hook is not None and item.connection_lease is not None:
+                self._before_request_hook(item.connection_lease, self._timeout + 10)
+                egress_owned = True
+            with self._lock:
+                now = float(self._clock())
+                if self._items.get(item.login_id) is not item or now >= item.expires_at:
+                    raise XianyuLoginError("login_expired")
+                self._renew(item, max(1, item.expires_at - now) + self._timeout + 10)
             response = item.session.request(method, url, **kwargs)
             return _response_json(response, url)
-        except XianyuLoginError:
+        except (XianyuLoginError, ShopSyncError):
             raise
         except Exception:
             raise XianyuLoginError("network_error") from None
@@ -489,6 +532,8 @@ class XianyuLoginManager:
                 except Exception:
                     pass
             self._upstream_gate.release()
+            if egress_owned and self._after_request_hook is not None:
+                self._after_request_hook(item.connection_lease)
 
     def start(self, user_id, account_key=DEFAULT_ACCOUNT_ID) -> dict:
         uid, key = self._scope(user_id, account_key)
@@ -501,52 +546,52 @@ class XianyuLoginManager:
                 raise XianyuLoginError("login_exists")
             previous = self._last_start.get(scope)
             if previous is not None and now - previous < self._cooldown:
-                raise XianyuLoginError("login_cooldown")
+                raise XianyuLoginError("login_cooldown", self._cooldown - (now - previous))
             active_count = sum(
                 item.status not in {"expired", "error"} for item in self._items.values()
             )
             if active_count >= self._capacity:
                 raise XianyuLoginError("login_capacity")
             login_id = secrets.token_urlsafe(32)
+            lease = None
+            if self._acquire_hook is not None:
+                lease = self._acquire_hook(uid, key, login_id, self._ttl + self._timeout + 10)
             try:
                 session = self._session_factory()
             except Exception:
+                if lease is not None and self._release_hook is not None:
+                    self._release_hook(lease)
                 raise XianyuLoginError("platform_error") from None
-            item = _Login(uid, login_id, now, now + self._ttl, session, account_key=key)
+            item = _Login(uid, login_id, now, now + self._ttl, session, account_key=key, connection_lease=lease)
             item.in_flight = True
             self._items[login_id] = item
             self._by_user[scope] = login_id
             self._last_start[scope] = now
 
         try:
-            with item.lock:
-                payload = self._call_json(
-                    item,
-                    "GET",
-                    GENERATE_URL,
-                    params={
-                        "appName": "xianyu",
-                        "appEntrance": "web",
-                        "fromSite": "77",
-                    },
-                )
-                data = _content_data(payload)
-                qr_url = _qr_url(data.get("codeContent"))
-                query_token = _query_token(data.get("t"))
-                query_ck = _opaque_token(data.get("ck"))
-                qr_svg = _validate_svg(self._qr_factory(qr_url))
-        except XianyuLoginError:
+            payload = self._call_json(
+                item, "GET", GENERATE_URL,
+                params={"appName": "xianyu", "appEntrance": "web", "fromSite": "77"},
+            )
+            data = _content_data(payload)
+            qr_url = _qr_url(data.get("codeContent"))
+            query_token = _query_token(data.get("t"))
+            query_ck = _opaque_token(data.get("ck"))
+            qr_svg = _validate_svg(self._qr_factory(qr_url))
+        except (XianyuLoginError, ShopSyncError):
             with self._lock:
                 if self._items.get(login_id) is item:
                     self._items.pop(login_id, None)
-                    self._by_user.pop((uid, key), None)
+                    if self._by_user.get((uid, key)) == login_id:
+                        self._by_user.pop((uid, key), None)
                 self._cleanup(item)
             raise
         except Exception:
             with self._lock:
                 if self._items.get(login_id) is item:
                     self._items.pop(login_id, None)
-                    self._by_user.pop((uid, key), None)
+                    if self._by_user.get((uid, key)) == login_id:
+                        self._by_user.pop((uid, key), None)
                 self._cleanup(item)
             raise XianyuLoginError("platform_error") from None
 
@@ -652,55 +697,50 @@ class XianyuLoginManager:
         login_token = ""
         cookie_header = ""
         error_code = ""
-        with item.lock:
+        temporary_error = None
+        try:
             try:
+                payload = self._call_json(
+                    item, "POST", QUERY_URL,
+                    params={"appName": "xianyu", "fromSite": "77"},
+                    data={"appName": "xianyu", "fromSite": "77", "appEntrance": "web",
+                          "t": query_token, "ck": query_ck},
+                    headers={
+                        "Content-Type": "application/x-www-form-urlencoded",
+                        "Origin": "https://passport.goofish.com",
+                        "Referer": "https://passport.goofish.com/mini_login.htm",
+                    },
+                )
+                data = _content_data(payload)
+            except XianyuLoginError as error:
+                if error.code in {"login_busy", "network_error", "login_expired"}:
+                    raise
+                raise XianyuLoginError("qr_query_failed") from None
+            upstream_status = data.get("qrCodeStatus")
+            if not isinstance(upstream_status, str):
+                raise XianyuLoginError("qr_query_failed")
+            upstream_status = upstream_status.upper()
+            if upstream_status == "NEW":
+                next_status = "waiting"
+            elif upstream_status in {"SCANED", "SCANNED"}:
+                next_status = "scanned"
+            elif upstream_status in {"EXPIRED", "CANCELED"}:
+                next_status = "expired"
+            elif upstream_status == "CONFIRMED":
                 try:
-                    payload = self._call_json(
-                        item,
-                        "POST",
-                        QUERY_URL,
-                        params={"appName": "xianyu", "fromSite": "77"},
-                        data={
-                            "appName": "xianyu",
-                            "fromSite": "77",
-                            "appEntrance": "web",
-                            "t": query_token,
-                            "ck": query_ck,
-                        },
-                        headers={
-                            "Content-Type": "application/x-www-form-urlencoded",
-                            "Origin": "https://passport.goofish.com",
-                            "Referer": "https://passport.goofish.com/mini_login.htm",
-                        },
-                    )
-                    data = _content_data(payload)
-                except XianyuLoginError as error:
-                    if error.code in {"login_busy", "network_error"}:
-                        raise
-                    raise XianyuLoginError("qr_query_failed") from None
-                upstream_status = data.get("qrCodeStatus")
-                if not isinstance(upstream_status, str):
-                    raise XianyuLoginError("qr_query_failed")
-                upstream_status = upstream_status.upper()
-                if upstream_status == "NEW":
-                    next_status = "waiting"
-                elif upstream_status in {"SCANED", "SCANNED"}:
-                    next_status = "scanned"
-                elif upstream_status in {"EXPIRED", "CANCELED"}:
-                    next_status = "expired"
-                elif upstream_status == "CONFIRMED":
-                    try:
-                        login_token = _login_token(data)
-                    except XianyuLoginError:
-                        raise XianyuLoginError("login_confirm_failed") from None
-                    cookie_header = self._confirm(item, login_token)
-                    next_status = "confirmed"
-                else:
-                    raise XianyuLoginError("qr_query_failed")
-            except XianyuLoginError as exc:
-                error_code = exc.code
-            except Exception:
-                error_code = "platform_error"
+                    login_token = _login_token(data)
+                except XianyuLoginError:
+                    raise XianyuLoginError("login_confirm_failed") from None
+                cookie_header = self._confirm(item, login_token)
+                next_status = "confirmed"
+            else:
+                raise XianyuLoginError("qr_query_failed")
+        except ShopSyncError as exc:
+            temporary_error = exc
+        except XianyuLoginError as exc:
+            error_code = exc.code
+        except Exception:
+            error_code = "platform_error"
 
         with self._lock:
             current_now = float(self._clock())
@@ -708,12 +748,14 @@ class XianyuLoginManager:
             if current is not item:
                 self._cleanup(item)
                 raise XianyuLoginError("login_not_found")
-            if current_now >= item.expires_at or next_status == "expired":
+            if current_now >= item.expires_at or next_status == "expired" or error_code == "login_expired":
                 item.in_flight = False
                 self._expire(item, current_now)
                 return self._public(item, current_now)
             item.in_flight = False
             item.login_token = ""
+            if temporary_error is not None:
+                raise temporary_error
             if error_code in {"login_busy", "network_error"}:
                 raise XianyuLoginError(error_code)
             if error_code:
@@ -729,6 +771,11 @@ class XianyuLoginManager:
             item.status = next_status
             item.error_code = ""
             if next_status == "confirmed":
+                try:
+                    self._renew(item, self._confirmed_ttl + self._timeout + 10)
+                except XianyuLoginError:
+                    self._expire(item, current_now)
+                    raise
                 item.cookie_header = cookie_header
                 item.expires_at = current_now + self._confirmed_ttl
                 item.query_token = ""
@@ -749,8 +796,36 @@ class XianyuLoginManager:
                 raise XianyuLoginError("login_busy")
             if item.status != "confirmed" or not item.cookie_header:
                 raise XianyuLoginError("login_not_confirmed")
+            # Completion has a bounded validation budget; the confirmed Cookie
+            # deadline itself is never extended by retries.
+            try:
+                self._renew(item, max(180, item.expires_at - _now))
+            except XianyuLoginError:
+                self._expire(item, _now)
+                raise
             item.consuming = True
             return item.cookie_header
+
+    def connection_lease(self, user_id, login_id, account_key=DEFAULT_ACCOUNT_ID):
+        item, now = self._get(user_id, login_id, account_key)
+        with self._lock:
+            if item.status != "confirmed" or now >= item.expires_at or not item.consuming:
+                raise XianyuLoginError("login_expired")
+            self._renew(item, 180)
+            return item.connection_lease
+
+    def retry_state(self, user_id, login_id, account_key=DEFAULT_ACCOUNT_ID) -> dict:
+        """Local-only confirmed lifetime; never poll or refresh the deadline."""
+        try:
+            item, now = self._get(user_id, login_id, account_key)
+            with self._lock:
+                usable = item.status == "confirmed" and bool(item.cookie_header) and not item.consumed
+                seconds = max(0, int(math.ceil(item.expires_at - now))) if usable else 0
+                if seconds and not item.consuming:
+                    self._renew(item, seconds + self._timeout + 10)
+                return {"login_expires_in": seconds, "can_retry_login": bool(seconds and not item.consuming)}
+        except Exception:
+            return {"login_expires_in": 0, "can_retry_login": False}
 
     def finish_consume(
         self,
@@ -789,8 +864,8 @@ class XianyuLoginManager:
             scope = (item.user_id, item.account_key)
             if self._by_user.get(scope) == item.login_id:
                 self._by_user.pop(scope, None)
-        with item.lock:
-            self._cleanup(item)
+            if not item.in_flight:
+                self._cleanup(item)
 
     def clear_user(
         self,
@@ -810,16 +885,7 @@ class XianyuLoginManager:
                 if item.user_id == uid and item.account_key == key
             ]
             for item in items:
-                self._items.pop(item.login_id, None)
-        for item in items:
-            # An upstream request that currently owns the lock will observe
-            # that the item was detached and clean itself before returning.
-            if not item.lock.acquire(blocking=False):
-                continue
-            try:
-                self._cleanup(item)
-            finally:
-                item.lock.release()
+                self._detach(item)
 
     def clear_user_all(self, user_id, preserve_cooldown: bool = False) -> None:
         """Clear QR sessions for every account owned by one user.
@@ -838,24 +904,25 @@ class XianyuLoginManager:
                     self._last_start.pop(scope, None)
             items = [item for item in self._items.values() if item.user_id == uid]
             for item in items:
-                self._items.pop(item.login_id, None)
-        for item in items:
-            if not item.lock.acquire(blocking=False):
-                continue
-            try:
-                self._cleanup(item)
-            finally:
-                item.lock.release()
+                self._detach(item)
+
+    def _detach(self, item: _Login) -> None:
+        # Called under the registry lock. Active I/O cleans itself on return;
+        # consuming entries remain addressable so finish_consume releases them.
+        item.expires_at = min(item.expires_at, float(self._clock()))
+        item.status = "expired"
+        if not item.consuming:
+            self._items.pop(item.login_id, None)
+        if not item.in_flight and not item.consuming:
+            self._cleanup(item)
 
     def clear(self) -> None:
         with self._lock:
             items = list(self._items.values())
-            self._items.clear()
             self._by_user.clear()
             self._last_start.clear()
-        for item in items:
-            with item.lock:
-                self._cleanup(item)
+            for item in items:
+                self._detach(item)
 
     def shutdown(self) -> None:
         self._stop_sweeper.set()

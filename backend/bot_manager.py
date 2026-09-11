@@ -8,6 +8,7 @@ names are never placed in child environments.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -522,6 +523,90 @@ def ensure_dir(
         if initialize and not existed:
             _discard_initialized_path(account_path)
         raise OSError("cannot initialize account storage" if initialize else "cannot prepare account storage") from error
+
+
+class AccountInitializationError(OSError):
+    """A bounded initialization reason; never include storage paths or contents."""
+
+    def __init__(self, reason: str):
+        self.reason = reason
+        super().__init__(reason)
+
+
+def account_initialization_reason(error: BaseException) -> str:
+    """Preserve the actionable cause through storage exception wrappers."""
+    seen = set()
+    for _ in range(8):
+        if error is None or id(error) in seen:
+            break
+        seen.add(id(error))
+        if isinstance(error, AccountInitializationError):
+            return error.reason
+        code = getattr(error, "errno", None)
+        if code in {errno.EACCES, errno.EPERM}:
+            return "storage_permission_denied"
+        if code == errno.EROFS:
+            return "storage_read_only"
+        if code in {errno.ENOSPC, getattr(errno, "EDQUOT", errno.ENOSPC)}:
+            return "storage_full"
+        if code in {errno.EEXIST, errno.ENOTDIR, errno.EISDIR, errno.ELOOP}:
+            return "storage_conflict"
+        error = error.__cause__ or error.__context__
+    return "storage_error"
+
+
+def _only_initialization_defaults(path: Path) -> bool:
+    """Inspect an existing new-user directory before allowing any repair writes."""
+    info = path.lstat()
+    if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+        return False
+    for child in path.iterdir():
+        info = child.lstat()
+        if stat.S_ISLNK(info.st_mode):
+            return False
+        if child.name == "ai_knowledge":
+            if not stat.S_ISDIR(info.st_mode) or any(child.iterdir()):
+                return False
+            continue
+        if child.name not in INITIAL_ACCOUNT_FILES or not stat.S_ISREG(info.st_mode):
+            return False
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        descriptor = os.open(child, flags)
+        with os.fdopen(descriptor, "rb") as stream:
+            opened = os.fstat(stream.fileno())
+            if (not stat.S_ISREG(opened.st_mode) or opened.st_size > 256 * 1024
+                    or (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino)):
+                return False
+            payload = stream.read(256 * 1024 + 1)
+        if len(payload) > 256 * 1024:
+            return False
+        try:
+            actual = json.loads(payload.decode("utf-8"))
+        except (UnicodeError, ValueError):
+            return False
+        if json.dumps(actual, sort_keys=True) != json.dumps(json.loads(INITIAL_ACCOUNT_FILES[child.name]), sort_keys=True):
+            return False
+    return True
+
+
+def initialize_new_user_storage(user_id: int) -> bool:
+    """Initialize a new user's default shop under the caller's DB transaction.
+
+    An empty directory or default-only residue from an interrupted attempt can
+    be completed without replacing files. Existing business data is never
+    adopted. Return ownership so later DB rollback cannot delete a reused path.
+    """
+    path = _storage().account_dir(user_id, DEFAULT_ACCOUNT_ID)
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        ensure_dir(user_id, DEFAULT_ACCOUNT_ID, initialize=True)
+        return True
+    if not _only_initialization_defaults(path):
+        raise AccountInitializationError("storage_conflict")
+    if not initialize_unused_account_storage(user_id):
+        raise AccountInitializationError("storage_conflict")
+    return False
 
 
 def initialize_unused_account_storage(user_id: int) -> bool:

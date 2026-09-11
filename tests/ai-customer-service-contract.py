@@ -4,12 +4,16 @@
 from __future__ import annotations
 
 import base64
+import contextlib
+import io
 import json
+import logging
 import os
 import stat
 import sys
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -65,7 +69,224 @@ def assert_development_master_key() -> None:
         )
 
 
+def assert_sandbox_preview() -> None:
+    """All provider traffic is fake; preview must be read-only even on failure."""
+    with tempfile.TemporaryDirectory(prefix="xianyu-ai-sandbox-") as root:
+        tenants = Path(root) / "tenants"
+        requests = []
+        response = {"decision": "reply", "reply": "我是小喵客服，可以帮你解答问题。", "reason_code": "answered"}
+        provider_failure = {"code": ""}
+        during_request = {"callback": None}
+
+        def requester(_url, _key, payload):
+            requests.append(payload)
+            if during_request["callback"]:
+                during_request["callback"]()
+            if provider_failure["code"]:
+                raise AIServiceError(provider_failure["code"], 503)
+            return {"choices": [{"message": {"content": json.dumps(response, ensure_ascii=False)}}]}
+
+        service = AIService(
+            tenants,
+            environ={"SAAS_AI_MASTER_KEY": base64.b64encode(b"s" * 32).decode("ascii")},
+            resolver=lambda _host, port, type=None: [(None, None, None, None, ("93.184.216.34", port))],
+            requester=requester,
+        )
+        scope = (17, 31, "sandbox-a")
+        other_scope = (17, 32, "sandbox-b")
+        metadata = {
+            "version": 2, "provider": "openai_chat_completions", "base_url": "https://example.com/v1",
+            "model": "fixture-model", "api_key_configured": True, "connection_status": "verified",
+            "revision": 1, "key_revision": 1,
+        }
+        for selected_scope in (scope, other_scope):
+            service._write_root_json(selected_scope, "ai_connection.json", metadata)
+            service._write_root_json(
+                selected_scope, "ai_connection_secret.json",
+                service._encrypt_key(selected_scope, "sandbox-fixture-key-only", 1, 1),
+            )
+        product = {"id": "1001", "title": "模拟商品甲", "description": "仅用于合同", "price": 12}
+        service._write_root_json(scope, "shop_snapshot.json", {"products": [product]})
+        service._write_root_json(other_scope, "shop_snapshot.json", {"products": [{**product, "id": "2002"}]})
+        service._write_root_json(scope, "session_fixture.json", {"messages": []})
+
+        def snapshot():
+            return {
+                str(path.relative_to(tenants)): (
+                    path.stat().st_mtime_ns, stat.S_IMODE(path.stat().st_mode),
+                    path.read_bytes() if path.is_file() else None,
+                )
+                for path in (tenants, *tenants.rglob("*"))
+            }
+
+        def readonly(callback):
+            before = snapshot()
+            output = io.StringIO()
+            handler = logging.StreamHandler(output)
+            logging.getLogger().addHandler(handler)
+            try:
+                with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output), \
+                        patch.object(service.storage, "ensure_account_dir", side_effect=AssertionError("read created directory")), \
+                        patch.object(service, "_write_root_json", side_effect=AssertionError("preview wrote settings")), \
+                        patch.object(service, "_write_path_json", side_effect=AssertionError("preview wrote knowledge")):
+                    return callback()
+            finally:
+                logging.getLogger().removeHandler(handler)
+                assert snapshot() == before, "preview changed files, directories, modes or mtimes"
+                assert output.getvalue() == "", "preview wrote request content to logs/output"
+
+        def preview(**kwargs):
+            result = readonly(lambda: service.preview(*scope, buyer_message="你是谁", **kwargs))
+            assert result["sent"] is False
+            assert "prompt" not in result and "api_key" not in result
+            return result
+
+        # No saved store configuration, no product and no enabled bot are required.
+        result = preview()
+        assert result["decision"] == "reply" and len(requests) == 1
+        assert result["config_source"] == "sandbox_defaults" and result["hit_level"] == ""
+        assert result["sources"] == [] and "config_revision" not in result
+        assert requests[-1]["messages"][-1] == {"role": "user", "content": "你是谁"}
+        prompt = json.dumps(requests[-1]["messages"], ensure_ascii=False)
+        assert "小喵客服" in prompt and "不得编造店铺" in prompt
+        assert "当前没有可用的商品资料，不得猜测具体商品事实" in prompt
+        readonly(lambda: assert_error(
+            "ai_unconfigured", lambda: service._effective_reply_inputs(
+                scope, item_id=None, item_context=None, store_config_override=None,
+                knowledge_override=None, require_enabled=False,
+            ),
+        ))
+        for empty in ({}, empty_store_config()):
+            result = preview(store_config_override=empty)
+            assert result["decision"] == "reply" and result["config_source"] == "draft_override"
+            assert result["candidate_revision"] == 0 and "store_content" not in result["sources"]
+
+        draft = {**empty_store_config(), "persona_name": "沙盘小蓝", "store_content": "草稿专属服务说明，不得保存。"}
+        history = [{"role": "user", "content": "沙盘前序问题"}, {"role": "assistant", "content": "沙盘前序回答"}]
+        result = preview(store_config_override=draft, history=history)
+        assert result["config_source"] == "draft_override" and result["candidate_revision"] == 0
+        assert "草稿专属服务说明" in requests[-1]["messages"][1]["content"]
+        assert "沙盘小蓝" in requests[-1]["messages"][1]["content"]
+        assert requests[-1]["messages"][-3:-1] == history
+        result = preview(item_id="1001", knowledge_override={"content": "商品草稿专属说明，不得保存。"})
+        assert result["knowledge_status"] == "draft_override"
+        assert "商品草稿专属说明" in requests[-1]["messages"][2]["content"]
+        assert "实时价格：12" in requests[-1]["messages"][2]["content"]
+        result = preview(item_id="1001")
+        assert result["knowledge_status"] == "unconfigured"
+        assert "商品草稿专属说明" not in json.dumps(requests[-1], ensure_ascii=False)
+
+        calls = len(requests)
+        for invalid in (
+            {"item_id": "2002", "knowledge_override": {"content": "跨店铺伪造"}},
+            {"item_id": "9999"},
+        ):
+            readonly(lambda invalid=invalid: assert_error(
+                "item_not_found", lambda: service.preview(*scope, buyer_message="你是谁", **invalid),
+            ))
+        for invalid in (
+            {"store_config_override": {"api_key": "never-allowed"}},
+            {"store_config_override": {"store_content": 123}},
+            {"item_id": "1001", "knowledge_override": {"content": 123}},
+            {"item_id": "../2002"},
+        ):
+            readonly(lambda invalid=invalid: assert_error(
+                "invalid_payload", lambda: service.preview(*scope, buyer_message="你是谁", **invalid),
+            ))
+        readonly(lambda: assert_error(
+            "item_not_found", lambda: service.preview(18, 31, "sandbox-a", buyer_message="你是谁", item_id="1001"),
+        ))
+        assert len(requests) == calls
+
+        # Production and publishing stay fail-closed for empty/draft/disabled stores.
+        for config, action, code in (
+            (None, None, "ai_unconfigured"),
+            ({**draft, "enabled": True}, "draft", "ai_unconfigured"),
+            ({**draft, "enabled": False}, "save", "ai_disabled"),
+        ):
+            if action:
+                service.save_config(*scope, config=config, action=action, expected_revision=service.get_config(*scope)["revision"])
+            readonly(lambda code=code: assert_error(code, lambda: service.reply(*scope, message="你是谁")))
+            readonly(lambda code=code: assert_error(code, lambda: service.ensure_reply_ready(*scope)))
+            assert preview()["decision"] == "reply"
+        readonly(lambda: assert_error(
+            "invalid_payload", lambda: service.save_config(
+                *scope, config=empty_store_config(), action="publish", expected_revision=service.get_config(*scope)["revision"],
+            ),
+        ))
+        result = preview()
+        assert result["config_source"] == "published" and result["config_revision"] == 2
+        result = preview(store_config_override={})
+        assert result["candidate_revision"] == 2 and result["config_source"] == "draft_override"
+        assert "草稿专属服务说明" not in requests[-1]["messages"][1]["content"]
+        saved_settings = service.get_config(*scope)
+        service._write_root_json(scope, "ai_settings.json", {
+            **saved_settings,
+            "published": {**saved_settings["published"], "config": {**empty_store_config(), "enabled": True}},
+        })
+        readonly(lambda: assert_error("ai_unconfigured", lambda: service.reply(*scope, message="你是谁")))
+        readonly(lambda: assert_error("ai_unconfigured", lambda: service.ensure_reply_ready(*scope)))
+        assert preview()["decision"] == "reply"
+        service._write_root_json(scope, "ai_settings.json", saved_settings)
+
+        # Published product knowledge is used only when no explicit product draft exists.
+        service.save_knowledge(*scope, "1001", knowledge={"content": "已保存商品参考"}, expected_revision=0)
+        result = preview(item_id="1001", knowledge_override={"content": "只在当前请求有效"})
+        assert result["knowledge_status"] == "draft_override"
+        assert "已保存商品参考" not in requests[-1]["messages"][2]["content"]
+        result = preview(item_id="1001", knowledge_override={})
+        assert "product_content" not in result["sources"]
+        result = preview(item_id="1001")
+        assert result["knowledge_status"] == "published"
+        assert "已保存商品参考" in requests[-1]["messages"][2]["content"]
+
+        # Failures and rejected provider output do not write state or leak text.
+        provider_failure["code"] = "service_unavailable"
+        result = preview(store_config_override=draft, item_id="1001", knowledge_override={"content": "失败请求草稿"})
+        assert result["decision"] == "no_reply" and result["reason_code"] == "service_unavailable"
+        provider_failure["code"] = ""
+        response["reply"] = "加我微信处理"
+        result = preview()
+        assert result["decision"] == "no_reply" and result["reason_code"] == "reply_off_platform_contact"
+        response["reply"] = "我是小喵客服，可以帮你解答问题。"
+        result = preview(recent_assistant_replies=[response["reply"]])
+        assert result["reason_code"] == "reply_recent_duplicate"
+
+        # A missing/invalid connection still blocks model traffic on an empty sandbox.
+        calls = len(requests)
+        result = readonly(lambda: service.preview(19, 33, "no-connection", buyer_message="你是谁"))
+        assert result["sent"] is False and result["reason_code"] == "connection_unconfigured"
+        assert len(requests) == calls
+        for bad_metadata, code in (
+            ({**metadata, "connection_status": "unverified"}, "connection_unverified"),
+            ({**metadata, "key_revision": 99}, "credential_unavailable"),
+        ):
+            service._write_root_json(scope, "ai_connection.json", bad_metadata)
+            assert preview(store_config_override={})["reason_code"] == code
+            assert len(requests) == calls
+        service._write_root_json(scope, "ai_connection.json", metadata)
+
+        # A connection generation change discards the late result without writes.
+        generation = {"revision": 1}
+        during_request["callback"] = lambda: generation.update(revision=2)
+        with patch.object(service, "_connection_generation", side_effect=lambda _scope: (generation["revision"],)):
+            result = preview(store_config_override={})
+        assert result["decision"] == "no_reply" and result["reason_code"] == "revision_conflict"
+        during_request["callback"] = None
+
+        # Read-only path resolution must still reject a directory symlink into another shop.
+        knowledge_dir = service.storage.account_dir(scope[0], scope[2]) / "ai_knowledge"
+        other_knowledge = service.storage.account_dir(other_scope[0], other_scope[2]) / "ai_knowledge"
+        other_knowledge.symlink_to(knowledge_dir, target_is_directory=True)
+        readonly(lambda: assert_error(
+            "credential_unavailable", lambda: service.preview(*other_scope, buyer_message="你是谁", item_id="2002"),
+        ))
+
+    print("AI sandbox contract: defaults, drafts, isolation, production guards, read-only failures and generation passed")
+
+
 def main() -> None:
+    assert_sandbox_preview()
     assert_development_master_key()
     defaults = empty_store_config()
     assert defaults["version"] == 2

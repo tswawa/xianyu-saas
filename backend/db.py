@@ -954,6 +954,56 @@ class DB:
                 raise
         return "acquired"
 
+    def reserve_shop_connection(
+        self, resource_key, owner, sync_key, lease_seconds=180,
+        risk_until=0, now=None,
+    ):
+        """Atomically preflight local protection and reserve one shop, without I/O.
+
+        QR sessions and ordinary syncs use the same owner-fenced reservation.
+        The separate sync row retains its cooldown even after a connection ends.
+        """
+        import math
+
+        resource_key, owner, sync_key = str(resource_key), str(owner), str(sync_key)
+        if not resource_key or len(resource_key) > 200 or not owner or len(owner) > 128:
+            raise ValueError("invalid shop connection identity")
+        now = time.time() if now is None else float(now)
+        until = now + min(max(float(lease_seconds), 1.0), 3600.0)
+        with self._lock:
+            self.con.execute("BEGIN IMMEDIATE")
+            try:
+                blockers = []
+                if float(risk_until) > now:
+                    blockers.append((float(risk_until), "risk_cooldown"))
+                for key in (sync_key, resource_key):
+                    row = self.con.execute(
+                        "SELECT * FROM control_leases WHERE resource_key = ?", (key,),
+                    ).fetchone()
+                    if row:
+                        if row["lease_until"] > now:
+                            blockers.append((row["lease_until"], "sync_busy"))
+                        if row["cooldown_until"] > now:
+                            blockers.append((row["cooldown_until"], "sync_cooldown"))
+                if blockers:
+                    deadline, code = max(blockers, key=lambda item: item[0])
+                    self.con.rollback()
+                    remaining = deadline - now
+                    return {"code": code, "retry_after": max(1, math.ceil(remaining)) if math.isfinite(remaining) else None}
+                self.con.execute(
+                    """INSERT INTO control_leases
+                       (resource_key, owner, lease_until, cooldown_until, updated_at)
+                       VALUES (?, ?, ?, 0, ?)
+                       ON CONFLICT(resource_key) DO UPDATE SET owner = excluded.owner,
+                         lease_until = excluded.lease_until, updated_at = excluded.updated_at""",
+                    (resource_key, owner, until, now),
+                )
+                self.con.commit()
+                return {"code": "acquired", "retry_after": 0}
+            except Exception:
+                self.con.rollback()
+                raise
+
     def renew_control_lease(self, resource_key, owner, lease_seconds=60, now=None):
         """Atomically extend an unexpired lease still owned by ``owner``."""
         now = time.time() if now is None else float(now)
@@ -1883,6 +1933,40 @@ class DB:
                 if self.con.in_transaction:
                     self.con.rollback()
                 raise
+
+    def discard_unregistered_storage(self, user_id, cleanup: Callable[[int], bool]) -> bool:
+        """Serialize failed-registration cleanup with allocation of the same ID.
+
+        A rolled-back AUTOINCREMENT ID can be reused immediately. Never remove
+        its directory after another transaction has claimed that user/account.
+        Storage cleanup failure leaves safe residue for an explicit later retry.
+        """
+        user_id = int(user_id)
+        with self._lock:
+            owns_transaction = False
+            try:
+                if self.con.in_transaction:
+                    return False
+                self.con.execute("BEGIN IMMEDIATE")
+                owns_transaction = True
+                for table, column in (("users", "id"), ("shop_accounts", "user_id"),
+                                      ("worker_runtimes", "user_id")):
+                    if self.con.execute(
+                        f"SELECT 1 FROM {table} WHERE {column} = ? LIMIT 1", (user_id,)
+                    ).fetchone():
+                        return False
+                return bool(cleanup(user_id))
+            except (OSError, ValueError, sqlite3.Error):
+                return False
+            finally:
+                if owns_transaction:
+                    try:
+                        if self.con.in_transaction:
+                            self.con.rollback()
+                    except sqlite3.Error:
+                        # A broken connection must not turn compensation into
+                        # a second failure or touch another caller's transaction.
+                        pass
 
     def remove_unconfigured_user(self, user_id):
         """Compensate a failed trusted initialization before a session exists."""

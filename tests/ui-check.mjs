@@ -16,9 +16,10 @@ const assetVersion = versionSource.match(/^ASSET_VERSION\s*=\s*["']([^"']+)["']\
 assert.match(assetVersion, /^[0-9]{8}-[0-9]{2}$/);
 const desktopSettingsOpsScope = ["settings", "ops", "dashboard", "goods", "resources", "popover", "home-alerts"].includes(process.env.SAAS_UI_SCOPE);
 const mockOnlyScope = process.env.SAAS_UI_SCOPE === "mock";
+const connectionFlowsScope = process.env.SAAS_UI_SCOPE === "connection-flows";
 // Public documentation images are opt-in, never a side effect of a test scope.
 const docsCaptureScope = process.env.SAAS_UI_SCOPE === "docs-capture";
-const screenshotsEnabled = !docsCaptureScope && !desktopSettingsOpsScope && !mockOnlyScope && process.env.SAAS_UI_SCREENSHOTS !== "0";
+const screenshotsEnabled = !docsCaptureScope && !desktopSettingsOpsScope && !mockOnlyScope && !connectionFlowsScope && process.env.SAAS_UI_SCREENSHOTS !== "0";
 if (screenshotsEnabled) fs.mkdirSync(resultRoot, { recursive: true });
 for (const staleName of screenshotsEnabled ? [
   "local-live-desktop.png", "local-live-mobile.png", "shop-connector-missing-desktop.png",
@@ -235,6 +236,9 @@ const fixtures = {
   userConnectionTokens: new Map(),
   settingsRequests: [],
   settingsTestDelayMs: 0,
+  settingsTestUpstreamStatus: 0,
+  settingsSiteSessionExpired: false,
+  settingsTestResponseGates: [],
   opsRequests: [],
   opsReadResponses: [],
   opsWorkerTimers: new Set(),
@@ -255,6 +259,8 @@ const fixtures = {
   releaseCheckOverrides: null,
   aiPreviewRequests: [],
   aiPreviewResponseDelays: [],
+  aiPreviewResponses: [],
+  aiPreviewResponseGates: [],
   aiExtractResponses: [],
   aiExtractResponseDelays: [],
   aiKnowledgeResponseDelays: [],
@@ -301,6 +307,9 @@ const fixtures = {
   qrCancels: 0,
   qrNextMode: "expired",
   qrStartDelayMs: 0,
+  qrStartResponses: [],
+  qrCompleteResponses: [],
+  qrCompleteRequests: [],
   qrSyncFailures: 0,
   qrStageFailures: 0,
   qrStageCancelNotFound: 0,
@@ -642,9 +651,21 @@ function handleSettingsOpsMock(req, res, apiPath, payload, rawBody = "") {
         if (!String(payload.base_url || "").startsWith("https://")) return fail("unsafe_url", "连接地址不安全", 400);
         if (!String(payload.model || "").trim()) return fail("model_not_found", "模型不存在", 404);
         if (payload.provider !== "ollama_chat" && !payload.api_key && !(connection.api_key_configured && connection.provider === payload.provider)) return fail("authentication_failed", "请输入当前接口的 API Key", 401);
+        if (fixtures.settingsTestUpstreamStatus) {
+          const upstreamStatus = fixtures.settingsTestUpstreamStatus;
+          fixtures.settingsTestUpstreamStatus = 0;
+          return reply({ detail: { source: "provider", code: "authentication_failed", upstream_status: upstreamStatus,
+            message: `上游模型 HTTP ${upstreamStatus}：API Key 鉴权失败，请更正后重试` } }, 502);
+        }
         const token = `mock-user-verification-${fixtures.userConnectionTokens.size + 1}`;
         fixtures.userConnectionTokens.set(token, { username, fingerprint: mockConnectionFingerprint(payload) });
         const result = { ok: true, status: "verified", verification_token: token, expires_in: 180 };
+        const gate = fixtures.settingsTestResponseGates.shift();
+        if (gate) {
+          gate.capture(result);
+          void gate.promise.then(() => json(res, result));
+          return true;
+        }
         const delay = fixtures.settingsTestDelayMs;
         fixtures.settingsTestDelayMs = 0;
         if (delay) { setTimeout(() => json(res, result), delay); return true; }
@@ -840,6 +861,11 @@ function createServer() {
       }
       if (apiPath === "/api/version/public" && req.method === "GET") return json(res, { version: fixtures.version.version, asset_version: fixtures.version.asset_version });
       if (!loggedIn) return json(res, { detail: "未登录" }, 401);
+      if (apiPath === "/api/settings/ai/connection/test" && req.method === "POST" && fixtures.settingsSiteSessionExpired) {
+        fixtures.settingsSiteSessionExpired = false;
+        loggedIn = false;
+        return json(res, { detail: { source: "application", code: "session_expired", message: "本站登录会话已失效" } }, 401);
+      }
       if (apiPath.startsWith("/api/ops/") && fixtures.opsSiteSessionExpired) {
         fixtures.opsSiteSessionExpired = false;
         loggedIn = false;
@@ -1097,11 +1123,13 @@ function createServer() {
         return json(res, fixtures.analyticsByPeriod?.[days] || fixtures.analytics);
       }
       if (apiPath === "/api/bot/login/start" && req.method === "POST") {
+        fixtures.qrStarts += 1;
+        const queued = fixtures.qrStartResponses.shift();
+        if (queued) return json(res, { detail: structuredClone(queued.detail) }, queued.status || 429);
         const loginId = `qr-ui-${String(++fixtures.qrLoginCounter).padStart(32, "0")}`;
         const accountKey = String(req.headers["x-shop-account"] || "default");
         fixtures.qrLogins.set(loginId, { polls: 0, mode: fixtures.qrNextMode, accountKey });
         fixtures.qrNextMode = "success";
-        fixtures.qrStarts += 1;
         const delay = fixtures.qrStartDelayMs;
         fixtures.qrStartDelayMs = 0;
         if (delay) {
@@ -1134,19 +1162,27 @@ function createServer() {
           return json(res, { detail: { code: "mtop_context_failed", message: "扫码确认成功，但登录上下文初始化失败，请刷新二维码重试。", retryable: true } }, 502);
         }
         if (login.mode === "expired") return json(res, { login_id: qrStatusMatch[1], status: "expired", expires_in: 0 });
+        if (login.mode === "confirmed") return json(res, { login_id: qrStatusMatch[1], status: "confirmed", expires_in: 90 });
         if (login.polls === 1) return json(res, { login_id: qrStatusMatch[1], status: "waiting", expires_in: 148 });
         if (login.polls === 2) return json(res, { login_id: qrStatusMatch[1], status: "scanned", expires_in: 146 });
         return json(res, { login_id: qrStatusMatch[1], status: "confirmed", expires_in: 90 });
       }
       if (apiPath === "/api/bot/login/complete" && req.method === "POST") {
+        fixtures.qrCompleteRequests.push({ accountKey: String(req.headers["x-shop-account"] || "default"), payload: structuredClone(payload) });
         const login = fixtures.qrLogins.get(payload.login_id);
         if (!login || login.accountKey !== String(req.headers["x-shop-account"] || "default")) {
           return json(res, { detail: { code: "login_not_found", message: "登录会话不存在" } }, 404);
         }
+        const queued = fixtures.qrCompleteResponses.shift();
+        if (queued) {
+          const response = queued.detail ? { detail: structuredClone(queued.detail) } : { login_id: payload.login_id, status: "connected", connected: true, product_count: fixtures.products.length };
+          if (queued.delay) { setTimeout(() => json(res, response, queued.status || 200), queued.delay); return; }
+          return json(res, response, queued.status || 200);
+        }
         if (login.mode === "sync_fail_once" && !login.syncFailed) {
           login.syncFailed = true;
           fixtures.qrSyncFailures += 1;
-          return json(res, { detail: { code: "network_error", message: "暂时无法连接闲鱼", retryable: true } }, 503);
+          return json(res, { detail: { code: "network_error", message: "暂时无法连接闲鱼", retryable: true, login_expires_in: 90, can_retry_login: true } }, 503);
         }
         fixtures.qrLogins.delete(payload.login_id);
         fixtures.qrConnects += 1;
@@ -1424,13 +1460,16 @@ function createServer() {
             : question.includes("售后")
               ? "售后问题需要结合具体情况确认，如涉及退款或争议我会转人工处理。"
               : `我已收到你的当前问题：${question}`;
-        const response = { reply, sources: ["realtime_facts", "store_content", "product_content", ...(Array.isArray(payload.history) && payload.history.length ? ["conversation"] : [])], knowledge_status: "saved", safety_status: "已通过安全检查" };
+        const queued = fixtures.aiPreviewResponses.shift();
+        const response = queued?.body || { reply, sent: false, config_source: payload.store_config && typeof payload.store_config === "object" ? "draft_override" : scoped.value.config.published ? "published" : "sandbox_defaults", sources: ["realtime_facts", "store_content", "product_content", ...(Array.isArray(payload.history) && payload.history.length ? ["conversation"] : [])], knowledge_status: "saved", safety_status: "已通过安全检查" };
+        const gate = fixtures.aiPreviewResponseGates.shift();
+        if (gate) { gate.then(() => json(res, response, queued?.status || 200)); return; }
         const delay = Number(fixtures.aiPreviewResponseDelays.shift() || 0);
         if (delay > 0) {
-          setTimeout(() => json(res, response), delay);
+          setTimeout(() => json(res, response, queued?.status || 200), delay);
           return;
         }
-        return json(res, response);
+        return json(res, response, queued?.status || 200);
       }
       if (apiPath === "/api/automation" && req.method === "GET") {
         const scoped = scopedFixture(req, "automation", fixtures.automation);
@@ -2434,12 +2473,387 @@ async function checkSettingsOpsMock(baseUrl) {
   }
 }
 
+// Isolated browser regression: only the in-process fixture server is reachable.
+// Keep this separate from the existing long settings/home/mock regressions.
+async function checkConnectionFlows(browser, baseUrl) {
+  const saved = { ...fixtures };
+  for (const [key, value] of Object.entries(fixtures)) {
+    if (Array.isArray(value)) fixtures[key] = structuredClone(value);
+  }
+  Object.assign(fixtures, {
+    me: structuredClone(saved.me), bot: structuredClone(saved.bot), ai: structuredClone(saved.ai),
+    shopAccounts: [structuredClone(saved.shopAccounts[0]), { ...saved.shopAccounts[0], id: 91, key: "flow-empty", name: "沙盘空商品店" }],
+    accountData: {}, apiRequests: [], aiRequests: [], aiPreviewRequests: [], aiPreviewResponses: [], aiPreviewResponseDelays: [], aiPreviewResponseGates: [],
+    qrLogins: new Map(), qrStarts: 0, qrConnects: 0, qrCancels: 0, qrStartDelayMs: 0,
+    qrStartResponses: [], qrCompleteResponses: [], qrCompleteRequests: [],
+  });
+  fixtures.ai.config = { draft: structuredClone(defaultAiStoreConfig), published: null, status: "draft", revision: 0 };
+  fixtures.ai.knowledge = {};
+  fixtures.accountData["flow-empty"] = { ai: { ...structuredClone(fixtures.ai), products: [], knowledge: {} }, products: [], bot: { ...fixtures.bot, product_count: 0, products_set: false } };
+  // The existing HTTP-only mock may have left its synthetic session logged in.
+  const logout = await fetch(`${baseUrl.replace(/\/$/, "")}/api/auth/logout`, { method: "POST" });
+  assert.equal(logout.status, 200);
+  const { page, evidence } = await desktopContractPage(browser, baseUrl);
+  await page.context().routeWebSocket("**/*", (socket) => { evidence.externalRequests.push(socket.url()); socket.close(); });
+  await page.evaluate(() => {
+    window.__flowDangerousClicks = [];
+    document.addEventListener("click", (event) => {
+      const target = event.target.closest('#aiSavePersona, #aiSaveKnowledge, #aiPublishKnowledge, #manualReplySend, #chatAiStart, [data-ai-publish]');
+      if (target) window.__flowDangerousClicks.push(target.id || "publish");
+    }, true);
+  });
+  // Dirty-form confirmation is a local discard decision, never a publish.
+  page.removeAllListeners("dialog");
+  page.on("dialog", async (dialog) => {
+    if (dialog.type() === "confirm") await dialog.accept();
+    else { evidence.pageErrors.push(`unexpected ${dialog.type()} dialog`); await dialog.dismiss(); }
+  });
+  const apiCount = (suffix) => fixtures.apiRequests.filter((request) => request.path.endsWith(suffix)).length;
+  const observe = (promise) => { void promise.catch(() => {}); return promise; };
+  const responseFor = (suffix) => observe(page.waitForResponse((response) => new URL(response.url()).pathname.endsWith(suffix)));
+  const pendingPreviewGates = new Set();
+  const holdPreview = () => {
+    let release;
+    fixtures.aiPreviewResponseGates.push(new Promise((resolve) => { release = resolve; }));
+    pendingPreviewGates.add(release);
+    return () => { pendingPreviewGates.delete(release); release(); };
+  };
+  const cooldown = (extra = {}) => ({ code: "sync_cooldown", retry_after: 2, message: "fixture cooldown", ...extra });
+  const doubleClick = (selector) => page.locator(selector).evaluate((node) => { node.click(); node.click(); });
+  const openQr = async () => {
+    await openView(page, "shops");
+    const response = responseFor("/api/bot/login/start");
+    await doubleClick("#xianyuConnectButton");
+    return response;
+  };
+  const waitRefreshReady = () => page.waitForFunction(() => {
+    const button = document.querySelector("#refreshXianyuLogin");
+    return button && !button.hidden && !button.disabled;
+  });
+  const closeQr = async () => {
+    await page.click("#closeXianyuLogin");
+    await page.waitForSelector("#xianyuLoginDialog", { state: "hidden" });
+  };
+  const ask = async (question, expectedStatus = 200) => {
+    await page.fill("#aiPreviewInput", question);
+    const response = responseFor("/api/bot/ai/preview");
+    await doubleClick("#aiRunPreview");
+    const result = await response;
+    assert.equal(result.status(), expectedStatus);
+    await page.waitForFunction(() => !document.querySelector("#aiRunPreview")?.disabled);
+    return result.json();
+  };
+  try {
+    await desktopLogin(page, fixtures.me.username);
+    for (const code of ["sync_cooldown", "risk_cooldown"]) {
+      fixtures.qrStartResponses.push({ detail: cooldown({ code }) });
+      const starts = fixtures.qrStarts;
+      const images = apiCount("/qr.svg");
+      const created = fixtures.qrLoginCounter;
+      assert.equal((await openQr()).status(), 429);
+      await page.waitForFunction(() => document.querySelector("#refreshXianyuLogin")?.disabled === true);
+      assert.equal(await page.locator("#xianyuQrImage").isHidden(), true);
+      assert.equal(fixtures.qrLoginCounter, created, "start cooldown must not create a QR session");
+      await doubleClick("#refreshXianyuLogin");
+      await waitRefreshReady();
+      await page.waitForTimeout(150);
+      assert.equal(fixtures.qrStarts, starts + 1, "start countdown and duplicate clicks must not contact Xianyu automatically");
+      assert.equal(apiCount("/qr.svg"), images, "cooldown must never fetch a QR image");
+      fixtures.qrNextMode = "expired";
+      const retry = responseFor("/api/bot/login/start");
+      await doubleClick("#refreshXianyuLogin");
+      assert.equal((await retry).status(), 200);
+      await page.waitForSelector("#xianyuQrImage:not([hidden])");
+      assert.equal(fixtures.qrStarts, starts + 2);
+      await closeQr();
+    }
+
+    // A confirmed login is reusable only with a strict boolean and enough TTL.
+    for (const detail of [
+      cooldown({ login_expires_in: 90, can_retry_login: true }),
+      cooldown({ login_expires_in: 90, can_retry_login: false }),
+      cooldown({ login_expires_in: 1, can_retry_login: true }),
+      cooldown({ login_expires_in: 90, can_retry_login: "true" }),
+    ]) {
+      fixtures.qrNextMode = "confirmed";
+      fixtures.qrCompleteResponses.push({ status: 429, detail });
+      const failed = responseFor("/api/bot/login/complete");
+      await openQr();
+      assert.equal((await failed).status(), 429);
+      await page.waitForFunction(() => document.querySelector("#refreshXianyuLogin")?.disabled === true);
+      assert.equal(await page.locator("#xianyuQrImage").isHidden(), true, "confirmed QR must not remain under a loading spinner");
+      const starts = fixtures.qrStarts;
+      const completes = fixtures.qrCompleteRequests.length;
+      const loginId = fixtures.qrCompleteRequests.at(-1).payload.login_id;
+      await doubleClick("#refreshXianyuLogin");
+      await waitRefreshReady();
+      await page.waitForTimeout(100);
+      assert.equal(fixtures.qrStarts, starts);
+      assert.equal(fixtures.qrCompleteRequests.length, completes, "cooldown expiry alone cannot retry complete");
+      const reusable = detail.can_retry_login === true && detail.retry_after < detail.login_expires_in;
+      fixtures.qrNextMode = "expired";
+      const retry = responseFor(reusable ? "/api/bot/login/complete" : "/api/bot/login/start");
+      await doubleClick("#refreshXianyuLogin");
+      assert.equal((await retry).status(), 200);
+      if (reusable) {
+        await page.waitForSelector("#xianyuLoginDialog", { state: "hidden" });
+        assert.equal(fixtures.qrCompleteRequests.length, completes + 1);
+        assert.equal(fixtures.qrCompleteRequests.at(-1).payload.login_id, loginId);
+        assert.equal(fixtures.qrStarts, starts, "valid retry reuses the confirmed login rather than generating QR");
+      } else {
+        await page.waitForSelector("#xianyuQrImage:not([hidden])");
+        assert.equal(fixtures.qrStarts, starts + 1);
+        assert.equal(fixtures.qrCompleteRequests.length, completes, "false, nonboolean or expired login requires a fresh scan");
+        await closeQr();
+      }
+    }
+
+    // A once-reusable confirmed session can expire while the user waits to click.
+    fixtures.qrNextMode = "confirmed";
+    fixtures.qrCompleteResponses.push({ status: 429, detail: cooldown({ retry_after: 1, login_expires_in: 2, can_retry_login: true }) });
+    const expiringComplete = responseFor("/api/bot/login/complete");
+    await openQr();
+    await expiringComplete;
+    await waitRefreshReady();
+    const expiredCompletes = fixtures.qrCompleteRequests.length;
+    const expiredStarts = fixtures.qrStarts;
+    await page.waitForTimeout(1200);
+    assert.equal(fixtures.qrCompleteRequests.length, expiredCompletes);
+    assert.equal(fixtures.qrStarts, expiredStarts);
+    fixtures.qrNextMode = "expired";
+    const renewed = responseFor("/api/bot/login/start");
+    await doubleClick("#refreshXianyuLogin");
+    await renewed;
+    await page.waitForSelector("#xianyuQrImage:not([hidden])");
+    assert.equal(fixtures.qrCompleteRequests.length, expiredCompletes, "elapsed session TTL must prohibit reuse even after a retryable error");
+    assert.equal(fixtures.qrStarts, expiredStarts + 1);
+    await closeQr();
+
+    // Closing, changing shops, and logging out clear the cooldown timer.
+    for (const action of ["close", "shop", "logout"]) {
+      fixtures.qrStartResponses.push({ detail: cooldown() });
+      await openQr();
+      await page.waitForFunction(() => document.querySelector("#refreshXianyuLogin")?.disabled === true);
+      const starts = fixtures.qrStarts;
+      const completes = fixtures.qrCompleteRequests.length;
+      if (action === "close") await closeQr();
+      else await page.locator(action === "shop" ? '#accountTabs [data-account-switch="flow-empty"]' : "#logoutButton").evaluate((node) => node.click());
+      await page.waitForSelector("#xianyuLoginDialog", { state: "hidden" }).catch((error) => { throw new Error(`${action} must close the QR dialog`, { cause: error }); });
+      const copy = await page.locator("#xianyuLoginMessage").textContent();
+      await page.waitForTimeout(2200);
+      assert.equal(fixtures.qrStarts, starts);
+      assert.equal(fixtures.qrCompleteRequests.length, completes);
+      assert.equal(await page.locator("#xianyuLoginMessage").textContent(), copy, `${action} must stop countdown DOM updates`);
+      if (action === "logout") await desktopLogin(page, fixtures.me.username);
+      if (action === "shop") await page.locator('#accountTabs [data-account-switch="default"]').click();
+    }
+
+    // A late start or complete cannot replace or close a newly opened login.
+    for (const phase of ["start", "complete"]) {
+      fixtures.qrNextMode = phase === "complete" ? "confirmed" : "expired";
+      if (phase === "start") fixtures.qrStartDelayMs = 700;
+      else fixtures.qrCompleteResponses.push({ delay: 700 });
+      await openView(page, "shops");
+      const late = responseFor(`/api/bot/login/${phase}`);
+      const request = page.waitForRequest((request) => new URL(request.url()).pathname.endsWith(`/api/bot/login/${phase}`));
+      await page.click("#xianyuConnectButton");
+      await request;
+      await closeQr();
+      fixtures.qrStartResponses.push({ detail: cooldown({ retry_after: 3 }) });
+      await openQr();
+      await late;
+      await page.waitForTimeout(100);
+      assert.equal(await page.locator("#xianyuLoginDialog").isVisible(), true, `late ${phase} must not close the newer login`);
+      assert.equal(await page.locator("#xianyuQrImage").isHidden(), true);
+      assert.equal(await page.locator("#refreshXianyuLogin").isDisabled(), true);
+      await closeQr();
+    }
+
+    await openView(page, "ai-config");
+    await page.waitForSelector("#aiKnowledgeContent:enabled");
+    await page.fill("#aiStoreContent", "未保存店铺草稿：仅在沙盘使用");
+    await page.fill("#aiPersonaName", "未保存客服名称");
+    await page.selectOption("#aiTone", "professional");
+    await page.fill("#aiForbiddenClaims", "未保存禁止承诺");
+    await page.fill("#aiHandoffRules", "未保存转人工规则");
+    await page.fill("#aiKnowledgeContent", "未保存商品草稿：仅在沙盘使用");
+    let response = await ask("第一轮草稿问题");
+    assert.equal(response.sent, false);
+    assert.equal(response.config_source, "draft_override");
+    let sent = fixtures.aiPreviewRequests.at(-1).payload;
+    assert.equal(sent.store_config.store_content, await page.inputValue("#aiStoreContent"));
+    assert.deepEqual(sent.store_config, { ...defaultAiStoreConfig, store_content: "未保存店铺草稿：仅在沙盘使用", persona_name: "未保存客服名称", tone: "professional", forbidden_claims: "未保存禁止承诺", handoff_rules: "未保存转人工规则" });
+    assert.equal(sent.knowledge.content, await page.inputValue("#aiKnowledgeContent"));
+    assert.equal(sent.item_id, await page.locator("#aiProductList .is-active[data-ai-product]").getAttribute("data-ai-product"));
+    assert.deepEqual(sent.history, []);
+    const reply = response.reply;
+    await ask("第二轮继续咨询");
+    sent = fixtures.aiPreviewRequests.at(-1).payload;
+    assert.deepEqual(sent.history, [{ role: "user", content: "第一轮草稿问题" }, { role: "assistant", content: reply }]);
+    assert.equal(fixtures.aiPreviewRequests.length, 2, "double-click sends one preview per question");
+
+    fixtures.aiPreviewResponses.push({ status: 503, body: { detail: { code: "provider_unavailable", message: "fixture preview failure" } } });
+    const draft = { store: await page.inputValue("#aiStoreContent"), product: await page.inputValue("#aiKnowledgeContent") };
+    await ask("失败时保留的问题", 503);
+    assert.equal(await page.inputValue("#aiPreviewInput"), "失败时保留的问题");
+    assert.equal(await page.inputValue("#aiStoreContent"), draft.store);
+    assert.equal(await page.inputValue("#aiKnowledgeContent"), draft.product);
+    for (const [reason, message] of [["connection_unconfigured", "请先在设置中测试并保存统一模型连接"], ["timeout", "模型服务响应超时"]]) {
+      fixtures.aiPreviewResponses.push({ body: { decision: "no_reply", reply: "", reason_code: reason, sent: false, config_source: "draft_override" } });
+      await page.fill("#aiPreviewInput", "模型失败时保留的问题");
+      const failedDecision = responseFor("/api/bot/ai/preview");
+      await page.click("#aiRunPreview");
+      assert.equal((await failedDecision).status(), 200);
+      await page.waitForFunction((expected) => document.querySelector("#aiPreviewOutput")?.textContent.includes(expected), message);
+      await page.waitForFunction(() => !document.querySelector("#aiRunPreview")?.disabled);
+      assert.equal(await page.inputValue("#aiPreviewInput"), "模型失败时保留的问题");
+      assert.equal(await page.inputValue("#aiStoreContent"), draft.store);
+      assert.equal(await page.inputValue("#aiKnowledgeContent"), draft.product);
+    }
+    await page.fill("#aiStoreContent", "");
+    await page.fill("#aiKnowledgeContent", "");
+    response = await ask("你是谁");
+    assert.equal(response.sent, false);
+    assert.ok(response.reply);
+    assert.equal(fixtures.aiPreviewRequests.at(-1).payload.store_config.store_content, "");
+    assert.equal(fixtures.aiPreviewRequests.at(-1).payload.knowledge.content, "");
+
+    for (const action of ["product", "close", "shop"]) {
+      const releaseLate = holdPreview();
+      const marker = `迟到沙盘-${action}`;
+      await page.fill("#aiPreviewInput", marker);
+      const late = responseFor("/api/bot/ai/preview");
+      const request = page.waitForRequest((request) => new URL(request.url()).pathname.endsWith("/api/bot/ai/preview"));
+      await page.click("#aiRunPreview");
+      await request;
+      let newer;
+      let releaseNewer;
+      if (action === "product") {
+        const nextProduct = page.locator("#aiProductList [data-ai-product]:not(.is-active)").first();
+        const nextId = await nextProduct.getAttribute("data-ai-product");
+        const knowledge = responseFor(`/api/bot/ai/products/${nextId}/knowledge`);
+        const versions = responseFor(`/api/bot/ai/products/${nextId}/versions`);
+        await nextProduct.click();
+        await Promise.all([knowledge, versions]);
+        await page.waitForSelector("#aiKnowledgeContent:enabled");
+        await page.fill("#aiKnowledgeContent", "新商品未保存草稿");
+        await page.fill("#aiPreviewInput", "新商品正在生成的问题");
+        releaseNewer = holdPreview();
+        newer = observe(page.waitForResponse((response) => new URL(response.url()).pathname.endsWith("/api/bot/ai/preview") && response.request().postDataJSON()?.buyer_message === "新商品正在生成的问题"));
+        const nextRequest = page.waitForRequest((request) => new URL(request.url()).pathname.endsWith("/api/bot/ai/preview") && request.postDataJSON()?.buyer_message === "新商品正在生成的问题");
+        await doubleClick("#aiRunPreview");
+        await nextRequest;
+      } else if (action === "close") await openView(page, "home");
+      else await page.locator('#accountTabs [data-account-switch="flow-empty"]').click();
+      releaseLate();
+      await late;
+      await page.waitForTimeout(100);
+      assert.equal((await page.locator("#aiPreviewOutput").textContent()).includes(marker), false, `${action} ignores the previous preview response`);
+      assert.equal((await page.locator("#aiPreviewHistory").textContent()).includes(marker), false);
+      if (newer) {
+        assert.equal(await page.locator("#aiRunPreview").isDisabled(), true, "an old finally must not unlock the new product preview");
+        assert.equal(await page.inputValue("#aiPreviewInput"), "新商品正在生成的问题");
+        assert.equal(await page.inputValue("#aiKnowledgeContent"), "新商品未保存草稿");
+        releaseNewer();
+        await newer;
+        await page.waitForFunction(() => !document.querySelector("#aiRunPreview")?.disabled);
+        assert.equal((await page.locator("#aiPreviewOutput").textContent()).includes("新商品正在生成的问题"), true);
+      }
+      if (action === "close") await openView(page, "ai-config");
+    }
+    await page.waitForFunction(() => document.querySelectorAll("#aiProductList [data-ai-product]").length === 0);
+    assert.equal(await page.locator("#aiRunPreview").isEnabled(), true, "no-product shop still permits basic sandbox questions");
+    response = await ask("你是谁");
+    assert.equal(response.sent, false);
+    assert.ok(response.reply);
+    sent = fixtures.aiPreviewRequests.at(-1);
+    assert.equal(sent.accountKey, "flow-empty");
+    assert.ok(sent.payload.item_id == null || sent.payload.item_id === "");
+    assert.equal(Object.hasOwn(sent.payload, "knowledge"), false, "no product must not inherit old product knowledge");
+    assert.deepEqual(sent.payload.history, [], "a new shop cannot inherit sandbox conversation history");
+
+    const writes = fixtures.apiRequests.filter((request) => request.method !== "GET" && !["/api/auth/login", "/api/auth/logout", "/api/bot/login/start", "/api/bot/login/complete", "/api/bot/ai/preview"].includes(request.path) && !/^\/api\/bot\/login\/[^/]+\/cancel$/.test(request.path));
+    assert.deepEqual(writes, [], "sandbox must perform zero config/knowledge PUT, publish, real-send or worker-start operations");
+    assert.deepEqual(await page.evaluate(() => window.__flowDangerousClicks), [], "publish, save, real-send and worker buttons must never be operated");
+    assert.deepEqual(evidence.pageErrors, []);
+    assert.deepEqual(evidence.externalRequests, []);
+    assert.equal(evidence.failedResponses.every((failure) => (failure.status === 429 && ["/api/bot/login/start", "/api/bot/login/complete"].includes(failure.path)) || (failure.status === 503 && failure.path === "/api/bot/ai/preview")), true, JSON.stringify(evidence.failedResponses));
+    console.log(JSON.stringify({ ok: true, scope: "connection-flows", screenshots: 0, cases: ["start-cooldown-no-qr", "manual-countdown-retry", "confirmed-login-reuse", "strict-bool-and-session-expiry", "expires-after-countdown", "duplicate-clicks", "close-shop-logout-clear-timers", "late-start-complete", "unsaved-store-product-drafts", "history", "failure-preserves-input", "empty-content", "no-product", "late-preview-close-shop-product", "stale-finally-keeps-new-request-busy"], qrStarts: fixtures.qrStarts, completes: fixtures.qrCompleteRequests.length, previews: fixtures.aiPreviewRequests.length, publishOrSend: 0 }));
+    await desktopApiClick(page, "#logoutButton", "/api/auth/logout");
+  } catch (error) {
+    console.error(JSON.stringify({ scope: "connection-flows", error: error.message, previews: fixtures.aiPreviewRequests.map((request) => ({ account: request.accountKey, item: request.payload.item_id, question: request.payload.buyer_message })), state: await page.evaluate(() => ({ view: document.querySelector('[data-panel]:not([hidden])')?.dataset.panel, busy: document.querySelector('#aiRunPreview')?.disabled, question: document.querySelector('#aiPreviewInput')?.value, knowledge: document.querySelector('#aiKnowledgeContent')?.value, output: document.querySelector('#aiPreviewOutput')?.textContent })).catch(() => null) }));
+    throw error;
+  } finally {
+    for (const release of pendingPreviewGates) release();
+    await page.close();
+    Object.assign(fixtures, saved);
+  }
+}
+
 function resourceRow(account, values = {}) {
   return { account_id: account.id, key: account.key, name: account.name, enabled: true,
     worker_state: "running", mode: "rules", metrics_state: "ready", cpu_percent: 12.5,
     rss_bytes: 64 * 1024 * 1024, vms_bytes: 120 * 1024 * 1024, uptime_seconds: 3661,
     memory_limit_bytes: 400 * 1024 * 1024, configured_memory_limit_bytes: 400 * 1024 * 1024,
     pending_restart: false, sampled_at: Date.now() / 1000, message: "", ...values };
+}
+
+async function assertHomeOverviewLayout(page, label) {
+  assert.equal(await page.locator('.home-quick-actions').count(), 0, 'removed overview shortcuts must not remain hidden in the DOM');
+  assert.equal(await page.locator('#homeStatCards + .overview-grid-2col').count(), 1, 'overview content follows the statistics without four shortcut buttons');
+  const empty = page.locator('#attentionList .attention-empty');
+  assert.equal(await empty.innerText(), '当前没有需要处理的事项', 'empty attention retains its explanatory text');
+  assert.equal(await empty.locator('svg').count(), 0, 'only the empty-state circle icon is removed');
+  assert.equal(await empty.evaluate((node) => getComputedStyle(node).textAlign), 'center');
+  assert.equal(await page.locator('.home-resources-heading').count(), 1);
+  assert.ok(await page.locator('#homeResourceTitle use').evaluate((node) => node.getBBox().width > 0), 'resource heading must not reserve space for a missing icon');
+  const viewport = page.viewportSize();
+  for (const width of [1440, 768, 390]) {
+    await page.setViewportSize({ width, height: 900 });
+    await waitForPanelSettled(page);
+    const layout = await page.locator('.home-resources-card').evaluate((card) => {
+      const measure = (node) => {
+        const box = node.getBoundingClientRect();
+        const style = getComputedStyle(node);
+        return { left: box.left, right: box.right, top: box.top, bottom: box.bottom, width: box.width,
+          centerY: box.top + box.height / 2, font: parseFloat(style.fontSize), display: style.display,
+          text: node.textContent.trim(), clientWidth: node.clientWidth, scrollWidth: node.scrollWidth };
+      };
+      const wrapper = card.querySelector('.home-resources-table-wrap');
+      const previousScroll = wrapper.scrollLeft;
+      wrapper.scrollLeft = wrapper.scrollWidth;
+      const scrolledLeft = wrapper.scrollLeft;
+      wrapper.scrollLeft = previousScroll;
+      return { card: measure(card), header: measure(card.querySelector('.section-title')),
+        heading: measure(card.querySelector('.home-resources-heading')), title: measure(card.querySelector('#homeResourceTitle')),
+        scope: measure(card.querySelector('.section-scope-badge')), link: measure(card.querySelector('[data-view="shops"]')),
+        wrapper: measure(wrapper), overflowX: getComputedStyle(wrapper).overflowX, scrolledLeft };
+    });
+    const context = `${label} ${width}px: ${JSON.stringify(layout)}`;
+    assert.equal(layout.title.text, '店铺运行情况');
+    assert.equal(layout.scope.text, '本账号全部店铺');
+    assert.equal(layout.heading.display, 'flex', context);
+    assert.ok(layout.title.font >= 14 && layout.title.font <= 16, `resource title stays near 15px; ${context}`);
+    assert.ok(layout.scope.font >= 10 && layout.scope.font <= 12 && layout.title.font - layout.scope.font >= 3, `scope is a smaller badge near 11px; ${context}`);
+    for (const name of ['heading', 'title', 'scope', 'link', 'wrapper']) {
+      const box = layout[name];
+      assert.ok(box.width > 0 && box.left >= layout.card.left - 1 && box.right <= layout.card.right + 1, `${name} stays within the card; ${context}`);
+      if (name !== 'wrapper') assert.ok(box.scrollWidth <= box.clientWidth + 1, `${name} must wrap rather than clip; ${context}`);
+    }
+    const overlaps = (a, b) => Math.min(a.right, b.right) - Math.max(a.left, b.left) > 1
+      && Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top) > 1;
+    assert.equal(overlaps(layout.title, layout.scope), false, `title and scope cannot collide; ${context}`);
+    assert.equal(overlaps(layout.heading, layout.link), false, `heading and monitor link cannot collide; ${context}`);
+    assert.ok(layout.header.bottom <= layout.wrapper.top + 1, `resource table stays below its heading; ${context}`);
+    if (width === 1440) {
+      assert.ok(layout.scope.left >= layout.title.right + 4 && Math.abs(layout.title.centerY - layout.scope.centerY) <= 2, `desktop title and badge share a centered row; ${context}`);
+    }
+    assert.ok(['auto', 'scroll'].includes(layout.overflowX), `resource table retains its own horizontal scroller; ${context}`);
+    if (layout.wrapper.scrollWidth > layout.wrapper.clientWidth + 1) assert.ok(layout.scrolledLeft > 0, `wide resource rows remain reachable inside the card; ${context}`);
+    await assertNoOverflow(page, `${label} ${width}px`);
+  }
+  await page.setViewportSize(viewport);
+  await waitForPanelSettled(page);
 }
 
 async function checkHomeAlerts(browser, baseUrl) {
@@ -2547,6 +2961,8 @@ async function checkHomeAlerts(browser, baseUrl) {
     await page.locator('[data-attention-toggle="att_aaaaaaaaaaaaaaaaaaaaaaaa"]').click();
     await page.waitForFunction(() => document.querySelector("#attentionCount")?.textContent === "0");
     await reloadHome();
+    assert.equal(await page.locator('#attentionList .attention-empty').count(), 0, 'resolved real attention remains an actionable history row');
+    assert.equal(await page.locator('#attentionList .attention-row > svg use[href$="#circle-check"]').count(), 1, 'real resolved-attention icons are not removed with the empty-state icon');
     assert.equal(await page.locator('[data-attention-toggle]').getAttribute("aria-pressed"), "true", "processed status survives copy normalization and reload");
     await page.locator('[data-attention-toggle]').click();
     await page.waitForFunction(() => document.querySelector("#attentionCount")?.textContent === "1");
@@ -2588,10 +3004,11 @@ async function checkHomeAlerts(browser, baseUrl) {
     await reloadHome();
     assert.match(await page.locator("#attentionList").innerText(), /当前没有需要处理的事项/);
     assert.equal(await page.locator("#attentionCount").innerText(), "0");
+    await assertHomeOverviewLayout(page, 'recovered attention overview');
     assert.equal(fixtures.shopActionRequests.length, 0, "view and acknowledgement actions cannot trigger shop probes");
     assert.equal(fixtures.cookieSaves + fixtures.botStartModes.length + fixtures.qrStarts + fixtures.qrConnects, 0, "display fixes must not reauthorize or restart workers");
     assertDesktopEvidence(evidence);
-    console.log(JSON.stringify({ ok: true, scope: "home-alerts", layoutCases: cases.length, alertCases: ["legacy-worker-risk", "resolved-history", "explicit-verification", "local-cooldown", "platform-busy", "account-restricted", "session-expired", "recovered"], noPlatformRequests: true }));
+    console.log(JSON.stringify({ ok: true, scope: "home-alerts", layoutCases: cases.length, homeLayoutWidths: [1440, 768, 390], alertCases: ["legacy-worker-risk", "resolved-history", "explicit-verification", "local-cooldown", "platform-busy", "account-restricted", "session-expired", "recovered", "text-only-empty", "resolved-actions-kept"], noPlatformRequests: true }));
   } catch (error) {
     await reportDesktopFailure(page, "home-alerts", error, evidence);
     throw error;
@@ -2632,7 +3049,15 @@ async function checkDashboardDesktop(browser, baseUrl) {
       await page.waitForFunction(() => document.querySelector('#analyticsChart')?.children.length > 0);
       assert.ok(fixtures.analyticsRequests.includes(1) && fixtures.analyticsRequests.includes(7), 'today totals and seven-day trend have separate sources');
       assert.equal(fixtures.apiRequests.some((item) => item.path.startsWith('/api/admin/')), false, 'owner must not fetch platform-private settings');
-      await assertNoOverflow(page, 'new overview desktop');
+      await assertHomeOverviewLayout(page, 'simplified overview');
+      for (const view of ['shops', 'chat', 'goods', 'orders']) {
+        const navigation = page.locator(`#sidebar [data-view="${view}"]`);
+        assert.equal(await navigation.isVisible(), true, `${view} remains available in primary navigation`);
+        await navigation.click();
+        await page.waitForSelector(`[data-panel="${view}"]:not([hidden])`);
+      }
+      await page.locator('#sidebar .sidebar-logo[data-view="home"]').click();
+      await page.waitForSelector('[data-panel="home"]:not([hidden])');
     }
 
     await openView(page, 'goods');
@@ -2682,7 +3107,7 @@ async function checkDashboardDesktop(browser, baseUrl) {
     const stored = await page.evaluate(() => window.__uiStorageWrites);
     assert.equal(JSON.stringify(stored).includes('仅二店商品'), false, 'preferences must not persist product bodies');
     assertDesktopEvidence(evidence);
-    console.log(JSON.stringify({ ok: true, scope: process.env.SAAS_UI_SCOPE, cases: [...(process.env.SAAS_UI_SCOPE === 'goods' ? [] : ['honest-today-metrics', 'separate-trend']), 'cards-list-pagination', 'search-and-status', 'advanced-binding-no-overwrite', 'shop-isolation', '1280-768-390-layout', 'preferences-only'] }));
+    console.log(JSON.stringify({ ok: true, scope: process.env.SAAS_UI_SCOPE, cases: [...(process.env.SAAS_UI_SCOPE === 'goods' ? [] : ['honest-today-metrics', 'separate-trend', 'no-overview-shortcuts', 'primary-navigation', 'text-only-empty', 'resource-heading-1440-768-390']), 'cards-list-pagination', 'search-and-status', 'advanced-binding-no-overwrite', 'shop-isolation', '1280-768-390-layout', 'preferences-only'] }));
   } catch (error) {
     await reportDesktopFailure(page, process.env.SAAS_UI_SCOPE, error, evidence);
     throw error;
@@ -2732,7 +3157,7 @@ async function checkResourcesDesktop(browser, baseUrl) {
     assert.match(home, /64/);
     assert.match(home, /400/);
     assert.match(home, /768/);
-    await assertNoOverflow(page, 'resources home desktop');
+    await assertHomeOverviewLayout(page, 'resource summary overview');
     assert.ok(await page.locator('#homeResourceBody tr').count() <= 5, 'overview shows a compact resource summary');
     await openView(page, 'shops');
     await page.waitForFunction(() => document.querySelector('#shopResourcesBody')?.textContent.includes('资源分页店53'));
@@ -2817,7 +3242,7 @@ async function checkResourcesDesktop(browser, baseUrl) {
       await assertNoOverflow(page, `resource settings ${width}`);
     }
     assertDesktopEvidence(evidence);
-    console.log(JSON.stringify({ ok: true, scope: 'resources', cases: ['effective-defaults', 'admin-only-cas', 'no-stop-on-save', 'applied-vs-next-limit', 'conflict-keeps-policy', 'owner-read-only', 'cross-user-draft-clear', 'mobile-layout'] }));
+    console.log(JSON.stringify({ ok: true, scope: 'resources', cases: ['effective-defaults', 'admin-only-cas', 'no-stop-on-save', 'applied-vs-next-limit', 'conflict-keeps-policy', 'owner-read-only', 'cross-user-draft-clear', 'mobile-layout', 'resource-heading-1440-768-390', 'bounded-table-scroll'] }));
   } catch (error) {
     await reportDesktopFailure(page, 'resources', error, evidence);
     throw error;
@@ -2828,6 +3253,17 @@ async function checkSettingsDesktop(browser, baseUrl) {
   const { page, evidence } = await desktopContractPage(browser, baseUrl);
   const owner = structuredClone(fixtures.me);
   const accounts = fixtures.shopAccounts;
+  const documentTimeOrigin = await page.evaluate(() => performance.timeOrigin);
+  const pendingTests = [];
+  const holdSettingsTest = () => {
+    let capture, release;
+    const captured = new Promise((resolve) => { capture = resolve; });
+    const promise = new Promise((resolve) => { release = resolve; });
+    const gate = { captured, promise, capture, release };
+    fixtures.settingsTestResponseGates.push(gate);
+    pendingTests.push(gate);
+    return gate;
+  };
   fixtures.shopAccounts = [...accounts, { ...accounts[0], id: 2, key: "settings-second", name: "设置保留测试店" }];
   try {
     await desktopLogin(page, owner.username);
@@ -2841,6 +3277,51 @@ async function checkSettingsDesktop(browser, baseUrl) {
     for (const tab of ["accounts", "audit"]) assert.equal(await page.locator(`[data-settings-tab="${tab}"]`).isVisible(), false);
     assert.equal(await page.locator('#settingsAiLegacySelect, .settings-ai-legacy-box, [data-settings-tab="version"], [data-settings-panel="version"], #adminUpdateControls, #updateChannelSelect').count(), 0, "removed migration/version controls must not remain hidden in DOM");
     assert.equal(fixtures.settingsRequests.some((item) => item.path.includes("legacy-sources")), false);
+
+    // Provider authentication failures are HTTP 502, never site logout. Keep
+    // the synthetic draft/key available for correction and an immediate retry.
+    for (const upstreamStatus of [401, 403]) {
+      const baseUrlDraft = `https://provider-${upstreamStatus}.example.invalid/v1`;
+      const modelDraft = `provider-${upstreamStatus}-draft`;
+      const keyDraft = `mock-provider-${upstreamStatus}-secret`;
+      await page.fill("#aiBaseUrl", baseUrlDraft);
+      await page.fill("#aiModel", modelDraft);
+      await page.fill("#aiApiKey", keyDraft);
+      const logoutCount = fixtures.authLogoutRequests;
+      const loginCount = fixtures.apiRequests.filter((item) => item.path === "/api/auth/login").length;
+      const revision = userConnectionFixture().revision;
+      fixtures.settingsTestUpstreamStatus = upstreamStatus;
+      evidence.allowedFailures.push({ path: "/api/settings/ai/connection/test", status: 502 });
+      const failure = await desktopApiClick(page, "#aiTestConnection", "/api/settings/ai/connection/test", "POST", 502);
+      assert.equal(failure.detail.code, "authentication_failed");
+      assert.equal(failure.detail.source, "provider");
+      assert.equal(failure.detail.upstream_status, upstreamStatus);
+      await page.waitForFunction((message) => document.querySelector("#aiConnectionMessage")?.textContent.includes(message), failure.detail.message);
+      await page.waitForSelector("#aiTestConnection:not(:disabled):not(.is-loading)");
+      assert.equal(await page.locator("#workspace").isVisible(), true, `provider ${upstreamStatus} must retain the site session`);
+      assert.equal(await page.locator("#authScreen").isVisible(), false);
+      assert.equal(fixtures.authLogoutRequests, logoutCount);
+      assert.equal(fixtures.apiRequests.filter((item) => item.path === "/api/auth/login").length, loginCount);
+      assert.equal(await page.locator("#aiSaveConnection").isDisabled(), true, "failed tests must not authorize saving");
+      await page.click('[data-settings-tab="security"]');
+      await page.click('[data-settings-tab="ai"]');
+      assert.equal(await page.inputValue("#aiBaseUrl"), baseUrlDraft);
+      assert.equal(await page.inputValue("#aiModel"), modelDraft);
+      assert.equal(await page.inputValue("#aiApiKey"), keyDraft, "provider errors must preserve the unsaved key after rendering");
+      await page.fill("#aiModel", `${modelDraft}-corrected`);
+      await page.fill("#aiApiKey", `${keyDraft}-corrected`);
+      const retry = await desktopApiClick(page, "#aiTestConnection", "/api/settings/ai/connection/test");
+      assert.equal(retry.status, "verified");
+      assert.ok(retry.verification_token);
+      await page.waitForSelector("#aiTestConnection:not(:disabled):not(.is-loading)");
+      assert.equal(await page.locator("#aiSaveConnection").isEnabled(), true);
+      assert.equal(fixtures.settingsRequests.findLast((item) => item.path.endsWith("/test")).payload.api_key, `${keyDraft}-corrected`);
+      assert.equal(await page.inputValue("#aiApiKey"), `${keyDraft}-corrected`);
+      assert.equal(userConnectionFixture().revision, revision, "testing alone must not save a draft");
+      assert.doesNotMatch(await page.locator("body").innerText(), /mock-provider-(?:401|403)-secret/);
+    }
+    await assertNoBusinessStorage(page, /mock-provider-(?:401|403)-secret/);
+
     await page.fill("#aiBaseUrl", "https://first.example.invalid/v1");
     await page.fill("#aiModel", "first-user-model");
     await page.fill("#aiApiKey", "mock-first-user-secret");
@@ -2854,6 +3335,97 @@ async function checkSettingsDesktop(browser, baseUrl) {
     assert.ok(initialSave.verification_token);
     assert.equal(userConnectionFixture().revision, 1);
     await page.waitForFunction(() => document.querySelector("#aiApiKey")?.value === "");
+
+    // A real site 401 must still clear sensitive drafts. Reuse this document
+    // and the same user so neither reload nor a new DOM button can hide busy state.
+    await page.fill("#aiBaseUrl", "https://session-expired.example.invalid/v1");
+    await page.fill("#aiModel", "session-expired-draft");
+    await page.fill("#aiApiKey", "mock-session-expired-secret");
+    fixtures.settingsSiteSessionExpired = true;
+    evidence.allowedFailures.push({ path: "/api/settings/ai/connection/test", status: 401 });
+    const expired = await desktopApiClick(page, "#aiTestConnection", "/api/settings/ai/connection/test", "POST", 401);
+    assert.equal(expired.detail.source, "application");
+    assert.equal(expired.detail.code, "session_expired");
+    await page.waitForSelector("#authScreen:not([hidden])");
+    assert.equal(await page.locator("#workspace").isVisible(), false);
+    for (const selector of ["#aiBaseUrl", "#aiModel", "#aiApiKey"]) {
+      assert.equal(await page.inputValue(selector), "", `${selector} must clear on site session expiry`);
+    }
+    assert.equal(await page.locator("#aiSaveConnection").isDisabled(), true);
+    await desktopLogin(page, owner.username);
+    await openView(page, "settings");
+    await page.waitForFunction(() => document.querySelector("#aiModel")?.value === "first-user-model");
+    assert.equal(await page.evaluate(() => performance.timeOrigin), documentTimeOrigin, "401 recovery must not reload the document");
+    await page.waitForSelector("#aiTestConnection:not(:disabled):not(.is-loading)");
+    assert.equal(await page.inputValue("#aiBaseUrl"), "https://first.example.invalid/v1");
+    assert.equal(await page.inputValue("#aiApiKey"), "", "logging in must not resurrect the expired session's API key");
+    assert.equal(await page.locator("#aiSaveConnection").isDisabled(), true);
+    await page.fill("#aiModel", "session-retry-model");
+    await page.fill("#aiApiKey", "mock-session-retry-secret");
+    const sessionRetry = await desktopApiClick(page, "#aiTestConnection", "/api/settings/ai/connection/test");
+    assert.equal(sessionRetry.status, "verified");
+    await page.waitForSelector("#aiTestConnection:not(:disabled):not(.is-loading)");
+    assert.equal(await page.locator("#aiSaveConnection").isEnabled(), true, "testing must work immediately after logging back in");
+    await assertNoBusinessStorage(page, /mock-session-(?:expired|retry)-secret|session-expired-draft/);
+
+    // Hold both responses explicitly: the old request returns only after a
+    // new login has started another test. Identical user/candidate/revision
+    // ensure fingerprint checks cannot substitute for settings object identity.
+    const raceDraft = { baseUrl: "https://session-race.example.invalid/v1", model: "session-race-model", key: "mock-session-race-secret" };
+    const fillRaceDraft = async () => {
+      await page.fill("#aiBaseUrl", raceDraft.baseUrl);
+      await page.fill("#aiModel", raceDraft.model);
+      await page.fill("#aiApiKey", raceDraft.key);
+    };
+    const isConnectionTest = (request) => new URL(request.url()).pathname === "/xianyu-saas/api/settings/ai/connection/test" && request.method() === "POST";
+    await fillRaceDraft();
+    const oldGate = holdSettingsTest();
+    const [oldRequest] = await Promise.all([page.waitForRequest(isConnectionTest), page.click("#aiTestConnection")]);
+    const oldResult = await waitForMockGate(oldGate.captured, "previous-session model test");
+    assert.equal(await page.locator("#aiTestConnection").isDisabled(), true);
+    assert.equal(await page.locator("#aiTestConnection").evaluate((node) => node.classList.contains("is-loading")), true);
+    await page.click("#logoutButton");
+    await page.waitForSelector("#authScreen:not([hidden])");
+    for (const selector of ["#aiBaseUrl", "#aiModel", "#aiApiKey"]) assert.equal(await page.inputValue(selector), "");
+    await desktopLogin(page, owner.username);
+    await openView(page, "settings");
+    await page.waitForFunction(() => document.querySelector("#aiModel")?.value === "first-user-model");
+    assert.equal(await page.evaluate(() => performance.timeOrigin), documentTimeOrigin);
+    await page.waitForSelector("#aiTestConnection:not(:disabled):not(.is-loading)");
+    assert.equal(await page.inputValue("#aiApiKey"), "");
+    await fillRaceDraft();
+    const currentGate = holdSettingsTest();
+    const [currentRequest] = await Promise.all([page.waitForRequest(isConnectionTest), page.click("#aiTestConnection")]);
+    const currentResult = await waitForMockGate(currentGate.captured, "current-session model test");
+    assert.deepEqual(oldRequest.postDataJSON(), currentRequest.postDataJSON());
+    assert.notEqual(oldResult.verification_token, currentResult.verification_token);
+    await page.click('[data-settings-tab="security"]');
+    await page.click('[data-settings-tab="ai"]');
+    assert.equal(await page.locator("#aiTestConnection").isDisabled(), true, "rendering must preserve the current test's busy state");
+    assert.equal(await page.locator("#aiTestConnection").evaluate((node) => node.classList.contains("is-loading")), true);
+    const oldResponsePromise = page.waitForResponse((response) => response.request() === oldRequest);
+    oldGate.release();
+    const oldResponse = await oldResponsePromise;
+    assert.equal(oldResponse.status(), 200);
+    assert.deepEqual(await oldResponse.json(), oldResult);
+    await oldResponse.finished();
+    await waitForPanelSettled(page);
+    assert.equal(await page.locator("#aiTestConnection").isDisabled(), true, "late old-session finally must not unlock the current test");
+    assert.equal(await page.locator("#aiTestConnection").evaluate((node) => node.classList.contains("is-loading")), true);
+    assert.equal(await page.locator("#aiSaveConnection").isDisabled(), true, "late old-session success must not publish a verification token");
+    assert.match(await page.locator("#aiConnectionMessage").innerText(), /正在测试/);
+    assert.equal(await page.inputValue("#aiModel"), raceDraft.model);
+    assert.equal(await page.inputValue("#aiApiKey"), raceDraft.key);
+    const currentResponsePromise = page.waitForResponse((response) => response.request() === currentRequest);
+    currentGate.release();
+    const currentResponse = await currentResponsePromise;
+    assert.equal(currentResponse.status(), 200);
+    assert.deepEqual(await currentResponse.json(), currentResult);
+    await page.waitForFunction(() => /连接测试成功/.test(document.querySelector("#aiConnectionMessage")?.textContent || ""));
+    await page.waitForSelector("#aiTestConnection:not(:disabled):not(.is-loading)");
+    assert.equal(await page.locator("#aiSaveConnection").isEnabled(), true);
+    assert.equal(userConnectionFixture().revision, 1, "late-response tests must not save a connection");
+    await assertNoBusinessStorage(page, /mock-session-race-secret/);
 
     // A draft belongs to the signed-in user, not the selected shop. Switching
     // stores must preserve both visible inputs and the draft's test context.
@@ -2995,11 +3567,15 @@ async function checkSettingsDesktop(browser, baseUrl) {
     await assertNoOverflow(page, "settings administrator desktop");
     assertDesktopEvidence(evidence);
     console.log(JSON.stringify({ ok: true, scope: "settings", desktop: 1440, screenshots: 0, connectionWrites: fixtures.settingsRequests.filter((item) => item.method === "PUT").length,
-      cases: ["no-migration", "cross-shop-draft", "test-invalidation", "revision-conflict", "cross-user-clear", "delete-confirm-tombstone", "help-reopen", "owner-no-admin", "single-release-link", "confirmed-higher-version"] }));
+      cases: ["no-migration", "provider-401-502-retry", "provider-403-502-retry", "site-401-clears-draft", "relogin-test-without-reload", "late-test-keeps-current-busy", "cross-shop-draft", "test-invalidation", "revision-conflict", "cross-user-clear", "delete-confirm-tombstone", "help-reopen", "owner-no-admin", "single-release-link", "confirmed-higher-version"] }));
   } catch (error) {
     await reportDesktopFailure(page, "settings", error, evidence);
     throw error;
   } finally {
+    for (const gate of pendingTests) gate.release();
+    fixtures.settingsTestResponseGates = [];
+    fixtures.settingsTestUpstreamStatus = 0;
+    fixtures.settingsSiteSessionExpired = false;
     fixtures.me = owner;
     fixtures.shopAccounts = accounts;
     await page.close();
@@ -3306,7 +3882,8 @@ function seedDocsCaptureFixtures() {
   assert.ok(docsCaptureScope, "documentation fixtures require the explicit capture scope");
   fixtures.docsCaptureRequests = [];
   fixtures.me = { ...fixtures.me, username: "docs-owner" };
-  fixtures.version = { ...fixtures.version, commit: "demo", build_dirty: false, release_notes: "演示工作台" };
+  fixtures.version = { ...fixtures.version, version: JSON.parse(fs.readFileSync(path.join(repoRoot, "package.json"), "utf8")).version,
+    commit: "demo", build_dirty: false, release_notes: "演示工作台" };
   const updatedAt = "2026-09-10T10:00:00+08:00";
   fixtures.products = [
     { ...productFixtures[0], title: "数字工具使用教程", description: "手机与电脑阅读说明，包含常见问题解答。", updated_at: updatedAt },
@@ -3552,8 +4129,15 @@ async function run() {
   const server = createServer();
   const port = await listen(server);
   if (mockOnlyScope) {
-    try { await checkSettingsOpsMock(`http://127.0.0.1:${port}/xianyu-saas`); }
-    finally { await close(server); }
+    let mockBrowser;
+    try {
+      await checkSettingsOpsMock(`http://127.0.0.1:${port}/xianyu-saas`);
+      mockBrowser = await chromium.launch({ headless: true });
+      await checkConnectionFlows(mockBrowser, `http://127.0.0.1:${port}/xianyu-saas/`);
+    } finally {
+      if (mockBrowser) await mockBrowser.close();
+      await close(server);
+    }
     return;
   }
   const browser = await chromium.launch({ headless: true });
@@ -3588,6 +4172,8 @@ async function run() {
       await checkOrderManagement(browser, `http://127.0.0.1:${port}/xianyu-saas/`);
       return;
     }
+    await checkConnectionFlows(browser, `http://127.0.0.1:${port}/xianyu-saas/`);
+    if (connectionFlowsScope) return;
     const bootstrapToken = "bootstrap-ui-contract-token-0123456789abcdef";
     fixtures.authCapabilities = { registration_enabled: false, bootstrap_available: true, password_min_length: 12 };
     const bootstrapPage = await browser.newPage({ viewport: { width: 1440, height: 900 }, deviceScaleFactor: 1, serviceWorkers: "block" });

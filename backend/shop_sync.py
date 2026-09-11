@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import tempfile
@@ -230,8 +231,12 @@ def _account_root(user_id: int, account_key: str | None = DEFAULT_ACCOUNT_ID, *,
 class ShopSyncError(RuntimeError):
     """A safe synchronization failure that never contains a platform response."""
 
-    def __init__(self, code: str, message: str):
+    def __init__(self, code: str, message: str, retry_after: float | None = None):
         self.code = code
+        self.retry_after = (
+            max(0, math.ceil(retry_after))
+            if retry_after is not None and math.isfinite(retry_after) else None
+        )
         super().__init__(message)
 
 
@@ -337,7 +342,7 @@ def reserve_sync(user_id: int, account_key: str = DEFAULT_ACCOUNT_ID) -> None:
         scope = (int(user_id), normalize_account_key(account_key))
         previous = _last_sync_by_tenant.get(scope, 0.0)
         if previous and now - previous < SYNC_COOLDOWN_SECONDS:
-            raise ShopSyncError("sync_cooldown", "操作太频繁，请稍后再试")
+            raise ShopSyncError("sync_cooldown", "操作太频繁，请稍后再试", SYNC_COOLDOWN_SECONDS - (now - previous))
         _last_sync_by_tenant[scope] = now
 
 
@@ -599,6 +604,12 @@ def _circuit_until() -> float:
         return 0
 
 
+def check_sync_circuit() -> None:
+    remaining = _circuit_until() - time.time()
+    if remaining > 0:
+        raise ShopSyncError("risk_cooldown", SYNC_STATUS_CATALOG["risk_cooldown"]["message"], remaining)
+
+
 def _trip_circuit() -> None:
     _atomic_json(CIRCUIT_PATH, {"until": time.time() + 600})
 
@@ -679,8 +690,7 @@ def _classify_response(raw) -> dict:
 
 def _request(cookie_header: str, cookies: dict[str, str], api: str, data: dict, spm_cnt: str) -> dict:
     global _last_request_at
-    if _circuit_until() > time.time():
-        raise ShopSyncError("risk_cooldown", SYNC_STATUS_CATALOG["risk_cooldown"]["message"])
+    check_sync_circuit()
 
     data_value = json.dumps(data, ensure_ascii=True, separators=(",", ":"))
     timestamp = str(int(time.time() * 1000))
