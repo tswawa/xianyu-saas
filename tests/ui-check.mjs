@@ -4287,10 +4287,15 @@ async function checkUpdates(browser, baseUrl) {
   const count = (path, method = "GET") => fixtures.apiRequests.filter((item) => item.path === path && item.method === method).length;
   const installs = () => fixtures.updateRequests.filter((item) => ["apply", "rollback"].includes(item.action)).length;
   const tick = async (ms = 300001, expectRead = true) => {
-    const response = expectRead ? page.waitForResponse((item) => new URL(item.url()).pathname.endsWith("/api/version")) : null;
+    const responses = expectRead ? Promise.all([
+      page.waitForResponse((item) => new URL(item.url()).pathname.endsWith("/api/version") && item.request().method() === "GET"),
+      page.waitForResponse((item) => new URL(item.url()).pathname.endsWith("/api/admin/updates") && item.request().method() === "GET"),
+    ]) : null;
     await page.clock.fastForward(ms);
-    if (response) await response;
-    await page.waitForLoadState("networkidle");
+    if (responses) {
+      await responses;
+      await page.evaluate(() => undefined);
+    }
   };
   const setCheck = (value) => { fixtures.version.update_check = structuredClone(value); fixtures.updateStatus.update_check = structuredClone(value); };
   const setVisibility = (hidden) => page.evaluate((value) => {
