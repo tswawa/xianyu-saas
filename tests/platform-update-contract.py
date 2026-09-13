@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import base64
+from contextlib import contextmanager
 import hashlib
 import importlib.util
 import io
@@ -327,6 +328,41 @@ def install_signed_release(destination: Path, version: str, *, maintenance: byte
         (destination / internal).chmod(0o600)
 
 
+@contextmanager
+def trusted_rollback_fixture(releases: Path):
+    """Inject only this fixture's provisioning boundary outside isolated Linux root."""
+    if os.name == "posix" and os.geteuid() == 0:
+        yield
+        return
+    from platform_update import _trusted_update_directory
+
+    actual_lstat = Path.lstat
+
+    def fixture_directory(path, *, writable=False):
+        if path != releases and releases not in path.parents:
+            return _trusted_update_directory(path, writable=writable)
+        assert not writable, "the rollback reader must not request write access"
+        if os.name == "posix":
+            # Keep real directory/type/mode checks, accepting only the real test UID.
+            _trusted_update_directory(path, writable=True)
+        else:
+            assert path.is_dir() and not path.is_symlink()
+
+    def fixture_owner(path, *args, **kwargs):
+        metadata = actual_lstat(path, *args, **kwargs)
+        if path == releases or releases in path.parents:
+            values = list(metadata)
+            values[4] = 0
+            if os.name != "posix":
+                values[0] &= ~0o022
+            return os.stat_result(values)
+        return metadata
+
+    with patch("platform_update._trusted_update_directory", side_effect=fixture_directory), \
+         patch.object(Path, "lstat", fixture_owner):
+        yield
+
+
 def load_updater_module():
     path = ROOT / "deploy" / "updater" / "updater.py"
     spec = importlib.util.spec_from_file_location("xianyu_contract_updater", path)
@@ -630,20 +666,8 @@ def main() -> None:
     (tampered_rollback / "backend/update_maintenance.py").write_bytes(
         b"MAINTENANCE_PROTOCOL = 1\n# changed after signing\n"
     )
-    actual_lstat = Path.lstat
-
-    def root_owned_read_only(path, *args, **kwargs):
-        metadata = actual_lstat(path, *args, **kwargs)
-        if path == portable_releases or portable_releases in path.parents:
-            values = list(metadata)
-            values[0] &= ~0o022
-            values[4] = 0
-            return os.stat_result(values)
-        return metadata
-
     with patch.dict(os.environ, {"SAAS_RELEASES_DIR": str(portable_releases)}, clear=False), \
-         patch("platform_update._trusted_update_directory"), \
-         patch.object(Path, "lstat", root_owned_read_only):
+         trusted_rollback_fixture(portable_releases):
         rollback_candidates = available_rollback_versions("0.5.0")
     assert rollback_candidates == [{
         "version": "0.4.7",
@@ -811,11 +835,13 @@ def main() -> None:
     materialized = updater.materialize_release(config, update_intent)
     assert materialized == releases / "0.2.0"
     updater.verify_existing_release(config, "0.2.0")
-    assert available_rollback_versions("0.1.0") == [], "newer releases are not rollback targets"
+    with trusted_rollback_fixture(releases):
+        assert available_rollback_versions("0.1.0") == [], "newer releases are not rollback targets"
     updater.switch_current(config, materialized)
     assert updater.current_release(config) == materialized.resolve()
     install_signed_release(releases / "0.0.6", "0.0.6", maintenance=False)
-    rollback_candidates = available_rollback_versions("0.2.0")
+    with trusted_rollback_fixture(releases):
+        rollback_candidates = available_rollback_versions("0.2.0")
     assert not any(x["version"] == "0.0.6" for x in rollback_candidates), "signed pre-maintenance code is not an automatic rollback baseline"
     assert rollback_candidates == [{"version": "0.1.0", "manifest_sha256": hashlib.sha256((old_release / CACHED_MANIFEST_FILE).read_bytes()).hexdigest()}]
     updater.switch_current(config, old_release)

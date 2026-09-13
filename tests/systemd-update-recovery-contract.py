@@ -93,14 +93,34 @@ def static_contracts() -> None:
     print("systemd recovery static contract: passed")
 
 
-def load_updater():
+def load_updater(bundle_root: Path | None = None):
     assert sys.platform == "linux", "Linux runtime contracts may not use an fcntl shim"
-    sys.path.insert(0, str(ROOT / "backend"))
-    spec = importlib.util.spec_from_file_location("systemd_recovery_updater", UPDATER_FILE)
+    temporary = None
+    if bundle_root is None:
+        # sudo does not make a CI checkout root-owned. Provision the independent
+        # installed bundle with real ownership/modes instead of relaxing trust.
+        temporary = tempfile.TemporaryDirectory(prefix="xianyu-systemd-bundle-")
+        bundle_root = Path(temporary.name)
+        tree = ast.parse(UPDATER_FILE.read_text(encoding="utf-8"))
+        files = next(ast.literal_eval(node.value) for node in tree.body
+                     if isinstance(node, ast.Assign) and any(
+                         isinstance(target, ast.Name) and target.id == "UPDATER_BUNDLE_FILES"
+                         for target in node.targets))
+        for relative in files:
+            target = bundle_root / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes((ROOT / relative).read_bytes())
+            target.chmod(0o644)
+        for directory, _, _ in os.walk(bundle_root):
+            Path(directory).chmod(0o755)
+    sys.path.insert(0, str(ROOT / "backend"))  # App-only contracts are not part of the installed updater.
+    sys.path.insert(0, str(bundle_root / "backend"))
+    spec = importlib.util.spec_from_file_location("systemd_recovery_updater", bundle_root / "deploy/updater/updater.py")
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
+    module._contract_bundle = temporary  # Keep the real installed tree alive for all fixtures.
     return module
 
 
@@ -313,7 +333,7 @@ class Fixture:
         self.environment = {"SAAS_CURRENT_ROOT": str(current), "SAAS_UPDATE_STAGING_DIR": str(self.config.staging_dir),
                             "SAAS_UPDATE_PUBLIC_KEY_FILE": str(keyfile), "SAAS_UPDATE_INTENT_FILE": str(self.config.intent_file),
                             "SAAS_UPDATER_STATE_DIR": str(self.config.private_state_dir),
-                            "SAAS_UPDATER_BUNDLE_ROOT": str(ROOT), "SAAS_UPDATER_ENTRYPOINT": str(UPDATER_FILE),
+                            "SAAS_UPDATER_BUNDLE_ROOT": str(updater.SCRIPT_ROOT), "SAAS_UPDATER_ENTRYPOINT": str(updater.SCRIPT_PATH),
                             "SAAS_TESTING": "1",
                             "SAAS_DB": str(database_path), "SAAS_TENANTS_DIR": str(self.config.tenants_dir),
                             "SAAS_RESTORE_WORKERS": "0", "PYTHONDONTWRITEBYTECODE": "1"}
@@ -572,8 +592,13 @@ def initialization_identity_contracts(updater):
         assert type(payload["initialized_at"]) in {int, float} and payload["initialized_at"] > 0
         canonical = bytearray()
         entrypoint_sha256 = ""
+        assert updater.SCRIPT_ROOT != ROOT
         for relative in updater.UPDATER_BUNDLE_FILES:
             raw = ROOT.joinpath(*Path(relative).parts).read_bytes()
+            installed = updater.SCRIPT_ROOT / relative
+            assert installed.read_bytes() == raw
+            assert installed.stat().st_uid == os.geteuid()
+            assert installed.stat().st_mode & 0o022 == 0
             digest = hashlib.sha256(raw).hexdigest()
             canonical.extend(relative.encode("utf-8"))
             canonical.extend(b"\0")
@@ -614,6 +639,15 @@ def initialization_identity_contracts(updater):
                 "update_updater_identity_invalid",
                 lambda: updater.initialize_layout(f.config),
             )
+        assert not (f.config.status_dir / "initialization.json").exists()
+
+    with fixture(updater, maintenance=True, initialize=False) as f:
+        directory = updater.SCRIPT_ROOT / "backend"
+        directory.chmod(0o777)
+        try:
+            expect_error("update_directory_untrusted", lambda: updater.initialize_layout(f.config))
+        finally:
+            directory.chmod(0o755)
         assert not (f.config.status_dir / "initialization.json").exists()
     print("systemd static initialization identity contracts: passed")
 
@@ -801,7 +835,7 @@ def runtime_backup_contracts(updater):
 
 
 def crash_child(config_file: str, point: str):
-    updater = load_updater()
+    updater = load_updater(Path(os.environ["SAAS_UPDATER_BUNDLE_ROOT"]))
     payload = json.loads(Path(config_file).read_text())
     fields = dict(payload["config"])
     path_fields = {"releases_dir", "current_link", "staging_dir", "state_dir", "database_path", "intent_file",
