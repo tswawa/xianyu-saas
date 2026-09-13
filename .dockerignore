@@ -30,5 +30,18 @@ backend/build-info.json
 *.db-*
 config/saas.env
 worker/.env
+# 本地更新 IPC、日志、备份和签名私钥绝不进入任一构建上下文。
+update-ipc
+updater-state
+**/update-staging
+**/update-intents
+**/.env
+**/.env.*
+**/*.key
+**/*.pem
+*.zip
+*.tar
+*.tar.gz
+*.sig
 xianyusaas迭代演示UI-1.html
 智能客服交互原型UI.html

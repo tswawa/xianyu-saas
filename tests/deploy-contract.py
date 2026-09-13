@@ -6,7 +6,7 @@ import re
 import socket
 import subprocess
 import time
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -19,6 +19,10 @@ UPDATER_PATH = (ROOT / "deploy/systemd/xianyu-saas-updater.path").read_text(enco
 BOOTSTRAP_DROPIN = (ROOT / "deploy/systemd/xianyu-saas-bootstrap.conf.example").read_text(encoding="utf-8")
 UPDATER_SOURCE = (ROOT / "deploy/updater/updater.py").read_text(encoding="utf-8")
 API_SOURCE = (ROOT / "backend/app.py").read_text(encoding="utf-8")
+DOCKERFILE = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+DOCKER_UPDATES = (ROOT / "docker-compose.updates.yml").read_text(encoding="utf-8")
+DOCKER_ENGINE = (ROOT / "backend/docker_engine.py").read_text(encoding="utf-8")
+DOCKER_UPDATER = (ROOT / "backend/docker_updater.py").read_text(encoding="utf-8")
 LOGROTATE = (ROOT / "deploy/xianyu-saas-bot-logrotate.conf").read_text(encoding="utf-8")
 
 BOOTSTRAP = "location = /xianyu-saas/api/auth/bootstrap {"
@@ -163,16 +167,22 @@ for directive in (
     "Environment=SAAS_CURRENT_LINK=/opt/xianyu-saas/current",
     "Environment=SAAS_RELEASES_DIR=/opt/xianyu-saas/releases",
     "Environment=SAAS_UPDATE_STAGING_DIR=/var/lib/xianyu-saas/update-staging",
-    "Environment=SAAS_UPDATE_INTENT_FILE=/var/lib/xianyu-saas/update-intents/intent.json",
-    "ExecStart=/opt/xianyu-saas/runtime/backend-venv/bin/python /opt/xianyu-saas/current/deploy/updater/updater.py",
+    "Environment=SAAS_UPDATE_INTENT_FILE=/var/lib/xianyu-saas-updates/intent.json",
+    "Environment=SAAS_UPDATER_STATE_DIR=/var/lib/xianyu-saas-updater",
+    "ExecStart=/opt/xianyu-saas/runtime/backend-venv/bin/python /opt/xianyu-saas/updater/deploy/updater/updater.py",
     "ProtectSystem=strict",
     "ReadWritePaths=/opt/xianyu-saas /var/lib/xianyu-saas",
     "UMask=0077",
 ):
     assert directive in UPDATER_SERVICE, directive
-assert "PathExists=/var/lib/xianyu-saas/update-intents/intent.json" in UPDATER_PATH
+assert "PathExists=/var/lib/xianyu-saas-updates/intent.json" in UPDATER_PATH
+assert "PathExists=/var/lib/xianyu-saas-updater/active.json" in UPDATER_PATH
 assert "Unit=xianyu-saas-updater.service" in UPDATER_PATH
-assert "DirectoryMode=0700" in UPDATER_PATH
+assert "DirectoryMode=01770" in UPDATER_PATH
+assert "Environment=SAAS_UPDATE_STATUS_DIR=/var/lib/xianyu-saas-updates/status" in SERVICE
+assert "ReadWritePaths=/var/lib/xianyu-saas -/var/lib/xianyu-saas-updates" in SERVICE
+assert "/current/deploy/updater/updater.py" not in next(line for line in UPDATER_SERVICE.splitlines() if line.startswith("ExecStart="))
+assert "StateDirectory=xianyu-saas-updater" in UPDATER_SERVICE
 for directive in (
     "LoadCredential=bootstrap-token:/etc/xianyu-saas/bootstrap-token",
     "Environment=SAAS_BOOTSTRAP_ENABLED=1",
@@ -194,7 +204,38 @@ assert "git pull" not in UPDATER_SOURCE.lower()
 assert "systemctl" not in API_SOURCE.lower()
 assert "git pull" not in API_SOURCE.lower()
 
-tenants_log_root = str(Path("/", "var", "lib", "xianyu-saas", "tenants"))
+# Docker updater: the official fixed Compose plugin owns only the application
+# lifecycle. The web IPC remains path/command-free and the updates overlay is last.
+for directive in (
+    "FROM docker:28.3.3-cli AS updater-docker-cli",
+    "FROM docker/buildx-bin:0.26.1 AS updater-buildx",
+    "FROM docker:29.8.0-cli AS updater-compose-cli",
+    "COPY --from=updater-compose-cli /usr/local/libexec/docker/cli-plugins/docker-compose",
+    'test "$(docker compose version --short)" = "5.5.1"',
+):
+    assert directive in DOCKERFILE, directive
+app_overlay = DOCKER_UPDATES.split("\n  xianyu-saas:\n", 1)[1].split("\n  xianyu-updater:\n", 1)[0]
+assert "container_name:" not in app_overlay
+assert "必须最后应用" in DOCKER_UPDATES
+for target in ("target: /updates", "target: /app/update-signing.pub"):
+    assert target in app_overlay, target
+for guard in (
+    "def register(",
+    "def validate_registration(",
+    "def compose_up(",
+    '"--no-deps", "--no-build"',
+    '"--pull", "never"',
+    '"stop", "--timeout", "60"',
+):
+    assert guard in DOCKER_ENGINE, guard
+assert "def replace(" not in DOCKER_ENGINE
+assert "NetworkingConfig" not in DOCKER_ENGINE
+for guard in ("docker-deployment.json", "trusted-update-signing.pub", "def initialize(", "compose_stop_started", "compose_up_started", "compose_restore_started"):
+    assert guard in DOCKER_UPDATER, guard
+for forbidden in ("down -v", "renew-anon-volumes", "remove-orphans", "prune"):
+    assert forbidden not in (DOCKER_ENGINE + DOCKER_UPDATER).lower(), forbidden
+
+tenants_log_root = str(PurePosixPath("/", "var", "lib", "xianyu-saas", "tenants"))
 for directive in (
     f"{tenants_log_root}/*/bot.log",
     f"{tenants_log_root}/*/accounts/*/bot.log",

@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import textwrap
 import types
 import zipfile
 from pathlib import Path
@@ -30,6 +31,9 @@ SCRIPT = ROOT / "scripts" / "build-release.py"
 VERSION = "0.2.0"
 EPOCH = 1700000000
 sys.dont_write_bytecode = True
+sys.path.insert(0, str(ROOT / "backend"))
+
+import docker_update_protocol as DOCKER
 
 
 def load_builder():
@@ -111,6 +115,7 @@ class Repository:
             "package-lock.json": BUILDER.json_bytes({"name": "xianyu-saas", "version": version, "lockfileVersion": 3, "packages": {"": {"name": "xianyu-saas", "version": version}}}),
             "backend/version.py": f'VERSION = "{version}"\nASSET_VERSION = "contract"\n'.encode(),
             "backend/platform_update.py": UPDATER_SOURCE,
+            "backend/docker_update_protocol.py": (ROOT / "backend/docker_update_protocol.py").read_bytes(),
             "backend/requirements.txt": b"requests\ncryptography\n",
             "backend/example.py": b"VALUE = 42\n",
             "frontend/index.html": b"<!doctype html><title>fixture</title>\n",
@@ -262,16 +267,26 @@ class OfflineSession:
 def verify_bundle(repo: Repository, output: Path, *, epoch=EPOCH):
     names = UPDATER._asset_names(repo.version)
     base = f"xianyu-saas-{repo.version}"
-    expected_assets = {*names, f"{base}-source.zip", f"{base}.update-signing.pub", "release-notes.md", "artifacts.json", "SHA256SUMS"}
+    docker_names = DOCKER.docker_asset_names(repo.version)
+    expected_assets = {*names, *docker_names, f"{base}.update-signing.pub", "release-notes.md", "artifacts.json", "SHA256SUMS"}
+    assert len(expected_assets) == 10
     assert {path.name for path in output.iterdir()} == expected_assets
+    release_metadata = {"id": 1, "tag_name": f"v{repo.version}", "prerelease": "-" in repo.version,
+                        "assets": [{"id": index + 1, "name": name, "size": (output / name).stat().st_size}
+                                   for index, name in enumerate(sorted(expected_assets))]}
+    for assets in (release_metadata["assets"], [item for item in release_metadata["assets"] if item["name"] not in docker_names[1:]]):
+        legacy_release = UPDATER._parse_release({**release_metadata, "assets": assets}, "release")
+        assert (legacy_release.artifact.name, legacy_release.manifest.name, legacy_release.signature.name) == names
     index = json.loads((output / "artifacts.json").read_bytes())
     assert set(index) == {"schema", "version", "commit", "public_key_fingerprint", "files"}
     assert index["schema"] == 1 and index["version"] == repo.version and index["commit"] == repo.commit
     assert index["public_key_fingerprint"] == "sha256:" + hashlib.sha256(repo.public).hexdigest()
-    assert len(index["files"]) == 6
+    assert len(index["files"]) == 8
+    assert {record["name"] for record in index["files"]} == expected_assets - {"artifacts.json", "SHA256SUMS"}
     for record in index["files"]:
         assert record == BUILDER.asset_record(output / record["name"])
     checksums = dict(line.split("  ", 1)[::-1] for line in (output / "SHA256SUMS").read_text().splitlines())
+    assert len(checksums) == len((output / "SHA256SUMS").read_text().splitlines()) == 9
     assert set(checksums) == expected_assets - {"SHA256SUMS"}
     for name, checksum in checksums.items():
         assert hashlib.sha256((output / name).read_bytes()).hexdigest() == checksum
@@ -280,6 +295,20 @@ def verify_bundle(repo: Repository, output: Path, *, epoch=EPOCH):
     manifest_raw = (output / names[1]).read_bytes()
     signature_raw = (output / names[2]).read_bytes()
     assert len(base64.b64decode(signature_raw, validate=True)) == 64
+    assert signature_raw == base64.b64encode(repo.key.sign(manifest_raw)), "legacy OTA signature format changed"
+    docker_raw = (output / docker_names[1]).read_bytes()
+    docker_signature = (output / docker_names[2]).read_bytes()
+    docker_manifest = DOCKER.verify_docker_manifest(docker_raw, docker_signature, repo.public, repo.version)
+    assert json.loads(docker_raw) == {
+        "schema": 1, "protocol": 1, "version": repo.version, "commit": repo.commit,
+        "source": BUILDER.asset_record(output / docker_names[0]),
+        "runtime_manifest_sha256": hashlib.sha256(manifest_raw).hexdigest(),
+    }
+    source_root = DOCKER.extract_verified_source(output / docker_names[0], output.parent / (output.name + "-docker"), docker_manifest)
+    assert source_root.name == base
+    assert (source_root / "Dockerfile").read_bytes() == repo.files["Dockerfile"]
+    assert (source_root / "docker/entrypoint.sh").read_bytes() == repo.files["docker/entrypoint.sh"]
+    assert set(docker_manifest.__dict__) == {"version", "commit", "source_name", "source_size", "source_sha256", "runtime_manifest_sha256", "protocol"}
     release = UPDATER.ReleaseInfo("fixture", repo.version, f"v{repo.version}", "", "", "-" in repo.version,
                                   UPDATER.ReleaseAsset(1, names[0], (output / names[0]).stat().st_size),
                                   UPDATER.ReleaseAsset(2, names[1], len(manifest_raw)),
@@ -341,6 +370,57 @@ def verify_bundle(repo: Repository, output: Path, *, epoch=EPOCH):
     return release, expected, manifest_raw, signature_raw
 
 
+def workflow_contract(repo: Repository, output: Path):
+    # Execute the actual workflow's offline gates, not duplicated test validators.
+    workflow = (ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8")
+    block = workflow.split("          assets=(\n", 1)[1].split("          )", 1)[0]
+    listed = [line.strip().strip('"').replace("$dir/", "").replace("$base", f"xianyu-saas-{repo.version}") for line in block.splitlines()]
+    assert len(listed) == 10 and set(listed) == {path.name for path in output.iterdir()}
+    section = workflow.split("      - name: Validate complete signed bundle\n", 1)[1].split("      - name:", 1)[0]
+    local_gate = textwrap.dedent(section.split("          python -B - <<'PY'\n", 1)[1].split("          PY\n", 1)[0])
+    env = clean_environment()
+    env["RELEASE_VERSION"] = repo.version
+
+    def local_result():
+        return subprocess.run([sys.executable, "-B", "-c", local_gate], cwd=repo.root, env=env, capture_output=True, timeout=30)
+
+    result = local_result()
+    assert result.returncode == 0, result.stderr.decode()
+    checksum_file = output / "SHA256SUMS"
+    original = checksum_file.read_bytes()
+    try:
+        checksum_file.write_bytes(b"\n".join(original.splitlines()[:-1]) + b"\n")
+        assert local_result().returncode != 0, "workflow accepted eight instead of nine checksums"
+    finally:
+        checksum_file.write_bytes(original)
+    missing = output / DOCKER.docker_asset_names(repo.version)[2]
+    payload = missing.read_bytes()
+    try:
+        missing.unlink()
+        assert local_result().returncode != 0, "workflow accepted a missing Docker signature"
+    finally:
+        missing.write_bytes(payload)
+    extra = output / "unexpected-asset.txt"
+    try:
+        extra.write_bytes(b"not an official asset")
+        assert local_result().returncode != 0, "workflow accepted an eleventh asset"
+    finally:
+        extra.unlink()
+    remote_gate = textwrap.dedent(workflow.split('          python - "$dir" "$RUNNER_TEMP/release-assets.json" <<\'PY\'\n', 1)[1].split("          PY\n", 1)[0])
+    uploaded = [{"name": path.name, "size": path.stat().st_size} for path in output.iterdir()]
+    snapshot = repo.root / ".local" / "uploaded-fixture.json"
+    for changes, success in ((uploaded, True), (uploaded[:-1], False),
+                             ([*uploaded, {"name": "old-extra.txt", "size": 1}], False),
+                             ([{**uploaded[0], "size": 1}, *uploaded[1:]], False)):
+        snapshot.write_bytes(BUILDER.json_bytes({"assets": changes}))
+        result = subprocess.run([sys.executable, "-B", "-c", remote_gate, str(output), str(snapshot)],
+                                cwd=repo.root, env=env, capture_output=True, timeout=30)
+        assert (result.returncode == 0) is success, "workflow draft gate missed an incomplete/extra upload"
+    assert workflow.index("Draft must contain exactly") < workflow.index("--draft=false")
+    assert "python -B tests/docker-update-protocol-contract.py" in workflow
+    print("release bundle: actual workflow gates enforce ten local/uploaded assets and nine checksums")
+
+
 def normal_and_tamper_contract(run: Path):
     repo = Repository(run / "normal")
     # These are deliberately ignored/untracked and must never be opened or shipped.
@@ -349,6 +429,7 @@ def normal_and_tamper_contract(run: Path):
     output, result = repo.build(default_output=True)
     assert_success(result)
     release, expected, manifest_raw, signature_raw = verify_bundle(repo, output)
+    workflow_contract(repo, output)
     repeated, result = repo.build("repeat")
     assert_success(result)
     assert {p.name: p.read_bytes() for p in output.iterdir()} == {p.name: p.read_bytes() for p in repeated.iterdir()}
@@ -436,9 +517,34 @@ def key_and_version_contract(run: Path):
         changed = Repository(run / f"semver-{index}", version=version)
         assert_rejected(changed, "release_version_invalid")
     prerelease = Repository(run / "prerelease", version="0.3.0-rc.1+build.2")
-    _, result = prerelease.build()
+    output, result = prerelease.build()
     assert_success(result)
-    print("release bundle: key validation and commit version consistency passed")
+    verify_bundle(prerelease, output)
+    for index, name in enumerate(("Dockerfile", "docker/entrypoint.sh")):
+        incomplete = Repository(run / f"docker-input-{index}")
+        incomplete.change(name, b"")
+        assert_rejected(incomplete, "release_docker_source_missing")
+    literal = Repository(run / "literal-version")
+    literal_source = f'VERSION = "{VERSION}"\nraise AssertionError("never execute version source")\n'.encode()
+    literal.change("backend/version.py", literal_source)
+    literal.files["backend/version.py"] = literal_source
+    output, result = literal.build()
+    assert_success(result)
+    verify_bundle(literal, output)
+    for payload in (f'"""VERSION = "{VERSION}"\n"""\nVERSION = "0.3.0"\n'.encode(),
+                    f'VERSION = "{VERSION}"\nVERSION = "0.3.0"\n'.encode(), b"VERSION = current_version()\n"):
+        literal.change("backend/version.py", payload)
+        assert_rejected(literal, "release_version_mismatch")
+    repetitive = Repository(run / "repetitive-source")
+    payload = b"0" * (2 * 1024 * 1024)
+    repetitive.change("frontend/assets/repeated.txt", payload)
+    repetitive.files["frontend/assets/repeated.txt"] = payload
+    output, result = repetitive.build()
+    assert_success(result)
+    verify_bundle(repetitive, output)
+    with zipfile.ZipFile(output / DOCKER.docker_asset_names(repetitive.version)[0]) as source:
+        assert source.getinfo(f"xianyu-saas-{repetitive.version}/frontend/assets/repeated.txt").compress_type == zipfile.ZIP_STORED
+    print("release bundle: key validation, static commit versions and required Docker inputs passed")
 
 
 def privacy_contract(run: Path):

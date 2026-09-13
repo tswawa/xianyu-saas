@@ -34,6 +34,7 @@ os.environ.update(
         "SAAS_RELEASES_DIR": str(RUN_DIR / "install" / "releases"),
         "SAAS_TESTING": "1",
         "SAAS_RESTORE_WORKERS": "0",
+        "SAAS_DEPLOYMENT_MODE": "systemd",
     }
 )
 sys.path.insert(0, str(ROOT / "backend"))
@@ -136,7 +137,7 @@ def write_source_root() -> None:
         json.dumps(lock, sort_keys=True), encoding="utf-8"
     )
     (SOURCE_ROOT / "backend" / "requirements.txt").write_text(
-        "requests==2.32.5\ncryptography==46.0.1\n", encoding="utf-8"
+        "requests==2.32.5\ncryptography==46.0.1\n", encoding="utf-8", newline="\n"
     )
     (SOURCE_ROOT / "backend" / "version.py").write_text(
         'VERSION = "0.1.0"\nASSET_VERSION = "contract-asset"\n', encoding="utf-8"
@@ -180,6 +181,11 @@ def candidate_files(version: str, *, dependency="1.0.0") -> dict[str, tuple[byte
             False,
         ),
         "frontend/index.html": (b"<html>contract-asset</html>", False),
+        "backend/update_maintenance.py": (
+            b"MAINTENANCE_PROTOCOL = 1\n"
+            b"raise AssertionError('candidate maintenance code must never execute')\n",
+            False,
+        ),
         "scripts/release-check.sh": (b"#!/bin/sh\nexit 0\n", True),
     }
 
@@ -190,8 +196,13 @@ def build_bundle(
     dependency="1.0.0",
     extra_member=None,
     manifest_path_override: str | None = None,
+    maintenance: bytes | bool = True,
 ):
     files = candidate_files(version, dependency=dependency)
+    if maintenance is False:
+        files.pop("backend/update_maintenance.py")
+    elif isinstance(maintenance, bytes):
+        files["backend/update_maintenance.py"] = (maintenance, False)
     artifact_name, manifest_name, signature_name = _asset_names(version)
     archive_buffer = io.BytesIO()
     with tarfile.open(fileobj=archive_buffer, mode="w:gz") as archive:
@@ -285,9 +296,13 @@ def assert_error(code: str, operation) -> None:
         raise AssertionError(f"expected PlatformUpdateError: {code}")
 
 
-def install_signed_release(destination: Path, version: str) -> None:
-    release, _, manifest_raw, signature_raw, _ = build_bundle(version)
+def install_signed_release(destination: Path, version: str, *, maintenance: bytes | bool = True) -> None:
+    release, _, manifest_raw, signature_raw, _ = build_bundle(version, maintenance=maintenance)
     files = candidate_files(version)
+    if maintenance is False:
+        files.pop("backend/update_maintenance.py")
+    elif isinstance(maintenance, bytes):
+        files["backend/update_maintenance.py"] = (maintenance, False)
     destination.mkdir(parents=True)
     for relative, (payload, executable) in files.items():
         path = destination / relative
@@ -573,6 +588,72 @@ def main() -> None:
         ),
     )
 
+    maintenance_stage = stage_release(
+        stable, "stable", "0.1.0", session=FakeSession(stable_assets), require_maintenance=True,
+    )
+    validate_candidate(
+        maintenance_stage["candidate_path"], stable.version,
+        maintenance_stage["manifest_sha256"], require_maintenance=True,
+    )
+    shutil.rmtree(Path(maintenance_stage["candidate_path"]).parent)
+    invalid_maintenance_sources = (
+        False,
+        b"",
+        b"MAINTENANCE_PROTOCOL = 2\n",
+        b"MAINTENANCE_PROTOCOL = int('1')\n",
+        b"MAINTENANCE_PROTOCOL = 1\nimport math as MAINTENANCE_PROTOCOL\n",
+    )
+    for offset, maintenance_source in enumerate(invalid_maintenance_sources, 1):
+        release, assets, _, _, _ = build_bundle(
+            f"0.4.{offset}", maintenance=maintenance_source,
+        )
+        before = {path.name for path in STAGING_ROOT.iterdir()}
+        assert_error(
+            "update_maintenance_protocol_unsupported",
+            lambda release=release, assets=assets: stage_release(
+                release, "stable", "0.1.0", session=FakeSession(assets), require_maintenance=True,
+            ),
+        )
+        assert {path.name for path in STAGING_ROOT.iterdir()} == before
+
+    portable_releases = RUN_DIR / "portable-rollback-releases"
+    trusted_rollback = portable_releases / "0.4.7"
+    install_signed_release(trusted_rollback, "0.4.7")
+    install_signed_release(
+        portable_releases / "0.4.6",
+        "0.4.6",
+        maintenance=b"MAINTENANCE_PROTOCOL = 1\nimport math as MAINTENANCE_PROTOCOL\n",
+    )
+    install_signed_release(portable_releases / "0.4.5", "0.4.5", maintenance=False)
+    tampered_rollback = portable_releases / "0.4.4"
+    install_signed_release(tampered_rollback, "0.4.4")
+    (tampered_rollback / "backend/update_maintenance.py").write_bytes(
+        b"MAINTENANCE_PROTOCOL = 1\n# changed after signing\n"
+    )
+    actual_lstat = Path.lstat
+
+    def root_owned_read_only(path, *args, **kwargs):
+        metadata = actual_lstat(path, *args, **kwargs)
+        if path == portable_releases or portable_releases in path.parents:
+            values = list(metadata)
+            values[0] &= ~0o022
+            values[4] = 0
+            return os.stat_result(values)
+        return metadata
+
+    with patch.dict(os.environ, {"SAAS_RELEASES_DIR": str(portable_releases)}, clear=False), \
+         patch("platform_update._trusted_update_directory"), \
+         patch.object(Path, "lstat", root_owned_read_only):
+        rollback_candidates = available_rollback_versions("0.5.0")
+    assert rollback_candidates == [{
+        "version": "0.4.7",
+        "manifest_sha256": hashlib.sha256((trusted_rollback / CACHED_MANIFEST_FILE).read_bytes()).hexdigest(),
+    }]
+
+    if "--portable" in sys.argv:
+        print("platform update portable staging: ok; POSIX intent, ownership and executor checks not run")
+        return
+
     clean_staged = stage_release(
         stable, "stable", "0.1.0", session=FakeSession(stable_assets)
     )
@@ -733,7 +814,10 @@ def main() -> None:
     assert available_rollback_versions("0.1.0") == [], "newer releases are not rollback targets"
     updater.switch_current(config, materialized)
     assert updater.current_release(config) == materialized.resolve()
-    assert available_rollback_versions("0.2.0") == ["0.1.0"]
+    install_signed_release(releases / "0.0.6", "0.0.6", maintenance=False)
+    rollback_candidates = available_rollback_versions("0.2.0")
+    assert not any(x["version"] == "0.0.6" for x in rollback_candidates), "signed pre-maintenance code is not an automatic rollback baseline"
+    assert rollback_candidates == [{"version": "0.1.0", "manifest_sha256": hashlib.sha256((old_release / CACHED_MANIFEST_FILE).read_bytes()).hexdigest()}]
     updater.switch_current(config, old_release)
 
     class FakeRunner:
@@ -810,4 +894,10 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    if "--portable" in sys.argv and os.name != "posix":
+        # Explicitly inject only the pre-provisioned key boundary. Signatures
+        # and archive validation remain real; do not fake POSIX file ownership.
+        with patch("platform_update.load_public_key", return_value=PRIVATE_KEY.public_key()):
+            main()
+    else:
+        main()

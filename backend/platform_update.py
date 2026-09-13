@@ -9,10 +9,10 @@ from __future__ import annotations
 
 import base64
 import binascii
-import fcntl
 import hashlib
 import io
 import json
+import math
 import os
 import re
 import secrets
@@ -20,10 +20,12 @@ import stat
 import subprocess
 import tarfile
 import tempfile
+import time
+from email.utils import parsedate_to_datetime
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import BinaryIO
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 import requests
 from cryptography.exceptions import InvalidSignature, UnsupportedAlgorithm
@@ -31,6 +33,12 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 from version import VERSION, RELEASE_CHANNEL, deployment_kind
+from update_maintenance import (
+    read_trusted_json,
+    status_directory,
+    supports_maintenance_protocol,
+    UpdateStateError,
+)
 
 
 RELEASE_OWNER = "tswawa"
@@ -38,6 +46,17 @@ RELEASE_REPOSITORY = "xianyu-saas"
 GITHUB_API_HOST = "api.github.com"
 GITHUB_API_ROOT = f"https://{GITHUB_API_HOST}/repos/{RELEASE_OWNER}/{RELEASE_REPOSITORY}"
 GITHUB_API_VERSION = "2022-11-28"
+GITHUB_ASSET_CDN_HOSTS = frozenset({
+    "release-assets.githubusercontent.com", "objects.githubusercontent.com",
+    "github-releases.githubusercontent.com",
+})
+MAX_ASSET_REDIRECTS = 3
+OPERATION_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+UPDATE_STAGES = frozenset({
+    "staged", "queued", "verifying_package", "building", "preflighting", "preparing",
+    "stopping", "backing_up", "migrating", "switching", "verifying", "succeeded",
+    "rolling_back", "rolled_back", "failed", "recovery_failed",
+})
 RELEASE_ASSET_PREFIX = "xianyu-saas"
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 MAX_RELEASE_METADATA_BYTES = 2 * 1024 * 1024
@@ -46,6 +65,8 @@ MAX_SIGNATURE_BYTES = 4096
 MAX_ARCHIVE_BYTES = 128 * 1024 * 1024
 MAX_UNPACKED_BYTES = 512 * 1024 * 1024
 MAX_FILE_BYTES = 64 * 1024 * 1024
+MAX_MAINTENANCE_SOURCE_BYTES = 256 * 1024
+MAX_UPDATER_BUNDLE_FILE_BYTES = 4 * 1024 * 1024
 MAX_ARCHIVE_MEMBERS = 5000
 MAX_RELEASE_NOTES_CHARS = 16_000
 MAX_PATH_LENGTH = 500
@@ -100,6 +121,24 @@ DEPENDENCY_JSON_FIELDS = (
     "peerDependencies",
     "engines",
 )
+MAINTENANCE_MODULE_PATH = "backend/update_maintenance.py"
+SYSTEMD_INITIALIZATION_FILE = "initialization.json"
+SYSTEMD_UPDATER_PYTHON = "/opt/xianyu-saas/runtime/backend-venv/bin/python"
+SYSTEMD_UPDATER_ENTRYPOINT_RELATIVE = "deploy/updater/updater.py"
+SYSTEMD_UPDATER_BUNDLE_FILES = (
+    "backend/account_storage.py",
+    "backend/db.py",
+    "backend/docker_update_protocol.py",
+    "backend/platform_update.py",
+    "backend/runtime_settings.py",
+    "backend/update_maintenance.py",
+    "backend/version.py",
+    SYSTEMD_UPDATER_ENTRYPOINT_RELATIVE,
+)
+SYSTEMD_INITIALIZATION_KEYS = frozenset({
+    "schema", "protocol", "public_key_sha256", "bundle_sha256",
+    "entrypoint_sha256", "initialized_at",
+})
 MARKER_FILE = ".xianyu-release.json"
 CACHED_MANIFEST_FILE = ".xianyu-manifest.json"
 CACHED_SIGNATURE_FILE = ".xianyu-manifest.sig"
@@ -125,7 +164,8 @@ class SemVer:
 
     @classmethod
     def parse(cls, value: str) -> "SemVer":
-        match = SEMVER_RE.fullmatch(str(value or "").strip())
+        text = str(value or "").strip()
+        match = SEMVER_RE.fullmatch(text) if len(text) <= 200 else None
         if match is None:
             raise PlatformUpdateError("release_version_invalid")
         prerelease = tuple(match.group(4).split(".")) if match.group(4) else ()
@@ -185,6 +225,7 @@ class ReleaseInfo:
     artifact: ReleaseAsset
     manifest: ReleaseAsset
     signature: ReleaseAsset
+    runtime_manifest: ReleaseAsset | None = None
 
 
 @dataclass(frozen=True)
@@ -208,11 +249,16 @@ def _github_headers(*, binary: bool = False) -> dict[str, str]:
 
 
 def _validate_fixed_api_url(url: str, *, asset: bool = False) -> None:
-    parsed = urlsplit(str(url or ""))
+    try:
+        parsed = urlsplit(str(url or ""))
+        port = parsed.port
+    except (ValueError, TypeError) as exc:
+        raise PlatformUpdateError("update_source_rejected") from exc
     if (
-        parsed.scheme != "https"
+        any(ord(c) < 32 or ord(c) == 127 for c in str(url)) or "\\" in str(url)
+        or parsed.scheme != "https"
         or parsed.hostname != GITHUB_API_HOST
-        or parsed.port not in {None, 443}
+        or port not in {None, 443}
         or parsed.username is not None
         or parsed.password is not None
         or parsed.fragment
@@ -231,14 +277,91 @@ def _validate_fixed_api_url(url: str, *, asset: bool = False) -> None:
         raise PlatformUpdateError("update_source_rejected")
 
 
-def _status_error(status_code: int) -> PlatformUpdateError:
-    if status_code in {401, 403}:
-        return PlatformUpdateError("update_source_auth_failed")
-    if status_code == 404:
-        return PlatformUpdateError("update_release_not_found")
-    if status_code == 429:
-        return PlatformUpdateError("update_source_rate_limited")
-    return PlatformUpdateError("update_source_failed")
+def _status_error(status_code: int, response=None) -> PlatformUpdateError:
+    headers = {str(k).lower(): str(v) for k, v in getattr(response, "headers", {}).items()}
+    limited = status_code == 429 or (status_code == 403 and (
+        headers.get("x-ratelimit-remaining") == "0" or "retry-after" in headers))
+    code = "update_source_rate_limited" if limited else (
+        "update_source_auth_failed" if status_code in {401, 403} else
+        "update_release_not_found" if status_code == 404 else "update_source_failed")
+    error = PlatformUpdateError(code)
+    delays = []
+    for field in ("retry-after", "x-ratelimit-reset"):
+        value = headers.get(field, "")
+        if not value:
+            continue
+        try:
+            delay = float(value) - (time.time() if field == "x-ratelimit-reset" else 0)
+        except ValueError:
+            try:
+                delay = parsedate_to_datetime(value).timestamp() - time.time()
+            except (TypeError, ValueError, OverflowError):
+                continue
+        if math.isfinite(delay) and delay > 0:
+            delays.append(delay)
+    if delays:
+        error.retry_after = min(max(delays), 86400)
+    return error
+
+
+def _validate_asset_redirect(url: str) -> None:
+    try:
+        parsed = urlsplit(url)
+        path = unquote(parsed.path)
+        if (len(url) > 8192 or any(ord(c) < 32 or ord(c) == 127 for c in url)
+                or "\\" in url or parsed.scheme != "https"
+                or parsed.hostname not in GITHUB_ASSET_CDN_HOSTS
+                or parsed.port not in {None, 443} or parsed.username is not None
+                or parsed.password is not None or parsed.fragment
+                or any(p in {".", "..", ""} for p in path.split("/")[1:])
+                or not re.fullmatch(r"/github-production-release-asset(?:-[0-9a-f]+)?/[1-9][0-9]*/[A-Za-z0-9_.-]+", path)
+                or "%" in parsed.path or "\\" in path):
+            raise ValueError("untrusted CDN")
+    except (ValueError, TypeError) as exc:
+        raise PlatformUpdateError("update_redirect_rejected") from exc
+
+
+def _open_release_response(session, url: str, *, asset: bool = False, timeout=(5, 60)):
+    """Follow only bounded asset-CDN hops; never reuse ambient credentials."""
+    _validate_fixed_api_url(url, asset=asset)
+    headers = _github_headers(binary=asset)
+    for hop in range(MAX_ASSET_REDIRECTS + 1):
+        try:
+            if isinstance(session, requests.Session):
+                prepared = session.prepare_request(requests.Request("GET", url, headers=headers))
+                # Session headers, cookies, auth and .netrc must not restore
+                # credentials removed at a cross-origin redirect.
+                for name in ("Authorization", "Cookie", "Proxy-Authorization"):
+                    prepared.headers.pop(name, None)
+                if "Authorization" in headers:
+                    prepared.headers["Authorization"] = headers["Authorization"]
+                # Session.send also prepares Response.next when redirects are
+                # disabled, which can eagerly consume an unbounded redirect body.
+                # Use its transport adapter without cookie/redirect processing.
+                proxies = requests.utils.get_environ_proxies(url) if session.trust_env else {}
+                proxies.update(session.proxies)
+                response = session.get_adapter(url).send(prepared, timeout=timeout,
+                                                        stream=True, verify=True, cert=None, proxies=proxies)
+            else:
+                response = session.get(url, headers=dict(headers), timeout=timeout,
+                                       allow_redirects=False, stream=True, verify=True)
+        except requests.RequestException as exc:
+            raise PlatformUpdateError("update_source_failed") from exc
+        status = int(getattr(response, "status_code", 0) or 0)
+        if not 300 <= status < 400:
+            return response
+        try:
+            if not asset or hop >= MAX_ASSET_REDIRECTS or status not in {301, 302, 303, 307, 308}:
+                raise PlatformUpdateError("update_redirect_rejected")
+            location = next((str(v) for k, v in response.headers.items() if k.lower() == "location"), "")
+            _validate_asset_redirect(location)
+            # Once leaving the pinned API host, credentials never return.
+            headers = {k: v for k, v in headers.items()
+                       if k.lower() not in {"authorization", "cookie", "proxy-authorization"}}
+            url = location
+        finally:
+            response.close()
+    raise PlatformUpdateError("update_redirect_rejected")
 
 
 def _response_bytes(response, max_bytes: int) -> bytes:
@@ -246,7 +369,7 @@ def _response_bytes(response, max_bytes: int) -> bytes:
     if 300 <= status_code < 400:
         raise PlatformUpdateError("update_redirect_rejected")
     if status_code != 200:
-        raise _status_error(status_code)
+        raise _status_error(status_code, response)
     raw_length = str(getattr(response, "headers", {}).get("content-length", "") or "").strip()
     if raw_length:
         try:
@@ -268,17 +391,7 @@ def _response_bytes(response, max_bytes: int) -> bytes:
 
 
 def _request_bytes(session, url: str, *, max_bytes: int, asset: bool = False) -> bytes:
-    _validate_fixed_api_url(url, asset=asset)
-    try:
-        response = session.get(
-            url,
-            headers=_github_headers(binary=asset),
-            timeout=(5, 60),
-            allow_redirects=False,
-            stream=True,
-        )
-    except requests.RequestException as exc:
-        raise PlatformUpdateError("update_source_failed") from exc
+    response = _open_release_response(session, url, asset=asset)
     try:
         return _response_bytes(response, max_bytes)
     finally:
@@ -291,22 +404,23 @@ def _download_asset_to_file(session, asset: ReleaseAsset, destination: Path) -> 
     _validate_fixed_api_url(asset.api_url, asset=True)
     if asset.size <= 0 or asset.size > MAX_ARCHIVE_BYTES:
         raise PlatformUpdateError("update_download_too_large")
-    try:
-        response = session.get(
-            asset.api_url,
-            headers=_github_headers(binary=True),
-            timeout=(5, 120),
-            allow_redirects=False,
-            stream=True,
-        )
-    except requests.RequestException as exc:
-        raise PlatformUpdateError("update_source_failed") from exc
+    response = _open_release_response(session, asset.api_url, asset=True, timeout=(5, 120))
     status_code = int(getattr(response, "status_code", 0) or 0)
     try:
         if 300 <= status_code < 400:
             raise PlatformUpdateError("update_redirect_rejected")
         if status_code != 200:
-            raise _status_error(status_code)
+            raise _status_error(status_code, response)
+        raw_length = getattr(response, "headers", {}).get("content-length")
+        if raw_length is not None:
+            try:
+                length = int(raw_length)
+            except (TypeError, ValueError) as exc:
+                raise PlatformUpdateError("update_source_invalid") from exc
+            if length > asset.size or length > MAX_ARCHIVE_BYTES:
+                raise PlatformUpdateError("update_download_too_large")
+            if length < 0:
+                raise PlatformUpdateError("update_source_invalid")
         digest = hashlib.sha256()
         total = 0
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
@@ -381,7 +495,7 @@ def _parse_asset(raw, expected_name: str, max_size: int) -> ReleaseAsset:
     return ReleaseAsset(asset_id=asset_id, name=expected_name, size=size)
 
 
-def _parse_release(raw, channel: str) -> ReleaseInfo | None:
+def _parse_release(raw, channel: str, *, deployment: str = "systemd") -> ReleaseInfo | None:
     if not isinstance(raw, dict) or raw.get("draft") is True:
         return None
     try:
@@ -392,7 +506,11 @@ def _parse_release(raw, channel: str) -> ReleaseInfo | None:
     prerelease = bool(raw.get("prerelease") or parsed_version.prerelease)
     if channel == "stable" and prerelease:
         return None
-    names = _asset_names(version)
+    if deployment == "docker":
+        from docker_update_protocol import docker_asset_names
+        names = docker_asset_names(version)
+    else:
+        names = _asset_names(version)
     assets = raw.get("assets")
     if not isinstance(assets, list):
         raise PlatformUpdateError("release_assets_invalid")
@@ -409,6 +527,12 @@ def _parse_release(raw, channel: str) -> ReleaseInfo | None:
     artifact = _parse_asset(by_name[names[0]], names[0], MAX_ARCHIVE_BYTES)
     manifest = _parse_asset(by_name[names[1]], names[1], MAX_MANIFEST_BYTES)
     signature = _parse_asset(by_name[names[2]], names[2], MAX_SIGNATURE_BYTES)
+    runtime_manifest = None
+    if deployment == "docker":
+        runtime_name = _asset_names(version)[1]
+        if runtime_name not in by_name:
+            raise PlatformUpdateError("release_assets_missing")
+        runtime_manifest = _parse_asset(by_name[runtime_name], runtime_name, MAX_MANIFEST_BYTES)
     notes = str(raw.get("body", ""))[:MAX_RELEASE_NOTES_CHARS]
     return ReleaseInfo(
         release_id=str(raw.get("id", ""))[:120],
@@ -420,10 +544,11 @@ def _parse_release(raw, channel: str) -> ReleaseInfo | None:
         artifact=artifact,
         manifest=manifest,
         signature=signature,
+        runtime_manifest=runtime_manifest,
     )
 
 
-def inspect_releases(channel: str, current_version: str, session=None) -> tuple[dict, ReleaseInfo | None]:
+def inspect_releases(channel: str, current_version: str, session=None, *, deployment: str = "systemd") -> tuple[dict, ReleaseInfo | None]:
     """Separate an empty channel from an up-to-date build and incomplete releases."""
     if channel not in VALID_CHANNELS:
         raise PlatformUpdateError("update_channel_invalid")
@@ -461,7 +586,7 @@ def inspect_releases(channel: str, current_version: str, session=None) -> tuple[
         return payload, None
     payload.update(available=True, release_notes=str(winner.get("body", ""))[:MAX_RELEASE_NOTES_CHARS])
     try:
-        release = _parse_release(winner, channel)
+        release = _parse_release(winner, channel, deployment=deployment)
     except PlatformUpdateError as exc:
         payload.update(status="incomplete", error_code=exc.code)
         return payload, None
@@ -513,11 +638,17 @@ def inspect_public_releases(current_version: str, session=None) -> dict:
                    status="available" if available else "current",
                    published_at=str(winner.get("published_at") or "")[:80],
                    release_notes=str(winner.get("body") or "")[:MAX_RELEASE_NOTES_CHARS])
+    payload["installer_assets"] = {}
+    for deployment in ("docker", "systemd"):
+        try:
+            payload["installer_assets"][deployment] = _parse_release(winner, RELEASE_CHANNEL, deployment=deployment) is not None
+        except PlatformUpdateError:
+            payload["installer_assets"][deployment] = False
     return payload
 
 
-def fetch_release(channel: str, current_version: str, session=None) -> ReleaseInfo | None:
-    payload, release = inspect_releases(channel, current_version, session=session)
+def fetch_release(channel: str, current_version: str, session=None, *, deployment: str = "systemd") -> ReleaseInfo | None:
+    payload, release = inspect_releases(channel, current_version, session=session, deployment=deployment)
     if payload["status"] == "incomplete":
         raise PlatformUpdateError(payload["error_code"])
     return release
@@ -542,6 +673,8 @@ def release_payload(release: ReleaseInfo | None, channel: str, current_version: 
 
 def _public_key_file() -> Path:
     raw = os.environ.get("SAAS_UPDATE_PUBLIC_KEY_FILE", "").strip()
+    if not raw and deployment_kind() == "docker":
+        raw = "/app/update-signing.pub"
     if not raw:
         raise PlatformUpdateError("update_public_key_missing")
     path = Path(raw)
@@ -556,15 +689,20 @@ def load_public_key() -> Ed25519PublicKey:
         metadata = path.lstat()
         if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
             raise PlatformUpdateError("update_public_key_invalid")
+        protected = not metadata.st_mode & 0o022
+        # Docker Desktop Windows binds report 0777 even on read-only mounts.
+        # Accept that only for root-owned keys on a kernel-enforced read-only mount.
+        if not protected and metadata.st_uid == 0 and deployment_kind() == "docker" and hasattr(os, "statvfs"):
+            protected = bool(os.statvfs(path).f_flag & os.ST_RDONLY)
         if (
-            metadata.st_uid not in {0, os.geteuid()}
-            or metadata.st_mode & 0o022
+            metadata.st_uid not in {0, getattr(os, "geteuid", lambda: 0)()}
+            or not protected
             or metadata.st_size <= 0
             or metadata.st_size > 4096
         ):
             raise PlatformUpdateError("update_public_key_invalid")
-        raw = path.read_bytes().strip()
-    except OSError as exc:
+        raw = _read_secure_file(path, 4096).strip()
+    except (OSError, PlatformUpdateError) as exc:
         raise PlatformUpdateError("update_public_key_invalid") from exc
     try:
         if raw.startswith(b"-----BEGIN"):
@@ -587,7 +725,7 @@ def _systemd_properties(unit: str) -> dict[str, str]:
     try:
         result = subprocess.run(
             ["/usr/bin/systemctl", "--no-pager", "--no-ask-password", "show", unit,
-             "--property=LoadState,ActiveState,SubState,Paths,Triggers"],
+             "--property=LoadState,ActiveState,SubState,Paths,Triggers,ExecStart"],
             capture_output=True, text=True, timeout=2,
             env={"PATH": "/usr/bin:/bin", "LANG": "C", "SYSTEMD_PAGER": "cat"},
         )
@@ -606,10 +744,130 @@ def _trusted_update_directory(path: Path, *, writable: bool = False) -> None:
         if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
             raise PlatformUpdateError("update_installation_unavailable")
         allowed_owner = {0, os.geteuid()} if writable else {0}
-        if metadata.st_uid not in allowed_owner or metadata.st_mode & 0o022:
+        sticky_root = metadata.st_uid == 0 and metadata.st_mode & stat.S_ISVTX
+        if metadata.st_uid not in allowed_owner or (metadata.st_mode & 0o022 and not sticky_root):
             raise PlatformUpdateError("update_installation_unavailable")
     if writable and not os.access(path, os.W_OK | os.X_OK):
         raise PlatformUpdateError("update_installation_unavailable")
+
+
+def _systemd_updater_bundle_root() -> Path:
+    path = Path(os.environ.get("SAAS_UPDATER_BUNDLE_ROOT", "/opt/xianyu-saas/updater").strip())
+    if not path.is_absolute() or ".." in path.parts:
+        raise PlatformUpdateError("update_updater_identity_mismatch")
+    return path
+
+
+def _systemd_updater_entrypoint(bundle_root: Path | None = None) -> Path:
+    bundle_root = bundle_root or _systemd_updater_bundle_root()
+    expected = bundle_root.joinpath(*PurePosixPath(SYSTEMD_UPDATER_ENTRYPOINT_RELATIVE).parts)
+    path = Path(os.environ.get("SAAS_UPDATER_ENTRYPOINT", str(expected)).strip())
+    if not path.is_absolute() or ".." in path.parts or path != expected:
+        raise PlatformUpdateError("update_updater_identity_mismatch")
+    return path
+
+
+def _read_systemd_bundle_file(bundle_root: Path, relative: str) -> bytes:
+    if relative not in SYSTEMD_UPDATER_BUNDLE_FILES:
+        raise PlatformUpdateError("update_updater_identity_mismatch")
+    path = bundle_root.joinpath(*PurePosixPath(relative).parts)
+    try:
+        _trusted_update_directory(path.parent)
+        before = path.lstat()
+        if (stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode)
+                or before.st_nlink != 1 or before.st_uid != 0
+                or stat.S_IMODE(before.st_mode) & 0o022
+                or before.st_size <= 0 or before.st_size > MAX_UPDATER_BUNDLE_FILE_BYTES):
+            raise PlatformUpdateError("update_updater_identity_mismatch")
+        payload = _read_secure_file(path, MAX_UPDATER_BUNDLE_FILE_BYTES)
+        after = path.lstat()
+        if ((before.st_dev, before.st_ino, before.st_mode, before.st_uid, before.st_nlink,
+             before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+                != (after.st_dev, after.st_ino, after.st_mode, after.st_uid, after.st_nlink,
+                    after.st_size, after.st_mtime_ns, after.st_ctime_ns)):
+            raise PlatformUpdateError("update_updater_identity_mismatch")
+        return payload
+    except PlatformUpdateError as exc:
+        if exc.code == "update_updater_identity_mismatch":
+            raise
+        raise PlatformUpdateError("update_updater_identity_mismatch") from exc
+    except OSError as exc:
+        raise PlatformUpdateError("update_updater_identity_mismatch") from exc
+
+
+def _systemd_updater_identity() -> tuple[str, str]:
+    bundle_root = _systemd_updater_bundle_root()
+    _trusted_update_directory(bundle_root)
+    entrypoint = _systemd_updater_entrypoint(bundle_root)
+    canonical = bytearray()
+    entrypoint_sha256 = ""
+    for relative in SYSTEMD_UPDATER_BUNDLE_FILES:
+        payload = _read_systemd_bundle_file(bundle_root, relative)
+        digest = hashlib.sha256(payload).hexdigest()
+        canonical.extend(relative.encode("utf-8"))
+        canonical.extend(b"\0")
+        canonical.extend(str(len(payload)).encode("ascii"))
+        canonical.extend(b"\0")
+        canonical.extend(digest.encode("ascii"))
+        canonical.extend(b"\n")
+        if bundle_root.joinpath(*PurePosixPath(relative).parts) == entrypoint:
+            entrypoint_sha256 = digest
+    if not entrypoint_sha256:
+        raise PlatformUpdateError("update_updater_identity_mismatch")
+    return hashlib.sha256(canonical).hexdigest(), entrypoint_sha256
+
+
+def read_systemd_initialization() -> dict:
+    try:
+        payload = read_trusted_json(status_directory() / SYSTEMD_INITIALIZATION_FILE)
+    except UpdateStateError as exc:
+        raise PlatformUpdateError("update_state_invalid") from exc
+    if payload is None:
+        raise PlatformUpdateError("update_updater_not_initialized")
+    if not isinstance(payload, dict) or set(payload) != SYSTEMD_INITIALIZATION_KEYS:
+        raise PlatformUpdateError("update_state_invalid")
+    if type(payload.get("schema")) is not int or payload["schema"] != 1:
+        raise PlatformUpdateError("update_state_invalid")
+    if type(payload.get("protocol")) is not int or payload["protocol"] != 1:
+        raise PlatformUpdateError("update_protocol_mismatch")
+    stamp = payload.get("initialized_at")
+    if (type(stamp) not in {int, float} or not math.isfinite(stamp) or stamp <= 0
+            or any(not isinstance(payload.get(name), str) or not SHA256_RE.fullmatch(payload[name])
+                   for name in ("public_key_sha256", "bundle_sha256", "entrypoint_sha256"))):
+        raise PlatformUpdateError("update_state_invalid")
+    key = load_public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    if not secrets.compare_digest(payload["public_key_sha256"], hashlib.sha256(key).hexdigest()):
+        raise PlatformUpdateError("update_public_key_mismatch")
+    try:
+        bundle_sha256, entrypoint_sha256 = _systemd_updater_identity()
+    except PlatformUpdateError as exc:
+        if exc.code == "update_updater_identity_mismatch":
+            raise
+        raise PlatformUpdateError("update_updater_identity_mismatch") from exc
+    if (not secrets.compare_digest(payload["bundle_sha256"], bundle_sha256)
+            or not secrets.compare_digest(payload["entrypoint_sha256"], entrypoint_sha256)):
+        raise PlatformUpdateError("update_updater_identity_mismatch")
+    return {**payload, "initialized_at": float(stamp)}
+
+
+def _systemd_exec_start_matches(value: str, entrypoint: Path) -> bool:
+    text = str(value or "")
+    if text.count("argv[]=") != 1 or text.count("path=") != 1:
+        return False
+    fields = {}
+    for raw in text.replace("{", ";").replace("}", ";").split(";"):
+        item = raw.strip()
+        if "=" not in item:
+            continue
+        key, field = item.split("=", 1)
+        if key in {"path", "argv[]"}:
+            if key in fields:
+                return False
+            fields[key] = field.strip()
+    return (
+        fields.get("path") == SYSTEMD_UPDATER_PYTHON
+        and fields.get("argv[]", "").split() == [SYSTEMD_UPDATER_PYTHON, str(entrypoint)]
+    )
 
 
 def _systemd_update_ready() -> None:
@@ -626,13 +884,15 @@ def _systemd_update_ready() -> None:
     load_public_key()
     if _public_key_file().lstat().st_uid != 0:
         raise PlatformUpdateError("update_public_key_invalid")
+    read_systemd_initialization()
     # A marker alone is not evidence that a deployment is a signed release.
     marker = _marker_payload(source)
     if marker.get("schema") != 1 or marker.get("version") != VERSION:
         raise PlatformUpdateError("update_installation_unavailable")
     manifest = _read_secure_file(source / CACHED_MANIFEST_FILE, MAX_MANIFEST_BYTES)
     verify_manifest_signature(manifest, _read_secure_file(source / CACHED_SIGNATURE_FILE, MAX_SIGNATURE_BYTES))
-    parse_manifest(manifest, _release_from_marker(marker))
+    _, files = parse_manifest(manifest, _release_from_marker(marker))
+    _require_maintenance_protocol(source, files)
     _verify_candidate_version(source, VERSION)
     _trusted_update_directory(_staging_root(), writable=True)
     _trusted_update_directory(_intent_file().parent, writable=True)
@@ -641,23 +901,129 @@ def _systemd_update_ready() -> None:
     if (watcher.get("LoadState") != "loaded" or watcher.get("ActiveState") != "active"
             or service.get("LoadState") != "loaded" or service.get("ActiveState") == "failed"
             or "xianyu-saas-updater.service" not in watcher.get("Triggers", "").split()
-            or watcher.get("Paths") != f"{_intent_file()} (PathExists)"):
+            or not re.search(r"(?:^|\s)" + re.escape(f"{_intent_file()} (PathExists)") + r"(?:$|\s)", watcher.get("Paths", ""))):
         raise PlatformUpdateError("update_service_unavailable")
+    if not _systemd_exec_start_matches(service.get("ExecStart", ""), _systemd_updater_entrypoint()):
+        raise PlatformUpdateError("update_updater_identity_mismatch")
+
+
+def docker_update_root() -> Path:
+    root = Path(os.environ.get("SAAS_DOCKER_UPDATE_ROOT", "/updates"))
+    if not root.is_absolute() or ".." in root.parts:
+        raise PlatformUpdateError("update_installation_unavailable")
+    return root
+
+
+def _safe_error_code(value, default="update_state_invalid") -> str:
+    return value if isinstance(value, str) and re.fullmatch(r"[a-z][a-z0-9_]{0,79}", value) else default
+
+
+def _rollback_candidates(raw, current_version: str) -> list[dict]:
+    if not isinstance(raw, list) or len(raw) > 20:
+        raise PlatformUpdateError("update_state_invalid")
+    result = []
+    seen = set()
+    for entry in raw:
+        if not isinstance(entry, dict):
+            raise PlatformUpdateError("update_state_invalid")
+        version, digest = entry.get("version"), entry.get("manifest_sha256")
+        if (not isinstance(version, str) or not isinstance(digest, str)
+                or not SHA256_RE.fullmatch(digest) or version in seen
+                or SemVer.parse(version).compare(SemVer.parse(current_version)) >= 0):
+            raise PlatformUpdateError("update_state_invalid")
+        result.append({"version": version, "manifest_sha256": digest})
+        seen.add(version)
+    return result
+
+
+def read_docker_capabilities() -> dict:
+    try:
+        payload = read_trusted_json(docker_update_root() / "status" / "capabilities.json")
+        if payload is None:
+            raise PlatformUpdateError("update_service_unavailable")
+        if (type(payload.get("schema")) is not int or payload["schema"] != 1
+                or type(payload.get("protocol")) is not int or payload["protocol"] != 1):
+            raise PlatformUpdateError("update_protocol_mismatch")
+        stamp = payload.get("heartbeat_at")
+        if (type(stamp) not in {int, float} or not math.isfinite(stamp)
+                or stamp <= 0 or time.time() - stamp > 45 or stamp - time.time() > 5):
+            raise PlatformUpdateError("update_service_stale")
+        deployment = os.environ.get("SAAS_DOCKER_DEPLOYMENT_ID", "").strip()
+        if not deployment or payload.get("deployment_id") != deployment:
+            raise PlatformUpdateError("update_deployment_mismatch")
+        if payload.get("current_version") != VERSION:
+            raise PlatformUpdateError("update_current_version_mismatch")
+        key_file = _public_key_file()
+        _trusted_update_directory(key_file.parent)
+        if key_file.lstat().st_uid != 0:
+            raise PlatformUpdateError("update_public_key_invalid")
+        key_raw = load_public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+        if payload.get("public_key_sha256") != hashlib.sha256(key_raw).hexdigest():
+            raise PlatformUpdateError("update_public_key_mismatch")
+        if payload.get("ready") is not True:
+            raise PlatformUpdateError(_safe_error_code(payload.get("reason"), "update_service_unavailable"))
+        for name in ("artifacts", "requests"):
+            _trusted_update_directory(docker_update_root() / name, writable=True)
+        return {"schema": 1, "protocol": 1, "ready": True, "reason": "",
+                "heartbeat_at": float(stamp), "current_version": VERSION,
+                "rollback_versions": _rollback_candidates(payload.get("rollback_versions", []), VERSION)}
+    except UpdateStateError as exc:
+        raise PlatformUpdateError(exc.code) from exc
+    except OSError as exc:
+        raise PlatformUpdateError("update_installation_unavailable") from exc
+
+
+def read_operation_status(operation: dict) -> dict | None:
+    """Merge only executor-owned, identity-matched, safe progress fields."""
+    operation_id = str(operation.get("operation_id") or "")
+    if not OPERATION_ID_RE.fullmatch(operation_id):
+        raise PlatformUpdateError("update_operation_invalid")
+    root = docker_update_root() / "status" if operation.get("deployment") == "docker" else status_directory()
+    try:
+        payload = read_trusted_json(root / "operations" / f"{operation_id}.json")
+    except UpdateStateError as exc:
+        raise PlatformUpdateError(exc.code) from exc
+    if payload is None:
+        return None
+    stamp = payload.get("updated_at")
+    if (type(payload.get("schema")) is not int or payload["schema"] != 1
+            or payload.get("operation_id") != operation_id
+            or payload.get("action") != operation.get("action")
+            or payload.get("version") != operation.get("version")
+            or payload.get("status") not in UPDATE_STAGES | {"running"}
+            or payload.get("phase") not in UPDATE_STAGES
+            or ((payload.get("status") in {"succeeded", "rolled_back", "failed", "recovery_failed"}
+                 or payload.get("phase") in {"succeeded", "rolled_back", "failed", "recovery_failed"})
+                and payload.get("status") != payload.get("phase"))
+            or type(stamp) not in {int, float} or not math.isfinite(stamp) or stamp <= 0
+            or stamp > time.time() + 5):
+        raise PlatformUpdateError("update_state_invalid")
+    current = payload.get("current_version")
+    if not isinstance(current, str):
+        raise PlatformUpdateError("update_state_invalid")
+    SemVer.parse(current)
+    return {"schema": 1, "operation_id": operation_id, "action": operation["action"],
+            "version": operation["version"], "current_version": current,
+            "status": payload["status"], "phase": payload["phase"], "updated_at": float(stamp),
+            "error_code": _safe_error_code(payload.get("error_code"), "")}
 
 
 def update_capabilities() -> dict:
     mode = deployment_kind()
     instructions = {
-        "docker": "这是源码构建的 Docker 部署。先备份数据并取得已确认的目标源码，再使用原 Compose 文件及本地覆盖配置重新构建、启动。保留原数据卷，不要删除数据卷。网页不能替宿主机执行升级。",
+        "docker": "Docker 网页更新需显式接入独立更新器、可信签名公钥和本项目共享目录；普通容器不会获得宿主控制权限。升级仅回退代码或镜像，不恢复旧业务数据。",
         "source": "这是源码部署。请维护者备份数据、取得目标源码并按原部署方式更新和重启；当前未配置网页安装服务。",
         "systemd": "签名版本部署需配置可信发布目录、签名公钥以及运行中的独立更新服务。应用前请备份数据；页面会显示请求及执行状态。",
     }
     result = {"deployment": mode, "check": True, "download": False, "apply": False,
               "rollback": False, "reason": "update_installation_unsupported", "instruction": instructions[mode]}
-    if mode != "systemd":
+    if mode not in {"systemd", "docker"}:
         return result
     try:
-        _systemd_update_ready()
+        if mode == "docker":
+            read_docker_capabilities()
+        else:
+            _systemd_update_ready()
     except PlatformUpdateError as exc:
         result["reason"] = exc.code
     except (OSError, ValueError, RuntimeError):
@@ -985,6 +1351,7 @@ def stage_release(
     current_version: str,
     *,
     session=None,
+    require_maintenance=False,
 ) -> dict:
     if channel not in VALID_CHANNELS:
         raise PlatformUpdateError("update_channel_invalid")
@@ -1010,6 +1377,8 @@ def stage_release(
         if not secrets.compare_digest(artifact_sha256, str(manifest["artifact_sha256"])):
             raise PlatformUpdateError("update_artifact_hash_mismatch")
         extract_verified_archive(archive_path, candidate_root, expected_files)
+        if require_maintenance:
+            _require_maintenance_protocol(candidate_root, expected_files)
         _verify_candidate_version(candidate_root, release.version)
         _verify_dependency_stability(candidate_root, _source_root())
         _write_secure_file(candidate_root / CACHED_MANIFEST_FILE, manifest_raw)
@@ -1055,6 +1424,163 @@ def stage_release(
     }
 
 
+def _docker_artifact_directory(operation_id: str, *, create: bool = False) -> Path:
+    if not OPERATION_ID_RE.fullmatch(str(operation_id)):
+        raise PlatformUpdateError("update_operation_invalid")
+    parent = docker_update_root() / "artifacts"
+    _trusted_update_directory(parent, writable=True)
+    path = parent / operation_id
+    if create:
+        path.mkdir(mode=0o700)
+    metadata = path.lstat()
+    if (stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != os.geteuid() or stat.S_IMODE(metadata.st_mode) & 0o077):
+        raise PlatformUpdateError("update_candidate_invalid")
+    return path
+
+
+def _docker_manifest(raw: bytes, signature: bytes, version: str):
+    from docker_update_protocol import DockerUpdateError, verify_docker_manifest
+    key = load_public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    try:
+        return verify_docker_manifest(raw, signature, key, expected_version=version)
+    except DockerUpdateError as exc:
+        raise PlatformUpdateError(exc.code) from exc
+
+
+def stage_docker_release(release: ReleaseInfo, channel: str, current_version: str,
+                         operation_id: str, *, session=None) -> dict:
+    from docker_update_protocol import DockerUpdateError, extract_verified_source
+    import shutil
+    if channel not in VALID_CHANNELS:
+        raise PlatformUpdateError("update_channel_invalid")
+    if SemVer.parse(release.version).compare(SemVer.parse(current_version)) <= 0:
+        raise PlatformUpdateError("update_downgrade_rejected")
+    session = session or requests.Session()
+    raw = _request_bytes(session, release.manifest.api_url, max_bytes=MAX_MANIFEST_BYTES, asset=True)
+    signature = _request_bytes(session, release.signature.api_url, max_bytes=MAX_SIGNATURE_BYTES, asset=True)
+    manifest = _docker_manifest(raw, signature, release.version)
+    if release.artifact.name != manifest.source_name or release.artifact.size != manifest.source_size:
+        raise PlatformUpdateError("update_manifest_invalid")
+    if release.runtime_manifest is None:
+        raise PlatformUpdateError("release_assets_missing")
+    runtime_raw = _request_bytes(session, release.runtime_manifest.api_url, max_bytes=MAX_MANIFEST_BYTES, asset=True)
+    if hashlib.sha256(runtime_raw).hexdigest() != manifest.runtime_manifest_sha256:
+        raise PlatformUpdateError("update_manifest_invalid")
+    directory = None
+    try:
+        directory = _docker_artifact_directory(operation_id, create=True)
+        digest = _download_asset_to_file(session, release.artifact, directory / "source.zip")
+        if not secrets.compare_digest(digest, manifest.source_sha256):
+            raise PlatformUpdateError("update_artifact_hash_mismatch")
+        source_root = extract_verified_source(directory / "source.zip", directory / ".validation", manifest)
+        _require_maintenance_protocol(source_root)
+        shutil.rmtree(directory / ".validation")
+        _write_secure_file(directory / "docker.manifest.json", raw)
+        _write_secure_file(directory / "docker.manifest.sig", signature)
+    except BaseException as exc:
+        if directory is not None:
+            shutil.rmtree(directory, ignore_errors=True)
+        if isinstance(exc, DockerUpdateError):
+            code = (
+                "update_artifact_hash_mismatch"
+                if exc.code in {"docker_source_hash_mismatch", "docker_source_size_mismatch"}
+                else exc.code
+            )
+            raise PlatformUpdateError(code) from exc
+        if isinstance(exc, OSError):
+            raise PlatformUpdateError("update_staging_failed") from exc
+        raise
+    return {"version": release.version, "channel": channel, "operation_id": operation_id,
+            "deployment": "docker", "manifest_sha256": hashlib.sha256(raw).hexdigest(),
+            "candidate_path": "", "release_id": release.release_id, "release_notes": release.notes}
+
+
+def validate_docker_candidate(operation_id: str, version: str, manifest_sha256: str) -> None:
+    from docker_update_protocol import DockerUpdateError, extract_verified_source
+    import shutil
+
+    validation: Path | None = None
+    try:
+        directory = _docker_artifact_directory(operation_id)
+        raw = _read_secure_file(directory / "docker.manifest.json", MAX_MANIFEST_BYTES)
+        signature = _read_secure_file(directory / "docker.manifest.sig", MAX_SIGNATURE_BYTES)
+        if not secrets.compare_digest(hashlib.sha256(raw).hexdigest(), manifest_sha256):
+            raise PlatformUpdateError("update_candidate_invalid")
+        manifest = _docker_manifest(raw, signature, version)
+        validation = directory / f".validation-{secrets.token_hex(8)}"
+        source_root = extract_verified_source(directory / "source.zip", validation, manifest)
+        _require_maintenance_protocol(source_root)
+    except DockerUpdateError as exc:
+        code = (
+            "update_artifact_hash_mismatch"
+            if exc.code in {"docker_source_hash_mismatch", "docker_source_size_mismatch"}
+            else exc.code
+        )
+        raise PlatformUpdateError(code) from exc
+    except OSError as exc:
+        raise PlatformUpdateError("update_candidate_invalid") from exc
+    finally:
+        if validation is not None:
+            shutil.rmtree(validation, ignore_errors=True)
+
+
+def write_docker_update_request(operation: dict) -> dict:
+    operation_id = str(operation.get("operation_id") or "")
+    if not OPERATION_ID_RE.fullmatch(operation_id):
+        raise PlatformUpdateError("update_operation_invalid")
+    action = operation.get("action")
+    if (action not in {"apply", "rollback"} or not SHA256_RE.fullmatch(str(operation.get("manifest_sha256", "")))
+            or int(operation.get("requested_by", 0)) <= 0):
+        raise PlatformUpdateError("update_intent_invalid")
+    SemVer.parse(operation["version"])
+    SemVer.parse(operation["expected_current_version"])
+    parent = docker_update_root() / "requests"
+    _trusted_update_directory(parent, writable=True)
+    payload = {"schema": 1, "operation_id": operation_id, "action": action,
+               "version": operation["version"], "expected_current_version": operation["expected_current_version"],
+               "manifest_sha256": operation["manifest_sha256"], "requested_at": operation["requested_at"],
+               "requested_by": int(operation["requested_by"])}
+    try:
+        _publish_request(parent / f"{operation_id}.json", payload)
+    except OSError as exc:
+        raise PlatformUpdateError("update_intent_write_failed") from exc
+    return {"queued": True, "status": "queued", "action": action, "version": operation["version"],
+            "operation_id": operation_id}
+
+
+def _publish_request(path: Path, payload: dict, *, processing: Path | None = None) -> None:
+    # No fake lock implementation on Windows: deployment I/O requires Linux.
+    if os.name != "posix":
+        raise PlatformUpdateError("update_state_platform_unsupported")
+    import fcntl
+    parent = path.parent
+    lock_fd = os.open(parent / ".intent.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    temporary = parent / f".{path.name}.{secrets.token_hex(8)}.tmp"
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        for existing in (path, processing):
+            if existing is None:
+                continue
+            if existing.exists() or existing.is_symlink():
+                old = json.loads(_read_secure_file(existing, 16384))
+                if payload.get("operation_id") and all(old.get(k) == v for k, v in payload.items()):
+                    return
+                raise PlatformUpdateError("update_intent_pending")
+        _write_secure_file(temporary, json.dumps(payload, sort_keys=True, separators=(",", ":")).encode())
+        os.replace(temporary, path)
+        descriptor = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    except (ValueError, UnicodeError) as exc:
+        raise PlatformUpdateError("update_intent_pending") from exc
+    finally:
+        temporary.unlink(missing_ok=True)
+        os.close(lock_fd)
+
+
 def _candidate_root(candidate_path: str) -> Path:
     configured_root = _staging_root()
     candidate = Path(str(candidate_path or ""))
@@ -1092,14 +1618,15 @@ def _read_secure_file(path: Path, max_bytes: int) -> bytes:
         or metadata.st_size > max_bytes
     ):
         raise PlatformUpdateError("update_candidate_invalid")
-    flags = os.O_RDONLY
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0)
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     try:
         descriptor = os.open(path, flags)
         try:
             opened = os.fstat(descriptor)
-            if not stat.S_ISREG(opened.st_mode) or opened.st_size != metadata.st_size:
+            if (not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1
+                    or (opened.st_dev, opened.st_ino, opened.st_size) != (metadata.st_dev, metadata.st_ino, metadata.st_size)):
                 raise PlatformUpdateError("update_candidate_invalid")
             payload = bytearray()
             while True:
@@ -1109,11 +1636,39 @@ def _read_secure_file(path: Path, max_bytes: int) -> bytes:
                 payload.extend(chunk)
                 if len(payload) > max_bytes:
                     raise PlatformUpdateError("update_candidate_invalid")
+            after = os.fstat(descriptor)
+            if (len(payload) != opened.st_size
+                    or (opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns)
+                    != (after.st_size, after.st_mtime_ns, after.st_ctime_ns)):
+                raise PlatformUpdateError("update_candidate_invalid")
             return bytes(payload)
         finally:
             os.close(descriptor)
     except OSError as exc:
         raise PlatformUpdateError("update_candidate_invalid") from exc
+
+
+def _require_maintenance_protocol(candidate_root: Path, files: dict[str, ManifestFile] | None = None) -> None:
+    """Require one signed, literal maintenance protocol declaration without importing it."""
+    expected = files.get(MAINTENANCE_MODULE_PATH) if files is not None else None
+    if files is not None and expected is None:
+        raise PlatformUpdateError("update_maintenance_protocol_unsupported")
+    if expected is not None and (expected.size <= 0 or expected.size > MAX_MAINTENANCE_SOURCE_BYTES):
+        raise PlatformUpdateError("update_maintenance_protocol_unsupported")
+    try:
+        source = _read_secure_file(
+            candidate_root / MAINTENANCE_MODULE_PATH,
+            expected.size if expected is not None else MAX_MAINTENANCE_SOURCE_BYTES,
+        )
+    except PlatformUpdateError as exc:
+        raise PlatformUpdateError("update_maintenance_protocol_unsupported") from exc
+    if expected is not None and (
+        len(source) != expected.size
+        or not secrets.compare_digest(hashlib.sha256(source).hexdigest(), expected.sha256)
+    ):
+        raise PlatformUpdateError("update_candidate_invalid")
+    if not supports_maintenance_protocol(source):
+        raise PlatformUpdateError("update_maintenance_protocol_unsupported")
 
 
 def _marker_payload(candidate: Path) -> dict:
@@ -1209,18 +1764,25 @@ def load_verified_candidate(
     return marker, expected_files
 
 
-def validate_candidate(candidate_path: str, version: str, manifest_sha256: str = "") -> dict:
-    marker, _ = load_verified_candidate(candidate_path, version, manifest_sha256)
+def validate_candidate(candidate_path: str, version: str, manifest_sha256: str = "", *, require_maintenance=False) -> dict:
+    marker, files = load_verified_candidate(candidate_path, version, manifest_sha256)
+    if require_maintenance:
+        _require_maintenance_protocol(_candidate_root(candidate_path), files)
     return marker
 
 
-def available_rollback_versions(current_version: str) -> list[str]:
+def available_rollback_versions(current_version: str) -> list[dict]:
+    if deployment_kind() == "docker":
+        try:
+            return read_docker_capabilities()["rollback_versions"]
+        except PlatformUpdateError:
+            return []
     raw = os.environ.get("SAAS_RELEASES_DIR", "/opt/xianyu-saas/releases").strip()
     root = Path(raw)
     if not root.is_absolute() or not root.exists() or root.is_symlink() or not root.is_dir():
         return []
     current = SemVer.parse(current_version)
-    versions: list[tuple[SemVer, str]] = []
+    versions: list[tuple[SemVer, dict]] = []
     try:
         entries = tuple(root.iterdir())
     except OSError:
@@ -1230,15 +1792,32 @@ def available_rollback_versions(current_version: str) -> list[str]:
             continue
         try:
             parsed = SemVer.parse(path.name)
-            marker = _json_file(path / MARKER_FILE)
-        except PlatformUpdateError:
+            _trusted_update_directory(path)
+            marker = _marker_payload(path)
+            raw_manifest = _read_secure_file(path / CACHED_MANIFEST_FILE, MAX_MANIFEST_BYTES)
+            verify_manifest_signature(raw_manifest, _read_secure_file(path / CACHED_SIGNATURE_FILE, MAX_SIGNATURE_BYTES))
+            if hashlib.sha256(raw_manifest).hexdigest() != marker.get("manifest_sha256"):
+                continue
+            _, files = parse_manifest(raw_manifest, _release_from_marker(marker))
+            for relative, expected in files.items():
+                file = path / relative
+                _trusted_update_directory(file.parent)
+                metadata = file.lstat()
+                if metadata.st_uid != 0 or metadata.st_mode & 0o022:
+                    raise PlatformUpdateError("update_candidate_invalid")
+                if hashlib.sha256(_read_secure_file(file, expected.size)).hexdigest() != expected.sha256:
+                    raise PlatformUpdateError("update_candidate_invalid")
+            _require_maintenance_protocol(path, files)
+            _verify_candidate_version(path, path.name)
+            _verify_dependency_stability(path, _source_root())
+        except (PlatformUpdateError, OSError):
             continue
         if parsed.compare(current) >= 0:
             continue
         if marker.get("schema") != 1 or str(marker.get("version", "")) != path.name:
             continue
-        versions.append((parsed, path.name))
-    ordered: list[tuple[SemVer, str]] = []
+        versions.append((parsed, {"version": path.name, "manifest_sha256": marker["manifest_sha256"]}))
+    ordered: list[tuple[SemVer, dict]] = []
     for item in versions:
         inserted = False
         for index, existing in enumerate(ordered):
@@ -1253,7 +1832,7 @@ def available_rollback_versions(current_version: str) -> list[str]:
 
 def _intent_file() -> Path:
     raw = os.environ.get(
-        "SAAS_UPDATE_INTENT_FILE", "/var/lib/xianyu-saas/update-intents/intent.json"
+        "SAAS_UPDATE_INTENT_FILE", "/var/lib/xianyu-saas-updates/intent.json"
     ).strip()
     path = Path(raw)
     if not path.is_absolute():
@@ -1262,84 +1841,45 @@ def _intent_file() -> Path:
 
 
 def _write_update_intent_unwrapped(
-    action: str,
-    version: str,
-    *,
-    channel: str,
-    requested_by: int,
-    candidate_path: str = "",
-    manifest_sha256: str = "",
+    action: str, version: str, *, channel: str, requested_by: int,
+    candidate_path: str = "", manifest_sha256: str = "", operation_id: str = "",
+    expected_current_version: str = "", requested_at: float | None = None,
 ) -> dict:
-    action = str(action)
-    channel = str(channel)
-    if action not in {"apply", "rollback"}:
+    if action not in {"apply", "rollback"} or int(requested_by) <= 0:
         raise PlatformUpdateError("update_intent_invalid")
     if channel not in VALID_CHANNELS:
         raise PlatformUpdateError("update_channel_invalid")
     SemVer.parse(version)
+    if operation_id and not OPERATION_ID_RE.fullmatch(operation_id):
+        raise PlatformUpdateError("update_operation_invalid")
     if action == "apply":
-        validate_candidate(candidate_path, version, manifest_sha256)
+        validate_candidate(
+            candidate_path,
+            version,
+            manifest_sha256,
+            require_maintenance=bool(operation_id),
+        )
     elif candidate_path:
         raise PlatformUpdateError("update_intent_invalid")
     intent = _intent_file()
     parent = intent.parent
     parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    metadata = parent.lstat()
-    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
-        raise PlatformUpdateError("update_intent_path_invalid")
-    os.chmod(parent, 0o700)
-    lock_path = parent / ".intent.lock"
-    lock_flags = os.O_RDWR | os.O_CREAT
-    if hasattr(os, "O_NOFOLLOW"):
-        lock_flags |= os.O_NOFOLLOW
-    lock_fd = os.open(lock_path, lock_flags, 0o600)
-    try:
-        os.fchmod(lock_fd, 0o600)
-        fcntl.flock(lock_fd, fcntl.LOCK_EX)
-        processing = intent.with_name("intent.processing.json")
-        if (
-            intent.exists()
-            or intent.is_symlink()
-            or processing.exists()
-            or processing.is_symlink()
-        ):
-            raise PlatformUpdateError("update_intent_pending")
-        payload = {
-            "schema": 1,
-            "action": action,
-            "version": str(version),
-            "channel": channel,
-            "candidate_path": str(candidate_path) if action == "apply" else "",
-            "manifest_sha256": str(manifest_sha256) if action == "apply" else "",
-            "requested_by": int(requested_by),
-            "requested_at": __import__("time").time(),
-            "nonce": secrets.token_hex(16),
-        }
-        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-        temporary = parent / f".{intent.name}.{secrets.token_hex(8)}.tmp"
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        descriptor = os.open(temporary, flags, 0o600)
-        try:
-            with os.fdopen(descriptor, "wb", closefd=True) as output:
-                descriptor = -1
-                output.write(encoded)
-                output.flush()
-                os.fsync(output.fileno())
-            os.replace(temporary, intent)
-            directory_fd = os.open(parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
-        finally:
-            if descriptor >= 0:
-                os.close(descriptor)
-            temporary.unlink(missing_ok=True)
-    finally:
-        os.close(lock_fd)
-    return {"queued": True, "action": action, "version": str(version)}
+    _trusted_update_directory(parent, writable=True)
+    # A root-owned sticky IPC parent must remain root-owned and traversable to
+    # expose read-only status. Never chmod somebody else's deployment directory.
+    payload = {"schema": 1, "action": action, "version": str(version), "channel": channel,
+               "candidate_path": candidate_path if action == "apply" else "",
+               "manifest_sha256": manifest_sha256, "requested_by": int(requested_by),
+               "requested_at": time.time() if requested_at is None else requested_at,
+               "nonce": operation_id or secrets.token_hex(16)}
+    if operation_id:
+        SemVer.parse(expected_current_version)
+        payload.update(operation_id=operation_id, expected_current_version=expected_current_version)
+    _publish_request(intent, payload, processing=intent.with_name("intent.processing.json"))
+    result = {"queued": True, "action": action, "version": str(version)}
+    if operation_id:
+        result.update(operation_id=operation_id, status="queued")
+    return result
 
 
 def write_update_intent(
@@ -1350,6 +1890,9 @@ def write_update_intent(
     requested_by: int,
     candidate_path: str = "",
     manifest_sha256: str = "",
+    operation_id: str = "",
+    expected_current_version: str = "",
+    requested_at: float | None = None,
 ) -> dict:
     """Write one private updater intent while keeping filesystem errors stable."""
     try:
@@ -1360,6 +1903,8 @@ def write_update_intent(
             requested_by=requested_by,
             candidate_path=candidate_path,
             manifest_sha256=manifest_sha256,
+            operation_id=operation_id, expected_current_version=expected_current_version,
+            requested_at=requested_at,
         )
     except PlatformUpdateError:
         raise

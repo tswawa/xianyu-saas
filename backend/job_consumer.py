@@ -21,6 +21,7 @@ from collections.abc import Callable
 
 from account_storage import AccountStorage, AccountStorageError
 from db import DB
+from update_maintenance import maintenance_active
 from shop_sync import (
     SYNC_COOLDOWN_SECONDS,
     SYNC_MAX_SECONDS,
@@ -75,6 +76,7 @@ class JobConsumer:
         lease_seconds: float = LEASE_SECONDS,
         owner: str | None = None,
         operations_service=None,
+        maintenance_func: Callable[[], bool] = maintenance_active,
     ):
         self.db = db or DB()
         self.sync_func = sync_func
@@ -86,6 +88,17 @@ class JobConsumer:
         self.owner = owner or f"consumer:{os.getpid()}:{time.time_ns()}"
         self.stop_event = threading.Event()
         self.operations_service = operations_service
+        self.maintenance_func = maintenance_func
+
+    def _paused_for_update(self) -> bool:
+        try:
+            return bool(self.maintenance_func())
+        except Exception:
+            return True
+
+    def _defer_for_update(self, row) -> str:
+        deferred = self.db.defer_job(int(row["id"]), self.owner, self.poll_seconds)
+        return "deferred" if deferred else "lease_lost"
 
     def stop(self) -> None:
         self.stop_event.set()
@@ -219,7 +232,7 @@ class JobConsumer:
                     or current["lease_owner"] != self.owner
                     or float(current["lease_until"] or 0) <= time.time()):
                 raise OperationsError("job_lease_lost", 409)
-            if self.stop_event.is_set():
+            if self.stop_event.is_set() or self._paused_for_update():
                 raise OperationsError("runner_interrupted", 503)
             return current
 
@@ -257,6 +270,8 @@ class JobConsumer:
 
     def process(self, row) -> str:
         """Reserve before reading the saved Cookie, including malformed old logins."""
+        if self.stop_event.is_set() or self._paused_for_update():
+            return self._defer_for_update(row)
         if row["kind"] != "shop_sync":
             return self._process(row)
         account = self._resolve_account(row)
@@ -282,6 +297,8 @@ class JobConsumer:
 
     def _process(self, row, connection_lease=None) -> str:
         """Process one claimed row and return its terminal action."""
+        if self.stop_event.is_set() or self._paused_for_update():
+            return self._defer_for_update(row)
         if row["kind"] == "ops_run":
             return self._process_ops(row)
         if row["kind"] != "shop_sync":
@@ -397,6 +414,8 @@ class JobConsumer:
         return "completed"
 
     def run_once(self, *, now: float | None = None, kinds=None) -> int:
+        if self.stop_event.is_set() or self._paused_for_update():
+            return 0
         rows = self.db.claim_jobs(
             self.owner,
             limit=1,

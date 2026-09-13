@@ -11,6 +11,8 @@
 - `backend/version.py` 中的 `VERSION` 常量；
 - 前端静态资产版本号：`backend/version.py` 中的 `ASSET_VERSION`、`frontend/assets/app.js` 中的 `ASSET_VERSION` 以及 `frontend/index.html` 中各静态资源链接的 `?v=` 查询串。
 
+Docker 网页更新还会检查 `backend/version.py` 的 `UPDATE_DATA_VERSION`：相同的正整数表示这些版本能够双向读写同一份业务数据。数据库、配置或凭据格式发生不兼容变更时必须递增，不能重复使用旧值，并在发布说明中写明人工迁移步骤。标记缺失或不同会拒绝自动更新和回退；这是发布者的兼容性声明，不是对迁移脚本的自动证明。Docker 更新器不再自动冷备或预演全量业务数据，日常备份仍由部署者负责。
+
 ## 2. 发布前检查与门禁流程
 
 1. **更新日志维护**：在 `CHANGELOG.md` 中添加对应版本的正式章节（例如 `## [<version>] - YYYY-MM-DD`），准确记录本次版本的新增功能、变更事项与问题修复；
@@ -67,16 +69,29 @@ python scripts/build-release.py --ref HEAD --output ".local/releases/${VERSION}"
 
 ## 6. 发布产物清单
 
-每次正式发布包含以下 8 项标准产物：
-
-1. `xianyu-saas-<version>.tar.gz`：OTA 升级归档，适配 systemd 更新器白名单规范，内部无顶层包装目录，解压即为项目文件结构；
-2. `xianyu-saas-<version>.manifest.json`：归档清单，记录 OTA 包元数据以及内部每个文件的相对路径、大小、SHA-256 校验和与可执行权限；
-3. `xianyu-saas-<version>.manifest.sig`：对 `manifest.json` 全文的标准 Base64 格式 Ed25519 签名；
-4. `xianyu-saas-<version>-source.zip`：完整源码包，包含对应 Git commit 跟踪的全部源代码、Docker 构建文件与文档，包含 `xianyu-saas-<version>/` 顶层目录，不含运行时数据、私有配置与临时文件；
+### 已发布版本（v0.2.2 历史事实）
+历史发布的 `v0.2.2` 包含 8 项标准官方产物：
+1. `xianyu-saas-<version>.tar.gz`：OTA 升级归档，适配 systemd 更新器白名单规范；
+2. `xianyu-saas-<version>.manifest.json`：归档清单，记录 OTA 包元数据与文件哈希；
+3. `xianyu-saas-<version>.manifest.sig`：对 `manifest.json` 的 Ed25519 签名；
+4. `xianyu-saas-<version>-source.zip`：完整源码包，包含对应 Git commit 的全部源码、Docker 构建文件与文档；
 5. `xianyu-saas-<version>.update-signing.pub`：构建时从 commit 中提取的签名公钥副本；
 6. `release-notes.md`：从 `CHANGELOG.md` 中提取的当前版本更新说明；
-7. `artifacts.json`：构建元数据汇总文件，包含版本号、commit 哈希、公钥指纹以及 6 项内容资产（`tar.gz`、`manifest.json`、`manifest.sig`、`source.zip`、`pub`、`release-notes.md`）的大小与 SHA-256 校验和；
+7. `artifacts.json`：构建元数据汇总文件，包含公钥指纹以及 6 项内容资产的大小与校验和；
 8. `SHA256SUMS`：包含 6 项内容资产与 `artifacts.json` 共 7 项文件的 SHA-256 校验清单，不包含自身散列。
+
+### 后续正式版本（0.3.0+ 规划）
+未来正式版本扩展为 10 项标准产物（新增 2 项 Docker 升级签名资产）：
+1. `xianyu-saas-<version>.tar.gz`
+2. `xianyu-saas-<version>.manifest.json`
+3. `xianyu-saas-<version>.manifest.sig`
+4. `xianyu-saas-<version>-source.zip`
+5. `xianyu-saas-<version>.docker.manifest.json`：Docker 升级清单，将完整源码包与构建输入绑定至版本、提交散列、源码哈希与尺寸；
+6. `xianyu-saas-<version>.docker.manifest.sig`：对 `docker.manifest.json` 的 Ed25519 签名；
+7. `xianyu-saas-<version>.update-signing.pub`
+8. `release-notes.md`
+9. `artifacts.json`：汇总 8 项内容资产元数据（含上述 2 项 Docker 资产）；
+10. `SHA256SUMS`：覆盖除自身外的全部 9 项文件的 SHA-256 校验清单。
 
 ### 指纹与完整性校验规则
 - `artifacts.json` 中的 `public_key_fingerprint` 定义为原始 32 字节 Ed25519 公钥二进制数据的 SHA-256 哈希（格式为 `sha256:<hex>`）。该指纹计算对象为解码后的原始公钥字节，不采用 PEM 文本文件的散列；
@@ -87,7 +102,7 @@ python scripts/build-release.py --ref HEAD --output ".local/releases/${VERSION}"
 
 ## 7. 运行端更新与环境约束
 
-- **systemd 部署模式**：运行端首次配置并显式信任公钥（`deploy/update-signing.pub`）后，方可启用带签名校验的自动更新服务；
-- **Docker 部署模式**：当前 Docker 运行模式仅提供新版本检测与后台提示，容器更新需由管理员在宿主机通过 `docker compose build` 与 `docker compose up -d` 完成，升级过程保留原有数据卷与挂载，工作台网页不接管宿主机升级容器；
+- **systemd 部署模式**：运行端首次接入须由 root 使用生产虚拟环境 Python，依序完成独立更新器组件安装、离线基线导入（`--import-trusted-baseline` 传入刚好三个绝对资产路径，经本地预装公钥验签与 AST 静态语法核验 `MAINTENANCE_PROTOCOL=1`，不自动切换 current/不触碰业务数据）、人工切换现役软链接，以及通过显式受控环境变量执行 `--initialize`（配置 sticky `01770` 专用 IPC 目录并原子写入严格六字段的可信接入记录 `initialization.json`，校验 API 公钥、独立 bundle 固定 8 文件与 entrypoint，作为控制面放行升级的门禁）；实际路径需与服务模板及环境变量严格同步。本机仅静态与便携测试通过，真实 Linux/systemd 端到端动态验收仍在等待隔离验证环境；
+- **Docker 部署模式**：通用方式仍支持管理员在宿主机通过 `docker compose up -d --build` 手动构建升级；新规划的 `docker-compose.updates.yml` 独立更新器引入官方 Compose 5.5.1 执行层（Docker CLI 28.3.3 与 Buildx 0.26.1 保持固定），依赖 Docker Engine API v1.47，作为受信任的高权限组件挂载宿主机 Docker socket（`read_only` 属于文件系统挂载属性，更新器仍可借由 UNIX socket 调用高权限 Docker 引擎管理 API 完成镜像构建与重编排），Web 容器不挂载 socket。首次接入通过标准输入原字节向 `initialize` 子命令登记完整 Compose 配置，回滚支持重新创建旧版容器（容器 ID 可变，原配置与数据卷保持，绝不覆盖业务数据）。升级期间不支持并行执行外部容器变更，检测到配置漂移时保留维护现场转人工排查。所有真实 Linux/Docker 环境端到端验收仍在等待隔离引擎环境；
 - **生产环境验收**：代码与打包阶段的离线测试不能代替真实闲鱼账号会话、真实第三方大模型接口以及真实订单履约流程的现场验证；
 - **部署与权限参考**：完整的生产环境配置、数据卷挂载及权限要求参见 [`docs/DEPLOYMENT.md`](DEPLOYMENT.md)。

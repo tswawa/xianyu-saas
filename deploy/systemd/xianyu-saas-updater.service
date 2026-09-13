@@ -1,7 +1,9 @@
 [Unit]
 Description=Xianyu SaaS signed release updater
 After=local-fs.target network.target
-RequiresMountsFor=/opt/xianyu-saas /var/lib/xianyu-saas
+RequiresMountsFor=/opt/xianyu-saas /var/lib/xianyu-saas /var/lib/xianyu-saas-updater /var/lib/xianyu-saas-updates
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=oneshot
@@ -14,8 +16,19 @@ Environment=SAAS_CURRENT_LINK=/opt/xianyu-saas/current
 Environment=SAAS_RELEASES_DIR=/opt/xianyu-saas/releases
 Environment=SAAS_STATE_DIR=/var/lib/xianyu-saas
 Environment=SAAS_UPDATE_STAGING_DIR=/var/lib/xianyu-saas/update-staging
-Environment=SAAS_UPDATE_INTENT_FILE=/var/lib/xianyu-saas/update-intents/intent.json
-ExecStart=/opt/xianyu-saas/runtime/backend-venv/bin/python /opt/xianyu-saas/current/deploy/updater/updater.py
+Environment=SAAS_UPDATE_INTENT_FILE=/var/lib/xianyu-saas-updates/intent.json
+Environment=SAAS_UPDATER_STATE_DIR=/var/lib/xianyu-saas-updater
+Environment=SAAS_UPDATE_PUBLIC_KEY_FILE=/opt/xianyu-saas/updater/deploy/update-signing.pub
+Environment=SAAS_UPDATER_BUNDLE_ROOT=/opt/xianyu-saas/updater
+Environment=SAAS_UPDATER_ENTRYPOINT=/opt/xianyu-saas/updater/deploy/updater/updater.py
+# Install this independent, root-owned updater bundle once, including its
+# matching backend modules and pinned public key. It must not follow current
+# during code rollback and never imports candidate maintenance code.
+ExecStart=/opt/xianyu-saas/runtime/backend-venv/bin/python /opt/xianyu-saas/updater/deploy/updater/updater.py
+StateDirectory=xianyu-saas-updater
+StateDirectoryMode=0700
+Restart=on-failure
+RestartSec=5s
 TimeoutStartSec=15min
 UMask=0077
 
@@ -31,5 +44,5 @@ RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 RestrictNamespaces=true
 RestrictSUIDSGID=true
 LockPersonality=true
-CapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_FOWNER CAP_CHOWN
-ReadWritePaths=/opt/xianyu-saas /var/lib/xianyu-saas
+CapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_FOWNER CAP_CHOWN CAP_SETUID CAP_SETGID
+ReadWritePaths=/opt/xianyu-saas /var/lib/xianyu-saas /var/lib/xianyu-saas-updater /var/lib/xianyu-saas-updates

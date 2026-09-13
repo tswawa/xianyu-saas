@@ -75,3 +75,10 @@ flowchart LR
 - 系统的完整运行依赖 Linux 内核接口（特别是 Worker 进程管理、Linux `/proc` 资源采样、`pidfd`、`fcntl`、`setsid` 与 `RLIMIT_AS` 地址空间限制）；
 - Linux 生产环境推荐使用 Docker Compose 或 systemd 服务守护；
 - Windows 宿主机通过 Docker Linux 容器运行完整后端，不支持 Windows 原生直接运行依赖上述 Linux 内核特性的全部服务。
+
+### 6. 版本探测与平台更新体系（0.3.0 规划）
+- **低频版本探测协调**：由服务端 `update_probe.py` 协调，默认每 6 小时（`SAAS_UPDATE_CHECK_INTERVAL_SECONDS=21600`）异步查询一次发布源。采用全站共享数据库缓存与租约机制，防止多标签页与多用户重复发起外部请求；网页前端仅在可见时每 5 分钟读取本地版本缓存并驱动徽标提示，探测过程不执行静默下载或安装。
+- **权限隔离的独立更新器**：
+  - **Docker Compose 模式**：通过最后叠加 `docker-compose.updates.yml` 引入官方 Compose 5.5.1 执行层（CLI 与 Buildx 保持固定），Web 应用容器绝不挂载 Docker socket；仅独立更新器挂载宿主机 Docker socket（`read_only` 挂载属性仍可发起高权限管理 API 调用，属于受信组件）。宿主机通过标准输入以原字节向更新器 `initialize` 登记完整项目配置（严禁泄漏含凭据 JSON）。升级由官方 Compose 负责单应用（`--no-deps`）构建与停止/启动，更新器负责验签、冷备与维护排空；回滚重建旧版容器（容器 ID 可变，继承原配置与数据卷），绝不覆盖业务数据；
+  - **systemd 模式**：更新执行器由 root 运行于活动代码软链接（`current`）之外的独立更新目录中（使用包含依赖的生产虚拟环境 Python 解释器，实际路径与服务模板及环境变量保持同步）。首次接入通过 `--import-trusted-baseline` 导入已签名基线资产并由 AST 静态语法核验 `MAINTENANCE_PROTOCOL=1`，人工切换现役软链接后执行 `--initialize` 建立专用 sticky 01770 IPC 目录并原子写入严格六字段的可信接入记录（作为控制面放行升级的门禁），意图与私有日志保持 0600 私密权限；
+- **安全确认与阶段反馈**：升级流程在前端原生弹窗中由管理员输入密码并确认风险后提交（HTTP 202 仅表示受理），密码不写入浏览器持久存储，服务重启期间前端展示重连状态。注意：真实 Linux/Docker 升级与回滚的端到端集成测试仍在等待隔离引擎环境。

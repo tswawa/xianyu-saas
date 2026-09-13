@@ -76,7 +76,7 @@ SAAS_UI_SCOPE=docs-capture node tests/ui-check.mjs
   ```bash
   python3 scripts/build-release.py --ref HEAD --output .local/releases/test-build
   ```
-- **自动化发布工作流**：必须在 `main` 分支 CI 完整执行通过后，方可向仓库推送 `v*` 格式版本标签（例如 `v0.2.2`）；不能预先推签或提前假设通过。推送标签后触发 `.github/workflows/release.yml`，工作流复用 CI 门禁并调用打包脚本生成带数字签名的 8 项正式资产草稿，校验无误后正式发布；
+- **自动化发布工作流**：必须在 `main` 分支 CI 完整执行通过后，方可向仓库推送 `v*` 格式版本标签（例如 `v0.2.2`）；不能预先推签或提前假设通过。推送标签后触发 `.github/workflows/release.yml`，工作流复用 CI 门禁并调用打包脚本生成带数字签名的发布资产草稿（历史 v0.2.2 包含 8 项资产；后续 0.3.0+ 规划扩展为 10 项，包含 Docker 升级清单及签名），校验无误后正式发布；
 - **公钥与私钥分离**：签名公钥保存于 `deploy/update-signing.pub`，签名私钥仅由服务端 Actions Secret 托管，严禁将私钥以任何形式提交至代码仓库或打入分发包。
 
 ## 提交信息与 PR 规范

@@ -9,6 +9,7 @@ import os
 import sys
 import tempfile
 import time
+import types
 from pathlib import Path
 from unittest.mock import patch
 
@@ -29,6 +30,16 @@ os.environ.update(
         "SAAS_AUDIT_HMAC_KEY": "contract-audit-key",
     }
 )
+if os.name != "posix":
+    # The contract uses an isolated temporary DB and does not claim to verify
+    # the production POSIX supervisor lock. Fail if app requests any other API.
+    def portable_flock(_descriptor, flags):
+        assert flags == 3
+
+    sys.modules.setdefault(
+        "fcntl",
+        types.SimpleNamespace(LOCK_EX=1, LOCK_NB=2, flock=portable_flock),
+    )
 sys.path.insert(0, str(ROOT / "backend"))
 
 from fastapi.testclient import TestClient  # noqa: E402
@@ -55,6 +66,25 @@ def login(client: TestClient, username: str, password: str) -> str:
 
 
 def main() -> None:
+    route_methods = {}
+    for route in app.app.routes:
+        path = getattr(route, "path", "")
+        route_methods.setdefault(path, set()).update(getattr(route, "methods", set()) or set())
+    for method, path in (
+        ("POST", "/api/admin/confirm"),
+        ("GET", "/api/admin/updates"),
+        ("POST", "/api/admin/updates/check"),
+        ("POST", "/api/admin/updates/download"),
+        ("POST", "/api/admin/updates/apply"),
+        ("POST", "/api/admin/updates/rollback"),
+    ):
+        assert method in route_methods.get(path, set()), (method, path)
+    with patch.object(app, "start_services") as start, patch.object(app, "shutdown_services") as stop:
+        with TestClient(app.app) as lifecycle_client:
+            assert lifecycle_client.get("/api/version/public").status_code == 200
+        start.assert_called_once_with()
+        stop.assert_called_once_with()
+
     admin_id = app.db.create_user(
         "platform-admin", ADMIN_PASSWORD, role="admin"
     )
@@ -63,6 +93,52 @@ def main() -> None:
     owner_client = TestClient(app.app)
     admin_token = login(admin_client, "platform-admin", ADMIN_PASSWORD)
     owner_token = login(owner_client, "shop-owner", OWNER_PASSWORD)
+
+    account = app.db.ensure_default_shop_account(owner_id)
+    app.db.persist_worker_runtime(
+        owner_id, account["id"], desired_state="running", mode="rules",
+        state="waiting_login", pid=None, last_error="session_expired",
+    )
+    job = app.db.enqueue_job(
+        owner_id, "shop_sync", "maintenance-completed-read", account_id=account["id"],
+        payload={"replace_cookie": False, "cookie_fingerprint": "synthetic"}, max_attempts=1,
+    )
+    job_owner = "maintenance-completed-contract"
+    assert app.db.claim_job(job["id"], job_owner, lease_seconds=30) is not None
+    assert app.db.complete_job(job["id"], job_owner)
+    app.write_secret(
+        owner_id, "auth_status.json",
+        json.dumps({"code": "session_expired", "reauthorization_required": True}),
+        str(account["account_key"]),
+    )
+    auth_before = app.read_secret(owner_id, "auth_status.json", str(account["account_key"]))
+    runtime_before = dict(app.db.get_worker_runtime(owner_id, account["id"]))
+    changes_before = app.db.con.total_changes
+    snapshot = {"nickname": "维护期合成店铺", "product_count": 1,
+                "synced_at": "2026-09-12T00:00:00Z", "truncated": False}
+    with patch.object(app, "maintenance_active", return_value=True), \
+         patch.object(app, "load_verified_snapshot", return_value=snapshot), \
+         patch.object(app, "_autostart_account_worker", wraps=app._autostart_account_worker) as autostart, \
+         patch.object(app, "_acquire_account_lease") as acquire, \
+         patch.object(app, "_clear_auth_status") as clear_auth, \
+         patch.object(app, "_persist_worker_observation") as persist, \
+         patch.object(app, "bot_start") as start, \
+         patch.object(app, "bot_status", return_value={"running": False}):
+        completed = owner_client.get(f"/api/bot/jobs/{job['id']}")
+        assert completed.status_code == 200, completed.text
+        worker = completed.json()["result"]["worker"]
+        assert worker["desired_running"] is True
+        assert worker["code"] == "update_maintenance_active"
+        autostart.assert_not_called()
+        direct = autostart(owner_id, account)
+        assert direct["desired_running"] is True
+        acquire.assert_not_called()
+        clear_auth.assert_not_called()
+        persist.assert_not_called()
+        start.assert_not_called()
+    assert app.db.con.total_changes == changes_before
+    assert dict(app.db.get_worker_runtime(owner_id, account["id"])) == runtime_before
+    assert app.read_secret(owner_id, "auth_status.json", str(account["account_key"])) == auth_before
 
     denied = owner_client.get("/api/admin/settings")
     assert denied.status_code == 403
@@ -191,15 +267,27 @@ def main() -> None:
     assert unlock.status_code == 200
     assert app.db.username_lock_status(app._username_hash("platform-admin"))["locked"] is False
 
+    installed = SemVer.parse(VERSION)
+    target_version = f"{installed.major}.{installed.minor + 1}.0"
+    operation_id = "a" * 32
+    app.db.create_update_operation(
+        operation_id=operation_id, action="apply", version=target_version, channel=app.RELEASE_CHANNEL,
+        deployment="systemd", manifest_sha256="a" * 64, candidate_path="/isolated/candidate",
+        expected_current_version=VERSION, requested_by=owner_id,
+        session_digest=hashlib.sha256(promoted_token.encode()).hexdigest(), release_notes="verified",
+    )
+    confirmation_fields = {"action": "update.apply", "version": target_version, "operation_id": operation_id}
+    capabilities = {"deployment": "systemd", "check": True, "download": True, "apply": True,
+                    "rollback": True, "reason": ""}
     wrong_confirmation = promoted_client.post(
-        "/api/admin/confirm",
-        json={"password": "Wrong-Admin-Password!", "action": "update.apply"},
+        "/api/admin/confirm", json={"password": "Wrong-Admin-Password!", **confirmation_fields},
     )
     assert wrong_confirmation.status_code == 403
-    confirmation = promoted_client.post(
-        "/api/admin/confirm",
-        json={"password": OWNER_PASSWORD, "action": "update.apply"},
-    )
+    assert promoted_client.post("/api/admin/confirm", json={"password": OWNER_PASSWORD, "action": "update.apply"}).status_code == 422
+    with patch("platform_update.update_capabilities", return_value=capabilities), patch("platform_update.validate_candidate"):
+        confirmation = promoted_client.post(
+            "/api/admin/confirm", json={"password": OWNER_PASSWORD, **confirmation_fields},
+        )
     assert confirmation.status_code == 200, confirmation.text
     raw_confirmation = confirmation.json()["confirmation_token"]
     digest = hashlib.sha256(raw_confirmation.encode("utf-8")).hexdigest()
@@ -212,12 +300,13 @@ def main() -> None:
         ).fetchone()
     assert stored is not None
     assert leaked is None
-    assert app.db.consume_admin_confirmation(
-        raw_confirmation, owner_id, "update.apply"
-    )
-    assert not app.db.consume_admin_confirmation(
-        raw_confirmation, owner_id, "update.apply"
-    )
+    binding = {"session_token": promoted_token, "version": target_version,
+               "manifest_sha256": "a" * 64, "operation_id": operation_id}
+    assert not app.db.consume_admin_confirmation(raw_confirmation, owner_id, "update.apply")
+    assert not app.db.consume_admin_confirmation(raw_confirmation, owner_id, "update.rollback", **binding)
+    assert not app.db.consume_admin_confirmation(raw_confirmation, owner_id, "update.apply", **{**binding, "version": "9.9.9"})
+    assert app.db.consume_admin_confirmation(raw_confirmation, owner_id, "update.apply", **binding)
+    assert not app.db.consume_admin_confirmation(raw_confirmation, owner_id, "update.apply", **binding)
 
     injection = promoted_client.get(
         "/api/admin/audit?event_type=auth.login_succeeded%27%20OR%201=1--"
@@ -264,43 +353,69 @@ def main() -> None:
     app.db.upsert_platform_update(target_version, channel, "staged", candidate_path="/isolated/candidate",
                                   manifest_sha256="a" * 64, release_notes="verified")
     before = dict(app.db.get_platform_update(target_version, channel))
-    with patch.object(app, "inspect_public_releases", return_value=payload):
+    probe_clock = [time.time()]
+    app.update_probe.clock = lambda: probe_clock[0]
+    with patch.object(app, "inspect_public_releases", return_value=payload) as inspector:
         for _ in range(2):
             checked = promoted_client.post("/api/admin/updates/check")
             assert checked.status_code == 200, checked.text
             assert checked.json()["status"] == "available" and checked.json()["checked_at"] > 0
+        assert inspector.call_count == 1, "manual checks share the coordinator cooldown"
     assert dict(app.db.get_platform_update(target_version, channel)) == before
     for status in ("no_release", "current"):
-        result = {**payload, "status": status, "available": False}
+        probe_clock[0] += 61
+        result = {**payload, "status": status, "available": False,
+                  "version": "" if status == "no_release" else VERSION}
         with patch.object(app, "inspect_public_releases", return_value=result):
             assert promoted_client.post("/api/admin/updates/check").json()["status"] == status
         assert promoted_client.get("/api/admin/updates").json()["update_check"]["status"] == status
+    probe_clock[0] += 61
     with patch.object(app, "inspect_public_releases", side_effect=app.PlatformUpdateError("update_source_failed")):
         assert promoted_client.post("/api/admin/updates/check").status_code == 502
-    assert app.db.get_platform_update_check(channel)["status"] == "error"
+    assert app.db.get_platform_update_check(channel)["status"] == "current", "failure preserves the last successful discovery"
+    status_payload = promoted_client.get("/api/admin/updates").json()
+    assert status_payload["update_probe"]["error_code"] == "update_source_failed"
+    assert status_payload["update_probe"]["state"] == "error"
+    assert "operation" in status_payload
+    assert "update_probe" in promoted_client.get("/api/version").json()
+    assert set(promoted_client.get("/api/version/public").json()) == {"version", "asset_version"}
     assert dict(app.db.get_platform_update(target_version, channel)) == before
     other_channel = "stable" if channel == "beta" else "beta"
     assert app.db.get_platform_update_check(other_channel)["status"] == "unchecked"
-    with patch("platform_update.deployment_kind", return_value="docker"), patch.object(app, "write_update_intent") as intent:
+    rollback_op = "b" * 32
+    app.db.create_update_operation(
+        operation_id=rollback_op, action="rollback", version=target_version, channel=channel,
+        deployment="docker", manifest_sha256="b" * 64, expected_current_version=VERSION,
+        requested_by=owner_id, session_digest=hashlib.sha256(promoted_token.encode()).hexdigest(),
+    )
+    with patch("platform_update.deployment_kind", return_value="docker"), \
+         patch("platform_update.read_docker_capabilities", side_effect=app.PlatformUpdateError("update_service_unavailable")), \
+         patch("platform_update.write_update_intent") as intent:
         for action in ("download", "apply", "rollback"):
             data = {"version": target_version}
             if action != "download":
-                data["confirmation_token"] = "unused-confirmation-token"
+                data.update(confirmation_token="unused-confirmation-token",
+                            operation_id=rollback_op if action == "rollback" else operation_id)
             unsupported = promoted_client.post("/api/admin/updates/" + action, json=data)
             assert unsupported.status_code == 503, unsupported.text
-            assert unsupported.json()["detail"]["code"] == "update_installation_unsupported"
+            assert unsupported.json()["detail"]["code"] == "update_service_unavailable"
         intent.assert_not_called()
-    with patch.object(app, "update_capabilities", return_value={
-        "check": True, "download": True, "apply": True, "rollback": True, "reason": "",
-    }), patch.object(app, "validate_candidate"), patch.object(app, "write_update_intent", return_value={"queued": True}):
-        confirmation = promoted_client.post("/api/admin/confirm", json={"password": OWNER_PASSWORD, "action": "update.apply"})
-        applied = promoted_client.post("/api/admin/updates/apply", json={
-            "version": target_version, "confirmation_token": confirmation.json()["confirmation_token"],
-        })
+    with patch("platform_update.update_capabilities", return_value=capabilities), \
+         patch("platform_update.validate_candidate"), patch("platform_update.read_operation_status", return_value=None), \
+         patch("platform_update.write_update_intent", return_value={"queued": True}) as intent:
+        confirmation = promoted_client.post("/api/admin/confirm", json={"password": OWNER_PASSWORD, **confirmation_fields})
+        assert confirmation.status_code == 200, confirmation.text
+        body = {"version": target_version, "operation_id": operation_id,
+                "confirmation_token": confirmation.json()["confirmation_token"]}
+        applied = promoted_client.post("/api/admin/updates/apply", json=body)
         assert applied.status_code == 202, applied.text
+        assert applied.json()["status"] == "queued"
         assert app.db.get_platform_update(target_version, channel)["status"] == "apply_requested"
-        with patch.object(app, "inspect_public_releases", return_value=payload):
+        assert promoted_client.post("/api/admin/updates/apply", json=body).status_code == 202
+        assert intent.call_count == 1, "repeated submission must not publish a second request"
+        with patch.object(app, "inspect_public_releases", return_value=payload) as inspector:
             assert promoted_client.post("/api/admin/updates/check").status_code == 200
+            inspector.assert_not_called()
         assert app.db.get_platform_update(target_version, channel)["status"] == "apply_requested"
         assert promoted_client.post("/api/admin/updates/download", json={"version": unknown_version}).status_code == 409
     print("platform admin contract: ok")

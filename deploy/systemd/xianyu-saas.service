@@ -12,6 +12,8 @@ EnvironmentFile=/etc/xianyu-saas.env
 Environment=PYTHONDONTWRITEBYTECODE=1
 Environment=SAAS_CURRENT_ROOT=/opt/xianyu-saas/current
 Environment=SAAS_DEPLOYMENT_MODE=systemd
+Environment=SAAS_UPDATE_INTENT_FILE=/var/lib/xianyu-saas-updates/intent.json
+Environment=SAAS_UPDATE_STATUS_DIR=/var/lib/xianyu-saas-updates/status
 ExecStart=/opt/xianyu-saas/runtime/backend-venv/bin/uvicorn app:app --host 127.0.0.1 --port 8096 --proxy-headers --forwarded-allow-ips=127.0.0.1
 
 Restart=on-failure
@@ -21,7 +23,7 @@ KillMode=control-group
 UMask=0077
 StateDirectory=xianyu-saas
 StateDirectoryMode=0700
-ReadWritePaths=/var/lib/xianyu-saas
+ReadWritePaths=/var/lib/xianyu-saas -/var/lib/xianyu-saas-updates
 
 NoNewPrivileges=true
 ProtectSystem=strict

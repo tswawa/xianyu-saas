@@ -43,7 +43,8 @@ jobs:
           import re
           from pathlib import Path
           version = json.loads(Path("package.json").read_text())["version"]
-          if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?", version):
+          match = re.fullmatch(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?", version)
+          if not match or len(version) > 128 or any(part.isdigit() and len(part) > 1 and part[0] == "0" for part in (match.group(4) or "").split(".")):
               raise SystemExit("Invalid release version")
           if os.environ["RELEASE_TAG"] != "v" + version:
               raise SystemExit("Tag and package version differ")
@@ -52,6 +53,10 @@ jobs:
           PY
       - name: Install packaging dependencies
         run: python -m pip install -r backend/requirements.txt
+      - name: Verify signed source and release contracts
+        run: |
+          python -B tests/docker-update-protocol-contract.py
+          python -B tests/release-bundle-contract.py
       - name: Build signed packages
         env:
           RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
@@ -59,6 +64,49 @@ jobs:
           RELEASE_VERSION: ${{ steps.metadata.outputs.version }}
         run: |
           python scripts/build-release.py --ref "$RELEASE_COMMIT" --output ".local/releases/$RELEASE_VERSION"
+      - name: Validate complete signed bundle
+        env:
+          RELEASE_VERSION: ${{ steps.metadata.outputs.version }}
+        run: |
+          python -B - <<'PY'
+          import hashlib
+          import json
+          import os
+          import sys
+          import tempfile
+          from pathlib import Path
+          sys.path.insert(0, "backend")
+          from docker_update_protocol import docker_asset_names, verify_docker_manifest, extract_verified_source
+          version = os.environ["RELEASE_VERSION"]
+          base = "xianyu-saas-" + version
+          folder = Path(".local/releases") / version
+          source, descriptor, signature = docker_asset_names(version)
+          content = {base + ".tar.gz", base + ".manifest.json", base + ".manifest.sig",
+                     source, descriptor, signature, base + ".update-signing.pub", "release-notes.md"}
+          expected = content | {"artifacts.json", "SHA256SUMS"}
+          if len(expected) != 10 or {p.name for p in folder.iterdir()} != expected:
+              raise SystemExit("Release must contain exactly ten assets")
+          index = json.loads((folder / "artifacts.json").read_bytes())
+          if len(index["files"]) != 8 or {item["name"] for item in index["files"]} != content:
+              raise SystemExit("Release index must contain eight content assets")
+          for item in index["files"]:
+              path = folder / item["name"]
+              if path.stat().st_size != item["size"] or hashlib.sha256(path.read_bytes()).hexdigest() != item["sha256"]:
+                  raise SystemExit("Release index checksum mismatch")
+          lines = (folder / "SHA256SUMS").read_text().splitlines()
+          sums = dict(line.split("  ", 1)[::-1] for line in lines)
+          if len(lines) != 9 or set(sums) != expected - {"SHA256SUMS"}:
+              raise SystemExit("Release checksums must contain nine assets")
+          for name, digest in sums.items():
+              if hashlib.sha256((folder / name).read_bytes()).hexdigest() != digest:
+                  raise SystemExit("Release asset checksum mismatch")
+          manifest = verify_docker_manifest((folder / descriptor).read_bytes(), (folder / signature).read_bytes(),
+                                            Path("deploy/update-signing.pub").read_bytes(), version)
+          if manifest.commit != index["commit"] or manifest.runtime_manifest_sha256 != hashlib.sha256((folder / (base + ".manifest.json")).read_bytes()).hexdigest():
+              raise SystemExit("Docker and runtime release identity mismatch")
+          with tempfile.TemporaryDirectory(prefix="signed-source-check-") as private:
+              extract_verified_source(folder / source, Path(private) / "source", manifest)
+          PY
       - name: Retain validated packages
         uses: actions/upload-artifact@v4
         with:
@@ -81,11 +129,14 @@ jobs:
             "$dir/$base.manifest.json"
             "$dir/$base.manifest.sig"
             "$dir/$base-source.zip"
+            "$dir/$base.docker.manifest.json"
+            "$dir/$base.docker.manifest.sig"
             "$dir/$base.update-signing.pub"
             "$dir/release-notes.md"
             "$dir/artifacts.json"
             "$dir/SHA256SUMS"
           )
+          test "${#assets[@]}" -eq 10
           for asset in "${assets[@]}"; do
             test -s "$asset"
           done
@@ -105,4 +156,15 @@ jobs:
           else
             gh release create "$RELEASE_TAG" "${assets[@]}" --repo "$GITHUB_REPOSITORY" --draft --verify-tag --title "$RELEASE_TAG" --notes-file "$dir/release-notes.md" "${prerelease[@]}"
           fi
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json assets > "$RUNNER_TEMP/release-assets.json"
+          python - "$dir" "$RUNNER_TEMP/release-assets.json" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+          local = {path.name: path.stat().st_size for path in Path(sys.argv[1]).iterdir()}
+          uploaded = json.loads(Path(sys.argv[2]).read_text())["assets"]
+          remote = {asset["name"]: asset["size"] for asset in uploaded}
+          if len(local) != 10 or len(uploaded) != 10 or remote != local:
+              raise SystemExit("Draft must contain exactly the ten validated assets before publication")
+          PY
           gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false "${prerelease[@]}" "${latest[@]}"

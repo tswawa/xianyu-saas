@@ -1,0 +1,77 @@
+# 显式叠加且必须最后应用：docker compose -f docker-compose.yml -f <用户覆盖> -f docker-compose.updates.yml ...
+# 仅补充受控更新字段；保留用户的 /data、端口、env_file、资源约束与 container_name。
+# SAAS_UPDATE_PUBLIC_KEY_HOST_FILE 必须指向预先可信安装的公钥文件。
+services:
+  xianyu-saas:
+    image: ${COMPOSE_PROJECT_NAME:-xianyu-saas}-xianyu-saas:managed
+    pull_policy: never
+    build:
+      target: runtime
+    labels:
+      io.xianyu.updates.role: app
+    environment:
+      SAAS_DOCKER_UPDATE_ROOT: /updates
+      SAAS_DOCKER_DEPLOYMENT_ID: ${COMPOSE_PROJECT_NAME:-xianyu-saas}:xianyu-saas
+      SAAS_UPDATE_PUBLIC_KEY_FILE: /app/update-signing.pub
+    depends_on:
+      xianyu-updater:
+        condition: service_started
+    volumes:
+      - type: volume
+        source: update-ipc
+        target: /updates
+      - type: bind
+        source: ${SAAS_UPDATE_PUBLIC_KEY_HOST_FILE:?Set the preinstalled trusted public key path}
+        target: /app/update-signing.pub
+        read_only: true
+        bind:
+          create_host_path: false
+
+  xianyu-updater:
+    image: ${COMPOSE_PROJECT_NAME:-xianyu-saas}-xianyu-updater:local
+    pull_policy: never
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: updater
+    restart: unless-stopped
+    user: "0:0"
+    read_only: true
+    # Buildx 客户端鉴权需要出站访问公开镜像仓库；不发布端口或操作 API。
+    network_mode: bridge
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER]
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=64m,mode=1777
+    labels:
+      io.xianyu.updates.role: updater
+    environment:
+      SAAS_DOCKER_APP_SERVICE: xianyu-saas
+      SAAS_DOCKER_UPDATE_ROOT: /updates
+      SAAS_DOCKER_UPDATER_STATE_DIR: /var/lib/xianyu-updater
+      SAAS_UPDATE_PUBLIC_KEY_FILE: /app/update-signing.pub
+    volumes:
+      - type: bind
+        source: /var/run/docker.sock
+        target: /var/run/docker.sock
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: volume
+        source: update-ipc
+        target: /updates
+      - type: volume
+        source: updater-private
+        target: /var/lib/xianyu-updater
+      - type: bind
+        source: ${SAAS_UPDATE_PUBLIC_KEY_HOST_FILE:?Set the preinstalled trusted public key path}
+        target: /app/update-signing.pub
+        read_only: true
+        bind:
+          create_host_path: false
+
+volumes:
+  update-ipc:
+  updater-private:

@@ -31,12 +31,15 @@
 - [ ] Docker 镜像构建正常：`docker compose build`；
 - [ ] 容器启动后健康检查正常响应：`GET /health` 返回 200；
 - [ ] 挂载数据卷 `./data` 能持久化数据库与各店铺配置文件；
-- [ ] Windows 部署说明明确通过 Docker Linux 容器运行完整服务，不宣称 Windows 原生直接运行依赖 `fcntl` 等内核特性的全部服务。
+- [ ] Windows 部署说明明确通过 Docker Linux 容器运行完整服务，不宣称 Windows 原生直接运行依赖 `fcntl` 等内核特性的全部服务；
+- [ ] （0.3.0 规划）Docker 更新器组件 `docker-compose.updates.yml` 语法与权限规范校验正常；引入官方 Compose 5.5.1 执行层（CLI 28.3.3、Buildx 0.26.1 保持固定），依赖 Docker Engine API v1.47，Web 容器不挂载 Docker socket，仅独立更新器作为受信高权限组件挂载 `/var/run/docker.sock`（挂载属性 `read_only` 仍可调用 Docker 管理 API）；宿主机支持以 stdin 原字节执行 `initialize` 配置登记；回滚支持重新创建旧版容器（容器 ID 可变，配置与数据卷保留，绝不覆盖业务数据）；注意：所有真实 Linux/Docker 容器升级与回滚端到端验收目前仍在等待隔离引擎/CI 环境，不可提前标记为已通过；
+- [ ] （0.3.0 规划）systemd 独立更新服务与基线接入规范核验正常；首次接入须由 root 依序完成独立 bundle 安装、离线 `--import-trusted-baseline`（AST 静态语法核验 `MAINTENANCE_PROTOCOL=1`，不自动切换 current/不触碰业务数据）、人工切换现役软链接及显式受控环境变量 `--initialize` 生成严格六字段的可信接入记录（`status/initialization.json`，匹配公钥、固定 8 文件 bundle 与 entrypoint，作为控制面放行升级的门禁）；真实 Linux/systemd 运行端动态验收仍在等待隔离环境，不可提前标记为已通过。
 
 ## 6. 版本发布与制品完整性检查
-- [ ] 版本号一致性：`package.json`、`package-lock.json` 与 `backend/version.py` 版本号一致（如 `0.2.2`）；
+- [ ] 版本号一致性：`package.json`、`package-lock.json` 与 `backend/version.py` 版本号一致（当前为 `0.2.2`，开发中规划为 `0.3.0`）；
 - [ ] 签名密钥分离：签名私钥由 GitHub Actions secret `RELEASE_SIGNING_KEY` 托管，公钥保存于 `deploy/update-signing.pub`，严禁将私钥打入任何安装包或源码；
 - [ ] 自动化打包工作流：明确 `main` 分支 CI 成功后方可推送版本标签（不能预先勾选成功或提前推签）；标签推送后触发 `.github/workflows/release.yml`，复用 CI 验证并自动执行 `scripts/build-release.py` 生成发布草稿；
-- [ ] 发行资产齐全（共 8 项）：`xianyu-saas-0.2.2.tar.gz`、`xianyu-saas-0.2.2.manifest.json`、`xianyu-saas-0.2.2.manifest.sig`、`xianyu-saas-0.2.2-source.zip`、`xianyu-saas-0.2.2.update-signing.pub`、`release-notes.md`、`artifacts.json`、`SHA256SUMS`；
-- [ ] 资产用途明确：`source.zip` 包含完整安全源码，用于 Docker 或手动部署；`tar.gz` + `manifest.json` + `manifest.sig` 专供签名 systemd 更新器；
-- [ ] 校验和与公钥指纹：`SHA256SUMS` 覆盖 6 项内容资产与 `artifacts.json` 共 7 项制品（不包含自身散列）；`artifacts.json` 中的 `public_key_fingerprint` 为原始 32 字节 Ed25519 公钥二进制的 SHA-256 摘要（带 `sha256:` 前缀，与直接计算 PEM 文本哈希不同）。
+- [ ] 历史发版资产（v0.2.2 共 8 项）：`xianyu-saas-0.2.2.tar.gz`、`manifest.json`、`manifest.sig`、`source.zip`、`update-signing.pub`、`release-notes.md`、`artifacts.json`、`SHA256SUMS`（`SHA256SUMS` 覆盖 6 项内容资产与 `artifacts.json` 共 7 项制品，不含自身）；
+- [ ] 后续正式发版资产（0.3.0+ 规划共 10 项）：在原有 8 项基础上增加对应版本的 `.docker.manifest.json` 与 `.docker.manifest.sig`；`artifacts.json` 记录 8 项内容资产元数据；`SHA256SUMS` 覆盖除自身外的全部 9 项文件；
+- [ ] 资产用途明确：`source.zip` 包含完整安全源码，用于 Docker 或手动部署；`tar.gz` + `manifest.json` + `manifest.sig` 专供签名 systemd 更新器；`.docker.manifest.json` + `.sig` 专供 Docker 独立更新器校验；
+- [ ] 校验和与公钥指纹：`artifacts.json` 中的 `public_key_fingerprint` 为原始 32 字节 Ed25519 公钥二进制的 SHA-256 摘要（带 `sha256:` 前缀，与直接计算 PEM 文本哈希不同）。

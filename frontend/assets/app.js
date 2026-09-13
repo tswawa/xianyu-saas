@@ -4,7 +4,7 @@
 
   const API_PREFIX = "/xianyu-saas";
   const QR_LOGIN_POLL_MS = 1500;
-  const ASSET_VERSION = "20260911-01";
+  const ASSET_VERSION = "20260913-01";
   const AI_TEXT_PLACEHOLDERS = new Set(["无", "暂无", "没有", "未填写", "待填写", "待补充", "占位", "n/a", "na", "none", "null", "todo", "tbd"]);
   const ICONS = API_PREFIX + "/assets/icons.svg?v=" + ASSET_VERSION + "#";
   // 旧版视图 key → 新版视图 key（历史会话/书签兜底）。
@@ -48,6 +48,7 @@
     bot: null,
     version: null,
     versionUpdate: null,
+    platformUpdate: null,
     versionLoadedPublic: false,
     settingsAi: {
       connection: null,
@@ -2822,6 +2823,7 @@
   }
 
   function clearSession(showMessage = true) {
+    resetPlatformUpdates();
     resetQrLogin();
     stopMerchantPolling();
     ["xianyuLoginDialog", "quickRepliesDialog", "batchDeliveryDialog", "templateEditorDialog", "cardsEditorDialog", "confirmDialog", "docsHelpModal"].forEach(closeDialog);
@@ -3251,6 +3253,7 @@
   }
 
   function renderAccount() {
+    ensurePlatformUpdateSession();
     const username = state.me?.username || "店主";
     text("#userAvatarBadge", username.slice(0, 1).toUpperCase());
   }
@@ -6754,60 +6757,36 @@
     };
   }
 
-  async function runUpdateAction(action, perform, successMessage) {
-    const docs = state.docs;
-    const caps = docs.update?.capabilities || docs.version?.capabilities || {};
-    if (docs.operation || docs.loading.version || docs.errors.version || !isPlatformAdmin() || (action !== "check" && caps[action] !== true)) return;
-    const username = state.me.username;
-    const valid = () => state.docs === docs && state.me?.username === username && isPlatformAdmin();
-    docs.operation = action;
-    docs.requests.version = (docs.requests.version || 0) + 1;
-    stopDocsPolling();
-    renderVersionPanel();
-    formMessage("#updateActionMessage", action === "check" ? "正在查询项目发布信息…" : "正在处理，请勿重复提交…");
-    try {
-      const result = await perform(valid);
-      if (!valid()) return;
-      if (action === "check") {
-        if (docs.version) docs.version.update_check = result;
-        if (docs.update) docs.update.update_check = result;
-        state.versionUpdate = { update_check: result };
-        renderVersionBadge();
-      }
-      formMessage("#updateActionMessage", successMessage, true);
-    } catch (error) {
-      if (!valid()) return;
-      if (action === "check") {
-        const failed = { status: "error", available: false, current_version: docs.version?.version, checked_at: Date.now() / 1000 };
-        if (docs.version) docs.version.update_check = failed;
-        if (docs.update) docs.update.update_check = failed;
-        state.versionUpdate = { update_check: failed };
-        renderVersionBadge();
-      }
-      formMessage("#updateActionMessage", error.message || "操作失败，请重试");
-    } finally {
-      if (state.docs === docs) {
-        docs.operation = "";
-        docs.loaded.version = false;
-        if ((action === "apply" || action === "rollback") && $("#updateAdminPassword")) $("#updateAdminPassword").value = "";
-        if (valid()) {
-          docs.pollAttempts = 0;
-          renderVersionPanel();
-          renderVersionBadge();
-          if (docs.tab === "version" && state.view === "settings") await loadDocsData({ force: true });
-        }
-      }
-    }
-  }
-
   async function checkPlatformUpdate() {
-    const refreshBtn = $("#versionBadgeRefresh");
-    if (refreshBtn) setBusy(refreshBtn, true);
+    const session = ensurePlatformUpdateSession();
+    if (!session || !isPlatformAdmin() || session.manual) return;
+    const probe = state.versionUpdate?.update_probe || state.version?.update_probe || {};
+    if (Number(probe.manual_cooldown_until || 0) * 1000 > Date.now()) {
+      session.probeError = UPDATE_UI_COPY.messages.probe_cooldown;
+      renderPlatformUpdate();
+      return;
+    }
+    session.manual = true;
+    const generation = ++session.generation;
+    setBusy($("#versionBadgeRefresh"), true);
     try {
-      await runUpdateAction("check", () => api("/api/admin/updates/check", { method: "POST" }), "检查完成，结果见上方发布状态。");
+      const result = await api("/api/admin/updates/check", { method: "POST", suppressSessionReset: true });
+      if (!platformUpdateSessionMatches(session) || generation !== session.generation) return;
+      session.probeError = "";
+      applyVersionSnapshot(session, state.version, { ...state.versionUpdate, update_check: result, update_probe: result.update_probe || state.versionUpdate?.update_probe });
+      session.cacheAt = Date.now();
+    } catch (error) {
+      if (!platformUpdateSessionMatches(session) || generation !== session.generation) return;
+      session.probeError = updateErrorMessage(error, "probe_failed");
+      applyVersionSnapshot(session, state.version, { ...state.versionUpdate, update_check: { status: "error", available: false } });
     } finally {
-      if (refreshBtn) setBusy(refreshBtn, false);
-      renderVersionBadge();
+      if (platformUpdateSessionMatches(session) && generation === session.generation) {
+        session.manual = false;
+        setBusy($("#versionBadgeRefresh"), false);
+        renderVersionBadge();
+        renderPlatformUpdate();
+        scheduleVersionCacheRefresh(session);
+      }
     }
   }
 
@@ -6851,7 +6830,7 @@
     if (state.publicVersionRequest) return state.publicVersionRequest;
     state.publicVersionRequest = (async () => {
       try {
-        const version = await api("/api/version/public");
+        const version = await api("/api/version/public", { suppressSessionReset: true });
         if (!version?.version) return;
         state.publicVersion = version;
         state.versionLoadedPublic = true;
@@ -6864,26 +6843,438 @@
     return state.publicVersionRequest;
   }
 
+  const VERSION_CACHE_REFRESH_MS = 5 * 60 * 1000;
+  const UPDATE_OPERATION_POLL_MS = 4000;
+  const UPDATE_READ_TIMEOUT_MS = 15000;
+  // Reader-facing copy is owned by AGY (.local/update-ui-copy.json).
+  const UPDATE_UI_COPY = {
+    deployments: { docker_compose: "Docker Compose 容器部署", systemd: "systemd 服务部署", source: "源码手动部署", unknown: "未知部署方式" },
+    phases: {
+      staged: "升级包已就绪", queued: "排队中", verifying_package: "校验升级包与签名", building: "构建新镜像", preflighting: "升级预检",
+      preparing: "准备运行环境", stopping: "停止旧服务", backing_up: "备份运行时数据", switching: "切换新版本服务", verifying: "验证服务健康与数据库",
+      succeeded: "升级成功", rolling_back: "正在回退至旧版本", rolled_back: "已安全回退至旧版本", failed: "升级失败", recovery_failed: "恢复失败，需人工排查",
+    },
+    messages: {
+      loading: "正在获取版本与更新状态...", unchecked: "尚未检查更新", no_update: "当前已是最新版本，无需更新",
+      updater_missing: "未检测到独立更新器，请参考文档为当前环境安装并启动更新组件", source_manual: "源码部署不支持网页自动升级，请拉取最新代码手动构建",
+      preparing: "正在下载并校验升级制品，请稍候...", confirm_password: "升级需要验证管理员身份，请输入当前管理员密码", risk_required: "请勾选确认已知晓升级风险",
+      reconnecting: "服务正在重启与健康检查，正在尝试重新连接...", completed: "系统升级已完成，请重新加载界面以应用最新资源", restored: "升级未完成，系统已安全回退至上一稳定版本",
+      failed: "升级失败，请查看下方具体原因或服务端日志", probe_failed: "版本检查失败，无法连接到更新源", probe_cooldown: "检查过于频繁，请稍后再试",
+      confirm_expired: "身份确认已过期，请重新输入密码确认", download_failed: "升级制品下载失败，请检查网络连接后重试", signature_failed: "升级包签名校验失败，制品已被拒绝",
+      recovery_failed: "自动恢复失败，系统处于维护状态，请查看服务端日志进行人工处理", unknown_error: "发生未知错误，请稍后重试或查看服务端日志",
+    },
+    errors: {
+      update_in_progress: "已有正在进行的更新任务，请等待完成", authentication_failed: "管理员密码错误或身份验证失败", permission_denied: "权限不足，仅管理员可执行升级操作",
+      signature_verification_failed: "升级包数字签名校验失败", signature_missing: "缺少升级包数字签名文件", manifest_invalid: "升级清单格式无效",
+      manifest_version_mismatch: "升级清单版本与目标版本不一致", manifest_sha_mismatch: "升级清单校验和不匹配", source_sha_mismatch: "源码包校验和不匹配",
+      unsupported_deployment: "当前部署方式不支持网页自动升级", updater_unhealthy: "更新器未运行或响应超时", updater_missing: "未安装或未启用独立更新器",
+      target_version_invalid: "目标版本号格式不合法", already_latest_version: "当前已是最新版本", preflight_check_failed: "升级预检失败，当前环境不满足升级条件",
+      build_failed: "新版本镜像构建失败", switch_failed: "切换新服务容器失败", health_check_failed: "新版本服务健康检查未通过", rollback_failed: "回滚到旧版本失败",
+      confirmation_expired: "确认令牌已失效，请重新确认", confirmation_invalid: "确认信息不匹配或已失效", maintenance_active: "系统处于维护模式，暂不可执行新更新",
+      rate_limited: "请求过于频繁，请稍后再试", download_failed: "下载升级资产失败", download_too_large: "升级文件超出允许的最大体积", network_error: "网络连接失败，无法访问更新服务器",
+      database_unavailable: "控制面数据库不可用", release_version_invalid: "发布版本号格式无效", update_source_rejected: "更新源不受信任或已被拒绝",
+      update_source_auth_failed: "更新源身份验证失败", update_release_not_found: "未找到指定的发布版本", update_source_rate_limited: "更新源访问频次超限，请稍后重试",
+      update_source_failed: "访问更新源失败", update_redirect_rejected: "更新源重定向目标不受信任", update_source_invalid: "更新源返回数据无效",
+      update_download_size_mismatch: "下载文件大小与清单声明不符", update_staging_failed: "升级制品暂存写入失败", release_assets_invalid: "发布制品结构或文件格式不合法",
+      release_assets_missing: "发布版本缺少必要的升级制品", update_channel_invalid: "更新渠道无效", update_public_key_missing: "服务端未配置更新签名公钥",
+      update_public_key_invalid: "更新签名公钥格式无效", update_service_unavailable: "更新服务暂不可用", update_installation_unavailable: "当前环境不具备自动升级条件",
+      update_operation_invalid: "更新操作标识或参数无效", update_not_staged: "目标版本的升级包尚未下载就绪", update_probe_failed: "版本检查失败，无法连接到更新源",
+      update_probe_cooldown: "版本检查过于频繁，请稍后再试", update_interrupted: "更新执行被意外中断", update_executor_error: "更新执行器内部错误",
+      update_executor_busy: "更新执行器繁忙，已有其他任务占用", update_request_expired: "更新请求已过期", update_invalid_admin: "操作发起人管理员身份无效",
+      update_downgrade_rejected: "不能安装当前版本或更旧版本", update_current_version_changed: "当前运行版本已发生变化，更新终止", update_current_version_mismatch: "当前运行版本已发生变化，请重新准备更新",
+      update_rollback_not_verified: "指定的回滚版本未通过可信校验", update_target_not_unique: "目标服务容器不唯一，无法安全升级", update_unsafe_permissions: "更新目录权限不符合安全要求",
+      update_unsafe_file: "升级文件包含不安全路径或符号链接", update_artifact_too_large: "升级制品大小超出安全限制", update_manifest_mismatch: "升级清单与实际制品不符",
+      update_dependency_change_rejected: "发布制品包含未审批的依赖变化", update_signature_invalid: "发布签名校验失败", update_artifact_hash_mismatch: "发布制品完整性校验失败",
+      update_archive_hash_mismatch: "发布文件完整性校验失败", update_intent_pending: "已有更新操作等待执行", update_candidate_invalid: "候选版本已失效，请重新下载",
+      update_installation_unsupported: "此部署方式不支持网页安装，请按部署说明更新", update_already_staged: "该版本已经下载校验，无需重复下载", update_busy: "已有安装或回滚操作正在进行，请先查看执行状态",
+      update_maintenance_active: "系统更新维护中，暂不接受新的业务操作", update_service_stale: "独立更新器心跳已过期，请联系维护者", update_protocol_mismatch: "独立更新器协议不匹配，请联系维护者",
+      update_deployment_mismatch: "独立更新器与当前部署不匹配", update_public_key_mismatch: "独立更新器与应用的签名公钥不匹配", update_version_changed: "发布版本已变化，请重新检查",
+      rollback_version_unavailable: "该回退版本或已验证制品当前不可用", update_lock_lost: "更新租约已失效，请重试并查看现有操作状态", update_maintenance_protocol_unsupported: "当前或目标版本缺少维护协议，请先人工接入可信新版本基线",
+      confirmation_action_invalid: "确认操作无效", reauthentication_failed: "管理员密码校验失败", update_database_unavailable: "升级状态数据库不可用",
+      update_lock_unavailable: "更新锁暂时不可用", update_not_available: "暂无可用的更新版本", update_release_exists: "目标更新版本已存在",
+      update_version_already_current: "目标版本与当前运行版本一致，无需更新", update_download_too_large: "升级文件超出允许的最大体积", update_manifest_invalid: "升级清单格式无效",
+      update_manifest_version_mismatch: "升级清单版本与目标版本不一致", docker_public_key_invalid: "Docker 更新公钥配置无效", docker_protocol_unsupported: "Docker 更新协议不受支持",
+      update_cli_invalid: "更新命令行参数无效", update_root_required: "执行更新操作需要 root 权限", update_import_path_invalid: "导入的基线资产路径无效或不唯一",
+      update_intent_owner_unavailable: "无法解析更新意图所属应用用户身份", update_service_command_failed: "执行服务管理命令失败", update_state_release_overlap: "状态目录与版本发布目录重叠，配置不合法",
+      update_staging_release_overlap: "暂存目录与版本发布目录重叠，配置不合法", update_current_layout_invalid: "现役版本软链接结构不合法", update_service_name_invalid: "服务单元名称不合法",
+      update_private_layout_invalid: "私有更新状态目录结构不合法", update_status_layout_invalid: "公开状态目录结构不合法", update_intent_expiry_invalid: "更新意图过期时间配置无效",
+      update_runtime_layout_invalid: "运行时目录结构不合法", update_directory_invalid: "更新相关目录不合法", update_directory_untrusted: "更新目录权限或属主不符合安全要求",
+      update_journal_invalid: "更新事务日志损坏或不合法", update_nonce_conflict: "更新凭据标识冲突，请重试", update_recovery_required: "系统处于异常恢复状态，请先执行故障恢复",
+      update_current_missing: "未找到现役版本软链接", update_current_invalid: "现役版本软链接目标无效", update_archive_path_invalid: "升级归档包内路径不合法",
+      update_runtime_path_rejected: "升级包内包含受保护或不允许的文件路径", update_lock_invalid: "更新锁文件无效", update_already_running: "已有更新任务正在运行中",
+      update_updater_not_initialized: "独立更新器尚未完成可信初始化，请先在服务端完成基线初始化", update_updater_identity_mismatch: "独立更新器文件身份与初始化记录不一致，已被系统拒绝",
+      update_compose_not_initialized: "Docker 更新器尚未完成 Compose 部署配置登记，请先在宿主机执行初始化登记", update_compose_unavailable: "Docker Compose 插件不可用或未正确安装", update_compose_version_mismatch: "Docker Compose 插件版本不符合要求（须为 5.5.1）",
+      update_compose_registration_invalid: "Compose 部署登记记录格式无效或已损坏", update_compose_config_invalid: "Compose 配置文件格式无效或解析失败", update_compose_configuration_unsupported: "Compose 配置包含不受支持的拓扑结构、依赖或字段",
+      update_compose_config_mismatch: "输入的 Compose 配置与当前运行的容器不匹配", update_compose_config_changed: "Compose 部署配置发生未登记的变更", update_compose_resource_changed: "数据卷、网络或挂载身份发生未登记的变更",
+      update_compose_bind_source_invalid: "Compose 目录挂载源路径无效或未通过验证", update_compose_literal_roundtrip_failed: "Compose 配置内容无法原样保留，请检查特殊字符或变量格式", update_compose_command_failed: "执行 Docker Compose 管理命令失败",
+      update_required_mounts_missing: "缺少必需的应用数据卷或挂载点配置", update_updater_mounts_invalid: "更新器容器挂载点配置不合法", update_public_key_mount_mismatch: "更新公钥挂载路径与系统配置不一致",
+      update_recovery_alias_conflict: "回退镜像别名冲突，请检查本地镜像标签", update_compose_config_too_large: "Compose 配置文件体积超出允许上限", update_compose_initialization_conflict: "系统已有登记记录或更新历史，不支持重复初始化",
+      update_invalid_cli: "更新器命令行子命令或参数无效",
+      update_data_version_unknown: "当前或目标镜像未声明数据兼容版本，请按部署说明手动升级",
+      update_data_backward_incompatible: "目标版本与当前数据格式不兼容，已停止自动更新，请按发布说明手动迁移",
+    },
+  };
+  const UPDATE_PHASE_ALIASES = { apply_requested: "queued", rollback_requested: "queued", applied: "succeeded", migrating: "preflighting" };
+  const UPDATE_TERMINAL_PHASES = new Set(["succeeded", "rolled_back", "failed", "recovery_failed"]);
+
+  function updateIdentity() {
+    return state.me ? JSON.stringify([state.me.id, state.me.username, state.me.role, isPlatformAdmin()]) : "";
+  }
+
+  function platformUpdateSessionMatches(session) {
+    return Boolean(session && state.platformUpdate === session && state.docs === session.docs && session.identity === updateIdentity());
+  }
+
+  function resetPlatformUpdates() {
+    const previous = state.platformUpdate;
+    if (previous) {
+      window.clearTimeout(previous.cacheTimer);
+      window.clearTimeout(previous.pollTimer);
+    }
+    state.platformUpdate = null;
+    $("#updatePasswordForm")?.reset();
+    closeDialog("platformUpdateDialog");
+    setBusy($("#versionBadgeRefresh"), false);
+  }
+
+  function ensurePlatformUpdateSession() {
+    if (!state.me) return null;
+    if (platformUpdateSessionMatches(state.platformUpdate)) return state.platformUpdate;
+    resetPlatformUpdates();
+    state.versionUpdate = null;
+    state.version = state.publicVersion || null;
+    state.docs.version = null;
+    state.docs.badgeLoaded = false;
+    state.docs.update = null;
+    const session = state.platformUpdate = {
+      identity: updateIdentity(), docs: state.docs, generation: 0, cacheAt: 0, cacheAttemptAt: 0, cacheTimer: 0, loading: false, manual: false,
+      confirmedCheck: null, error: "", probeError: "", stage: null, operation: null, operationRevision: 0, pollTimer: 0, pollLoading: false,
+      dialogEpoch: 0, busy: "", submitted: false, reconnecting: false,
+    };
+    scheduleVersionCacheRefresh(session);
+    renderVersionBadge();
+    return session;
+  }
+
+  function scheduleVersionCacheRefresh(session) {
+    if (!platformUpdateSessionMatches(session)) return;
+    window.clearTimeout(session.cacheTimer);
+    session.cacheTimer = 0;
+    if (document.hidden) return;
+    const lastRead = Math.max(session.cacheAt, session.cacheAttemptAt) || Date.now();
+    session.cacheTimer = window.setTimeout(() => {
+      if (platformUpdateSessionMatches(session) && !document.hidden) void loadVersionInfo({ force: true });
+    }, Math.max(1, VERSION_CACHE_REFRESH_MS - (Date.now() - lastRead)));
+  }
+
+  function updateErrorMessage(error, fallback = "unknown_error") {
+    const code = String(error?.code || error?.error_code || "");
+    return UPDATE_UI_COPY.errors[code] || (error?.status === 401 ? UPDATE_UI_COPY.errors.authentication_failed : UPDATE_UI_COPY.messages[fallback]);
+  }
+
+  function updatePhase(operation) {
+    const status = UPDATE_PHASE_ALIASES[operation?.status] || operation?.status;
+    if (UPDATE_TERMINAL_PHASES.has(status)) return status;
+    return UPDATE_PHASE_ALIASES[operation?.phase] || operation?.phase || status || "";
+  }
+
+  function updateOperationActive(session) {
+    return Boolean(session?.submitted || (session?.operation && !UPDATE_TERMINAL_PHASES.has(updatePhase(session.operation))));
+  }
+
+  function applyVersionSnapshot(session, version, update) {
+    const current = version || state.version || {};
+    let check = update?.update_check || current.update_check || {};
+    const failed = check.status === "error" || check.error_code || check.error;
+    if (failed && isConfirmedHigherRelease(session.confirmedCheck, current.version)) check = session.confirmedCheck;
+    else session.confirmedCheck = isConfirmedHigherRelease(check, current.version) ? check : null;
+    session.docs.version = state.version = { ...current, update_check: check };
+    session.docs.update = state.versionUpdate = update ? { ...update, update_check: check } : null;
+    session.docs.badgeLoaded = true;
+    renderVersionBadge();
+    renderPlatformUpdate();
+  }
+
   async function loadVersionInfo({ force = false } = {}) {
     if (!state.me) { await loadPublicVersionOnce(); return; }
-    const docs = state.docs;
-    if (docs.badgeLoading || (!force && docs.badgeLoaded)) return;
-    const username = state.me.username;
-    const admin = isPlatformAdmin();
-    const valid = () => state.docs === docs && state.me?.username === username && isPlatformAdmin() === admin;
-    docs.badgeLoading = true;
+    const session = ensurePlatformUpdateSession();
+    if (document.hidden || (session.loading && session.loading === session.generation) || session.manual || (!force && session.docs.badgeLoaded)) return;
+    const generation = ++session.generation;
+    const operationRevision = session.operationRevision;
+    session.loading = generation;
+    session.cacheAttemptAt = Date.now();
     try {
       const [version, update] = await Promise.all([
-        api("/api/version"), admin ? api("/api/admin/updates") : Promise.resolve(null),
+        api("/api/version", { suppressSessionReset: true, timeoutMs: UPDATE_READ_TIMEOUT_MS }),
+        isPlatformAdmin() ? api("/api/admin/updates", { suppressSessionReset: true, timeoutMs: UPDATE_READ_TIMEOUT_MS }) : Promise.resolve(null),
       ]);
-      if (!valid()) return;
-      docs.version = state.version = version;
-      docs.update = state.versionUpdate = update;
-      docs.badgeLoaded = true;
-      renderVersionBadge();
+      if (!platformUpdateSessionMatches(session) || generation !== session.generation) return;
+      session.cacheAt = Date.now();
+      session.probeError = "";
+      applyVersionSnapshot(session, version, update);
+      if (operationRevision === session.operationRevision) acceptUpdateOperation(session, update?.operation);
     } catch (error) {
-      if (valid()) formMessage("#versionLoadMessage", error.message || "版本信息读取失败");
-    } finally { if (valid()) docs.badgeLoading = false; }
+      if (platformUpdateSessionMatches(session) && generation === session.generation) {
+        session.probeError = updateErrorMessage(error, "probe_failed");
+        renderPlatformUpdate();
+      }
+    } finally {
+      if (platformUpdateSessionMatches(session) && session.loading === generation) {
+        session.loading = false;
+        renderVersionBadge();
+        scheduleVersionCacheRefresh(session);
+      }
+    }
+  }
+
+  function updateCapabilities() {
+    return state.versionUpdate?.capabilities || state.version?.capabilities || {};
+  }
+
+  function updateRollbackCandidates() {
+    const candidates = state.versionUpdate?.rollback_versions;
+    return Array.isArray(candidates) ? candidates.filter((item) => item && typeof item === "object" && parseSemVer(item.version) && /^[a-f0-9]{64}$/.test(item.manifest_sha256)) : [];
+  }
+
+  function updateActionAllowed(action) {
+    const caps = updateCapabilities();
+    return isPlatformAdmin() && caps[action] === true && caps.ready !== false && (action === "rollback" || caps.download === true);
+  }
+
+  function renderPlatformUpdate() {
+    const session = state.platformUpdate;
+    if (!platformUpdateSessionMatches(session)) return;
+    const caps = updateCapabilities();
+    const check = state.versionUpdate?.update_check || state.version?.update_check || {};
+    const operation = session.operation;
+    const phase = updatePhase(operation);
+    const active = updateOperationActive(session);
+    const target = session.stage?.version || operation?.version || (isConfirmedHigherRelease(check, state.version?.version) ? check.version : "");
+    text("#updateCurrentVersion", state.version?.version || "--");
+    text("#updateTargetVersion", target || "--");
+    text("#updateDeployment", UPDATE_UI_COPY.deployments[caps.deployment === "docker" ? "docker_compose" : caps.deployment] || UPDATE_UI_COPY.deployments.unknown);
+    text("#updateReleaseNotes", session.stage?.release_notes || check.release_notes || state.version?.release_notes || "");
+    let readiness = !session.docs.badgeLoaded ? UPDATE_UI_COPY.messages.loading : !updateActionAllowed("apply")
+      ? (caps.deployment === "source" ? UPDATE_UI_COPY.messages.source_manual : updateErrorMessage({ code: caps.reason || caps.error_code }, "updater_missing"))
+      : target ? "" : check.status === "current" ? UPDATE_UI_COPY.messages.no_update : UPDATE_UI_COPY.messages.unchecked;
+    const probe = state.versionUpdate?.update_probe || state.version?.update_probe;
+    if (probe?.state === "error") readiness = updateErrorMessage(probe, "probe_failed");
+    if (session.stage) readiness = UPDATE_UI_COPY.messages.confirm_password;
+    if (session.busy === "prepare") readiness = UPDATE_UI_COPY.messages.preparing;
+    text("#updateReadinessMessage", session.error || readiness || session.probeError);
+    const download = $("#updateDownloadButton");
+    if (download) { download.hidden = !isPlatformAdmin() || Boolean(session.stage) || active; download.disabled = Boolean(session.busy) || !target || !updateActionAllowed("apply"); }
+    const form = $("#updatePasswordForm");
+    if (form) form.hidden = !session.stage || active || !isPlatformAdmin();
+    const confirm = $("#updateConfirmButton");
+    if (confirm) confirm.disabled = Boolean(session.busy) || !session.stage || !updateActionAllowed(session.stage?.action);
+    if ($("#updateAdminPassword")) $("#updateAdminPassword").disabled = Boolean(session.busy);
+    if ($("#updateConfirmRisk")) $("#updateConfirmRisk").disabled = Boolean(session.busy);
+    const progress = $("#updateProgress");
+    if (progress) progress.hidden = !operation && !session.reconnecting;
+    text("#updatePhaseLabel", UPDATE_UI_COPY.phases[phase] || UPDATE_UI_COPY.messages.loading);
+    const operationMessage = session.reconnecting ? UPDATE_UI_COPY.messages.reconnecting
+      : phase === "succeeded" ? UPDATE_UI_COPY.messages.completed : phase === "rolled_back" ? (operation.action === "rollback" ? UPDATE_UI_COPY.phases.rolled_back : UPDATE_UI_COPY.messages.restored)
+        : phase === "recovery_failed" ? UPDATE_UI_COPY.messages.recovery_failed : operation?.error_code ? updateErrorMessage(operation)
+          : phase === "failed" ? UPDATE_UI_COPY.messages.failed : UPDATE_UI_COPY.phases[phase] || "";
+    text("#updateOperationMessage", operationMessage);
+    if ($("#updateReloadButton")) $("#updateReloadButton").hidden = !["succeeded", "rolled_back"].includes(phase);
+    if ($("#updateRetryButton")) $("#updateRetryButton").hidden = active || !["failed", "recovery_failed"].includes(phase);
+    const rollback = $("#updateRollbackSelect");
+    if (rollback) {
+      const selected = rollback.value;
+      const candidates = updateRollbackCandidates();
+      const show = isPlatformAdmin() && candidates.length > 0 && !active && !session.stage;
+      rollback.closest(".update-rollback-card").hidden = !show;
+      rollback.hidden = !show;
+      rollback.innerHTML = candidates.map((item) => '<option value="' + esc(item.version) + '">' + esc(item.version) + '</option>').join("");
+      if (candidates.some((item) => item.version === selected)) rollback.value = selected;
+      rollback.disabled = Boolean(session.busy);
+      $("#updateRollbackButton").hidden = !show;
+      $("#updateRollbackButton").disabled = Boolean(session.busy) || !updateActionAllowed("rollback");
+    }
+  }
+
+  function trapPlatformUpdateFocus(event) {
+    if (event.key !== "Tab") return;
+    const dialog = event.currentTarget;
+    const focusable = $$('a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])', dialog)
+      .filter((node) => !node.hidden && node.getClientRects().length > 0 && getComputedStyle(node).visibility !== "hidden");
+    if (!focusable.length) return;
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (event.shiftKey && (document.activeElement === first || !dialog.contains(document.activeElement))) {
+      event.preventDefault();
+      last.focus({ preventScroll: true });
+    } else if (!event.shiftKey && (document.activeElement === last || !dialog.contains(document.activeElement))) {
+      event.preventDefault();
+      first.focus({ preventScroll: true });
+    }
+  }
+
+  function closePlatformUpdate(event) {
+    if (event?.type === "close" && $("#platformUpdateDialog")?.open) return;
+    const session = state.platformUpdate;
+    $("#updatePasswordForm")?.reset();
+    if (!session) return;
+    session.dialogEpoch += 1;
+    if (!session.submitted) { session.stage = null; session.busy = ""; }
+    session.error = "";
+    if (event?.type === "close") $("#versionBadgeButton")?.focus({ preventScroll: true });
+  }
+
+  function openPlatformUpdate() {
+    if (!isPlatformAdmin()) return;
+    const session = ensurePlatformUpdateSession();
+    session.dialogEpoch += 1;
+    closeVersionBadgePopover();
+    openDialog("platformUpdateDialog");
+    renderPlatformUpdate();
+    $("#updateDialogClose")?.focus({ preventScroll: true });
+    void loadVersionInfo({ force: true });
+  }
+
+  async function preparePlatformUpdate(action = "apply") {
+    const session = ensurePlatformUpdateSession();
+    if (!session || session.busy || session.stage || updateOperationActive(session) || !updateActionAllowed(action) || !$("#platformUpdateDialog")?.open) return;
+    const candidate = action === "rollback" ? updateRollbackCandidates().find((item) => item.version === $("#updateRollbackSelect")?.value) : null;
+    const check = state.versionUpdate?.update_check || state.version?.update_check;
+    const version = action === "rollback" ? candidate?.version : isConfirmedHigherRelease(check, state.version?.version) ? check.version : "";
+    if (!version) return;
+    const epoch = session.dialogEpoch;
+    const valid = () => platformUpdateSessionMatches(session) && session.dialogEpoch === epoch && $("#platformUpdateDialog")?.open && isPlatformAdmin();
+    session.busy = "prepare";
+    session.error = "";
+    session.reconnecting = false;
+    session.operationRevision += 1;
+    renderPlatformUpdate();
+    try {
+      const result = await api("/api/admin/updates/download", { method: "POST", body: JSON.stringify({ version, action }), suppressSessionReset: true });
+      if (!valid()) return;
+      if (result.status !== "staged" || result.version !== version || !/^[a-f0-9]{32}$/.test(result.operation_id) || !/^[a-f0-9]{64}$/.test(result.manifest_sha256)
+        || (candidate && candidate.manifest_sha256 !== result.manifest_sha256)) throw new ApiError(UPDATE_UI_COPY.messages.unknown_error, 502, "manifest_invalid");
+      session.stage = { ...result, action };
+      session.operation = null;
+      $("#updatePasswordForm")?.reset();
+    } catch (error) {
+      if (valid()) session.error = updateErrorMessage(error, "download_failed");
+    } finally {
+      if (valid()) {
+        session.busy = "";
+        renderPlatformUpdate();
+        if (session.stage) $("#updateAdminPassword")?.focus({ preventScroll: true });
+      }
+    }
+  }
+
+  async function confirmPlatformUpdate(event) {
+    event.preventDefault();
+    const session = ensurePlatformUpdateSession();
+    const stage = session?.stage;
+    if (!stage || session.busy || !updateActionAllowed(stage.action) || !$("#platformUpdateDialog")?.open) return;
+    if (!$("#updateConfirmRisk").checked) { session.error = UPDATE_UI_COPY.messages.risk_required; renderPlatformUpdate(); return; }
+    let password = $("#updateAdminPassword").value;
+    if (!password) { session.error = UPDATE_UI_COPY.messages.confirm_password; renderPlatformUpdate(); return; }
+    const epoch = session.dialogEpoch;
+    const valid = () => platformUpdateSessionMatches(session) && session.dialogEpoch === epoch && session.stage === stage && $("#platformUpdateDialog")?.open && isPlatformAdmin();
+    session.busy = "confirm";
+    session.error = "";
+    renderPlatformUpdate();
+    let token = "";
+    let didSubmit = false;
+    try {
+      const confirmation = await api("/api/admin/confirm", { method: "POST", body: JSON.stringify({ password, action: "update." + stage.action, version: stage.version, operation_id: stage.operation_id }), suppressSessionReset: true });
+      password = "";
+      if (!valid()) return;
+      $("#updateAdminPassword").value = "";
+      token = confirmation.confirmation_token || confirmation.confirmation_id || "";
+      if (!token || (confirmation.operation_id && confirmation.operation_id !== stage.operation_id)) throw new ApiError(UPDATE_UI_COPY.errors.confirmation_invalid, 403, "confirmation_invalid");
+      // From this point closing the dialog only hides it: the operation may
+      // already be queued even when a service restart interrupts the response.
+      session.submitted = true;
+      didSubmit = true;
+      session.operationRevision += 1;
+      session.operation = { operation_id: stage.operation_id, action: stage.action, version: stage.version, status: "submitting", phase: "" };
+      renderPlatformUpdate();
+      scheduleUpdateOperationPoll(session);
+      const queued = await api("/api/admin/updates/" + stage.action, { method: "POST", body: JSON.stringify({ version: stage.version, operation_id: stage.operation_id, confirmation_token: token }), suppressSessionReset: true });
+      if (!platformUpdateSessionMatches(session)) return;
+      const acknowledged = queued.operation || queued;
+      const completed = UPDATE_TERMINAL_PHASES.has(updatePhase(acknowledged));
+      if ((!completed && acknowledged.status !== "queued" && queued.queued !== true) || (acknowledged.operation_id && acknowledged.operation_id !== stage.operation_id)) throw new ApiError(UPDATE_UI_COPY.messages.unknown_error, 502);
+      if (!completed && !UPDATE_TERMINAL_PHASES.has(updatePhase(session.operation))) session.operation = { ...session.operation, status: "queued", phase: "queued" };
+      session.stage = null;
+      session.error = "";
+      // A duplicate submission may return its terminal state with HTTP 200;
+      // read the operation endpoint before displaying installation success.
+      if (completed) void pollUpdateOperation(session);
+    } catch (error) {
+      if (!platformUpdateSessionMatches(session)) return;
+      if (didSubmit && UPDATE_TERMINAL_PHASES.has(updatePhase(session.operation))) return;
+      if (session.submitted && (!error.status || error.status >= 500 || error.status === 408)) session.reconnecting = true;
+      else if (session.submitted || valid()) {
+        session.submitted = false;
+        session.operation = null;
+        if (!valid()) session.stage = null;
+        session.error = updateErrorMessage(error);
+      }
+    } finally {
+      password = "";
+      token = "";
+      if (platformUpdateSessionMatches(session) && (didSubmit || valid())) {
+        $("#updateAdminPassword").value = "";
+        session.busy = "";
+        renderPlatformUpdate();
+        if (session.submitted) scheduleUpdateOperationPoll(session);
+      }
+    }
+  }
+
+  function acceptUpdateOperation(session, operation) {
+    if (!operation || !platformUpdateSessionMatches(session) || !isPlatformAdmin()) return;
+    const id = String(operation.operation_id || operation.id || "");
+    if (!id || ["staged", "available"].includes(operation.status) || (session.stage && !session.submitted) || session.busy === "prepare") return;
+    if (session.operation && String(session.operation.operation_id || session.operation.id) !== id && updateOperationActive(session)) return;
+    if (session.operation?.operation_id === id && UPDATE_TERMINAL_PHASES.has(updatePhase(session.operation)) && updatePhase(session.operation) !== updatePhase(operation)) return;
+    const wasTerminal = session.operation?.operation_id === id && UPDATE_TERMINAL_PHASES.has(updatePhase(session.operation));
+    session.operation = { ...operation, operation_id: id };
+    session.operationRevision += 1;
+    session.reconnecting = false;
+    const terminal = UPDATE_TERMINAL_PHASES.has(updatePhase(operation));
+    session.submitted = !terminal;
+    if (terminal) {
+      session.stage = null;
+      if (!wasTerminal) {
+        session.generation += 1;
+        session.cacheAt = 0;
+        session.manual = false;
+        setBusy($("#versionBadgeRefresh"), false);
+      }
+      window.clearTimeout(session.pollTimer);
+    } else scheduleUpdateOperationPoll(session);
+    renderPlatformUpdate();
+  }
+
+  function scheduleUpdateOperationPoll(session) {
+    if (!platformUpdateSessionMatches(session) || !isPlatformAdmin() || !updateOperationActive(session)) return;
+    window.clearTimeout(session.pollTimer);
+    session.pollTimer = window.setTimeout(() => void pollUpdateOperation(session), UPDATE_OPERATION_POLL_MS);
+  }
+
+  async function pollUpdateOperation(session) {
+    if (!platformUpdateSessionMatches(session) || session.pollLoading || !isPlatformAdmin()) return;
+    session.pollLoading = true;
+    const revision = session.operationRevision;
+    try {
+      const update = await api("/api/admin/updates", { suppressSessionReset: true, timeoutMs: UPDATE_READ_TIMEOUT_MS });
+      if (!platformUpdateSessionMatches(session) || revision !== session.operationRevision) return;
+      acceptUpdateOperation(session, update?.operation);
+      if (!updateOperationActive(session)) void loadVersionInfo({ force: true });
+    } catch (_) {
+      if (platformUpdateSessionMatches(session)) { session.reconnecting = true; renderPlatformUpdate(); }
+    } finally {
+      if (platformUpdateSessionMatches(session)) { session.pollLoading = false; scheduleUpdateOperationPoll(session); }
+    }
   }
 
   const SEMVER_RE = /^v?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z.-]+)?$/;
@@ -6944,15 +7335,97 @@
     return isHigherVersion(check.version, currentVersion);
   }
 
+  function renderVersionBadgeRollback() {
+    const rollbackSection = $("#versionRollbackDetails");
+    const divider = $("#versionRollbackDivider");
+    if (!isPlatformAdmin()) {
+      if (rollbackSection) rollbackSection.hidden = true;
+      if (divider) divider.hidden = true;
+      return;
+    }
+    if (rollbackSection) rollbackSection.hidden = false;
+    if (divider) divider.hidden = false;
+
+    const listEl = $("#versionRollbackList");
+    const actionRow = $("#versionRollbackActionRow");
+    const rollbackBtn = $("#versionPopoverRollbackBtn");
+    const candidates = updateRollbackCandidates();
+    const canRollback = updateActionAllowed("rollback");
+    const session = state.platformUpdate;
+    const hasLoaded = Boolean(state.versionUpdate || session?.cacheAt);
+    const isLoading = Boolean(session?.loading || (!hasLoaded && !session?.probeError));
+    const hasError = Boolean(session?.probeError);
+
+    if (isLoading) {
+      if (listEl) {
+        listEl.innerHTML = '<p class="version-rollback-empty">正在获取回退历史...</p>';
+      }
+      if (actionRow) actionRow.hidden = true;
+      return;
+    }
+
+    if (hasError) {
+      if (listEl) {
+        listEl.innerHTML = '<p class="version-rollback-empty">获取回退记录失败</p>';
+      }
+      if (actionRow) actionRow.hidden = true;
+      return;
+    }
+
+    if (!candidates || candidates.length === 0) {
+      if (listEl) {
+        listEl.innerHTML = '<p class="version-rollback-empty">暂无可回退版本</p>';
+      }
+      if (actionRow) actionRow.hidden = true;
+      return;
+    }
+
+    const displayCandidates = candidates.slice(0, 3);
+    const existingSelected = $('input[name="versionRollbackChoice"]:checked', listEl)?.value;
+    const selectedVersion = displayCandidates.some((c) => c.version === existingSelected)
+      ? existingSelected
+      : displayCandidates[0].version;
+
+    if (listEl) {
+      listEl.innerHTML = displayCandidates.map((item) => {
+        const isChecked = item.version === selectedVersion ? "checked" : "";
+        const rawDate = item.date || item.release_date || item.published_at || item.created_at;
+        const dateHtml = (rawDate && typeof rawDate === "string")
+          ? '<span class="version-rollback-date">' + esc(rawDate.slice(0, 10)) + '</span>'
+          : "";
+        return (
+          '<label class="version-rollback-item">' +
+            '<input type="radio" name="versionRollbackChoice" value="' + esc(item.version) + '" ' + isChecked + '>' +
+            '<span class="version-rollback-ver">v' + esc(item.version) + '</span>' +
+            dateHtml +
+          '</label>'
+        );
+      }).join("");
+    }
+
+    if (actionRow) actionRow.hidden = false;
+    if (rollbackBtn) {
+      rollbackBtn.disabled = !canRollback;
+      const caps = updateCapabilities();
+      if (!canRollback && caps.reason) {
+        rollbackBtn.title = updateErrorMessage({ code: caps.reason || caps.error_code }, "updater_missing");
+      } else {
+        rollbackBtn.removeAttribute("title");
+      }
+    }
+  }
+
   function renderVersionBadge() {
     const versionObj = state.version || state.docs?.version || {};
     const updateObj = state.versionUpdate || state.docs?.update || {};
     const check = updateObj.update_check || versionObj.update_check || {};
+    const probe = updateObj.update_probe || versionObj.update_probe || check.update_probe || {};
     const curVer = versionObj.version ? "v" + versionObj.version : "v--";
+    const currentVersion = typeof versionObj.version === "string" ? versionObj.version : "";
     text("#versionBadgeValue", curVer);
     text("#versionBadgeCurrent", versionObj.version ? "v" + versionObj.version : "--");
 
-    const hasHigher = isConfirmedHigherRelease(check, versionObj.version);
+    const hasHigher = isConfirmedHigherRelease(check, currentVersion);
     const hasUpdate = Boolean(state.me && hasHigher);
     const btn = $("#versionBadgeButton");
     const dot = $("#versionBadgeDot");
@@ -6964,31 +7437,88 @@
     if (dot) dot.hidden = !hasUpdate;
 
     let statusText = "尚未检查";
+    let isUpToDate = false;
+
+    const isVersionMismatch = Boolean(check.current_version && currentVersion && check.current_version !== currentVersion);
+    const hasValidCurrentSemVer = Boolean(currentVersion && parseSemVer(currentVersion));
+    const hasValidCheckSemVer = Boolean(check.version && parseSemVer(check.version));
+
     if (hasHigher) {
-      statusText = "发现新版本 v" + (check.version || "");
+      statusText = "发现更高版本 v" + (check.version || "");
+    } else if (probe.state === "error" && probe.has_success !== true) {
+      statusText = UPDATE_UI_COPY.messages.probe_failed;
     } else if (check.status === "incomplete") {
       statusText = "发现更高版本（安装包不完整）";
     } else if (check.status === "no_release") {
       statusText = "尚无发布版本";
     } else if (check.status === "error" || check.error_code || check.error) {
       statusText = "更新检查失败";
-    } else if (check.status === "current" || check.status === "available") {
-      statusText = "未发现更高版本，无需更新";
+    } else if (isVersionMismatch) {
+      statusText = "更新检查失败";
+    } else if (check.status === "current") {
+      if (!check.error && !check.error_code && (!check.current_version || check.current_version === currentVersion)) {
+        statusText = "已是最新版本，无需更新";
+        isUpToDate = true;
+      } else {
+        statusText = "更新检查失败";
+      }
+    } else if (check.status === "available" && check.available === true && !check.error && !check.error_code && !isVersionMismatch) {
+      if (hasValidCurrentSemVer && hasValidCheckSemVer && compareSemVer(check.version, currentVersion) <= 0) {
+        statusText = "未发现更高版本，无需更新";
+        isUpToDate = true;
+      } else {
+        statusText = "更新检查数据无效";
+      }
     }
     text("#versionBadgeStatus", statusText);
+
+    const statusIcon = $("#versionBadgeStatusIcon");
+    if (statusIcon) statusIcon.hidden = !isUpToDate;
+
+    const canUpgrade = isPlatformAdmin() && hasHigher;
+    const updateBtn = $("#versionBadgeUpdate");
+    const updateActions = $("#versionBadgeUpdateActions");
+    if (updateBtn) {
+      updateBtn.hidden = !canUpgrade;
+      if (canUpgrade && check.version) {
+        text("#versionBadgeUpdateText", "立即升级到 v" + check.version);
+      }
+    }
+    if (updateActions) {
+      updateActions.hidden = !canUpgrade;
+    }
+
+    const session = state.platformUpdate;
+    const operation = session?.operation || state.versionUpdate?.operation;
+    const hasOp = Boolean(isPlatformAdmin() && (operation || session?.reconnecting));
+    const opBtn = $("#versionBadgeOperation");
+    const opWrap = $("#versionBadgeOperationContainer");
+    if (opBtn) {
+      opBtn.hidden = !hasOp;
+      if (hasOp) {
+        const phase = updatePhase(operation);
+        const isDone = ["succeeded", "rolled_back"].includes(phase);
+        text("#versionBadgeOperationText", isDone ? "查看更新结果" : "查看更新进度");
+      }
+    }
+    if (opWrap) {
+      opWrap.hidden = !hasOp;
+    }
 
     const refreshBtn = $("#versionBadgeRefresh");
     if (refreshBtn) {
       const admin = isPlatformAdmin();
       refreshBtn.hidden = !admin;
     }
-    const relLink = $("#versionBadgeReleaseLink");
+    const relLink = $("#versionBadgeDetails") || $("#versionBadgeReleaseLink");
     if (relLink) {
       relLink.hidden = false;
       relLink.href = "https://github.com/tswawa/xianyu-saas/releases";
       relLink.target = "_blank";
       relLink.rel = "noopener noreferrer";
     }
+
+    renderVersionBadgeRollback();
   }
 
   function toggleVersionBadgePopover(force) {
@@ -6998,13 +7528,23 @@
     const shouldOpen = typeof force === "boolean" ? force : popover.hidden;
     popover.hidden = !shouldOpen;
     button?.setAttribute("aria-expanded", String(shouldOpen));
+    if (shouldOpen) {
+      renderVersionBadge();
+      if (isPlatformAdmin() && !state.versionUpdate) {
+        void loadVersionInfo();
+      }
+    }
   }
 
-  function closeVersionBadgePopover() {
+  function closeVersionBadgePopover(options = {}) {
     const popover = $("#versionBadgePopover");
     const button = $("#versionBadgeButton");
-    if (popover) popover.hidden = true;
+    if (!popover || popover.hidden) return;
+    popover.hidden = true;
     button?.setAttribute("aria-expanded", "false");
+    if (options?.restoreFocus) {
+      button?.focus({ preventScroll: true });
+    }
   }
 
   async function loadUnifiedAiConnection() {
@@ -8719,11 +9259,54 @@
     });
     $("#versionBadgeClose")?.addEventListener("click", (e) => {
       e.stopPropagation();
-      closeVersionBadgePopover();
+      closeVersionBadgePopover({ restoreFocus: true });
     });
     $("#versionBadgeRefresh")?.addEventListener("click", (e) => {
       e.stopPropagation();
       void checkPlatformUpdate();
+    });
+    $("#versionBadgeUpdate")?.addEventListener("click", openPlatformUpdate);
+    $("#versionBadgeOperation")?.addEventListener("click", openPlatformUpdate);
+    $("#versionPopoverRollbackBtn")?.addEventListener("click", () => {
+      if (!isPlatformAdmin() || !updateActionAllowed("rollback")) return;
+      const selected = $('input[name="versionRollbackChoice"]:checked', $("#versionRollbackList"))?.value;
+      if (!selected) return;
+      closeVersionBadgePopover();
+      const rollbackSelect = $("#updateRollbackSelect");
+      if (rollbackSelect) {
+        rollbackSelect.value = selected;
+      }
+      openPlatformUpdate();
+      if (rollbackSelect) {
+        rollbackSelect.value = selected;
+      }
+      void preparePlatformUpdate("rollback");
+    });
+    $("#updateDownloadButton")?.addEventListener("click", () => void preparePlatformUpdate("apply"));
+    $("#updateRollbackButton")?.addEventListener("click", () => void preparePlatformUpdate("rollback"));
+    $("#updatePasswordForm")?.addEventListener("submit", confirmPlatformUpdate);
+    $("#platformUpdateDialog")?.addEventListener("keydown", trapPlatformUpdateFocus);
+    $("#platformUpdateDialog")?.addEventListener("close", closePlatformUpdate);
+    $("#platformUpdateDialog")?.addEventListener("cancel", closePlatformUpdate);
+    $("#updateReloadButton")?.addEventListener("click", () => {
+      if (isPlatformAdmin() && ["succeeded", "rolled_back"].includes(updatePhase(state.platformUpdate?.operation))) window.location.reload();
+    });
+    $("#updateRetryButton")?.addEventListener("click", () => {
+      const session = ensurePlatformUpdateSession();
+      if (!session || !isPlatformAdmin() || updateOperationActive(session)) return;
+      session.operation = null;
+      session.stage = null;
+      session.error = "";
+      renderPlatformUpdate();
+      void loadVersionInfo({ force: true });
+    });
+    document.addEventListener("visibilitychange", () => {
+      const session = ensurePlatformUpdateSession();
+      if (!session) return;
+      window.clearTimeout(session.cacheTimer);
+      if (document.hidden) return;
+      if (!session.cacheAt || Date.now() - session.cacheAt >= VERSION_CACHE_REFRESH_MS) void loadVersionInfo({ force: true });
+      else scheduleVersionCacheRefresh(session);
     });
     document.addEventListener("click", (event) => {
       const container = event.target.closest(".version-badge-container");
@@ -8731,7 +9314,7 @@
     });
     document.addEventListener("keydown", (event) => {
       if (event.key === "Escape") {
-        closeVersionBadgePopover();
+        closeVersionBadgePopover({ restoreFocus: true });
       }
     });
 

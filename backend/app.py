@@ -21,6 +21,7 @@ import stat
 import threading
 import time
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -61,7 +62,7 @@ from bot_manager import (
     process_id as bot_process_id,
     read_secret,
     shutdown_all,
-    start as bot_start,
+    start as _bot_start_unchecked,
     start_watchdog,
     status as bot_status,
     stop as bot_stop,
@@ -111,6 +112,9 @@ from shop_sync import (
 )
 from shop_sync_service import ShopConnectionCoordinator, ShopSyncPersistenceError, run_shop_sync_inner
 from version import RELEASE_CHANNEL, local_release_notes, version_payload
+from update_api import UpdateAPI
+from update_probe import ProbeCoordinator, ProbeError
+from update_maintenance import MaintenanceWatcher, maintenance_active, read_maintenance
 from user_ai_connection import UserAIConnections
 from operations import OperationsService, OperationsError
 from xianyu_login import XianyuLoginError, XianyuLoginManager
@@ -238,7 +242,45 @@ fulfillment_config = FulfillmentConfig(ai_service.storage)
 runtime_settings = RuntimeSettings(db)
 worker_manager.configure_resource_limits(runtime_settings.read)
 shop_resources = ShopResources(db, runtime_settings, worker_manager.managed_resource_snapshot, worker_manager._expected_worker_pid)
-app = FastAPI(title="xianyu-saas-api", docs_url=None, redoc_url=None)
+def _probe_interval_seconds():
+    try:
+        interval = int(os.environ.get("SAAS_UPDATE_CHECK_INTERVAL_SECONDS", "21600"))
+        return interval if 60 <= interval <= 604800 else 21600
+    except (TypeError, ValueError):
+        return 21600
+
+
+update_api = UpdateAPI(db, lambda: version_payload(RELEASE_CHANNEL)["version"], channel=RELEASE_CHANNEL)
+update_probe = ProbeCoordinator(
+    db, lambda version: inspect_public_releases(version),
+    lambda: version_payload(RELEASE_CHANNEL)["version"], channel=RELEASE_CHANNEL,
+    interval_seconds=_probe_interval_seconds(),
+    is_paused=lambda: maintenance_active() or db.active_update_operation() is not None or db.active_platform_update() is not None,
+)
+_business_write_lock = threading.Lock()
+_business_writes = 0
+_worker_maintenance_lock = threading.RLock()
+
+
+def bot_start(*args, **kwargs):
+    # Serialize the final maintenance check/spawn against the watcher's stop.
+    # In-flight HTTP work admitted before maintenance cannot spawn after drain.
+    with _worker_maintenance_lock:
+        if maintenance_active():
+            return False, "update_maintenance_active"
+        return _bot_start_unchecked(*args, **kwargs)
+
+
+@asynccontextmanager
+async def service_lifespan(_app):
+    start_services()
+    try:
+        yield
+    finally:
+        shutdown_services()
+
+
+app = FastAPI(title="xianyu-saas-api", docs_url=None, redoc_url=None, lifespan=service_lifespan)
 
 
 @app.exception_handler(RequestValidationError)
@@ -527,8 +569,10 @@ def _require_public_write_origin(request: Request) -> None:
 
 @app.middleware("http")
 async def security_headers(request: Request, call_next):
+    global _business_writes
     method = request.method.upper()
     response = None
+    counted = False
     if (
         method not in {"GET", "HEAD", "OPTIONS"}
         and request.url.path.startswith("/api/")
@@ -543,8 +587,23 @@ async def security_headers(request: Request, call_next):
                 status_code=exc.status_code,
                 headers=exc.headers,
             )
-    if response is None:
-        response = await call_next(request)
+    control_write = (request.url.path in {"/api/auth/login", "/api/auth/logout", "/api/admin/confirm"}
+                     or request.url.path.startswith("/api/admin/updates/"))
+    if response is None and method not in {"GET", "HEAD", "OPTIONS"} and not control_write:
+        with _business_write_lock:
+            if maintenance_active():
+                response = JSONResponse(status_code=503, content={"detail": {
+                    "code": "update_maintenance_active", "message": "系统更新维护中，暂不接受业务写入"}})
+            else:
+                _business_writes += 1
+                counted = True
+    try:
+        if response is None:
+            response = await call_next(request)
+    finally:
+        if counted:
+            with _business_write_lock:
+                _business_writes -= 1
     response.headers.setdefault("Cache-Control", "no-store")
     response.headers.setdefault("X-Content-Type-Options", "nosniff")
     response.headers.setdefault("X-Frame-Options", "DENY")
@@ -576,15 +635,85 @@ def ready():
     return {"ok": True, "service": "xianyu-saas-api", "database": "ready"}
 
 
+def _update_drain_counts() -> tuple[int, int]:
+    if os.name != "posix" or not Path("/proc/self/stat").is_file():
+        raise RuntimeError("update_drain_unavailable")
+    with db._lock:
+        jobs = int(db.con.execute("SELECT COUNT(*) FROM jobs WHERE status='running'").fetchone()[0])
+        # Background shop/auth flows retain a control lease while they can write;
+        # an expired running job still counts and is never assumed drained.
+        jobs += int(db.con.execute(
+            """SELECT COUNT(*) FROM control_leases WHERE owner<>'' AND lease_until>?
+               AND resource_key<>'platform-update'""", (time.time(),),
+        ).fetchone()[0])
+    with _business_write_lock:
+        jobs += _business_writes
+    managed = worker_manager.running_count()
+    if type(managed) is not int or managed < 0:
+        raise RuntimeError("update_drain_unavailable")
+    live = set()
+    for runtime in db.list_worker_runtimes():
+        pid = runtime["pid"]
+        if not pid:
+            continue
+        try:
+            state = (Path("/proc") / str(int(pid)) / "stat").read_text()
+        except FileNotFoundError:
+            continue
+        close = state.rfind(")")
+        if close < 0 or len(state) <= close + 2:
+            raise RuntimeError("update_drain_unavailable")
+        if state[close + 2] != "Z":
+            live.add(int(pid))
+    # Include orphan workers not yet registered/persisted after an API restart.
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            command = (entry / "cmdline").read_bytes().split(b"\x00")
+        except FileNotFoundError:
+            continue
+        if len(command) > 1 and os.path.realpath(os.fsdecode(command[1])) == os.path.realpath(worker_manager.BOT_MAIN):
+            live.add(int(entry.name))
+    return jobs, max(managed, len(live))
+
+
+@app.get("/internal/v1/update/drain", include_in_schema=False)
+def internal_update_drain(request: Request, operation_id: str = Query(pattern=r"^[0-9a-f]{32}$")):
+    # Use the actual peer, never proxy headers or the testing loopback shortcut.
+    try:
+        local = request.client is not None and ipaddress.ip_address(request.client.host).is_loopback
+    except ValueError:
+        local = False
+    if not local:
+        raise HTTPException(403, detail={"code": "loopback_required", "message": "仅限本机请求"})
+    state = read_maintenance()
+    result = {"schema": 1, "operation_id": operation_id, "active": bool(state["active"]),
+              "active_jobs": None, "active_workers": None, "ready": False,
+              "error_code": state.get("error_code", "")}
+    if result["error_code"]:
+        return result
+    if not state["active"] or state["operation_id"] != operation_id:
+        result["error_code"] = "update_maintenance_mismatch"
+        return result
+    try:
+        jobs, workers = _update_drain_counts()
+        result.update(active_jobs=jobs, active_workers=workers, ready=jobs == 0 and workers == 0)
+        if not result["ready"]:
+            result["error_code"] = "update_drain_pending"
+    except (OSError, ValueError, RuntimeError, sqlite3.Error):
+        result["error_code"] = "update_drain_unavailable"
+    return result
+
+
 def _local_release_notes() -> str:
     return local_release_notes()
 
 
 def _update_check_payload(channel: str) -> dict:
-    result = db.get_platform_update_check(channel)
-    if result.get("current_version") and result["current_version"] != version_payload(channel)["version"]:
-        return {"channel": channel, "status": "unchecked", "available": False, "checked_at": None}
-    return result
+    if channel == RELEASE_CHANNEL:
+        return update_probe.snapshot()
+    return db.get_platform_update_check(channel)
 
 
 def _platform_update_payload(row) -> dict | None:
@@ -662,12 +791,14 @@ class Auth:
 @app.get("/api/version")
 def get_version(user=Depends(Auth.current_user)):
     channel = RELEASE_CHANNEL
+    check = _update_check_payload(channel)
     return {
         **version_payload(channel),
         "release_notes": _local_release_notes(),
         "latest_update": _platform_update_payload(db.latest_platform_update(channel)),
-        "update_check": _update_check_payload(channel),
-        "capabilities": update_capabilities(),
+        "update_check": {key: value for key, value in check.items() if key != "update_probe"},
+        "update_probe": check["update_probe"],
+        "capabilities": update_api.capabilities(check),
     }
 
 
@@ -854,21 +985,25 @@ class PlatformUserUpdateIn(BaseModel):
 class AdminConfirmationIn(BaseModel):
     password: str
     action: str
+    version: str = Field(min_length=1, max_length=120)
+    operation_id: str = Field(pattern=r"^[0-9a-f]{32}$")
 
     class Config:
         extra = "forbid"
 
 
 class PlatformUpdateDownloadIn(BaseModel):
-    version: str = ""
+    version: str = Field(min_length=1, max_length=120)
+    action: str = Field(default="apply", pattern=r"^(apply|rollback)$")
 
     class Config:
         extra = "forbid"
 
 
 class PlatformUpdateApplyIn(BaseModel):
-    version: str
-    confirmation_token: str
+    version: str = Field(min_length=1, max_length=120)
+    operation_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    confirmation_token: str = Field(min_length=1, max_length=256)
 
     class Config:
         extra = "forbid"
@@ -1715,6 +1850,19 @@ def _worker_transition_payload(user_id: int, account, code: str = "") -> dict:
     }
 
 
+def _maintenance_worker_transition_payload(user_id: int, account) -> dict:
+    """Report a temporary pause without mutating durable worker/auth state."""
+    try:
+        return _worker_transition_payload(user_id, account, "update_maintenance_active")
+    except Exception:
+        return {
+            "desired_running": False,
+            "state": "stopped",
+            "running": False,
+            "code": "update_maintenance_active",
+        }
+
+
 def _start_account_worker_locked(
     user,
     account,
@@ -1727,6 +1875,11 @@ def _start_account_worker_locked(
     """Start one account while its worker-control lease is held."""
     user_id = int(user["id"])
     account_key = str(account["account_key"])
+    if maintenance_active():
+        raise HTTPException(503, detail={
+            "code": "update_maintenance_active",
+            "message": "系统更新维护中，自动客服将在维护结束后恢复",
+        })
     _ensure_account_lease(lease)
     try:
         _require_account_worker_configuration(
@@ -1756,6 +1909,11 @@ def _start_account_worker_locked(
             )
         raise HTTPException(409, "请先连接并验证闲鱼店铺")
 
+    if maintenance_active():
+        raise HTTPException(503, detail={
+            "code": "update_maintenance_active",
+            "message": "系统更新维护中，自动客服将在维护结束后恢复",
+        })
     _prepare_account_worker_start_locked(
         user_id,
         account,
@@ -1783,6 +1941,11 @@ def _start_account_worker_locked(
             )
         raise HTTPException(503, "机器人进程启动失败") from exc
     if not ok:
+        if reason == "update_maintenance_active":
+            raise HTTPException(503, detail={
+                "code": "update_maintenance_active",
+                "message": "系统更新维护中，自动客服将在维护结束后恢复",
+            })
         if automatic:
             _persist_worker_observation(
                 user_id,
@@ -1831,6 +1994,8 @@ def _start_account_worker_locked(
 
 def _autostart_account_worker(user_id: int, account) -> dict:
     """Clear verified auth state and resume durable running intent idempotently."""
+    if maintenance_active():
+        return _maintenance_worker_transition_payload(user_id, account)
     try:
         lease, owner = _acquire_account_lease(
             "worker-control",
@@ -1857,6 +2022,8 @@ def _autostart_account_worker(user_id: int, account) -> dict:
             return {"desired_running": False, "state": "stopped", "running": False, "code": "account_unavailable"}
         account_key = str(account["account_key"])
         runtime = db.get_worker_runtime(user_id, account["id"])
+        if maintenance_active():
+            return _maintenance_worker_transition_payload(user_id, account)
         try:
             _clear_auth_status(user_id, account_key)
         except OSError:
@@ -1870,6 +2037,8 @@ def _autostart_account_worker(user_id: int, account) -> dict:
                     last_error="auth_status_clear_failed",
                 )
             return _worker_transition_payload(user_id, account, "auth_status_clear_failed")
+        if maintenance_active():
+            return _maintenance_worker_transition_payload(user_id, account)
         if runtime is None or runtime["desired_state"] != "running":
             return _worker_transition_payload(user_id, account)
         user = db.get_user_by_id(user_id)
@@ -1885,6 +2054,8 @@ def _autostart_account_worker(user_id: int, account) -> dict:
             return _worker_transition_payload(user_id, account, "user_unavailable")
         persisted_mode = str(runtime["mode"] or "rules")
         mode = "rules_ai" if persisted_mode == "rules_ai" and has_permission(user, "automation.ai") else "rules"
+        if maintenance_active():
+            return _maintenance_worker_transition_payload(user_id, account)
         try:
             reason = _start_account_worker_locked(
                 user,
@@ -1895,6 +2066,9 @@ def _autostart_account_worker(user_id: int, account) -> dict:
                 automatic=True,
             )
         except HTTPException as exc:
+            detail = exc.detail if isinstance(exc.detail, dict) else {}
+            if detail.get("code") == "update_maintenance_active" or maintenance_active():
+                return _maintenance_worker_transition_payload(user_id, account)
             runtime = db.get_worker_runtime(user_id, account["id"])
             code = str(runtime["last_error"] or "worker_start_failed") if runtime else "worker_start_failed"
             if runtime is None or runtime["desired_state"] != "running" or runtime["state"] != "degraded":
@@ -1911,6 +2085,8 @@ def _autostart_account_worker(user_id: int, account) -> dict:
             return _worker_transition_payload(user_id, account, code)
         return _worker_transition_payload(user_id, account, reason)
     except Exception:
+        if maintenance_active():
+            return _maintenance_worker_transition_payload(user_id, account)
         try:
             if account is not None:
                 runtime = db.get_worker_runtime(user_id, account["id"])
@@ -1946,6 +2122,8 @@ def _reserve_watchdog_transition(
     target_mode: str | None,
 ):
     del target_mode
+    if maintenance_active():
+        return None
     account = db.get_shop_account(user_id, account_key=account_key)
     if account is None or not account["enabled"]:
         return None
@@ -1988,6 +2166,8 @@ def _persist_watchdog_transition(
     expected_pid: int,
 ) -> bool:
     del account_key, supervisor_generation
+    if maintenance_active():
+        return False
     lease, _owner, account = reservation
     try:
         _ensure_account_lease(lease)
@@ -2365,11 +2545,16 @@ def _async_job_response(job, account):
         snapshot = load_verified_snapshot(user_id, str(account["account_key"]))
         if snapshot is not None:
             result = dict(snapshot)
-            # The consumer cannot control API-owned workers. Finalizing the
-            # completed refresh here clears stale NEEDS_HUMAN auth state and
-            # resumes the account's durable running intent before the browser
-            # refreshes its status cards.
-            result["_worker_transition"] = _autostart_account_worker(user_id, account)
+            # A completed-job GET bypasses the write middleware. During update
+            # maintenance it must remain a pure read and preserve durable intent.
+            if maintenance_active():
+                result["_worker_transition"] = _maintenance_worker_transition_payload(user_id, account)
+            else:
+                # The consumer cannot control API-owned workers. Finalizing the
+                # completed refresh here clears stale NEEDS_HUMAN auth state and
+                # resumes the account's durable running intent before the browser
+                # refreshes its status cards.
+                result["_worker_transition"] = _autostart_account_worker(user_id, account)
             return _shop_sync_payload(result)
         detail = sync_status_payload("sync_error", "同步任务已结束，但店铺快照暂时不可用")
         detail["retryable"] = True
@@ -5723,7 +5908,15 @@ def admin_create_confirmation(
             403,
             detail={"code": "reauthentication_failed", "message": "管理员密码校验失败"},
         )
-    confirmation = db.create_admin_confirmation(admin["id"], body.action, ttl_seconds=180)
+    try:
+        confirmation = update_api.confirm(
+            body.operation_id, body.version, body.action.removeprefix("update."), admin["id"],
+            _request_token(request, request.headers.get("authorization", "")),
+        )
+    except PlatformUpdateError as error:
+        _raise_update_error(error)
+    except sqlite3.Error:
+        _raise_update_error(PlatformUpdateError("update_database_unavailable"))
     _audit(
         "platform.confirmation_issued",
         request,
@@ -5731,7 +5924,7 @@ def admin_create_confirmation(
         target_type="operation",
         target_id=body.action,
     )
-    return {"confirmation_token": confirmation, "expires_in": 180}
+    return confirmation
 
 
 @app.get("/api/admin/audit")
@@ -5794,14 +5987,36 @@ _UPDATE_ERROR_MESSAGES = {
     "update_installation_unsupported": "此部署方式不支持网页安装，请按部署说明更新",
     "update_installation_unavailable": "签名发布目录或权限未就绪，请联系维护者",
     "update_service_unavailable": "独立更新服务未就绪，请联系维护者",
+    "update_updater_not_initialized": "独立更新器尚未完成可信初始化，请联系维护者",
+    "update_updater_identity_mismatch": "独立更新器文件身份与初始化记录不一致",
+    "update_state_invalid": "独立更新器公开状态无效，请联系维护者",
     "update_already_staged": "该版本已经下载校验，无需重复下载",
     "update_busy": "已有安装或回滚操作正在进行，请先查看执行状态",
+    "confirmation_invalid": "二次确认已失效或与当前会话不匹配，请重新确认",
+    "update_maintenance_active": "系统更新维护中，暂不接受新的业务操作",
+    "update_service_stale": "独立更新器心跳已过期，请联系维护者",
+    "update_protocol_mismatch": "独立更新器协议不匹配，请联系维护者",
+    "update_deployment_mismatch": "独立更新器与当前部署不匹配",
+    "update_public_key_mismatch": "独立更新器与应用的签名公钥不匹配",
+    "update_current_version_mismatch": "当前版本已变化，请重新准备更新",
+    "update_not_staged": "请先准备并校验目标版本",
+    "update_version_changed": "发布版本已变化，请重新检查",
+    "rollback_version_unavailable": "该回退版本或已验证制品当前不可用",
+    "update_lock_lost": "更新租约已失效，请重试并查看现有操作状态",
+    "update_maintenance_protocol_unsupported": "当前或目标版本缺少维护协议，请先人工接入可信新版本基线",
+    "update_data_version_unknown": "当前或目标镜像未声明数据兼容版本，请按部署说明手动升级",
+    "update_data_backward_incompatible": "目标版本与当前数据格式不兼容，已停止自动更新，请按发布说明手动迁移",
 }
 
 
 def _raise_update_error(error: PlatformUpdateError):
     code = str(error.code)
-    if code in {
+    if code == "confirmation_invalid":
+        status = 403
+    elif code == "rollback_version_unavailable":
+        status = 404
+    elif code in {
+        "update_not_staged", "update_not_available", "update_version_changed", "update_current_version_mismatch",
         "update_downgrade_rejected",
         "update_intent_pending",
         "update_release_exists",
@@ -5810,7 +6025,10 @@ def _raise_update_error(error: PlatformUpdateError):
         "update_busy",
     }:
         status = 409
-    elif code.startswith("release_") or code.startswith("update_archive_") or code in {
+    elif code.startswith("release_") or code.startswith("update_archive_") or (
+        code.startswith("docker_") and code not in {"docker_public_key_invalid", "docker_protocol_unsupported"}
+    ) or code in {
+        "update_operation_invalid", "update_manifest_invalid", "update_manifest_version_mismatch",
         "update_channel_invalid",
         "update_dependency_change_rejected",
         "update_signature_invalid",
@@ -5853,26 +6071,33 @@ def _begin_platform_update_lease(seconds: float = 600) -> tuple[_AccountLease, s
     return _AccountLease("platform-update", owner, max(float(seconds), 30.0)), owner
 
 
-def _require_update_operation(operation: str) -> None:
-    capabilities = update_capabilities()
-    if capabilities.get(operation) is not True:
-        _raise_update_error(PlatformUpdateError(capabilities["reason"] or "update_installation_unsupported"))
-    if db.active_platform_update() is not None:
-        _raise_update_error(PlatformUpdateError("update_busy"))
+def _ensure_platform_update_lease(lease) -> None:
+    try:
+        lease.ensure_owned()
+        if not db.renew_control_lease(lease.key, lease.owner, lease_seconds=lease.lease_seconds):
+            raise RuntimeError("update lease lost")
+    except (RuntimeError, OSError, sqlite3.Error) as error:
+        raise PlatformUpdateError("update_lock_lost") from error
 
 
 def _admin_update_status_payload() -> dict:
     channel = RELEASE_CHANNEL
     current = version_payload(channel)
-    capabilities = update_capabilities()
-    active = db.active_platform_update()
-    return {
-        "current": current,
-        "latest_update": _platform_update_payload(active or db.latest_platform_update(channel)),
-        "update_check": _update_check_payload(channel),
-        "capabilities": capabilities,
-        "rollback_versions": available_rollback_versions(current["version"]) if capabilities["rollback"] else [],
-    }
+    try:
+        operation = update_api.latest_operation()
+        check = _update_check_payload(channel)
+        capabilities = update_api.capabilities(check)
+        active = db.active_platform_update()
+        return {
+            "current": current,
+            "latest_update": _platform_update_payload(active or db.latest_platform_update(channel)),
+            "update_check": {key: value for key, value in check.items() if key != "update_probe"},
+            "update_probe": check["update_probe"], "operation": operation,
+            "capabilities": capabilities,
+            "rollback_versions": available_rollback_versions(current["version"]) if capabilities["rollback"] else [],
+        }
+    except sqlite3.Error:
+        _raise_update_error(PlatformUpdateError("update_database_unavailable"))
 
 
 @app.get("/api/admin/updates")
@@ -5887,10 +6112,8 @@ def admin_check_update(
 ):
     channel = RELEASE_CHANNEL
     current = version_payload(channel)
-    lease, owner = _begin_platform_update_lease(120)
     try:
-        payload = inspect_public_releases(current["version"])
-        payload = db.save_platform_update_check(channel, payload)
+        payload = update_probe.check(force=True, raise_errors=True)
         _audit(
             "platform.update_checked", request, actor_user_id=admin["id"],
             target_type="version", target_id=payload.get("version") or current["version"],
@@ -5898,17 +6121,13 @@ def admin_check_update(
                       "channel": channel, "status": payload["status"]},
         )
         return payload
-    except PlatformUpdateError as exc:
-        db.save_platform_update_check(channel, {
-            "status": "error", "available": False, "current_version": current["version"],
-            "error_code": exc.code,
-        })
+    except (PlatformUpdateError, ProbeError) as exc:
         _audit("platform.update_checked", request, actor_user_id=admin["id"],
                target_type="version", target_id=current["version"], outcome="failure",
                metadata={"channel": channel, "code": exc.code})
         _raise_update_error(exc)
-    finally:
-        _release_account_lease(lease, owner)
+    except sqlite3.Error:
+        _raise_update_error(PlatformUpdateError("update_database_unavailable"))
 
 
 @app.post("/api/admin/updates/download")
@@ -5917,102 +6136,43 @@ def admin_download_update(
     request: Request,
     admin=Depends(require_platform_admin),
 ):
-    _require_update_operation("download")
-    channel = RELEASE_CHANNEL
-    current = version_payload(channel)
     lease, owner = _begin_platform_update_lease(900)
     try:
-        _require_update_operation("download")
-        release = fetch_release(channel, current["version"])
-        if release is not None:
-            existing = db.get_platform_update(release.version, channel)
-            if existing is not None and existing["status"] == "staged":
-                try:
-                    validate_candidate(existing["candidate_path"], release.version, existing["manifest_sha256"])
-                except PlatformUpdateError:
-                    pass  # A lost or damaged candidate may be downloaded again.
-                else:
-                    raise PlatformUpdateError("update_already_staged")
-        if release is None:
-            raise HTTPException(
-                409,
-                detail={"code": "update_not_available", "message": "未发现可安装的新版本，请先检查发布信息"},
-            )
-        requested_version = str(body.version or "").strip()
-        if requested_version and requested_version != release.version:
-            raise HTTPException(
-                409,
-                detail={"code": "update_version_changed", "message": "发布版本已变化，请重新检查"},
-            )
-        staged = stage_release(release, channel, current["version"])
-        db.upsert_platform_update(
-            release.version,
-            channel,
-            "staged",
-            release_id=release.release_id,
-            manifest_sha256=staged["manifest_sha256"],
-            candidate_path=staged["candidate_path"],
-            release_notes=release.notes,
-            requested_by=admin["id"],
+        staged = update_api.prepare(
+            body.version, body.action, admin["id"],
+            _request_token(request, request.headers.get("authorization", "")),
+            ensure_owned=lambda: _ensure_platform_update_lease(lease),
         )
-        _audit(
-            "platform.update_downloaded",
-            request,
-            actor_user_id=admin["id"],
-            target_type="version",
-            target_id=release.version,
-            metadata={"version": release.version, "channel": channel, "status": "staged"},
-        )
-        return {
-            "version": release.version,
-            "channel": channel,
-            "status": "staged",
-            "release_notes": release.notes,
-        }
+        _audit("platform.update_downloaded", request, actor_user_id=admin["id"],
+               target_type="version", target_id=body.version,
+               metadata={"version": body.version, "channel": RELEASE_CHANNEL, "status": "staged"})
+        return staged
     except PlatformUpdateError as exc:
         _raise_update_error(exc)
+    except sqlite3.Error:
+        _raise_update_error(PlatformUpdateError("update_database_unavailable"))
+    except ValueError as exc:
+        _raise_update_error(PlatformUpdateError("update_busy" if str(exc) == "update_busy" else "update_operation_invalid"))
     finally:
         _release_account_lease(lease, owner)
 
 
 def _request_platform_install(action: str, body, request: Request, admin):
-    _require_update_operation(action)
     lease, owner = _begin_platform_update_lease(300)
     try:
-        _require_update_operation(action)
-        channel = RELEASE_CHANNEL
-        current = version_payload(channel)
-        row = db.get_platform_update(body.version, channel)
-        fields = {}
-        if action == "apply":
-            if row is None or row["status"] != "staged":
-                raise HTTPException(409, detail={"code": "update_not_staged", "message": "请先下载并校验该版本"})
-            if SemVer.parse(body.version).compare(SemVer.parse(current["version"])) <= 0:
-                raise PlatformUpdateError("update_downgrade_rejected")
-            fields = {key: str(row[key]) for key in ("release_id", "candidate_path", "manifest_sha256", "release_notes")}
-            validate_candidate(fields["candidate_path"], body.version, fields["manifest_sha256"])
-        elif body.version not in available_rollback_versions(current["version"]):
-            raise HTTPException(404, detail={"code": "rollback_version_unavailable", "message": "该回滚版本不可用"})
-        if not db.consume_admin_confirmation(body.confirmation_token, admin["id"], "update." + action):
-            raise HTTPException(403, detail={"code": "confirmation_invalid", "message": "二次确认已失效，请重新确认"})
-        # Persist the request BEFORE notifying the independent updater, so a fast
-        # updater cannot have its progress overwritten by a late API write.
-        db.upsert_platform_update(body.version, channel, action + "_requested", requested_by=admin["id"], **fields)
-        try:
-            queued = write_update_intent(
-                action, body.version, channel=channel, requested_by=admin["id"],
-                candidate_path=fields.get("candidate_path", ""), manifest_sha256=fields.get("manifest_sha256", ""),
-            )
-        except PlatformUpdateError as exc:
-            db.upsert_platform_update(body.version, channel, "staged" if action == "apply" else "failed",
-                                      error_code=exc.code, requested_by=admin["id"], **fields)
-            raise
+        result = update_api.submit(
+            body.operation_id, body.version, action, body.confirmation_token, admin["id"],
+            _request_token(request, request.headers.get("authorization", "")),
+            ensure_owned=lambda: _ensure_platform_update_lease(lease),
+        )
         _audit("platform.update_requested" if action == "apply" else "platform.rollback_requested",
                request, actor_user_id=admin["id"], target_type="version", target_id=body.version,
-               metadata={"version": body.version, "channel": channel, "status": "queued"})
-        return queued
+               metadata={"version": body.version, "channel": RELEASE_CHANNEL, "status": result["status"]})
+        return JSONResponse(status_code=202 if result["queued"] else 200, content=result)
     except PlatformUpdateError as exc:
         _raise_update_error(exc)
+    except sqlite3.Error:
+        _raise_update_error(PlatformUpdateError("update_database_unavailable"))
     finally:
         _release_account_lease(lease, owner)
 
@@ -6063,6 +6223,8 @@ def _persist_restore_runtime(
 
 def restore_desired_workers(_pending=None):
     """Adopt existing processes before allocating slots to missing Workers."""
+    if maintenance_active():
+        return
     if os.environ.get("SAAS_RESTORE_WORKERS", "1").strip().lower() in {"0", "false", "no"}:
         return
     first_pass = _pending is None
@@ -6092,7 +6254,7 @@ def restore_desired_workers(_pending=None):
             # control state after acquisition so a concurrent stop/disable
             # cannot be resurrected from the stale iterator snapshot.
             runtime = db.get_worker_runtime(user_id, account_id)
-            if runtime is None:
+            if runtime is None or maintenance_active():
                 continue
             user = db.get_user_by_id(user_id)
             account = db.get_shop_account(user_id, account_id=account_id)
@@ -6251,7 +6413,11 @@ def restore_desired_workers(_pending=None):
                         continue
                 pending.append(runtime)
                 continue
+            if maintenance_active():
+                continue
             ok, reason = bot_start(user_id, mode, account_key)
+            if not ok and reason == "update_maintenance_active":
+                continue
             if not ok and reason == "max_bots_reached":
                 _persist_restore_runtime(runtime, desired_state="running", state="capacity_limited",
                                          pid=None, last_error="max_bots_reached")
@@ -6266,6 +6432,8 @@ def restore_desired_workers(_pending=None):
                 **persist_kwargs,
             )
         except Exception as exc:
+            if maintenance_active():
+                continue
             stop_reason = "not_running"
             try:
                 _, stop_reason = bot_stop(user_id, account_key)
@@ -6295,16 +6463,59 @@ def restore_desired_workers(_pending=None):
         restore_desired_workers(_pending=pending)
 
 
+def _enter_update_maintenance(_state):
+    # Registry stops must not call the API's persist-stop helpers: desired state
+    # remains authoritative for restoration after executor health verification.
+    with _worker_maintenance_lock:
+        shutdown_all()
+    for runtime in db.list_worker_runtimes():
+        if runtime["pid"]:
+            account = db.get_shop_account(int(runtime["user_id"]), account_id=int(runtime["account_id"]))
+            if account is None:
+                raise RuntimeError("update_drain_unavailable")
+            stopped, reason = bot_terminate_pid(int(runtime["user_id"]), int(runtime["pid"]), str(account["account_key"]))
+            if not stopped and reason not in {"already_dead", "pid_dead", "pid_invalid"}:
+                raise RuntimeError("update_drain_unavailable")
+    if worker_manager.running_count() != 0:
+        raise RuntimeError("update_drain_pending")
+
+
+maintenance_watcher = MaintenanceWatcher(_enter_update_maintenance, lambda: restore_desired_workers())
+_services_started = False
+_watchdog_thread = None
+
+
+def start_services():
+    global _services_started, _watchdog_thread
+    if _services_started or os.environ.get("SAAS_TESTING") == "1":
+        return
+    _services_started = True
+    try:
+        maintenance_watcher.poll_once()
+    except Exception:
+        # Keep health/status available even when draining is not yet possible;
+        # the watcher retries and the drain endpoint remains fail-closed.
+        pass
+    maintenance_watcher.start()
+    update_api.start()
+    update_probe.start()
+    if not maintenance_active():
+        restore_desired_workers()
+    if _watchdog_thread is None:
+        _watchdog_thread = start_watchdog(
+            lambda uid: db.get_user_by_id(uid)["expires_at"] if db.get_user_by_id(uid) else None,
+            _reserve_watchdog_transition, _persist_watchdog_transition, _release_watchdog_transition,
+        )
+
+
 def shutdown_services():
+    global _services_started
+    update_probe.stop()
+    update_api.stop()
+    maintenance_watcher.stop()
     qr_logins.shutdown()
     shutdown_all()
+    _services_started = False
 
 
-restore_desired_workers()
-start_watchdog(
-    lambda uid: db.get_user_by_id(uid)["expires_at"] if db.get_user_by_id(uid) else None,
-    _reserve_watchdog_transition,
-    _persist_watchdog_transition,
-    _release_watchdog_transition,
-)
 atexit.register(shutdown_services)

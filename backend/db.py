@@ -9,6 +9,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import secrets
 import sqlite3
 import threading
@@ -35,6 +36,15 @@ MAX_ACTIVE_SESSIONS = 8
 VALID_ROLES = frozenset({"admin", "owner"})
 # Legacy values remain readable for old signed artifacts; current UI uses release.
 VALID_UPDATE_CHANNELS = frozenset({"stable", "beta", "release"})
+UPDATE_OPERATION_TERMINAL = frozenset({"succeeded", "rolled_back", "failed", "recovery_failed"})
+UPDATE_OPERATION_PHASE_ORDER = {
+    phase: index
+    for index, phase in enumerate((
+        "staged", "queued", "verifying_package", "building", "preflighting",
+        "preparing", "stopping", "backing_up", "migrating", "switching",
+        "verifying", "rolling_back",
+    ))
+}
 logger = logging.getLogger(__name__)
 
 
@@ -301,6 +311,32 @@ class DB:
                 );
                 CREATE INDEX IF NOT EXISTS idx_admin_confirmations_expiry
                     ON admin_confirmations(expires_at, used_at);
+                CREATE TABLE IF NOT EXISTS platform_update_operations (
+                    operation_id TEXT PRIMARY KEY,
+                    action TEXT NOT NULL,
+                    version TEXT NOT NULL,
+                    channel TEXT NOT NULL,
+                    deployment TEXT NOT NULL,
+                    manifest_sha256 TEXT NOT NULL,
+                    candidate_path TEXT NOT NULL DEFAULT '',
+                    release_id TEXT NOT NULL DEFAULT '',
+                    release_notes TEXT NOT NULL DEFAULT '',
+                    expected_current_version TEXT NOT NULL,
+                    current_version TEXT NOT NULL,
+                    requested_by INTEGER NOT NULL,
+                    session_digest TEXT NOT NULL,
+                    confirmation_digest TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT 'staged',
+                    phase TEXT NOT NULL DEFAULT 'staged',
+                    error_code TEXT NOT NULL DEFAULT '',
+                    requested_at REAL,
+                    published_at REAL,
+                    executor_updated_at REAL NOT NULL DEFAULT 0,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_update_operations_status
+                    ON platform_update_operations(status, created_at DESC);
                 CREATE TABLE IF NOT EXISTS platform_updates (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     version TEXT NOT NULL,
@@ -323,9 +359,33 @@ class DB:
                     payload_json TEXT NOT NULL,
                     checked_at REAL NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS platform_update_probes (
+                    channel TEXT PRIMARY KEY,
+                    current_version TEXT NOT NULL DEFAULT '',
+                    last_success_json TEXT NOT NULL DEFAULT '{}',
+                    last_attempt_at REAL,
+                    last_success_at REAL,
+                    last_failure_at REAL,
+                    next_check_at REAL NOT NULL DEFAULT 0,
+                    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+                    last_error_code TEXT NOT NULL DEFAULT '',
+                    retry_not_before REAL NOT NULL DEFAULT 0,
+                    manual_cooldown_until REAL NOT NULL DEFAULT 0,
+                    lease_owner TEXT NOT NULL DEFAULT '',
+                    lease_until REAL NOT NULL DEFAULT 0,
+                    lease_generation INTEGER NOT NULL DEFAULT 0
+                );
                 """
             )
             self._migrate_auth_platform_locked()
+            confirmation_columns = {row["name"] for row in self.con.execute("PRAGMA table_info(admin_confirmations)")}
+            for name in ("session_digest", "version", "manifest_sha256", "operation_id"):
+                if name not in confirmation_columns:
+                    try:
+                        self.con.execute(f"ALTER TABLE admin_confirmations ADD COLUMN {name} TEXT NOT NULL DEFAULT ''")
+                    except sqlite3.OperationalError as error:
+                        if "duplicate column name" not in str(error).lower():
+                            raise
             self._migrate_shop_accounts_locked()
             # Existing installations have users but no account rows.  The
             # default account is intentionally metadata-only and keeps all
@@ -2477,54 +2537,255 @@ class DB:
                 ).fetchall()
         return rows[:limit], (int(rows[limit - 1]["id"]) if len(rows) > limit else None)
 
-    def create_admin_confirmation(self, user_id, action, ttl_seconds=300):
+    def _confirmation_session_locked(self, user_id, session_token, now):
+        return self.con.execute(
+            """SELECT 1 FROM tokens t JOIN users u ON u.id=t.user_id
+               WHERE t.token=? AND t.user_id=? AND t.created_at>? AND
+                     u.disabled_at IS NULL AND u.role='admin'""",
+            (str(session_token), int(user_id), now - TOKEN_TTL_SECONDS),
+        ).fetchone() is not None
+
+    def create_admin_confirmation(self, user_id, action, ttl_seconds=300, *,
+                                  session_token="", version="", manifest_sha256="", operation_id=""):
         raw = secrets.token_urlsafe(32)
         digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+        session_digest = hashlib.sha256(session_token.encode()).hexdigest() if session_token else ""
         now = time.time()
         with self._lock:
+            if (action not in {"update.apply", "update.rollback"}
+                    or not all((session_token, version, manifest_sha256, operation_id))
+                    or not re.fullmatch(r"[0-9a-f]{32}", operation_id)
+                    or not re.fullmatch(r"[0-9a-f]{64}", manifest_sha256)
+                    or not self._confirmation_session_locked(user_id, session_token, now)):
+                raise ValueError("confirmation_invalid")
             self.con.execute(
-                """
-                INSERT INTO admin_confirmations(
-                    token_digest, user_id, action, expires_at, used_at, created_at
-                ) VALUES (?, ?, ?, ?, NULL, ?)
-                """,
-                (digest, int(user_id), str(action), now + max(int(ttl_seconds), 30), now),
+                """INSERT INTO admin_confirmations(token_digest,user_id,action,expires_at,used_at,created_at,
+                       session_digest,version,manifest_sha256,operation_id)
+                   VALUES (?,?,?,?,NULL,?,?,?,?,?)""",
+                (digest, int(user_id), str(action), now + min(max(int(ttl_seconds), 30), 300), now,
+                 session_digest, version, manifest_sha256, operation_id),
             )
             self.con.commit()
         return raw
 
-    def consume_admin_confirmation(self, raw_token, user_id, action):
-        digest = hashlib.sha256(str(raw_token or "").encode("utf-8")).hexdigest()
+    def _confirmation_matches_locked(self, row, user_id, action, session_token, version,
+                                     manifest_sha256, operation_id, now):
+        session_digest = hashlib.sha256(session_token.encode()).hexdigest() if session_token else ""
+        return bool(row and row["used_at"] is None and float(row["expires_at"]) > now
+                    and int(row["user_id"]) == int(user_id)
+                    and all(secrets.compare_digest(str(row[k]), str(v)) for k,v in (
+                        ("action", action), ("session_digest", session_digest), ("version", version),
+                        ("manifest_sha256", manifest_sha256), ("operation_id", operation_id)))
+                    and (not session_digest or self._confirmation_session_locked(user_id, session_token, now)))
+
+    def consume_admin_confirmation(self, raw_token, user_id, action, *, session_token="",
+                                   version="", manifest_sha256="", operation_id=""):
+        if (action not in {"update.apply", "update.rollback"}
+                or not all((session_token, version, manifest_sha256, operation_id))
+                or not re.fullmatch(r"[0-9a-f]{32}", str(operation_id))
+                or not re.fullmatch(r"[0-9a-f]{64}", str(manifest_sha256))):
+            return False
+        digest = hashlib.sha256(str(raw_token or "").encode()).hexdigest()
         now = time.time()
         with self._lock:
             try:
                 self.con.execute("BEGIN IMMEDIATE")
-                row = self.con.execute(
-                    """
-                    SELECT user_id, action, expires_at, used_at
-                    FROM admin_confirmations WHERE token_digest = ?
-                    """,
-                    (digest,),
-                ).fetchone()
-                valid = bool(
-                    row
-                    and row["used_at"] is None
-                    and float(row["expires_at"]) > now
-                    and int(row["user_id"]) == int(user_id)
-                    and secrets.compare_digest(str(row["action"]), str(action))
-                )
-                if not valid:
+                row = self.con.execute("SELECT * FROM admin_confirmations WHERE token_digest=?", (digest,)).fetchone()
+                if not self._confirmation_matches_locked(row, user_id, action, session_token, version,
+                                                         manifest_sha256, operation_id, now):
                     self.con.rollback()
                     return False
-                cur = self.con.execute(
-                    """
-                    UPDATE admin_confirmations SET used_at = ?
-                    WHERE token_digest = ? AND used_at IS NULL AND expires_at > ?
-                    """,
-                    (now, digest, now),
-                )
+                self.con.execute("UPDATE admin_confirmations SET used_at=? WHERE token_digest=?", (now, digest))
                 self.con.commit()
-                return cur.rowcount == 1
+                return True
+            except BaseException:
+                if self.con.in_transaction:
+                    self.con.rollback()
+                raise
+
+    # ---- durable update operation / confirmed outbox ----
+    def _mirror_update_operation_locked(self, row):
+        status = row["action"] + "_requested" if row["status"] == "queued" else row["status"]
+        self.con.execute(
+            """INSERT INTO platform_updates(version,channel,release_id,status,manifest_sha256,candidate_path,
+                   release_notes,error_code,requested_by,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(version,channel) DO UPDATE SET status=excluded.status,
+                   manifest_sha256=excluded.manifest_sha256,candidate_path=excluded.candidate_path,
+                   release_id=CASE WHEN excluded.release_id<>'' THEN excluded.release_id ELSE platform_updates.release_id END,
+                   release_notes=CASE WHEN excluded.release_notes<>'' THEN excluded.release_notes ELSE platform_updates.release_notes END,
+                   error_code=excluded.error_code,requested_by=excluded.requested_by,updated_at=excluded.updated_at""",
+            (row["version"], row["channel"], row["release_id"], status, row["manifest_sha256"],
+             row["candidate_path"], row["release_notes"], row["error_code"], row["requested_by"],
+             row["created_at"], row["updated_at"]),
+        )
+
+    def create_update_operation(self, *, operation_id, action, version, channel, deployment, manifest_sha256,
+                                expected_current_version, requested_by, session_digest,
+                                candidate_path="", release_id="", release_notes=""):
+        if (not re.fullmatch(r"[0-9a-f]{32}", str(operation_id)) or action not in {"apply", "rollback"}
+                or channel not in VALID_UPDATE_CHANNELS or deployment not in {"docker", "systemd"}
+                or not re.fullmatch(r"[0-9a-f]{64}", str(manifest_sha256))
+                or not re.fullmatch(r"[0-9a-f]{64}", str(session_digest)) or int(requested_by) <= 0):
+            raise ValueError("update_operation_invalid")
+        now = time.time()
+        with self._lock:
+            try:
+                self.con.execute("BEGIN IMMEDIATE")
+                if self.active_update_operation() is not None:
+                    raise ValueError("update_busy")
+                self.con.execute(
+                    """INSERT INTO platform_update_operations(operation_id,action,version,channel,deployment,
+                           manifest_sha256,candidate_path,release_id,release_notes,expected_current_version,
+                           current_version,requested_by,session_digest,created_at,updated_at)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (operation_id, action, version, channel, deployment, manifest_sha256, candidate_path,
+                     release_id, str(release_notes)[:16000], expected_current_version, expected_current_version,
+                     int(requested_by), session_digest, now, now),
+                )
+                row = self.get_update_operation(operation_id)
+                self._mirror_update_operation_locked(row)
+                self.con.commit()
+                return row
+            except BaseException:
+                if self.con.in_transaction:
+                    self.con.rollback()
+                raise
+
+    def get_update_operation(self, operation_id):
+        with self._lock:
+            return self.con.execute("SELECT * FROM platform_update_operations WHERE operation_id=?",
+                                    (str(operation_id),)).fetchone()
+
+    def latest_update_operation(self, *, status=None):
+        with self._lock:
+            return self.con.execute(
+                """SELECT * FROM platform_update_operations WHERE (? IS NULL OR status=?)
+                   ORDER BY created_at DESC,operation_id DESC LIMIT 1""", (status, status),
+            ).fetchone()
+
+    def staged_update_operation(self, version, action, channel, deployment, current_version, session_digest):
+        with self._lock:
+            return self.con.execute(
+                """SELECT * FROM platform_update_operations WHERE status='staged' AND version=?
+                   AND action=? AND channel=? AND deployment=? AND expected_current_version=? AND session_digest=?
+                   ORDER BY created_at DESC LIMIT 1""",
+                (version, action, channel, deployment, current_version, session_digest),
+            ).fetchone()
+
+    def active_update_operation(self):
+        with self._lock:
+            return self.con.execute(
+                """SELECT * FROM platform_update_operations
+                   WHERE status NOT IN ('staged','succeeded','rolled_back','failed','recovery_failed')
+                   ORDER BY created_at DESC LIMIT 1""",
+            ).fetchone()
+
+    def list_update_operations(self, *, pending_only=False):
+        with self._lock:
+            return self.con.execute(
+                """SELECT * FROM platform_update_operations
+                   WHERE (?=0 OR status NOT IN ('staged','succeeded','rolled_back','failed','recovery_failed'))
+                   ORDER BY created_at DESC LIMIT 100""", (int(pending_only),),
+            ).fetchall()
+
+    def queue_update_operation(self, operation_id, raw_token, user_id, session_token, *, action, version):
+        now = time.time()
+        digest = hashlib.sha256(str(raw_token or "").encode()).hexdigest()
+        session_digest = hashlib.sha256(str(session_token).encode()).hexdigest()
+        with self._lock:
+            try:
+                self.con.execute("BEGIN IMMEDIATE")
+                row = self.get_update_operation(operation_id)
+                if (row is None or row["action"] != action or row["version"] != version
+                        or row["requested_by"] != int(user_id) or row["session_digest"] != session_digest
+                        or not self._confirmation_session_locked(user_id, session_token, now)):
+                    self.con.rollback()
+                    return None
+                if row["status"] != "staged":
+                    # A consumed token authorizes only replay of this same already
+                    # committed operation, never a new install or another session.
+                    valid = secrets.compare_digest(row["confirmation_digest"], digest)
+                    self.con.rollback()
+                    return row if valid else None
+                active = self.active_update_operation()
+                confirmation = self.con.execute("SELECT * FROM admin_confirmations WHERE token_digest=?", (digest,)).fetchone()
+                if active is not None or not self._confirmation_matches_locked(
+                        confirmation, user_id, "update." + action, session_token, version,
+                        row["manifest_sha256"], operation_id, now):
+                    self.con.rollback()
+                    return None
+                self.con.execute("UPDATE admin_confirmations SET used_at=? WHERE token_digest=?", (now, digest))
+                self.con.execute(
+                    """UPDATE platform_update_operations SET status='queued',phase='queued',error_code='',
+                           confirmation_digest=?,requested_at=?,updated_at=? WHERE operation_id=? AND status='staged'""",
+                    (digest, now, now, operation_id),
+                )
+                row = self.get_update_operation(operation_id)
+                self._mirror_update_operation_locked(row)
+                self.con.commit()
+                return row
+            except BaseException:
+                if self.con.in_transaction:
+                    self.con.rollback()
+                raise
+
+    def mark_update_operation_published(self, operation_id):
+        with self._lock:
+            self.con.execute(
+                """UPDATE platform_update_operations SET published_at=COALESCE(published_at,?),
+                       error_code=CASE WHEN executor_updated_at=0 THEN '' ELSE error_code END
+                   WHERE operation_id=? AND requested_at IS NOT NULL""", (time.time(), operation_id),
+            )
+            self.con.commit()
+
+    def note_update_operation_error(self, operation_id, code):
+        code = str(code) if re.fullmatch(r"[a-z][a-z0-9_]{0,79}", str(code)) else "update_state_invalid"
+        with self._lock:
+            self.con.execute(
+                """UPDATE platform_update_operations SET error_code=?
+                   WHERE operation_id=? AND status NOT IN ('succeeded','rolled_back','failed','recovery_failed')""",
+                (code, operation_id),
+            )
+            self.con.commit()
+
+    @staticmethod
+    def _update_operation_transition_allowed(current_phase, next_phase):
+        current_phase, next_phase = str(current_phase), str(next_phase)
+        if next_phase == "staged":
+            return False  # Executor status begins at queued; staged is API-owned.
+        if next_phase in UPDATE_OPERATION_TERMINAL:
+            return True
+        current_rank = UPDATE_OPERATION_PHASE_ORDER.get(current_phase)
+        next_rank = UPDATE_OPERATION_PHASE_ORDER.get(next_phase)
+        if current_rank is None or next_rank is None:
+            return False
+        if current_phase == "rolling_back":
+            return next_phase == "rolling_back"
+        return next_rank >= current_rank
+
+    def observe_update_operation(self, operation_id, payload):
+        """Only the API's trusted root reader calls this; terminal results are final."""
+        with self._lock:
+            try:
+                self.con.execute("BEGIN IMMEDIATE")
+                row = self.get_update_operation(operation_id)
+                if (row is None or row["requested_at"] is None
+                        or row["status"] in UPDATE_OPERATION_TERMINAL
+                        or payload["updated_at"] <= row["executor_updated_at"]
+                        or any(payload[k] != row[k] for k in ("operation_id", "action", "version"))
+                        or not self._update_operation_transition_allowed(row["phase"], payload["phase"])):
+                    self.con.rollback()
+                    return False
+                self.con.execute(
+                    """UPDATE platform_update_operations SET status=?,phase=?,current_version=?,error_code=?,
+                           executor_updated_at=?,published_at=COALESCE(published_at,?),updated_at=?
+                       WHERE operation_id=?""",
+                    (payload["status"], payload["phase"], payload["current_version"], payload["error_code"],
+                     payload["updated_at"], payload["updated_at"], max(time.time(), payload["updated_at"]), operation_id),
+                )
+                self._mirror_update_operation_locked(self.get_update_operation(operation_id))
+                self.con.commit()
+                return True
             except BaseException:
                 if self.con.in_transaction:
                     self.con.rollback()
@@ -2536,6 +2797,11 @@ class DB:
             raise ValueError("invalid update channel")
         fields = ("status", "available", "current_version", "version", "published_at", "release_notes", "error_code")
         result = {key: payload[key] for key in fields if key in payload}
+        if isinstance(payload.get("installer_assets"), dict):
+            result["installer_assets"] = {
+                kind: payload["installer_assets"].get(kind) is True
+                for kind in ("docker", "systemd")
+            }
         result.update(channel=channel, checked_at=time.time())
         with self._lock:
             self.con.execute(
@@ -2555,6 +2821,272 @@ class DB:
         return json.loads(row["payload_json"]) if row else {
             "channel": channel, "status": "unchecked", "available": False, "checked_at": None,
         }
+
+    # ---- shared release probe (independent of installation leases) ----
+    @staticmethod
+    def _platform_probe_number(value, *, minimum=0.0):
+        import math
+
+        result = float(value)
+        if not math.isfinite(result) or result < minimum:
+            raise ValueError("invalid update probe time")
+        return result
+
+    @staticmethod
+    def _platform_probe_version_valid(value):
+        """Validate stored SemVer syntax without importing installer/platform code."""
+        import re
+
+        if not isinstance(value, str) or len(value) > 200:
+            return False
+        match = re.fullmatch(
+            r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
+            r"(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?"
+            r"(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?",
+            value.strip(),
+        )
+        if match is None:
+            return False
+        return all(
+            not (part.isdigit() and len(part) > 1 and part.startswith("0"))
+            for part in (match.group(4) or "").split(".")
+        )
+
+    def _platform_update_probe_locked(self, channel, interval_seconds):
+        """Read the lease and successful result in one SQLite snapshot."""
+        row = self.con.execute(
+            """SELECT p.*, c.payload_json AS legacy_payload
+               FROM (SELECT ? AS channel) AS requested
+               LEFT JOIN platform_update_probes AS p ON p.channel = requested.channel
+               LEFT JOIN platform_update_checks AS c ON c.channel = requested.channel""",
+            (channel,),
+        ).fetchone()
+        initialized = row["channel"] is not None
+        raw = row["last_success_json"] if initialized else row["legacy_payload"]
+        try:
+            result = json.loads(raw or "{}")
+        except (TypeError, ValueError):
+            result = {}
+        if not isinstance(result, dict):
+            result = {}
+        checked_at = result.get("checked_at")
+        try:
+            checked_at = self._platform_probe_number(checked_at)
+        except (TypeError, ValueError, OverflowError):
+            checked_at = None
+        successful = bool(
+            checked_at is not None
+            and isinstance(result.get("status"), str)
+            and result.get("status") in {"available", "current", "no_release", "incomplete"}
+            and self._platform_probe_version_valid(result.get("current_version"))
+            and (
+                not result.get("version") if result.get("status") == "no_release"
+                else self._platform_probe_version_valid(result.get("version"))
+            )
+        )
+        if not successful:
+            result = {
+                "channel": channel, "status": "unchecked", "available": False,
+                "checked_at": None,
+            }
+        if initialized:
+            state = {key: row[key] for key in row.keys() if key != "legacy_payload"}
+            state.pop("last_success_json")
+        else:
+            state = {
+                "channel": channel,
+                "current_version": str(result.get("current_version") or ""),
+                "last_attempt_at": checked_at if successful else None,
+                "last_success_at": checked_at if successful else None,
+                "last_failure_at": None,
+                "next_check_at": checked_at + interval_seconds if successful else 0.0,
+                "consecutive_failures": 0,
+                "last_error_code": "",
+                "retry_not_before": 0.0,
+                "manual_cooldown_until": checked_at + 60.0 if successful else 0.0,
+                "lease_owner": "",
+                "lease_until": 0.0,
+                "lease_generation": 0,
+            }
+        state.update(result=result, initialized=initialized)
+        return state
+
+    def get_platform_update_probe(self, channel, *, interval_seconds=21600):
+        """Only read probe metadata; legacy successful checks remain usable."""
+        if channel not in VALID_UPDATE_CHANNELS:
+            raise ValueError("invalid update channel")
+        interval = self._platform_probe_number(interval_seconds, minimum=1.0)
+        with self._lock:
+            return self._platform_update_probe_locked(channel, interval)
+
+    def acquire_platform_update_probe(
+        self, channel, owner, current_version, *, force=False,
+        interval_seconds=21600, lease_seconds=120, manual_cooldown_seconds=60,
+        now=None,
+    ):
+        """Atomically apply schedule/cooldown and claim a generation-fenced lease."""
+        if channel not in VALID_UPDATE_CHANNELS:
+            raise ValueError("invalid update channel")
+        owner, current_version = str(owner), str(current_version)
+        if not owner or len(owner) > 128 or not current_version or len(current_version) > 200:
+            raise ValueError("invalid update probe identity")
+        now = self._platform_probe_number(time.time() if now is None else now)
+        interval = self._platform_probe_number(interval_seconds, minimum=1.0)
+        lease = min(self._platform_probe_number(lease_seconds, minimum=1.0), 3600.0)
+        cooldown = min(self._platform_probe_number(manual_cooldown_seconds), 86400.0)
+        with self._lock:
+            self.con.execute("BEGIN IMMEDIATE")
+            try:
+                state = self._platform_update_probe_locked(channel, interval)
+                if not state["initialized"]:
+                    # Import only a successful legacy check, never its error payload.
+                    last_attempt = state["last_attempt_at"]
+                    state["manual_cooldown_until"] = (
+                        last_attempt + cooldown if last_attempt is not None else 0.0
+                    )
+                    self.con.execute(
+                        """INSERT INTO platform_update_probes(
+                               channel, current_version, last_success_json,
+                               last_attempt_at, last_success_at, next_check_at,
+                               manual_cooldown_until
+                           ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                        (channel, state["current_version"],
+                         json.dumps(state["result"], ensure_ascii=True, allow_nan=False),
+                         last_attempt, state["last_success_at"], state["next_check_at"],
+                         state["manual_cooldown_until"]),
+                    )
+                outcome = "acquired"
+                if state["lease_owner"] and state["lease_until"] > now:
+                    outcome = "busy"
+                elif state["retry_not_before"] > now:
+                    outcome = "backoff"
+                elif state["manual_cooldown_until"] > now:
+                    outcome = "cooldown"
+                elif (
+                    not force and state["next_check_at"] > now
+                    and state["current_version"] == current_version
+                    and state["result"].get("checked_at") is not None
+                ):
+                    outcome = "cached"
+                generation = int(state["lease_generation"])
+                if outcome == "acquired":
+                    generation += 1
+                    self.con.execute(
+                        """UPDATE platform_update_probes SET current_version = ?,
+                               last_attempt_at = ?, next_check_at = ?,
+                               manual_cooldown_until = ?, lease_owner = ?,
+                               lease_until = ?, lease_generation = ?
+                           WHERE channel = ?""",
+                        (current_version, now, now + lease, now + cooldown, owner,
+                         now + lease, generation, channel),
+                    )
+                self.con.commit()
+                return {
+                    "outcome": outcome, "generation": generation,
+                    "consecutive_failures": int(state["consecutive_failures"]),
+                }
+            except BaseException:
+                self.con.rollback()
+                raise
+
+    def renew_platform_update_probe(
+        self, channel, owner, generation, *, lease_seconds=120, now=None,
+    ):
+        """An expired owner cannot resurrect its lease, even before a takeover."""
+        now = self._platform_probe_number(time.time() if now is None else now)
+        lease = min(self._platform_probe_number(lease_seconds, minimum=1.0), 3600.0)
+        with self._lock:
+            cur = self.con.execute(
+                """UPDATE platform_update_probes SET lease_until = ?
+                   WHERE channel = ? AND lease_owner = ? AND lease_generation = ?
+                     AND lease_until > ?""",
+                (now + lease, channel, str(owner), int(generation), now),
+            )
+            self.con.commit()
+            return cur.rowcount == 1
+
+    def finish_platform_update_probe(
+        self, channel, owner, generation, *, current_version, next_check_at,
+        payload=None, error_code="", retry_not_before=0, now=None,
+    ):
+        """Commit a result and legacy cache together, only under a live lease.
+
+        A failure touches only probe metadata. The last successful discovery is
+        retained, including when an older caller writes a legacy error check.
+        """
+        now = self._platform_probe_number(time.time() if now is None else now)
+        next_check_at = self._platform_probe_number(next_check_at, minimum=now)
+        retry_not_before = self._platform_probe_number(retry_not_before)
+        result = None
+        if payload is not None:
+            if payload.get("status") not in {"available", "current", "no_release", "incomplete"}:
+                raise ValueError("invalid successful update probe")
+            fields = (
+                "status", "available", "version", "published_at", "release_notes", "error_code",
+            )
+            result = {key: payload[key] for key in fields if key in payload}
+            if isinstance(payload.get("installer_assets"), dict):
+                result["installer_assets"] = {
+                    kind: payload["installer_assets"].get(kind) is True
+                    for kind in ("docker", "systemd")
+                }
+            result.update(channel=channel, current_version=str(current_version), checked_at=now)
+            encoded = json.dumps(result, ensure_ascii=True, allow_nan=False)
+        elif not error_code:
+            raise ValueError("missing update probe result")
+        with self._lock:
+            self.con.execute("BEGIN IMMEDIATE")
+            try:
+                if result is not None:
+                    cur = self.con.execute(
+                        """UPDATE platform_update_probes SET last_success_json = ?,
+                               last_success_at = ?, consecutive_failures = 0,
+                               last_error_code = '', retry_not_before = 0,
+                               next_check_at = ?, lease_owner = '', lease_until = 0
+                           WHERE channel = ? AND lease_owner = ? AND lease_generation = ?
+                             AND current_version = ? AND lease_until > ?""",
+                        (encoded, now, next_check_at, channel, str(owner), int(generation),
+                         str(current_version), now),
+                    )
+                else:
+                    cur = self.con.execute(
+                        """UPDATE platform_update_probes SET last_failure_at = ?,
+                               consecutive_failures = consecutive_failures + 1,
+                               last_error_code = ?, retry_not_before = ?,
+                               next_check_at = ?, lease_owner = '', lease_until = 0
+                           WHERE channel = ? AND lease_owner = ? AND lease_generation = ?
+                             AND current_version = ? AND lease_until > ?""",
+                        (now, str(error_code)[:80], retry_not_before, next_check_at,
+                         channel, str(owner), int(generation), str(current_version), now),
+                    )
+                if cur.rowcount != 1:
+                    self.con.rollback()
+                    return False
+                if result is not None:
+                    self.con.execute(
+                        """INSERT INTO platform_update_checks(channel, payload_json, checked_at)
+                           VALUES (?, ?, ?) ON CONFLICT(channel) DO UPDATE SET
+                           payload_json = excluded.payload_json, checked_at = excluded.checked_at""",
+                        (channel, encoded, now),
+                    )
+                self.con.commit()
+                return True
+            except BaseException:
+                self.con.rollback()
+                raise
+
+    def abandon_platform_update_probe(self, channel, owner, generation, *, now=None):
+        """Fence a cancelled/version-obsolete check without reporting a source error."""
+        now = self._platform_probe_number(time.time() if now is None else now)
+        with self._lock:
+            cur = self.con.execute(
+                """UPDATE platform_update_probes SET lease_owner = '', lease_until = 0,
+                       next_check_at = MIN(next_check_at, ?)
+                   WHERE channel = ? AND lease_owner = ? AND lease_generation = ?""",
+                (now, channel, str(owner), int(generation)),
+            )
+            self.con.commit()
+            return cur.rowcount == 1
 
     def active_platform_update(self):
         with self._lock:

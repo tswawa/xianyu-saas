@@ -124,6 +124,8 @@ docker compose logs -f
 docker compose down
 ```
 
+- **版本更新说明**：服务端默认每 6 小时低频探测新版本一次（全站共享数据库缓存，不自动静默安装），已登录页面在可见时每 5 分钟读取本地缓存并在版本徽标变黄提示。标准升级流程通过宿主机重新构建容器完成，详见 [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md)；新版本规划的独立更新器配置（`docker-compose.updates.yml`）支持带数据冷备与镜像回滚保护的受控升级（真实 Linux/Docker 端到端验收仍在等待隔离引擎环境）。
+
 ### 方式二：Linux 本地源码开发
 
 适用于需要修改后端或前端源码的开发者。

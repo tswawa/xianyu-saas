@@ -43,3 +43,34 @@ jobs:
         run: npx playwright install --with-deps chromium
       - name: Validate repository
         run: npm test
+
+  docker-updates:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: backend/requirements-dev.txt
+      - name: Install isolated test dependencies
+        run: |
+          python -m venv backend/.venv
+          backend/.venv/bin/pip install -r backend/requirements-dev.txt
+      - name: Verify native Linux permissions and recovery
+        run: |
+          sudo "$PWD/backend/.venv/bin/python" tests/update-maintenance-contract.py
+          sudo "$PWD/backend/.venv/bin/python" tests/systemd-update-recovery-contract.py
+      - name: Create isolated runner Docker context
+        run: |
+          docker version
+          docker buildx version
+          docker context create updates-ci --docker host=unix:///var/run/docker.sock
+      - name: Verify real Docker update and recovery
+        run: backend/.venv/bin/python tests/docker-updater-integration.py --run --context updates-ci --acknowledge-isolated-engine
+      - name: Remove runner test context
+        if: always()
+        run: docker context rm updates-ci --force || true

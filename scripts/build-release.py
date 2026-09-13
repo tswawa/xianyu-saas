@@ -20,7 +20,9 @@ import sys
 import tarfile
 import tempfile
 import types
+import unicodedata
 import zipfile
+import zlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -55,6 +57,7 @@ PRIVATE_PARTS = frozenset({
 PRIVATE_NAMES = frozenset({
     "agents.md", "memory.md", "memory_operations.md", "competitor-analysis-plan.md",
     "test-codes.txt", "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519", "intent.json",
+    ".xianyu-release.json", ".xianyu-manifest.json", ".xianyu-manifest.sig",
 })
 PRIVATE_DATA = re.compile(
     r"(?:^|[._-])(?:cookies?|tokens?|credentials?|secrets?|private[._-]?keys?|"
@@ -107,13 +110,14 @@ def git(root: Path, *args: str, data: bytes | None = None, codes=(0,)) -> subpro
 
 def canonical_path(path: str, *, max_length=500, max_component=240) -> None:
     parts = path.split("/")
-    if (not path or len(path) > max_length or "\\" in path or ":" in path
+    if (not path or len(path) > max_length or any(char in path for char in '\\:<>"|?*')
+            or unicodedata.normalize("NFC", path) != path
             or any(ord(char) < 32 or ord(char) == 127 for char in path)
             or any(part in {"", ".", ".."} or len(part) > max_component
                    or part.endswith((".", " ")) for part in parts)):
         raise BundleError("release_path_invalid")
     for part in parts:
-        if re.fullmatch(r"(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?", part, re.IGNORECASE):
+        if re.fullmatch(r"(?:con|prn|aux|nul|com[1-9¹²³]|lpt[1-9¹²³])(?:\..*)?", part, re.IGNORECASE):
             raise BundleError("release_path_invalid")
 
 
@@ -235,16 +239,23 @@ def release_version(files: dict, protocol) -> str:
     try:
         package = json.loads(files["package.json"][0])
         lock = json.loads(files["package-lock.json"][0])
-        versions = re.findall(r'^VERSION\s*=\s*["\']([^"\']+)["\']\s*$', files["backend/version.py"][0].decode("utf-8"), re.MULTILINE)
+        # Parse literals, never import/execute version.py or other source runtime.
+        tree = ast.parse(files["backend/version.py"][0], filename="backend/version.py")
+        assignments = [node for node in tree.body if isinstance(node, ast.Assign) and len(node.targets) == 1
+                       and isinstance(node.targets[0], ast.Name) and node.targets[0].id == "VERSION"]
+        stores = [node for node in ast.walk(tree) if isinstance(node, ast.Name) and node.id == "VERSION"
+                  and isinstance(node.ctx, (ast.Store, ast.Del))]
         version = package["version"]
-        if not isinstance(version, str) or version != version.strip():
+        if not isinstance(version, str) or len(version) > 128 or version != version.strip():
             raise BundleError("release_version_invalid")
         protocol.SemVer.parse(version)
-        if len(versions) != 1 or versions[0] != version or lock["version"] != version or lock["packages"][""]["version"] != version:
+        if (len(assignments) != 1 or len(stores) != 1 or not isinstance(assignments[0].value, ast.Constant)
+                or assignments[0].value.value != version
+                or lock["version"] != version or lock["packages"][""]["version"] != version):
             raise BundleError("release_version_mismatch")
         canonical_path(f"xianyu-saas-{version}-source.zip", max_component=protocol.MAX_PATH_COMPONENT)
         return version
-    except (KeyError, TypeError, ValueError, UnicodeError, protocol.PlatformUpdateError):
+    except (KeyError, TypeError, ValueError, UnicodeError, SyntaxError, RecursionError, protocol.PlatformUpdateError):
         raise BundleError("release_version_invalid") from None
 
 
@@ -368,8 +379,16 @@ def write_source_zip(path: Path, files: dict, version: str, epoch: int) -> None:
             info = zipfile.ZipInfo(f"xianyu-saas-{version}/{name}", date_time=date_time)
             info.create_system = 3
             info.external_attr = (stat.S_IFREG | (0o755 if executable else 0o644)) << 16
-            info.compress_type = zipfile.ZIP_DEFLATED
-            archive.writestr(info, payload, compress_type=zipfile.ZIP_DEFLATED, compresslevel=9)
+            compression = zipfile.ZIP_DEFLATED
+            if len(payload) > 1024 * 1024:
+                compressor = zlib.compressobj(9, zlib.DEFLATED, -15)
+                packed_size = len(compressor.compress(payload)) + len(compressor.flush())
+                if len(payload) > packed_size * 200:
+                    # Keep legitimate repetitive Git blobs within the verifier's
+                    # anti-bomb profile rather than shipping an unusable ZIP.
+                    compression = zipfile.ZIP_STORED
+            info.compress_type = compression
+            archive.writestr(info, payload, compress_type=compression, compresslevel=9)
 
 
 def asset_record(path: Path) -> dict:
@@ -400,6 +419,9 @@ def build(args, encoded: str | None) -> dict:
     for required in REQUIRED_LICENSES:
         if required not in files or not files[required][0].strip():
             raise BundleError("release_license_missing")
+    for required in ("Dockerfile", "docker/entrypoint.sh"):
+        if required not in files or not files[required][0].strip():
+            raise BundleError("release_docker_source_missing")
     version = release_version(files, protocol)
     notes = release_notes(files, version, protocol)
     key, seed = signing_key(encoded)
@@ -460,15 +482,26 @@ def build(args, encoded: str | None) -> dict:
         (stage / signature_name).write_bytes(signature)
         source_name = f"xianyu-saas-{version}-source.zip"
         write_source_zip(stage / source_name, files, version, epoch)
-        if (stage / source_name).stat().st_size > protocol.MAX_ARCHIVE_BYTES:
+        source_record = asset_record(stage / source_name)
+        if source_record["size"] > protocol.MAX_ARCHIVE_BYTES:
             raise BundleError("release_too_large")
+        # Docker authenticates every build input, without changing the existing
+        # schema-1 OTA descriptor, its signature bytes or its path allowlist.
+        docker_manifest_raw = json_bytes({
+            "schema": 1, "protocol": 1, "version": version, "commit": commit,
+            "source": source_record, "runtime_manifest_sha256": hashlib.sha256(manifest_raw).hexdigest(),
+        })
+        docker_signature = base64.b64encode(key.sign(docker_manifest_raw))
+        key.public_key().verify(base64.b64decode(docker_signature, validate=True), docker_manifest_raw)
+        (stage / f"xianyu-saas-{version}.docker.manifest.json").write_bytes(docker_manifest_raw)
+        (stage / f"xianyu-saas-{version}.docker.manifest.sig").write_bytes(docker_signature)
         (stage / f"xianyu-saas-{version}.update-signing.pub").write_bytes(files[args.public_key_file][0])
         (stage / "release-notes.md").write_bytes(notes)
         records = [asset_record(path) for path in sorted(stage.iterdir())]
         result = {"schema": 1, "version": version, "commit": commit,
                   "public_key_fingerprint": "sha256:" + hashlib.sha256(public_raw).hexdigest(), "files": records}
         (stage / "artifacts.json").write_bytes(json_bytes(result))
-        # The index describes six content assets. Checksums cover those plus the index;
+        # The index describes eight content assets. Checksums cover those plus the index;
         # neither metadata file pretends it can contain its own recursive hash.
         checksummed = sorted([*records, asset_record(stage / "artifacts.json")], key=lambda entry: entry["name"])
         (stage / "SHA256SUMS").write_bytes("".join(f'{entry["sha256"]}  {entry["name"]}\n' for entry in checksummed).encode("utf-8"))

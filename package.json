@@ -1,6 +1,6 @@
 {
   "name": "xianyu-saas",
-  "version": "0.2.2",
+  "version": "0.3.0",
   "private": true,
   "description": "按店铺账号隔离的闲鱼客服工作台、服务端与自动客服 worker",
   "license": "GPL-3.0-only",
@@ -18,7 +18,9 @@
     "test": "bash scripts/test-all.sh",
     "test:api": "backend/.venv/bin/python tests/api-contract.py && backend/.venv/bin/python tests/shop-sync-contract.py && backend/.venv/bin/python tests/xianyu-login-contract.py && backend/.venv/bin/python tests/qr-login-cooldown-contract.py",
     "test:auth": "backend/.venv/bin/python tests/auth-roles-contract.py && backend/.venv/bin/python tests/auth-security-contract.py && backend/.venv/bin/python tests/platform-admin-contract.py && backend/.venv/bin/python tests/registration-init-contract.py",
-    "test:update": "backend/.venv/bin/python tests/platform-update-contract.py",
+    "test:update": "backend/.venv/bin/python tests/platform-update-contract.py && backend/.venv/bin/python tests/update-probe-contract.py && backend/.venv/bin/python tests/update-maintenance-contract.py && backend/.venv/bin/python tests/docker-update-protocol-contract.py && backend/.venv/bin/python tests/docker-updater-contract.py && backend/.venv/bin/python tests/systemd-update-recovery-contract.py && backend/.venv/bin/python tests/update-api-contract.py",
+    "test:update-docker": "backend/.venv/bin/python tests/docker-updater-integration.py --run",
+    "test:update-docker:offline": "backend/.venv/bin/python tests/docker-updater-integration.py --self-test",
     "test:release": "backend/.venv/bin/python tests/release-bundle-contract.py",
     "test:settings": "backend/.venv/bin/python tests/user-ai-connection-contract.py && backend/.venv/bin/python tests/operations-tools-contract.py && backend/.venv/bin/python tests/operations-runtime-contract.py && backend/.venv/bin/python tests/operations-contract.py && backend/.venv/bin/python tests/settings-ops-api-contract.py && SAAS_UI_SCOPE=settings node tests/ui-check.mjs && SAAS_UI_SCOPE=ops node tests/ui-check.mjs",
     "test:p0": "backend/.venv/bin/python tests/control-plane-contract.py",
@@ -41,7 +43,7 @@
     "test:repository": "python3 tests/repository-contract.py",
     "test:ui": "node tests/ui-check.mjs",
     "test:worker": "cd worker && timeout 20m prlimit --as=3221225472 -- .venv/bin/python -m unittest discover -s tests -v",
-    "test:syntax": "python3 -m py_compile backend/*.py tests/*.py worker/*.py worker/utils/*.py worker/scripts/*.py worker/tests/*.py && node --check frontend/assets/app.js && node --check scripts/dev-server.mjs && node --check tests/ui-check.mjs"
+    "test:syntax": "python3 -m py_compile backend/*.py tests/*.py deploy/updater/updater.py worker/*.py worker/utils/*.py worker/scripts/*.py worker/tests/*.py && node --check frontend/assets/app.js && node --check scripts/dev-server.mjs && node --check tests/ui-check.mjs"
   },
   "devDependencies": {
     "playwright": "1.55.1"

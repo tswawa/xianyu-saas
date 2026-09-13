@@ -18,9 +18,10 @@ const desktopSettingsOpsScope = ["settings", "ops", "dashboard", "goods", "resou
 const mockOnlyScope = process.env.SAAS_UI_SCOPE === "mock";
 const connectionFlowsScope = process.env.SAAS_UI_SCOPE === "connection-flows";
 const ruleDraftsScope = process.env.SAAS_UI_SCOPE === "rule-drafts";
+const updatesScope = process.env.SAAS_UI_SCOPE === "updates";
 // Public documentation images are opt-in, never a side effect of a test scope.
 const docsCaptureScope = process.env.SAAS_UI_SCOPE === "docs-capture";
-const screenshotsEnabled = !docsCaptureScope && !desktopSettingsOpsScope && !mockOnlyScope && !connectionFlowsScope && !ruleDraftsScope && process.env.SAAS_UI_SCREENSHOTS !== "0";
+const screenshotsEnabled = !docsCaptureScope && !desktopSettingsOpsScope && !mockOnlyScope && !connectionFlowsScope && !ruleDraftsScope && !updatesScope && process.env.SAAS_UI_SCREENSHOTS !== "0";
 if (screenshotsEnabled) fs.mkdirSync(resultRoot, { recursive: true });
 for (const staleName of screenshotsEnabled ? [
   "local-live-desktop.png", "local-live-mobile.png", "shop-connector-missing-desktop.png",
@@ -155,6 +156,11 @@ const fixtures = {
     rollback_versions: ["0.0.9"],
   },
   updateRequests: [],
+  updateResponseGates: {},
+  pendingUpdateGates: new Set(),
+  updateStages: new Map(),
+  updateConfirmations: new Map(),
+  updateSequence: 0,
   adminUserRequests: [],
   adminSettingRequests: [],
   adminConfirmRequests: [],
@@ -880,7 +886,7 @@ function createServer() {
         return json(res, { ok: true, other_sessions_revoked: true });
       }
       if (handleSettingsOpsMock(req, res, apiPath, payload, rawBody)) return;
-      if (apiPath === "/api/version" && req.method === "GET") return json(res, fixtures.version);
+      if (apiPath === "/api/version" && req.method === "GET") return updateMockResponse(res, req.method, apiPath, fixtures.version);
       if (apiPath.startsWith("/api/admin/") && fixtures.me?.is_admin !== true) {
         return json(res, { detail: { code: "admin_required", message: "需要管理员权限" } }, 403);
       }
@@ -977,7 +983,7 @@ function createServer() {
       if (apiPath === "/api/admin/audit" && req.method === "GET") {
         return json(res, { events: fixtures.auditEvents, next_cursor: null });
       }
-      if (apiPath === "/api/admin/updates" && req.method === "GET") return json(res, fixtures.updateStatus);
+      if (apiPath === "/api/admin/updates" && req.method === "GET") return updateMockResponse(res, req.method, apiPath, fixtures.updateStatus);
       if (apiPath === "/api/admin/updates/check" && req.method === "POST") {
         fixtures.updateRequests.push({ action: "check", payload });
         fixtures.updateStatus.update_check = {
@@ -989,34 +995,43 @@ function createServer() {
           ...(fixtures.releaseCheckOverrides || {}),
         };
         fixtures.version.update_check = structuredClone(fixtures.updateStatus.update_check);
-        return json(res, fixtures.updateStatus.update_check);
+        return updateMockResponse(res, req.method, apiPath, fixtures.updateStatus.update_check);
       }
       if (apiPath === "/api/admin/updates/download" && req.method === "POST") {
         fixtures.updateRequests.push({ action: "download", payload });
-        fixtures.updateStatus.latest_update = {
-          ...fixtures.updateStatus.update_check,
-          version: String(payload.version || "0.2.0"), status: "staged", updated_at: 1788134401,
-        };
-        return json(res, {
-          version: fixtures.updateStatus.latest_update.version,
-          channel: "release",
-          status: "staged",
-          release_notes: fixtures.updateStatus.latest_update.release_notes,
-        });
+        const action = payload.action || "apply";
+        const caps = fixtures.updateStatus.capabilities;
+        const candidate = fixtures.updateStatus.rollback_versions?.find((item) => item?.version === payload.version && /^[a-f0-9]{64}$/.test(item.manifest_sha256));
+        if (caps[action] !== true || (action === "apply" && caps.download !== true) || (action === "rollback" && !candidate)) {
+          return updateMockResponse(res, req.method, apiPath, { detail: { code: "update_installation_unavailable" } }, 409);
+        }
+        const stage = { status: "staged", version: payload.version, action, operation_id: (++fixtures.updateSequence).toString(16).padStart(32, "0"),
+          deployment: caps.deployment, manifest_sha256: candidate?.manifest_sha256 || "a".repeat(64), release_notes: fixtures.updateStatus.update_check?.release_notes || "" };
+        fixtures.updateStages.set(stage.operation_id, stage);
+        return updateMockResponse(res, req.method, apiPath, stage);
       }
       if (apiPath === "/api/admin/confirm" && req.method === "POST") {
-        fixtures.adminConfirmRequests.push(payload);
-        return json(res, { confirmation_token: "ui-one-time-confirmation", expires_in: 180 });
+        const { password, ...binding } = payload;
+        fixtures.adminConfirmRequests.push({ ...binding, password_present: Boolean(password) });
+        if (password !== "Mock-Update-Password-123!") return updateMockResponse(res, req.method, apiPath, { detail: { code: "authentication_failed" } }, 401);
+        const stage = fixtures.updateStages.get(payload.operation_id);
+        if (!stage || stage.version !== payload.version || "update." + stage.action !== payload.action) return updateMockResponse(res, req.method, apiPath, { detail: { code: "confirmation_invalid" } }, 403);
+        const token = `mock-update-confirmation-${stage.operation_id}`;
+        fixtures.updateConfirmations.set(token, { ...binding, username: fixtures.me.username });
+        return updateMockResponse(res, req.method, apiPath, { confirmation_token: token, operation_id: stage.operation_id, expires_in: 180 });
       }
       if (["/api/admin/updates/apply", "/api/admin/updates/rollback"].includes(apiPath) && req.method === "POST") {
         const action = apiPath.endsWith("/apply") ? "apply" : "rollback";
-        fixtures.updateRequests.push({ action, payload });
-        fixtures.updateStatus.latest_update = {
-          ...(fixtures.updateStatus.latest_update || {}),
-          version: String(payload.version || ""), channel: "release",
-          status: action === "apply" ? "apply_requested" : "rollback_requested", error_code: "", updated_at: 1788134402,
-        };
-        return json(res, { queued: true, action, version: String(payload.version || "") }, 202);
+        const { confirmation_token, ...binding } = payload;
+        fixtures.updateRequests.push({ action, payload: { ...binding, confirmation_present: Boolean(confirmation_token) } });
+        const confirmation = fixtures.updateConfirmations.get(confirmation_token);
+        fixtures.updateConfirmations.delete(confirmation_token);
+        const stage = fixtures.updateStages.get(payload.operation_id);
+        if (!confirmation || confirmation.username !== fixtures.me.username || confirmation.action !== "update." + action || confirmation.operation_id !== payload.operation_id || confirmation.version !== payload.version || !stage) {
+          return updateMockResponse(res, req.method, apiPath, { detail: { code: "confirmation_invalid" } }, 403);
+        }
+        fixtures.updateStatus.operation = { ...stage, status: "queued", phase: "queued", error_code: "" };
+        return updateMockResponse(res, req.method, apiPath, fixtures.updateStatus.operation, 202);
       }
       if (apiPath === "/api/bot/accounts" && req.method === "GET") return json(res, { accounts: fixtures.shopAccounts });
       if (apiPath === "/api/bot/accounts" && req.method === "POST") {
@@ -2192,8 +2207,9 @@ async function assertNoBusinessStorage(page, pattern) {
   assert.doesNotMatch(JSON.stringify(snapshot), pattern, "business messages and API keys must never enter browser storage, including transient writes");
 }
 
-async function desktopContractPage(browser, baseUrl, contextOptions = {}) {
+async function desktopContractPage(browser, baseUrl, contextOptions = {}, clockTime = null) {
   const page = await browser.newPage({ viewport: { width: 1440, height: 900 }, deviceScaleFactor: 1, serviceWorkers: "block", ...contextOptions });
+  if (clockTime) await page.clock.install({ time: clockTime });
   page.setDefaultTimeout(8000);
   const evidence = { pageErrors: [], failedResponses: [], externalRequests: [], allowedFailures: [], confirmDialogs: [] };
   fixtures.desktopEvidence = evidence;
@@ -2246,6 +2262,25 @@ async function desktopApiClick(page, selector, apiPath, method = "POST", expecte
   return result.json();
 }
 
+function holdUpdateResponse(method, path, override = {}) {
+  let arrive;
+  let resolve;
+  const started = new Promise((done) => { arrive = done; });
+  const promise = new Promise((done) => { resolve = done; });
+  const release = () => { fixtures.pendingUpdateGates.delete(release); resolve(); };
+  fixtures.pendingUpdateGates.add(release);
+  (fixtures.updateResponseGates[`${method}:${path}`] ||= []).push({ arrive, promise, ...override });
+  return { started: () => waitForMockGate(started, `${method} ${path}`), release };
+}
+
+function updateMockResponse(res, method, path, body, status = 200) {
+  const gate = fixtures.updateResponseGates[`${method}:${path}`]?.shift();
+  if (!gate) return json(res, body, status);
+  const snapshot = structuredClone(gate.body || body);
+  gate.arrive();
+  gate.promise.then(() => json(res, snapshot, gate.status || status));
+}
+
 function holdAutomationResponse(method, accountKey = "default") {
   let arrive;
   let resolve;
@@ -2279,7 +2314,7 @@ async function assertVersionPopoverBounds(page, label) {
   const result = await page.evaluate(() => {
     const popover = document.querySelector('#versionBadgePopover');
     const bounds = popover.getBoundingClientRect();
-    const selector = '.version-popover-actions > .button, .version-popover-val, .version-popover-status';
+    const selector = '#versionBadgeCurrent, #versionBadgeStatus, button, a, summary, label';
     return { left: bounds.left, right: bounds.right, viewport: innerWidth,
       clientWidth: popover.clientWidth, scrollWidth: popover.scrollWidth,
       children: [...popover.querySelectorAll(selector)].filter((node) => !node.hidden && node.getClientRects().length).map((node) => {
@@ -2288,10 +2323,96 @@ async function assertVersionPopoverBounds(page, label) {
       }) };
   });
   assert.ok(result.left >= 7 && result.right <= result.viewport - 7, `${label}: popover stays inside the viewport: ${JSON.stringify(result)}`);
-  assert.ok(result.scrollWidth <= result.clientWidth + 1, `${label}: popover must not scroll horizontally`);
+  assert.ok(result.scrollWidth <= result.clientWidth + 1, `${label}: popover must not scroll horizontally: ${JSON.stringify(result)}`);
   for (const node of result.children) {
     assert.ok(node.left >= result.left && node.right <= result.right + 1, `${label}: ${node.id} extends outside its popover: ${JSON.stringify(node)}`);
     assert.ok(node.scrollWidth <= node.clientWidth + 1, `${label}: ${node.id} must wrap rather than clip text`);
+  }
+}
+
+async function checkVersionPopoverStates(page) {
+  const saved = { version: fixtures.version, updateStatus: fixtures.updateStatus };
+  const ready = { deployment: "docker", check: true, download: true, apply: true, rollback: true, reason: "" };
+  const current = "0.2.2";
+  const variants = [
+    ["unchecked", { status: "unchecked", available: false }, false],
+    ["current", { status: "current", available: false, version: current }, false],
+    ["same-version", { status: "available", available: true, version: current }, false],
+    ["older-version", { status: "available", available: true, version: "0.2.1" }, false],
+    ["no-release", { status: "no_release", available: false }, false],
+    ["incomplete", { status: "incomplete", available: true, version: "0.2.3" }, false],
+    ["error", { status: "error", available: false, error_code: "update_source_failed" }, false],
+    ["invalid-version", { status: "available", available: true, version: "invalid" }, false],
+    ["mismatched-current", { status: "current", available: false, version: current, current_version: "0.2.1" }, false],
+    ["higher-version", { status: "available", available: true, version: "0.2.3" }, true],
+  ];
+  const requestsBefore = fixtures.updateRequests.length;
+  try {
+    for (const [label, variant, hasUpdate] of variants) {
+      const update_check = { current_version: current, ...variant };
+      const update_probe = { state: variant.status === "error" ? "error" : "idle", has_success: variant.status === "current" || hasUpdate };
+      fixtures.version = { ...structuredClone(saved.version), version: current, capabilities: ready, update_check, update_probe };
+      fixtures.updateStatus = { ...structuredClone(saved.updateStatus), current: { version: current }, capabilities: ready,
+        update_check, update_probe, rollback_versions: [], operation: null };
+      await page.reload();
+      await page.waitForLoadState("networkidle");
+      await page.click("#versionBadgeButton");
+      assert.equal(await page.locator("#versionBadgeUpdate").isVisible(), hasUpdate, `${label}: upgrade is visible only for a confirmed higher release`);
+      assert.equal(await page.locator("#versionBadgeUpdate").evaluate((node) => node.hidden), !hasUpdate, `${label}: unavailable upgrade is hidden, not merely disabled`);
+      assert.equal(await page.locator("#versionBadgeUpdateActions").isVisible(), hasUpdate, `${label}: hidden upgrade leaves no empty actions row`);
+      assert.equal(await page.locator("#versionBadgeOperation").isVisible(), false, `${label}: no operation means no progress/result action`);
+      if (label === "current") assert.equal(await page.locator("#versionBadgeStatusIcon").isVisible(), true);
+      if (!["current", "same-version", "older-version"].includes(label)) {
+        assert.equal(await page.locator("#versionBadgeStatusIcon").isVisible(), false, `${label}: unknown, invalid and update-available states must not claim to be current`);
+      }
+      await assertVersionPopoverBounds(page, label);
+      await assertUnifiedVersionLink(page);
+      if (process.env.SAAS_UI_SCREENSHOTS === "1" && ["current", "higher-version"].includes(label)) {
+        const directory = path.join(repoRoot, ".local", "ui-popover-preview");
+        fs.mkdirSync(directory, { recursive: true });
+        await page.locator("#versionBadgePopover").screenshot({ path: path.join(directory, `${label}-desktop.png`) });
+        if (label === "current") {
+          await page.setViewportSize({ width: 390, height: 844 });
+          await assertVersionPopoverBounds(page, "current mobile");
+          await page.locator("#versionBadgePopover").screenshot({ path: path.join(directory, "current-mobile.png") });
+          await page.setViewportSize({ width: 1440, height: 900 });
+        }
+      }
+      await page.keyboard.press("Escape");
+      assert.equal(await page.locator("#versionBadgePopover").isHidden(), true, `${label}: Escape closes the popover`);
+      await page.waitForFunction(() => document.activeElement?.id === "versionBadgeButton");
+    }
+    const currentCheck = { status: "current", available: false, version: current, current_version: current };
+    fixtures.version.update_check = currentCheck;
+    fixtures.updateStatus.update_check = currentCheck;
+    fixtures.updateStatus.rollback_versions = ["0.1.0", { version: "0.2.1", manifest_sha256: "invalid" },
+      { version: "0.2.1", manifest_sha256: "a".repeat(64), published_at: "2026-09-08T00:00:00Z" },
+      { version: "0.2.0", manifest_sha256: "b".repeat(64) },
+      { version: "0.1.9", manifest_sha256: "c".repeat(64) },
+      { version: "0.1.8", manifest_sha256: "d".repeat(64) }];
+    await page.reload();
+    await page.waitForLoadState("networkidle");
+    await page.click("#versionBadgeButton");
+    await page.click("#versionRollbackDetails > summary");
+    assert.deepEqual(await page.locator('#versionRollbackList input[type="radio"]').evaluateAll((nodes) => nodes.map((node) => node.value)),
+      ["0.2.1", "0.2.0", "0.1.9"], "popover shows at most three verified rollback candidates");
+    assert.deepEqual(await page.locator(".version-rollback-date").allTextContents(), ["2026-09-08"], "only an API-provided release date is rendered");
+    await page.check('input[name="versionRollbackChoice"][value="0.2.0"]');
+    await assertVersionPopoverBounds(page, "expanded rollback choices");
+    if (process.env.SAAS_UI_SCREENSHOTS === "1") {
+      await page.locator("#versionBadgePopover").screenshot({ path: path.join(repoRoot, ".local", "ui-popover-preview", "rollback-desktop.png") });
+    }
+    await page.setViewportSize({ width: 320, height: 844 });
+    await assertVersionPopoverBounds(page, "320px expanded rollback choices");
+    await page.keyboard.press("Escape");
+    await page.waitForFunction(() => document.activeElement?.id === "versionBadgeButton");
+    await page.setViewportSize({ width: 1440, height: 900 });
+    assert.equal(fixtures.updateRequests.length, requestsBefore, "opening or rendering version states and selecting history must not check, download, update or roll back");
+    return [...variants.map(([label]) => label), "verified-rollback-list"];
+  } finally {
+    Object.assign(fixtures, saved);
+    await page.reload();
+    await page.waitForLoadState("networkidle");
   }
 }
 
@@ -2302,13 +2423,14 @@ async function checkVersionPopover(browser, baseUrl) {
   const cases = [];
   try {
     await desktopLogin(page, fixtures.me.username);
+    const updateStates = await checkVersionPopoverStates(page);
     for (const width of [1440, 1280, 768, 640, 390, 320]) {
       await page.setViewportSize({ width, height: 900 });
       for (const scale of [1, 1.5, 2]) {
         if (!await page.locator('#versionBadgePopover').isVisible()) await page.click('#versionBadgeButton');
         await page.evaluate((factor) => {
           const popover = document.querySelector('#versionBadgePopover');
-          const nodes = [...popover.querySelectorAll('.version-popover-header, .version-popover-row, .version-popover-label, .version-popover-val, .version-popover-status, .version-popover-actions > .button')];
+          const nodes = [...popover.querySelectorAll('#versionBadgeCurrent, #versionBadgeStatus, button, a, summary, label')];
           nodes.forEach((node) => { node.style.fontSize = ''; });
           const sizes = nodes.map((node) => parseFloat(getComputedStyle(node).fontSize));
           nodes.forEach((node, index) => { node.style.fontSize = `${sizes[index] * factor}px`; });
@@ -2335,7 +2457,7 @@ async function checkVersionPopover(browser, baseUrl) {
     await checkUpdateFromBadge(page);
     assert.equal(await page.locator('#versionBadgeButton').getAttribute('aria-expanded'), 'false');
     assertDesktopEvidence(evidence);
-    console.log(JSON.stringify({ ok: true, scope: 'popover', cases, longText: true, checksAndExternalLink: true }));
+    console.log(JSON.stringify({ ok: true, scope: 'popover', cases, updateStates, longText: true, checksAndExternalLink: true }));
   } catch (error) {
     await reportDesktopFailure(page, 'popover', error, evidence);
     throw error;
@@ -3486,7 +3608,7 @@ async function checkSettingsDesktop(browser, baseUrl) {
       await page.click("#settingsDocsBtn");
       await page.waitForSelector("#docsHelpModal[open]");
       assert.equal(await page.locator("#docsHelpModal .docs-manual").count(), 1);
-      assert.equal(await page.locator("#docsHelpModal details.docs-faq-item").count(), 4);
+      assert.equal(await page.locator("#docsHelpModal details.docs-faq-item").count(), 5);
       await page.locator("#docsHelpModal").getByRole("button", { name: /关闭/ }).click();
       await page.waitForSelector("#docsHelpModal:not([open])", { state: "attached" });
     }
@@ -3582,7 +3704,8 @@ async function checkSettingsDesktop(browser, baseUrl) {
     fixtures.releaseCheckOverrides = null;
     await page.click("#versionBadgeClose");
     assert.equal(fixtures.settingsRequests.some((item) => item.path.includes("legacy-sources") || Object.keys(item.payload).some((key) => key.startsWith("source_"))), false);
-    assert.deepEqual(fixtures.updateRequests.filter((item) => item.action !== "check"), [], "the simplified UI must not call removed download/apply/rollback actions");
+    assert.equal(fixtures.updateStatus.capabilities.apply, false, "this settings scenario has no configured updater");
+    assert.deepEqual(fixtures.updateRequests.filter((item) => item.action !== "check"), [], "unconfigured updater must not prepare or install from metadata views");
     assert.notEqual(await page.evaluate(() => window.__releaseNotesInjected), true);
     await assertNoOverflow(page, "settings administrator desktop");
     assertDesktopEvidence(evidence);
@@ -4145,6 +4268,347 @@ async function captureDocs(browser, baseUrl) {
   } finally { await page.close(); }
 }
 
+async function checkUpdates(browser, baseUrl) {
+  const saved = { ...fixtures };
+  for (const [key, value] of Object.entries(fixtures)) if (Array.isArray(value)) fixtures[key] = structuredClone(value);
+  const admin = { ...saved.me, id: 91, username: "update-admin", role: "admin", is_admin: true };
+  const ready = { deployment: "docker", check: true, download: true, apply: true, rollback: true, reason: "" };
+  const check = (version = "0.2.0") => ({ status: "available", available: true, version, current_version: "0.1.0", release_notes: "合成升级说明 <script>window.__updateInjected=true</script>" });
+  Object.assign(fixtures, {
+    me: admin, bot: structuredClone(saved.bot), accountData: {},
+    version: { ...structuredClone(saved.version), version: "0.1.0", capabilities: ready, update_check: { status: "unchecked", available: false }, update_probe: { state: "idle", has_success: false } },
+    updateStatus: { ...structuredClone(saved.updateStatus), capabilities: ready, update_check: { status: "unchecked", available: false }, operation: null, rollback_versions: [] },
+    updateResponseGates: {}, pendingUpdateGates: new Set(), updateStages: new Map(), updateConfirmations: new Map(), updateSequence: 0,
+    updateRequests: [], adminConfirmRequests: [], releaseCheckStatus: "available", releaseCheckOverrides: null,
+  });
+  await fetch(`${baseUrl.replace(/\/$/, "")}/api/auth/logout`, { method: "POST" });
+  const { page, evidence } = await desktopContractPage(browser, baseUrl, {}, new Date("2026-09-11T12:00:00Z"));
+  const updatesPath = "/api/admin/updates";
+  const count = (path, method = "GET") => fixtures.apiRequests.filter((item) => item.path === path && item.method === method).length;
+  const installs = () => fixtures.updateRequests.filter((item) => ["apply", "rollback"].includes(item.action)).length;
+  const tick = async (ms = 300001, expectRead = true) => {
+    const response = expectRead ? page.waitForResponse((item) => new URL(item.url()).pathname.endsWith("/api/version")) : null;
+    await page.clock.fastForward(ms);
+    if (response) await response;
+    await page.waitForLoadState("networkidle");
+  };
+  const setCheck = (value) => { fixtures.version.update_check = structuredClone(value); fixtures.updateStatus.update_check = structuredClone(value); };
+  const setVisibility = (hidden) => page.evaluate((value) => {
+    Object.defineProperty(document, "hidden", { configurable: true, get: () => value });
+    Object.defineProperty(document, "visibilityState", { configurable: true, get: () => value ? "hidden" : "visible" });
+    document.dispatchEvent(new Event("visibilitychange"));
+  }, hidden);
+  const clickUpdateEntry = async () => {
+    if (!await page.locator("#versionBadgePopover").isVisible()) await page.locator("#versionBadgeButton").click();
+    const entry = await page.locator("#versionBadgeUpdate").isVisible() ? "#versionBadgeUpdate" : "#versionBadgeOperation";
+    await page.locator(entry).click();
+  };
+  const open = async () => {
+    const refreshed = page.waitForResponse((response) => new URL(response.url()).pathname.endsWith("/api/admin/updates") && response.request().method() === "GET");
+    await clickUpdateEntry();
+    await page.waitForSelector("#platformUpdateDialog[open]");
+    await refreshed;
+    await page.waitForLoadState("networkidle");
+    assert.equal(await page.locator("#platformUpdateDialog").evaluate((dialog) => dialog.contains(document.activeElement)), true, "opening update dialog must move focus inside it");
+  };
+  const close = async () => {
+    await page.click("#updateDialogClose");
+    await page.waitForSelector("#platformUpdateDialog", { state: "hidden" });
+    await page.waitForFunction(() => document.activeElement?.id === "versionBadgeButton");
+  };
+  const prepare = async (action = "apply", trigger = null) => {
+    await desktopApiClick(page, trigger || (action === "apply" ? "#updateDownloadButton" : "#updateRollbackButton"), updatesPath + "/download");
+    await page.waitForSelector("#updatePasswordForm:not([hidden])");
+    await page.waitForFunction(() => !document.querySelector("#updateConfirmButton")?.disabled);
+    assert.equal(await page.evaluate(() => document.activeElement?.id), "updateAdminPassword", "prepared update must focus the password field");
+  };
+  const fillConfirmation = async (password = "Mock-Update-Password-123!") => {
+    await page.fill("#updateAdminPassword", password);
+    await page.check("#updateConfirmRisk");
+  };
+  const failGate = (method, path, code, status) => {
+    evidence.allowedFailures.push({ path, status });
+    return holdUpdateResponse(method, path, { status, body: { detail: { code } } });
+  };
+  const submitQueued = async () => {
+    const response = page.waitForResponse((item) => /\/api\/admin\/updates\/(apply|rollback)$/.test(new URL(item.url()).pathname));
+    await page.click("#updateConfirmButton");
+    assert.equal((await response).status(), 202);
+    await page.waitForFunction(() => document.querySelector("#updatePhaseLabel")?.textContent === "排队中"
+      && document.querySelector("#updatePasswordForm")?.hidden && !document.querySelector("#updateAdminPassword")?.disabled);
+    assert.equal(await page.locator("#updateReloadButton").isVisible(), false, "202 queued is never installation success");
+  };
+  try {
+    await desktopLogin(page, admin.username);
+    await page.waitForLoadState("networkidle");
+    assert.equal(await page.locator("#versionBadgeButton").evaluate((node) => node.classList.contains("has-update")), false);
+    setCheck(check());
+    await tick();
+    assert.equal(await page.locator("#versionBadgeButton").evaluate((node) => node.classList.contains("has-update")), true, "cached GET must discover releases without clicking check");
+    assert.equal(fixtures.updateRequests.length, 0, "automatic cache polling must not issue remote-check POSTs");
+    const visibleGets = count("/api/version");
+    await setVisibility(true);
+    await tick(600001, false);
+    assert.equal(count("/api/version"), visibleGets, "hidden tabs must not refresh local version cache");
+    const visibleRefresh = page.waitForResponse((response) => new URL(response.url()).pathname.endsWith("/api/version"));
+    await setVisibility(false);
+    await visibleRefresh;
+    await page.waitForLoadState("networkidle");
+    assert.equal(count("/api/version"), visibleGets + 1, "returning to an expired cache refreshes exactly once");
+    await setVisibility(true);
+    await setVisibility(false);
+    await page.waitForLoadState("networkidle");
+    assert.equal(count("/api/version"), visibleGets + 1, "fresh cache must not be reloaded on every visibility event");
+
+    const staleVersion = holdUpdateResponse("GET", "/api/version");
+    const staleStatus = holdUpdateResponse("GET", updatesPath);
+    await page.clock.fastForward(300001);
+    await Promise.all([staleVersion.started(), staleStatus.started()]);
+    fixtures.releaseCheckOverrides = { version: "0.3.0" };
+    await checkUpdateFromBadge(page);
+    staleVersion.release(); staleStatus.release();
+    await page.waitForLoadState("networkidle");
+    assert.match(await page.locator("#versionBadgeStatus").textContent(), /0\.3\.0/, "late automatic GET must not overwrite newer manual discovery");
+    setCheck({ status: "error", available: false, error_code: "update_source_failed" });
+    await tick();
+    assert.equal(await page.locator("#versionBadgeButton").evaluate((node) => node.classList.contains("has-update")), true, "probe errors preserve previously confirmed higher releases");
+    setCheck(check("0.3.0"));
+    fixtures.updateStatus.update_probe = { state: "error", has_success: true, error_code: "update_source_failed", manual_cooldown_until: await page.evaluate(() => Date.now() / 1000 + 600) };
+    await tick();
+    assert.equal(await page.locator("#versionBadgeButton").evaluate((node) => node.classList.contains("has-update")), true, "probe metadata errors do not invalidate successful discovery cache");
+    const checksBeforeCooldown = count(updatesPath + "/check", "POST");
+    await page.click("#versionBadgeButton");
+    await page.click("#versionBadgeRefresh");
+    assert.equal(count(updatesPath + "/check", "POST"), checksBeforeCooldown, "cached manual cooldown must prevent an extra check POST");
+    await page.click("#versionBadgeClose");
+    fixtures.updateStatus.update_probe = { state: "idle", has_success: true, manual_cooldown_until: 0 };
+
+    for (const [reason, expected] of [
+      ["update_updater_not_initialized", "独立更新器尚未完成可信初始化，请先在服务端完成基线初始化"],
+      ["update_updater_identity_mismatch", "独立更新器文件身份与初始化记录不一致，已被系统拒绝"],
+    ]) {
+      fixtures.updateStatus.capabilities = { ...ready, download: false, apply: false, rollback: false, reason };
+      await open();
+      assert.equal(await page.locator("#updateReadinessMessage").textContent(), expected);
+      await close();
+    }
+
+    fixtures.updateStatus.capabilities = { ...ready, download: false, apply: false, rollback: false, reason: "update_maintenance_protocol_unsupported" };
+    await open();
+    assert.equal(await page.locator("#updateReadinessMessage").textContent(), "当前或目标版本缺少维护协议，请先人工接入可信新版本基线");
+    assert.equal(await page.evaluate(() => document.activeElement?.id), "updateDialogClose", "update dialog must start on its close control");
+    await page.keyboard.press("Shift+Tab");
+    assert.equal(await page.locator("#platformUpdateDialog").evaluate((dialog) => dialog.contains(document.activeElement)), true, "update dialog must keep keyboard focus inside the modal");
+    await page.setViewportSize({ width: 390, height: 844 });
+    const narrowDialog = await page.locator("#platformUpdateDialog").evaluate((dialog) => {
+      const rect = dialog.getBoundingClientRect();
+      const body = dialog.querySelector(".platform-update-body");
+      const closeButton = dialog.querySelector("#updateDialogClose")?.getBoundingClientRect();
+      return { left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom, viewportWidth: innerWidth, viewportHeight: innerHeight,
+        bodyClientWidth: body?.clientWidth || 0, bodyScrollWidth: body?.scrollWidth || 0,
+        closeLeft: closeButton?.left || 0, closeRight: closeButton?.right || 0 };
+    });
+    assert.ok(narrowDialog.left >= 0 && narrowDialog.right <= narrowDialog.viewportWidth + 1 && narrowDialog.top >= 0 && narrowDialog.bottom <= narrowDialog.viewportHeight + 1,
+      `update dialog must fit narrow viewports: ${JSON.stringify(narrowDialog)}`);
+    assert.ok(narrowDialog.bodyScrollWidth <= narrowDialog.bodyClientWidth + 1, `update dialog body must not overflow horizontally: ${JSON.stringify(narrowDialog)}`);
+    assert.ok(narrowDialog.closeLeft >= 0 && narrowDialog.closeRight <= narrowDialog.viewportWidth + 1, `update dialog close control must remain reachable: ${JSON.stringify(narrowDialog)}`);
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.keyboard.press("Escape");
+    await page.waitForSelector("#platformUpdateDialog", { state: "hidden" });
+    await page.waitForFunction(() => document.activeElement?.id === "versionBadgeButton");
+
+    fixtures.updateStatus.capabilities = { ...ready, download: false, apply: false, rollback: false, reason: "updater_missing" };
+    await open();
+    assert.match(await page.locator("#updateReadinessMessage").textContent(), /未安装|未启用|未检测/);
+    assert.equal(await page.locator("#updateDownloadButton").isDisabled(), true);
+    await page.locator("#updateDownloadButton").evaluate((node) => node.click());
+    assert.equal(installs(), 0, "unconfigured updater cannot install");
+    assert.equal(count(updatesPath + "/download", "POST"), 0);
+    await close();
+
+    const old401 = failGate("GET", "/api/version", "authentication_failed", 401);
+    await page.clock.fastForward(300001);
+    await old401.started();
+    await desktopApiClick(page, "#logoutButton", "/api/auth/logout");
+    fixtures.me = { ...admin, id: 92, username: "update-owner", role: "owner", is_admin: false };
+    await desktopLogin(page, "update-owner");
+    old401.release();
+    await page.waitForLoadState("networkidle");
+    assert.equal(await page.locator("#workspace").isVisible(), true, "old cache 401 cannot log out a new session");
+    await page.click("#versionBadgeButton");
+    assert.equal(await page.locator("#versionBadgeUpdate").isVisible(), false);
+    assert.equal(await page.locator("#versionRollbackDetails").isVisible(), false, "owner must not see administrative rollback controls");
+    assert.equal(await page.locator(".version-popover-divider").isVisible(), false, "hidden rollback controls must not leave an empty divider");
+    await page.locator("#versionBadgeUpdate").evaluate((node) => node.click());
+    await page.locator("#updatePasswordForm").evaluate((form) => form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })));
+    assert.equal(count(updatesPath + "/download", "POST"), 0, "owner cannot forge hidden update controls");
+    assert.equal(installs(), 0);
+    await page.click("#versionBadgeClose");
+    await desktopApiClick(page, "#logoutButton", "/api/auth/logout");
+    const loggedOutGets = count("/api/version");
+    await tick(300001, false);
+    assert.equal(count("/api/version"), loggedOutGets, "logout must stop authenticated version timers");
+    fixtures.me = admin;
+    fixtures.updateStatus.capabilities = ready;
+    await desktopLogin(page, admin.username);
+    await page.waitForLoadState("networkidle");
+    await open();
+
+    evidence.allowedFailures.push({ path: updatesPath + "/download", status: 422 });
+    const unknownDownload = holdUpdateResponse("POST", updatesPath + "/download", { status: 422,
+      body: { detail: { code: "future_backend_update_error", message: "internal updater path disclosure" } } });
+    await page.click("#updateDownloadButton"); await unknownDownload.started(); unknownDownload.release();
+    await page.waitForFunction(() => document.querySelector("#updateReadinessMessage")?.textContent === "升级制品下载失败，请检查网络连接后重试");
+    assert.doesNotMatch(await page.locator("#updateReadinessMessage").textContent(), /future_backend_update_error|internal updater path disclosure/, "unknown backend update errors must stay safely generalized");
+
+    const signature = failGate("POST", updatesPath + "/download", "signature_verification_failed", 422);
+    await page.click("#updateDownloadButton"); await signature.started(); signature.release();
+    await page.waitForFunction(() => document.querySelector("#updateReadinessMessage")?.textContent.includes("签名校验失败"));
+    assert.equal(await page.locator("#updatePasswordForm").isVisible(), false);
+    assert.equal(installs(), 0);
+    const prepareClosed = holdUpdateResponse("POST", updatesPath + "/download");
+    await page.click("#updateDownloadButton"); await prepareClosed.started();
+    await close(); prepareClosed.release(); await page.waitForLoadState("networkidle");
+    await open();
+    assert.equal(await page.locator("#updatePasswordForm").isVisible(), false, "closed preparation cannot revive the confirmation form");
+    await prepare();
+    const preparedVersion = await page.locator("#updateTargetVersion").textContent();
+    await page.fill("#updateAdminPassword", "Mock-Update-Password-123!");
+    setCheck(check("0.4.0"));
+    await tick();
+    assert.equal(await page.inputValue("#updateAdminPassword"), "Mock-Update-Password-123!", "cache GET must preserve an entered password");
+    assert.equal(await page.locator("#updateTargetVersion").textContent(), preparedVersion, "cache GET must not change a prepared target");
+    const confirmationsBeforeRisk = fixtures.adminConfirmRequests.length;
+    await page.click("#updateConfirmButton");
+    assert.equal(fixtures.adminConfirmRequests.length, confirmationsBeforeRisk, "risk checkbox is required before password confirmation");
+    assert.match(await page.locator("#updateReadinessMessage").textContent(), /勾选/);
+    await fillConfirmation("wrong-mock-password");
+    evidence.allowedFailures.push({ path: "/api/admin/confirm", status: 401 });
+    await desktopApiClick(page, "#updateConfirmButton", "/api/admin/confirm", "POST", 401);
+    await page.waitForFunction(() => document.querySelector("#updateReadinessMessage")?.textContent.includes("密码错误"));
+    assert.equal(await page.locator("#workspace").isVisible(), true, "incorrect update password must not discard the login session");
+    assert.equal(await page.inputValue("#updateAdminPassword"), "");
+
+    await fillConfirmation();
+    const closedConfirmation = holdUpdateResponse("POST", "/api/admin/confirm");
+    await page.click("#updateConfirmButton"); await closedConfirmation.started();
+    await close(); closedConfirmation.release(); await page.waitForLoadState("networkidle");
+    assert.equal(installs(), 0, "closing before confirmation resolves must prevent apply");
+    await open(); await prepare(); await fillConfirmation();
+    const roleConfirmation = holdUpdateResponse("POST", "/api/admin/confirm");
+    await page.click("#updateConfirmButton"); await roleConfirmation.started();
+    fixtures.me = { ...admin, role: "owner", is_admin: false };
+    await page.locator("#refreshButton").evaluate((node) => node.click());
+    await page.waitForSelector("#platformUpdateDialog", { state: "hidden" });
+    roleConfirmation.release(); await page.waitForLoadState("networkidle");
+    assert.equal(installs(), 0, "a role change must invalidate in-flight privileged confirmation");
+    assert.equal(await page.locator("#versionBadgeUpdate").evaluate((node) => node.hidden), true);
+    fixtures.me = admin;
+    await desktopApiClick(page, "#refreshButton", "/api/me", "GET");
+    await page.waitForFunction(() => !document.querySelector("#versionBadgeUpdate")?.hidden);
+    await page.waitForLoadState("networkidle");
+    await open(); await prepare(); await fillConfirmation();
+    const staleConfirmation = holdUpdateResponse("POST", "/api/admin/confirm");
+    await page.click("#updateConfirmButton"); await staleConfirmation.started();
+    await page.locator("#logoutButton").evaluate((node) => node.click());
+    await page.waitForSelector("#authScreen:not([hidden])");
+    fixtures.me = { ...admin, id: 93, username: "update-admin-new" };
+    await desktopLogin(page, "update-admin-new");
+    staleConfirmation.release(); await page.waitForLoadState("networkidle");
+    assert.equal(installs(), 0, "late confirmation from a previous identity must never submit apply");
+    assert.equal(await page.inputValue("#updateAdminPassword"), "");
+    await open(); await prepare(); await fillConfirmation();
+    const expired = failGate("POST", updatesPath + "/apply", "confirmation_expired", 403);
+    await page.click("#updateConfirmButton"); await expired.started(); expired.release();
+    await page.waitForFunction(() => document.querySelector("#updateReadinessMessage")?.textContent.includes("已失效"));
+    fixtures.updateStatus.operation = null; // Rejected request did not queue at the real API.
+    assert.equal(await page.locator("#updatePasswordForm").isVisible(), true);
+    await fillConfirmation();
+    const closedApply = failGate("POST", updatesPath + "/apply", "confirmation_expired", 403);
+    await page.click("#updateConfirmButton"); await closedApply.started();
+    await close(); closedApply.release(); await page.waitForLoadState("networkidle");
+    fixtures.updateStatus.operation = null;
+    await open();
+    assert.equal(await page.locator("#updateDownloadButton").isDisabled(), false, "a rejected submission finishing after close must not leave a stale busy lock");
+    await prepare(); await fillConfirmation();
+    await submitQueued();
+    const stagedRequest = fixtures.updateRequests.findLast((item) => item.action === "download").payload;
+    const appliedRequest = fixtures.updateRequests.findLast((item) => item.action === "apply").payload;
+    const confirmedRequest = fixtures.adminConfirmRequests.at(-1);
+    assert.equal(confirmedRequest.action, "update.apply");
+    assert.equal(confirmedRequest.version, stagedRequest.version);
+    assert.equal(confirmedRequest.operation_id, appliedRequest.operation_id);
+    assert.equal(appliedRequest.confirmation_present, true);
+    assert.equal(await page.inputValue("#updateAdminPassword"), "");
+    const maintenance = failGate("GET", updatesPath, "update_maintenance_active", 503);
+    await page.clock.fastForward(4001); await maintenance.started(); maintenance.release();
+    await page.waitForFunction(() => document.querySelector("#updateOperationMessage")?.textContent.includes("重新连接"));
+    await close();
+    const preInstallVersion = holdUpdateResponse("GET", "/api/version");
+    const preInstallStatus = holdUpdateResponse("GET", updatesPath);
+    await clickUpdateEntry();
+    await Promise.all([preInstallVersion.started(), preInstallStatus.started()]);
+    await close();
+    fixtures.updateStatus.operation = { ...fixtures.updateStatus.operation, status: "succeeded", phase: "succeeded" };
+    fixtures.version.version = "0.4.0";
+    setCheck({ status: "current", available: false, version: "0.4.0", current_version: "0.4.0" });
+    await page.clock.fastForward(4001);
+    await page.waitForFunction(() => document.querySelector("#updatePhaseLabel")?.textContent === "升级成功"
+      && document.querySelector("#versionBadgeValue")?.textContent === "v0.4.0");
+    preInstallVersion.release(); preInstallStatus.release();
+    await page.waitForLoadState("networkidle");
+    assert.equal(await page.locator("#versionBadgeValue").textContent(), "v0.4.0", "pre-install GET cannot restore an old installed version");
+    await open();
+    assert.equal(await page.locator("#updatePhaseLabel").textContent(), "升级成功");
+    assert.equal(await page.locator("#updateReloadButton").isVisible(), true, "only verified success offers an explicit reload");
+    assert.equal(await page.locator("#versionBadgeButton").evaluate((node) => node.classList.contains("has-update")), false, "installed version clears the stale yellow prompt");
+    assert.equal(await page.locator("#workspace").isVisible(), true);
+
+    fixtures.updateStatus.rollback_versions = ["0.1.0", { version: "0.2.0", manifest_sha256: "bad" },
+      { version: "0.3.0", manifest_sha256: "b".repeat(64) }, { version: "0.2.5", manifest_sha256: "c".repeat(64) }];
+    fixtures.updateStatus.capabilities = { ...ready, download: false, apply: false, rollback: true, reason: "release_assets_missing" };
+    await close(); await open();
+    assert.deepEqual(await page.locator("#updateRollbackSelect option").allTextContents(), ["0.3.0", "0.2.5"], "only verified rollback objects are selectable");
+    assert.equal(await page.locator(".update-rollback-card").isVisible(), true);
+    await close();
+    await page.click("#versionBadgeButton");
+    assert.equal(await page.locator("#versionBadgeUpdate").isVisible(), false, "rollback remains accessible without advertising a new upgrade");
+    await page.click("#versionRollbackDetails > summary");
+    await page.check('input[name="versionRollbackChoice"][value="0.2.5"]');
+    const beforeRollback = installs();
+    await prepare("rollback", "#versionPopoverRollbackBtn");
+    assert.equal(installs(), beforeRollback, "popover rollback still requires password and risk confirmation before installation");
+    assert.deepEqual(fixtures.updateRequests.at(-1).payload, { version: "0.2.5", action: "rollback" }, "popover preserves the explicitly selected non-default rollback version");
+    await fillConfirmation();
+    const rollbackStage = Array.from(fixtures.updateStages.values()).at(-1);
+    const repeatedTerminal = holdUpdateResponse("POST", updatesPath + "/rollback", { status: 200,
+      body: { operation: { ...rollbackStage, status: "rolled_back", phase: "rolled_back" } } });
+    await page.click("#updateConfirmButton"); await repeatedTerminal.started();
+    assert.equal(fixtures.adminConfirmRequests.at(-1).action, "update.rollback");
+    fixtures.updateStatus.operation = { ...fixtures.updateStatus.operation, status: "rolled_back", phase: "rolled_back" };
+    const verifiedTerminal = holdUpdateResponse("GET", updatesPath);
+    await page.clock.fastForward(4001); await verifiedTerminal.started();
+    assert.equal(await page.locator("#updateReloadButton").isVisible(), false, "submission cannot claim success before an authoritative GET");
+    verifiedTerminal.release();
+    await page.waitForFunction(() => document.querySelector("#updatePhaseLabel")?.textContent === "已安全回退至旧版本");
+    repeatedTerminal.release();
+    await page.waitForLoadState("networkidle");
+    assert.equal(await page.locator("#updatePhaseLabel").textContent(), "已安全回退至旧版本", "a late terminal POST reply must not regress the observed operation result");
+    assert.equal(await page.locator("#updateReloadButton").isVisible(), true);
+    assert.notEqual(await page.evaluate(() => window.__updateInjected), true);
+    await assertNoBusinessStorage(page, /Mock-Update-Password|mock-update-confirmation/);
+    assert.doesNotMatch(JSON.stringify([fixtures.adminConfirmRequests, fixtures.updateRequests]), /Mock-Update-Password|wrong-mock-password|mock-update-confirmation/, "mock request logs redact passwords and one-time tokens");
+    assertDesktopEvidence(evidence);
+    await close();
+    await desktopApiClick(page, "#logoutButton", "/api/auth/logout");
+    console.log(JSON.stringify({ ok: true, scope: "updates", screenshots: 0, cases: ["automatic-cache-discovery", "visibility-and-virtual-time", "manual-generation", "probe-error-keeps-release", "manual-cooldown", "updater-initialization-errors", "maintenance-protocol-copy", "narrow-dialog-focus", "owner-denied", "updater-missing", "old-401-session-isolation", "unknown-error-generalization", "signature-password-expiry-errors", "prepare-confirm-queue-success", "draft-target-preservation", "close-and-session-block-submit", "role-change-blocks-confirmation", "closed-apply-rejection-unlocks", "restart-reconnect", "stale-get-after-install", "verified-rollback", "terminal-200-confirmed-by-get", "secret-redaction"] }));
+  } finally {
+    for (const release of fixtures.pendingUpdateGates) release();
+    await page.close();
+    Object.assign(fixtures, saved);
+  }
+}
+
 async function checkRuleDraftLoads(browser, baseUrl) {
   const saved = { ...fixtures };
   for (const [key, value] of Object.entries(fixtures)) {
@@ -4286,6 +4750,7 @@ async function run() {
       mockBrowser = await chromium.launch({ headless: true });
       await checkConnectionFlows(mockBrowser, `http://127.0.0.1:${port}/xianyu-saas/`);
       await checkRuleDraftLoads(mockBrowser, `http://127.0.0.1:${port}/xianyu-saas/`);
+      await checkUpdates(mockBrowser, `http://127.0.0.1:${port}/xianyu-saas/`);
     } finally {
       if (mockBrowser) await mockBrowser.close();
       await close(server);
@@ -4324,6 +4789,10 @@ async function run() {
       await checkOrderManagement(browser, `http://127.0.0.1:${port}/xianyu-saas/`);
       return;
     }
+    if (updatesScope) {
+      await checkUpdates(browser, `http://127.0.0.1:${port}/xianyu-saas/`);
+      return;
+    }
     if (ruleDraftsScope) {
       await checkRuleDraftLoads(browser, `http://127.0.0.1:${port}/xianyu-saas/`);
       return;
@@ -4331,6 +4800,7 @@ async function run() {
     await checkConnectionFlows(browser, `http://127.0.0.1:${port}/xianyu-saas/`);
     if (connectionFlowsScope) return;
     await checkRuleDraftLoads(browser, `http://127.0.0.1:${port}/xianyu-saas/`);
+    await checkUpdates(browser, `http://127.0.0.1:${port}/xianyu-saas/`);
     const bootstrapToken = "bootstrap-ui-contract-token-0123456789abcdef";
     fixtures.authCapabilities = { registration_enabled: false, bootstrap_available: true, password_min_length: 12 };
     const bootstrapPage = await browser.newPage({ viewport: { width: 1440, height: 900 }, deviceScaleFactor: 1, serviceWorkers: "block" });
@@ -4470,7 +4940,7 @@ async function run() {
     await waitForPanelSettled(page);
     assert.equal(await page.locator(".docs-manual").count(), 1);
     assert.equal(await page.locator(".docs-step-item").count(), 4);
-    assert.equal(await page.locator("details.docs-faq-item").count(), 4);
+    assert.equal(await page.locator("details.docs-faq-item").count(), 5);
     assert.doesNotMatch(await page.locator(".docs-manual").textContent(), /绝不会|全部测试通过|除此以外不向外部/);
     for (const view of ["shops", "goods", "chat", "orders", "home"]) {
       assert.ok(await page.locator('[data-view="' + view + '"]').count(), "guide destinations remain accessible from the workspace");
@@ -6383,7 +6853,8 @@ async function run() {
       assert.match(await page.locator("#versionBadgeStatus").innerText(), expected);
       assert.equal(await page.locator("#versionBadgeButton").evaluate((node) => node.classList.contains("has-update")), status === "available");
     }
-    assert.deepEqual(fixtures.updateRequests.filter((item) => item.action !== "check"), []);
+    assert.equal(fixtures.me.is_admin !== true || ["download", "apply", "rollback"].every((action) => fixtures.updateStatus.capabilities[action] !== true), true, "metadata-only flow runs as owner or without install capabilities");
+    assert.deepEqual(fixtures.updateRequests.filter((item) => item.action !== "check"), [], "owner/unconfigured-updater flow must not prepare or install updates");
     await page.click("#versionBadgeClose");
 
     await page.click('[data-settings-tab="accounts"]');
