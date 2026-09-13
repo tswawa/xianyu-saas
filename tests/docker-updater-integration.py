@@ -47,6 +47,24 @@ CANDIDATE_BASE_IMAGE = "python:3.12.11-slim-bookworm"
 CANDIDATE_BASE_REF = "docker.io/library/" + CANDIDATE_BASE_IMAGE
 BOOTSTRAP_BASE_REF = "docker.io/library/python:3.12-slim-bookworm"
 BUILDX_DU_COMMAND = ("/usr/local/bin/docker", "buildx", "du", "--builder", "default", "--verbose")
+INTERRUPTION_MARKER = "acceptance-interruption.once"
+# Test-only entrypoint: retain the real updater, but hold one explicitly armed
+# durable boundary. An ordinary restart has a grace period and can otherwise
+# arrive after the update commits, which is correctly recovered as succeeded.
+FIXTURE_UPDATER = '''import threading
+import docker_updater
+original_phase = docker_updater.Updater._phase
+def checkpoint_phase(self, journal, phase):
+    marker = self.config.private / MARKER
+    armed = phase == "switching" and marker.is_file()
+    if armed:
+        marker.unlink()
+    original_phase(self, journal, phase)
+    if armed:
+        threading.Event().wait()
+docker_updater.Updater._phase = checkpoint_phase
+raise SystemExit(docker_updater.main())
+'''.replace("MARKER", repr(INTERRUPTION_MARKER))
 
 FIXTURE_DB = '''import sqlite3
 class DB:
@@ -398,6 +416,7 @@ def compose_spec(project, token, data_source, kind, key_source="/engine/trusted.
             },
             "xianyu-updater": {
                 "image": project + "-xianyu-updater:local", "pull_policy": "never", "restart": "unless-stopped", "user": "0:0", "read_only": True,
+                "entrypoint": ["/usr/local/bin/python", "-c", FIXTURE_UPDATER],
                 "network_mode": "bridge", "labels": {ROLE: "updater", RUN_LABEL: token},
                 "environment": {"SAAS_DOCKER_APP_SERVICE": "xianyu-saas", "SAAS_DOCKER_UPDATER_HEALTH_TIMEOUT": "20", "SAAS_DOCKER_UPDATE_ROOT": UPDATE_ROOT, "SAAS_DOCKER_UPDATER_STATE_DIR": UPDATER_PRIVATE, "SAAS_UPDATE_PUBLIC_KEY_FILE": SIGNING_KEY},
                 "volumes": [{"type": "volume", "source": "ipc", "target": UPDATE_ROOT}, {"type": "volume", "source": "private", "target": UPDATER_PRIVATE}, {"type": "bind", "source": DOCKER_SOCKET, "target": DOCKER_SOCKET, "read_only": True}, {"type": "bind", "source": key_source, "target": SIGNING_KEY, "read_only": True, "bind": {"create_host_path": False}}],
@@ -416,15 +435,18 @@ def read_json(docker, container, path):
 
 def wait_for(callback, predicate, *, timeout=240, description="condition"):
     deadline = time.monotonic() + timeout
+    last_phase, last_error = None, None
     while time.monotonic() < deadline:
         try:
             value = callback()
+            last_phase = value.get("phase") if isinstance(value, dict) else None
+            last_error = None
             if predicate(value):
                 return value
-        except (ValueError, RuntimeError, KeyError, subprocess.TimeoutExpired):
-            pass
+        except (ValueError, RuntimeError, KeyError, subprocess.TimeoutExpired) as error:
+            last_error = type(error).__name__
         time.sleep(0.15)
-    raise AssertionError("timed out waiting for " + description)
+    raise AssertionError("timed out waiting for " + description + f" (last_phase={last_phase!r}, last_error={last_error!r})")
 
 
 def stage(docker, app, directory, version, digest, *, action="apply", current):
@@ -645,10 +667,12 @@ def acceptance(docker, root, token, kind, *, host_bind_root, host_bind_root_sour
 
         interrupted_bundle = work / "interrupted-bundle"
         interrupted_digest = bundle(interrupted_bundle, "1.3.0", key, token)
+        marker = (PurePosixPath(UPDATER_PRIVATE) / INTERRUPTION_MARKER).as_posix()
+        docker.execute(helper, "from pathlib import Path;Path(" + repr(marker) + ").touch(exist_ok=False)")
         operation = stage(docker, app, interrupted_bundle, "1.3.0", interrupted_digest, current="1.1.0")
         wait_for(lambda: status(docker, helper, operation), lambda v: v.get("phase") == "switching", timeout=600, description="durable switching checkpoint")
-        docker.run("restart", helper)
-        result = wait_for(lambda: status(docker, helper, operation), lambda v: v.get("phase") in {"rolled_back", "recovery_failed"}, timeout=180, description="updater process recovery")
+        docker.run("restart", "--timeout", "0", helper)
+        result = wait_for(lambda: status(docker, helper, operation), lambda v: v.get("phase") in {"succeeded", "rolled_back", "failed", "recovery_failed"}, timeout=180, description="updater process recovery")
         assert result["phase"] == "rolled_back", result
         assert docker.inspect(app)["Image"] == updated_image
         assert state(docker, app) == after_failed_start
@@ -781,11 +805,66 @@ def check_literal_roundtrip(root):
     print("PASS offline Compose literal roundtrip: dollars, quotes, spaces, Unicode and newlines remain stable")
 
 
+def check_interruption_checkpoint(root):
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    private = root / "checkpoint-private"
+    private.mkdir()
+    marker = private / INTERRUPTION_MARKER
+    phases = []
+
+    class OfflineUpdater:
+        def __init__(self):
+            self.config = SimpleNamespace(private=private)
+
+        def _phase(self, _journal, phase):
+            if phase == "switching":
+                assert not marker.exists(), "consume the one-shot marker before publishing switching"
+            phases.append(phase)
+
+    fake = SimpleNamespace(Updater=OfflineUpdater, main=lambda: 0)
+    with patch.dict(sys.modules, {"docker_updater": fake}), patch("threading.Event") as event:
+        spec = compose_spec("checkpoint-fixture", "synthetic", "business", "volume")
+        entrypoint = spec["services"]["xianyu-updater"]["entrypoint"]
+        assert entrypoint[:2] == ["/usr/local/bin/python", "-c"]
+        try:
+            exec(entrypoint[2], {})
+        except SystemExit as exited:
+            assert exited.code == 0
+        updater = OfflineUpdater()
+        marker.touch()
+        updater._phase({}, "verifying")
+        assert marker.exists() and not event.called
+        event.return_value.wait.side_effect = InterruptedError("synthetic crash")
+        try:
+            updater._phase({}, "switching")
+        except InterruptedError:
+            pass
+        else:
+            raise AssertionError("armed checkpoint did not hold the updater")
+        assert phases == ["verifying", "switching"] and not marker.exists()
+        event.return_value.wait.assert_called_once_with()
+        # A new operation after recovery must not hit the same one-shot barrier.
+        OfflineUpdater()._phase({}, "switching")
+        assert phases == ["verifying", "switching", "switching"]
+        event.return_value.wait.assert_called_once_with()
+    with patch.object(time, "monotonic", side_effect=[0, 0, 2]), patch.object(time, "sleep"):
+        try:
+            wait_for(lambda: {"phase": "succeeded", "private": "do-not-log"}, lambda _value: False, timeout=1)
+        except AssertionError as error:
+            assert "last_phase='succeeded'" in str(error) and "do-not-log" not in str(error)
+        else:
+            raise AssertionError("missing timeout diagnostic")
+    print("PASS offline interruption fixture: durable one-shot barrier, retry and sanitized timeout diagnostic")
+
+
 def self_test():
     with tempfile.TemporaryDirectory(prefix="docker-update-offline-") as temporary:
         root = Path(temporary)
         check_overlay_compose(root)
         check_literal_roundtrip(root)
+        check_interruption_checkpoint(root)
         key = Ed25519PrivateKey.generate()
         for version, fail in (("1.1.0", False), ("1.2.0", True)):
             folder = root / version
