@@ -10,7 +10,7 @@ from pathlib import Path
 
 
 # Must match package.json; image builds validate this before publication.
-VERSION = "0.3.1"
+VERSION = "0.3.2"
 ASSET_VERSION = "20260913-01"
 RELEASE_CHANNEL = "release"
 # Same value promises bidirectional data compatibility for Docker updates.
