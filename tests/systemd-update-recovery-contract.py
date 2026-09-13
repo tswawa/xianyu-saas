@@ -1141,6 +1141,16 @@ def root_reader_contract(updater):
         return
     import pwd
     user = pwd.getpwnam("nobody")
+    # CI may keep its interpreter/checkout under private parent directories.
+    # Load Python/modules first; every tested file operation follows this real drop.
+    drop_privileges = f"""
+os.setgroups([])
+os.setgid({user.pw_gid})
+os.setuid({user.pw_uid})
+assert os.getuid() == os.geteuid() == {user.pw_uid} != 0
+assert os.getgid() == os.getegid() == {user.pw_gid}
+assert os.getgroups() == []
+"""
     with fixture(updater, maintenance=True) as f:
         f.config = replace(f.config, intent_owner_uid=user.pw_uid)
         f.runner.config = f.config
@@ -1149,9 +1159,10 @@ def root_reader_contract(updater):
         for path in [f.config.state_dir, *f.config.state_dir.rglob("*")]:
             os.chown(path, user.pw_uid, user.pw_gid)
         updater.initialize_layout(f.config)
-        publish_code = """import json, sys
+        publish_code = """import json, os, sys
 sys.path.insert(0, sys.argv[1])
 from platform_update import write_update_intent
+""" + drop_privileges + """
 request = json.loads(sys.argv[2])
 result = write_update_intent('apply', request['version'], channel='release', requested_by=1,
     candidate_path=request['candidate_path'], manifest_sha256=request['manifest_sha256'],
@@ -1159,12 +1170,15 @@ result = write_update_intent('apply', request['version'], channel='release', req
 assert result['queued'] is True and result['status'] == 'queued'
 """
         published = subprocess.run([sys.executable, "-c", publish_code, str(ROOT / "backend"), json.dumps(asdict(f.intent))],
-                                   user=user.pw_uid, group=user.pw_gid, extra_groups=[], env={**os.environ, **f.environment},
+                                   env={**os.environ, **f.environment},
                                    capture_output=True, text=True, timeout=30)
         assert published.returncode == 0, published.stderr
         assert f.config.intent_file.stat().st_uid == user.pw_uid
         assert f.config.intent_file.stat().st_mode & 0o777 == 0o600
-        assert f.run()["status"] == "succeeded"
+        # Synthetic migrations use only stdlib and still run as the application UID.
+        # Model the deployed readable runtime, not the CI-only private venv path.
+        with patch.object(updater.sys, "executable", str(Path(sys._base_executable).resolve())):
+            assert f.run()["status"] == "succeeded"
         for suffix in ("-wal", "-shm"):
             sidecar = Path(str(f.config.database_path) + suffix)
             if sidecar.exists():
@@ -1176,6 +1190,7 @@ assert result['queued'] is True and result['status'] == 'queued'
         ipc.chmod(0o1770)
         target = f.config.current_link.resolve()
         code = """import json, os, pathlib, sys
+""" + drop_privileges + """
 root, status, private = map(pathlib.Path, sys.argv[1:4])
 for name in json.loads(sys.argv[4]):
     path = root / name
@@ -1190,10 +1205,13 @@ else: raise AssertionError('app replaced root status directory')
 try: list(private.iterdir())
 except PermissionError: pass
 else: raise AssertionError('app read private journal')
+try: (private / 'forged.json').write_text('{}')
+except PermissionError: pass
+else: raise AssertionError('app wrote private journal')
 """
         result = subprocess.run([sys.executable, "-c", code, str(target), str(f.config.status_dir), str(f.config.private_state_dir),
-                                 json.dumps(list(updater.INTERNAL_CANDIDATE_FILES))], user=user.pw_uid, group=user.pw_gid,
-                                extra_groups=[], capture_output=True, text=True, timeout=15)
+                                 json.dumps(list(updater.INTERNAL_CANDIDATE_FILES))],
+                                capture_output=True, text=True, timeout=15)
         assert result.returncode == 0, result.stderr
         for path in [f.config.status_dir, f.config.status_dir / "operation.json", *[target / name for name in updater.INTERNAL_CANDIDATE_FILES]]:
             assert path.stat().st_uid == 0

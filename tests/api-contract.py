@@ -500,8 +500,10 @@ def main():
     assert version_payload["update_check"]["channel"] == "release"
     assert set(version_payload) == {
         "version", "commit", "build_time", "asset_version",
-        "release_notes", "latest_update", "build_dirty", "deployment", "update_check", "capabilities",
+        "release_notes", "latest_update", "build_dirty", "deployment", "update_check", "update_probe", "capabilities",
     }
+    assert isinstance(version_payload["update_probe"], dict)
+    assert "update_probe" not in version_payload["update_check"]
     assert ".git" not in json.dumps(version_payload, ensure_ascii=False)
     user_id = int(app.db.get_user("free-user")["id"])
     tenant_dir = Path(TENANTS_PATH) / str(user_id)
