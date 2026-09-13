@@ -513,6 +513,7 @@ def workflow_contract(repo: Repository, output: Path):
     assert 'lock.get("status") != "locked"' in standalone_section
     assert "python scripts/build-standalone.py" in standalone_section
     assert "--manager-binary" in standalone_section
+    assert 'PYTHONDONTWRITEBYTECODE: "1"' in standalone_section
     assert "standalone-${{ matrix.target }}" in standalone_section
     assert "RELEASE_SIGNING_KEY" not in standalone_section
     assert workflow.count("secrets.RELEASE_SIGNING_KEY") == 1

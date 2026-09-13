@@ -64,7 +64,7 @@ SECRET_PATTERNS = (
     re.compile(r"ghp_[A-Za-z0-9]{20,}"),
     re.compile(r"AKIA[0-9A-Z]{16}"),
     re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
-    re.compile(r"sk-[A-Za-z0-9_-]{24,}"),
+    re.compile(r"sk-(?!linking-protocols-exception(?:[^A-Za-z0-9_-]|$))[A-Za-z0-9_-]{24,}"),
 )
 PORTABLE_PATHS = (
     "README.md",

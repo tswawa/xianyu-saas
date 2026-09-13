@@ -106,6 +106,7 @@ def fixture(run: Path):
         "frontend/index.html": b"<!doctype html><title>fixture</title>\n",
         "worker/requirements.txt": worker_requirements,
         "worker/main.py": b"VALUE = 2\n",
+        "worker/.env.example": b"COOKIES_STR=\nAPI_KEY=\n",
         "worker/stale.pyc": b"cache",
     })
     pbs = run / "python.tar.gz"
@@ -212,6 +213,7 @@ def success_contract(run: Path) -> None:
     assert (output / "backend/main.py").is_file()
     assert (output / "frontend/index.html").is_file()
     assert (output / "worker/main.py").is_file()
+    assert not (output / "worker/.env.example").exists()
     assert not (output / "app").exists()
     assert (output / "runtime/python/bin/python3").is_file()
     assert (output / "runtime/python/bin/python3").read_bytes() == (output / "runtime/python/bin/python3.12").read_bytes()

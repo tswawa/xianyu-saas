@@ -140,6 +140,7 @@ jobs:
             --output ".local/standalone/$TARGET/bundle"
       - name: Smoke test standalone runtime and manager
         env:
+          PYTHONDONTWRITEBYTECODE: "1"
           TARGET: ${{ matrix.target }}
         run: |
           root=".local/standalone/$TARGET/bundle"

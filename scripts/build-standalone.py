@@ -679,6 +679,11 @@ def build(args) -> Path:
             if not source_directory.is_dir() or source_directory.is_symlink():
                 raise StandaloneError("standalone_source_layout_invalid")
             shutil.copytree(source_directory, bundle / required, symlinks=False)
+        worker_env_example = bundle / "worker" / ".env.example"
+        if worker_env_example.exists():
+            if worker_env_example.is_symlink() or not worker_env_example.is_file():
+                raise StandaloneError("standalone_source_layout_invalid")
+            worker_env_example.unlink()
         shutil.copyfile(source_root / "package.json", bundle / "package.json")
         runtime = bundle / "runtime"
         runtime.mkdir()
