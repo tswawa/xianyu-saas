@@ -1162,6 +1162,9 @@ assert os.getgroups() == []
         publish_code = """import json, os, sys
 sys.path.insert(0, sys.argv[1])
 from platform_update import write_update_intent
+from cryptography.hazmat.backends import default_backend
+# Resolve the lazy backend while CI's private dependency directory is accessible.
+default_backend()
 """ + drop_privileges + """
 request = json.loads(sys.argv[2])
 result = write_update_intent('apply', request['version'], channel='release', requested_by=1,
