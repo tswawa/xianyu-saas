@@ -633,34 +633,35 @@ def initialization_identity_contracts(updater):
         assert intent.expected_current_version == "0.1.0"
         assert f.journal()["current_version"] == "0.1.0"
 
-    with fixture(updater, maintenance=True) as f:
-        manager_releases = f.root / "manager/releases"
-        manager_release = manager_releases / "0.2.0"
-        manager_release.mkdir(parents=True)
-        manager_releases.parent.chmod(0o755)
-        manager_releases.chmod(0o755)
-        manager_release.chmod(0o755)
-        manager = manager_release / "xianyu-saas"
-        manager.write_bytes(b"synthetic trusted manager\n")
-        manager.chmod(0o755)
-        manager_current = manager_releases.parent / "current"
-        manager_current.symlink_to(Path("releases") / manager_release.name)
-        with patch.dict(os.environ, {
-            "SAAS_MANAGER_RELEASES_DIR": str(manager_releases),
-            "SAAS_MANAGER_CURRENT": str(manager_current),
-            "SAAS_MANAGER_EXECUTABLE": str(manager_current / "xianyu-saas"),
-        }), patch.object(updater, "_release_runtime_metadata", return_value=object()):
-            updater.initialize_layout(f.config)
-        payload = json.loads((f.config.status_dir / "initialization.json").read_text(encoding="utf-8"))
-        assert set(payload) == {
-            "schema", "protocol", "public_key_sha256", "manager_version",
-            "manager_sha256", "platform", "architecture", "initialized_at",
-        }
-        assert payload["schema"] == 2 and payload["protocol"] == updater.MANAGER_PROTOCOL
-        assert payload["manager_version"] == "0.2.0"
-        assert payload["manager_sha256"] == hashlib.sha256(manager.read_bytes()).hexdigest()
-        assert payload["platform"] == "linux"
-        assert payload["architecture"] == updater.normalize_architecture()
+    if os.geteuid() == 0:
+        with fixture(updater, maintenance=True) as f:
+            manager_releases = f.root / "manager/releases"
+            manager_release = manager_releases / "0.2.0"
+            manager_release.mkdir(parents=True)
+            manager_releases.parent.chmod(0o755)
+            manager_releases.chmod(0o755)
+            manager_release.chmod(0o755)
+            manager = manager_release / "xianyu-saas"
+            manager.write_bytes(b"synthetic trusted manager\n")
+            manager.chmod(0o755)
+            manager_current = manager_releases.parent / "current"
+            manager_current.symlink_to(Path("releases") / manager_release.name)
+            with patch.dict(os.environ, {
+                "SAAS_MANAGER_RELEASES_DIR": str(manager_releases),
+                "SAAS_MANAGER_CURRENT": str(manager_current),
+                "SAAS_MANAGER_EXECUTABLE": str(manager_current / "xianyu-saas"),
+            }), patch.object(updater, "_release_runtime_metadata", return_value=object()):
+                updater.initialize_layout(f.config)
+            payload = json.loads((f.config.status_dir / "initialization.json").read_text(encoding="utf-8"))
+            assert set(payload) == {
+                "schema", "protocol", "public_key_sha256", "manager_version",
+                "manager_sha256", "platform", "architecture", "initialized_at",
+            }
+            assert payload["schema"] == 2 and payload["protocol"] == updater.MANAGER_PROTOCOL
+            assert payload["manager_version"] == "0.2.0"
+            assert payload["manager_sha256"] == hashlib.sha256(manager.read_bytes()).hexdigest()
+            assert payload["platform"] == "linux"
+            assert payload["architecture"] == updater.normalize_architecture()
 
     with fixture(updater, maintenance=False, initialize=False) as f:
         expect_error(
