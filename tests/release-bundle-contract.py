@@ -28,12 +28,16 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "build-release.py"
+VERIFY_SCRIPT = ROOT / "scripts" / "verify-public-release.py"
 VERSION = "0.2.0"
 EPOCH = 1700000000
 sys.dont_write_bytecode = True
+sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "backend"))
 
 import docker_update_protocol as DOCKER
+import standalone_runtime as STANDALONE
+from deploy.manager import installer as MANAGER_INSTALLER
 
 
 def load_builder():
@@ -45,6 +49,17 @@ def load_builder():
 
 
 BUILDER = load_builder()
+
+
+def load_verifier():
+    spec = importlib.util.spec_from_file_location("public_release_verifier_contract", VERIFY_SCRIPT)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+VERIFIER = load_verifier()
 UPDATER_SOURCE = (ROOT / "backend" / "platform_update.py").read_bytes()
 
 
@@ -102,6 +117,7 @@ class Repository:
         self.root = directory
         self.root.mkdir()
         self.version = version
+        self.build_count = 0
         self.key, self.seed, self.encoded, self.public = key_material()
         self.git("init", "--quiet")
         public = self.key.public_key().public_bytes(serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo) if public_pem else base64.b64encode(self.public) + b"\n"
@@ -113,7 +129,7 @@ class Repository:
             ".github/workflows/ci.yml": b"name: offline fixture\n",
             "package.json": BUILDER.json_bytes({"name": "xianyu-saas", "version": version, "private": True}),
             "package-lock.json": BUILDER.json_bytes({"name": "xianyu-saas", "version": version, "lockfileVersion": 3, "packages": {"": {"name": "xianyu-saas", "version": version}}}),
-            "backend/version.py": f'VERSION = "{version}"\nASSET_VERSION = "contract"\n'.encode(),
+            "backend/version.py": f'VERSION = "{version}"\nASSET_VERSION = "contract"\nUPDATE_DATA_VERSION = 1\n'.encode(),
             "backend/platform_update.py": UPDATER_SOURCE,
             "backend/docker_update_protocol.py": (ROOT / "backend/docker_update_protocol.py").read_bytes(),
             "backend/requirements.txt": b"requests\ncryptography\n",
@@ -139,6 +155,9 @@ class Repository:
             "docs/assets/readme/orders.png": b"public documentation screenshot fixture\n",
             "docs/说明.md": "说明样例\n".encode(),
             "deploy/update-signing.pub": public,
+            "deploy/runtime/backend.lock.json": b"{}\n",
+            "deploy/runtime/python-build-standalone.lock.json": b"{}\n",
+            "deploy/runtime/worker.lock.json": b"{}\n",
             "scripts/check.sh": b"#!/bin/sh\nexit 0\n",
             "tests/test_private_key.py": b"# Test code may discuss private keys without containing any.\n",
         }
@@ -173,9 +192,59 @@ class Repository:
         self.git("add", "--force", "--", name)
         self.commit = self.commit_changes()
 
+    def standalone_inputs(self, ref: str) -> Path:
+        self.build_count += 1
+        commit = self.git("rev-parse", "--verify", f"{ref}^{{commit}}").decode().strip()
+        root = self.root / ".local" / "standalone-inputs" / str(self.build_count)
+        for architecture in ("x86_64", "aarch64"):
+            target = f"linux-{architecture}"
+            directory = root / target
+            bundle = directory / "bundle"
+            manager = b"#!/bin/sh\n# synthetic manager " + target.encode() + b"\nexit 0\n"
+            runtime = {
+                "schema": 1,
+                "version": self.version,
+                "commit": commit,
+                "platform": "linux",
+                "architecture": architecture,
+                "target": target,
+                "python_version": "3.12.14",
+                "python_build": "3.12.14+contract-install_only_stripped",
+                "uv_version": "0.12.13",
+                "manager_protocol": 1,
+                "update_data_version": 1,
+                "backend_lock_sha256": hashlib.sha256(b"backend-lock").hexdigest(),
+                "worker_lock_sha256": hashlib.sha256(b"worker-lock").hexdigest(),
+            }
+            payloads = {
+                "package.json": BUILDER.json_bytes({"name": "xianyu-saas", "version": self.version}),
+                "backend/version.py": f'VERSION = "{self.version}"\nUPDATE_DATA_VERSION = 1\n'.encode(),
+                "backend/main.py": b"BACKEND = True\n",
+                "frontend/index.html": b"<!doctype html><title>standalone</title>\n",
+                "worker/main.py": b"WORKER = True\n",
+                "runtime/python/bin/python3": b"#!/bin/sh\nexit 0\n",
+                "runtime/site/backend/fixture.py": b"BACKEND_DEP = True\n",
+                "runtime/site/worker/fixture.py": b"WORKER_DEP = True\n",
+                "runtime/runtime.json": BUILDER.json_bytes(runtime),
+                "runtime/sbom.cdx.json": BUILDER.json_bytes({"bomFormat": "CycloneDX", "specVersion": "1.5"}),
+                "runtime/third-party.json": BUILDER.json_bytes({"schema": 1, "packages": []}),
+                "manager/xianyu-saas": manager,
+            }
+            for name, payload in payloads.items():
+                path = bundle / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(payload)
+                if name in {"runtime/python/bin/python3", "manager/xianyu-saas"}:
+                    path.chmod(0o755)
+            bootstrap = directory / "manager"
+            bootstrap.write_bytes(manager)
+            bootstrap.chmod(0o755)
+        return root
+
     def build(self, label="bundle", *, ref="HEAD", changes=None, extra=(), default_output=False):
         output = self.root / ".local" / "releases" / (self.version if default_output else label)
-        command = [sys.executable, "-B", str(SCRIPT), "--ref", ref]
+        inputs = self.standalone_inputs(ref)
+        command = [sys.executable, "-B", str(SCRIPT), "--ref", ref, "--standalone-input-root", str(inputs)]
         if not default_output:
             command.extend(["--output", str(output)])
         command.extend(extra)
@@ -214,6 +283,15 @@ def updater_error(code, operation):
         assert exc.code == code, (exc.code, code)
     else:
         raise AssertionError(f"real updater should reject: {code}")
+
+
+def verifier_error(code, operation):
+    try:
+        operation()
+    except VERIFIER.VerificationError as exc:
+        assert str(exc) == code, (str(exc), code)
+    else:
+        raise AssertionError(f"public verifier should reject: {code}")
 
 
 @contextlib.contextmanager
@@ -268,8 +346,9 @@ def verify_bundle(repo: Repository, output: Path, *, epoch=EPOCH):
     names = UPDATER._asset_names(repo.version)
     base = f"xianyu-saas-{repo.version}"
     docker_names = DOCKER.docker_asset_names(repo.version)
-    expected_assets = {*names, *docker_names, f"{base}.update-signing.pub", "release-notes.md", "artifacts.json", "SHA256SUMS"}
-    assert len(expected_assets) == 10
+    content = VERIFIER.expected_content(repo.version)
+    expected_assets = set(content) | {"artifacts.json", "artifacts.json.sig", "SHA256SUMS"}
+    assert len(content) == 16 and len(expected_assets) == 19
     assert {path.name for path in output.iterdir()} == expected_assets
     release_metadata = {"id": 1, "tag_name": f"v{repo.version}", "prerelease": "-" in repo.version,
                         "assets": [{"id": index + 1, "name": name, "size": (output / name).stat().st_size}
@@ -277,16 +356,30 @@ def verify_bundle(repo: Repository, output: Path, *, epoch=EPOCH):
     for assets in (release_metadata["assets"], [item for item in release_metadata["assets"] if item["name"] not in docker_names[1:]]):
         legacy_release = UPDATER._parse_release({**release_metadata, "assets": assets}, "release")
         assert (legacy_release.artifact.name, legacy_release.manifest.name, legacy_release.signature.name) == names
-    index = json.loads((output / "artifacts.json").read_bytes())
-    assert set(index) == {"schema", "version", "commit", "public_key_fingerprint", "files"}
-    assert index["schema"] == 1 and index["version"] == repo.version and index["commit"] == repo.commit
+    index_raw = (output / "artifacts.json").read_bytes()
+    index = json.loads(index_raw)
+    assert set(index) == {"schema", "version", "commit", "manager_protocol", "public_key_fingerprint", "files"}
+    assert index["schema"] == 2 and index["version"] == repo.version and index["commit"] == repo.commit
+    assert index["manager_protocol"] == 1
     assert index["public_key_fingerprint"] == "sha256:" + hashlib.sha256(repo.public).hexdigest()
-    assert len(index["files"]) == 8
-    assert {record["name"] for record in index["files"]} == expected_assets - {"artifacts.json", "SHA256SUMS"}
+    assert len(index["files"]) == len(content)
+    assert {record["name"] for record in index["files"]} == set(content)
     for record in index["files"]:
-        assert record == BUILDER.asset_record(output / record["name"])
+        kind_target = content[record["name"]]
+        assert record == {**BUILDER.asset_record(output / record["name"]), **kind_target, "manager_protocol": 1}
+    manager_index = MANAGER_INSTALLER._parse_index(index_raw, repo.version)
+    for architecture in ("x86_64", "aarch64"):
+        standalone_base = f"{base}-linux-{architecture}"
+        for kind, name in (
+            ("manager", standalone_base),
+            ("archive", standalone_base + ".tar.gz"),
+            ("manifest", standalone_base + ".manifest.json"),
+            ("signature", standalone_base + ".manifest.sig"),
+        ):
+            assert MANAGER_INSTALLER._select_record(manager_index, name, kind, architecture).name == name
+    repo.key.public_key().verify(base64.b64decode((output / "artifacts.json.sig").read_bytes(), validate=True), index_raw)
     checksums = dict(line.split("  ", 1)[::-1] for line in (output / "SHA256SUMS").read_text().splitlines())
-    assert len(checksums) == len((output / "SHA256SUMS").read_text().splitlines()) == 9
+    assert len(checksums) == len((output / "SHA256SUMS").read_text().splitlines()) == len(expected_assets) - 1
     assert set(checksums) == expected_assets - {"SHA256SUMS"}
     for name, checksum in checksums.items():
         assert hashlib.sha256((output / name).read_bytes()).hexdigest() == checksum
@@ -351,7 +444,10 @@ def verify_bundle(repo: Repository, output: Path, *, epoch=EPOCH):
     if os.name != "nt":
         assert stat.S_IMODE((extracted / "scripts/check.sh").stat().st_mode) == 0o755
         assert stat.S_IMODE((extracted / "frontend/index.html").stat().st_mode) == 0o644
-    source_only = {"Dockerfile", "docker-compose.yml", "docker/entrypoint.sh", "LICENSING.md", "CONTRIBUTING.md", ".github/workflows/ci.yml", "worker/.env.example"}
+    source_only = {
+        "Dockerfile", "docker-compose.yml", "docker/entrypoint.sh", "LICENSING.md", "CONTRIBUTING.md",
+        ".github/workflows/ci.yml", "worker/.env.example", *BUILDER.PUBLIC_RUNTIME_LOCKS,
+    }
     assert not set(expected) & source_only
     with zipfile.ZipFile(output / f"{base}-source.zip") as archive:
         prefix = base + "/"
@@ -366,59 +462,71 @@ def verify_bundle(repo: Repository, output: Path, *, epoch=EPOCH):
             payload = archive.read(entry)
             assert payload == ((extracted / relative).read_bytes() if relative == "backend/build-info.json" else repo.files[relative])
             assert repo.seed not in payload and repo.encoded.encode() not in payload
+    for architecture in ("x86_64", "aarch64"):
+        target = STANDALONE.target_name(architecture)
+        archive_name, standalone_manifest_name, standalone_signature_name = STANDALONE.standalone_asset_names(repo.version, architecture)
+        manager_name = STANDALONE.manager_asset_name(repo.version, architecture)
+        standalone_raw = (output / standalone_manifest_name).read_bytes()
+        repo.key.public_key().verify(base64.b64decode((output / standalone_signature_name).read_bytes(), validate=True), standalone_raw)
+        standalone_manifest = json.loads(standalone_raw)
+        runtime = STANDALONE.validate_standalone_manifest(
+            standalone_manifest,
+            expected_version=repo.version,
+            expected_target=target,
+            expected_artifact=archive_name,
+        )
+        assert runtime.commit == repo.commit and runtime.target == target and runtime.manager_protocol == 1
+        assert standalone_manifest["artifact_sha256"] == hashlib.sha256((output / archive_name).read_bytes()).hexdigest()
+        assert standalone_manifest["artifact_size"] == (output / archive_name).stat().st_size
+        with tarfile.open(output / archive_name, "r:gz") as archive:
+            members = archive.getmembers()
+            paths = {member.name for member in members}
+            assert not any(path == "app" or path.startswith("app/") for path in paths)
+            assert not any(path == "deploy" or path.startswith("deploy/") for path in paths)
+            assert not any("nginx" in path.lower() for path in paths)
+            assert {path.split("/", 1)[0] for path in paths} >= {"backend", "frontend", "worker", "runtime", "manager"}
+            assert all(member.isfile() and not member.issym() and not member.islnk() for member in members)
+            assert archive.extractfile("manager/xianyu-saas").read() == (output / manager_name).read_bytes()
+            assert json.loads(archive.extractfile("runtime/runtime.json").read()) == standalone_manifest["runtime"]
+        assert {item["path"] for item in standalone_manifest["files"]} == paths
     assert set(BUILDER.REQUIRED_LICENSES) <= set(expected)
+    VERIFIER.verify(output, repo.version, repo.commit, output / f"{base}.update-signing.pub")
     return release, expected, manifest_raw, signature_raw
 
 
 def workflow_contract(repo: Repository, output: Path):
-    # Execute the actual workflow's offline gates, not duplicated test validators.
     workflow = (ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8")
-    block = workflow.split("          assets=(\n", 1)[1].split("          )", 1)[0]
-    listed = [line.strip().strip('"').replace("$dir/", "").replace("$base", f"xianyu-saas-{repo.version}") for line in block.splitlines()]
-    assert len(listed) == 10 and set(listed) == {path.name for path in output.iterdir()}
-    section = workflow.split("      - name: Validate complete signed bundle\n", 1)[1].split("      - name:", 1)[0]
-    local_gate = textwrap.dedent(section.split("          python -B - <<'PY'\n", 1)[1].split("          PY\n", 1)[0])
-    env = clean_environment()
-    env["RELEASE_VERSION"] = repo.version
-
-    def local_result():
-        return subprocess.run([sys.executable, "-B", "-c", local_gate], cwd=repo.root, env=env, capture_output=True, timeout=30)
-
-    result = local_result()
-    assert result.returncode == 0, result.stderr.decode()
-    checksum_file = output / "SHA256SUMS"
-    original = checksum_file.read_bytes()
-    try:
-        checksum_file.write_bytes(b"\n".join(original.splitlines()[:-1]) + b"\n")
-        assert local_result().returncode != 0, "workflow accepted eight instead of nine checksums"
-    finally:
-        checksum_file.write_bytes(original)
-    missing = output / DOCKER.docker_asset_names(repo.version)[2]
-    payload = missing.read_bytes()
-    try:
-        missing.unlink()
-        assert local_result().returncode != 0, "workflow accepted a missing Docker signature"
-    finally:
-        missing.write_bytes(payload)
-    extra = output / "unexpected-asset.txt"
-    try:
-        extra.write_bytes(b"not an official asset")
-        assert local_result().returncode != 0, "workflow accepted an eleventh asset"
-    finally:
-        extra.unlink()
-    remote_gate = textwrap.dedent(workflow.split('          python - "$dir" "$RUNNER_TEMP/release-assets.json" <<\'PY\'\n', 1)[1].split("          PY\n", 1)[0])
-    uploaded = [{"name": path.name, "size": path.stat().st_size} for path in output.iterdir()]
-    snapshot = repo.root / ".local" / "uploaded-fixture.json"
-    for changes, success in ((uploaded, True), (uploaded[:-1], False),
-                             ([*uploaded, {"name": "old-extra.txt", "size": 1}], False),
-                             ([{**uploaded[0], "size": 1}, *uploaded[1:]], False)):
-        snapshot.write_bytes(BUILDER.json_bytes({"assets": changes}))
-        result = subprocess.run([sys.executable, "-B", "-c", remote_gate, str(output), str(snapshot)],
-                                cwd=repo.root, env=env, capture_output=True, timeout=30)
-        assert (result.returncode == 0) is success, "workflow draft gate missed an incomplete/extra upload"
-    assert workflow.index("Draft must contain exactly") < workflow.index("--draft=false")
-    assert "python -B tests/docker-update-protocol-contract.py" in workflow
-    print("release bundle: actual workflow gates enforce ten local/uploaded assets and nine checksums")
+    manager_spec = (ROOT / "deploy/manager/xianyu-saas-manager.spec").read_text(encoding="utf-8")
+    standalone_builder = (ROOT / "scripts/build-standalone.py").read_text(encoding="utf-8")
+    assert "deploy/nginx/" not in manager_spec and "nginx" not in manager_spec.lower()
+    assert "deploy/nginx/" not in standalone_builder and "nginx" not in standalone_builder.lower()
+    standalone_section = workflow.split("  standalone:\n", 1)[1].split("  publish:\n", 1)[0]
+    publish_section = workflow.split("  publish:\n", 1)[1]
+    assert "target: linux-x86_64" in standalone_section and "architecture: x86_64" in standalone_section
+    assert "target: linux-aarch64" in standalone_section and "architecture: aarch64" in standalone_section
+    assert "runner: ubuntu-24.04-arm" in standalone_section
+    assert 'pyinstaller==6.16.0' in standalone_section
+    assert "apt-get install --yes binutils" in standalone_section
+    assert 'dist/xianyu-saas" ".local/standalone/$TARGET/manager"' in standalone_section
+    assert 'parsed.hostname != "files.pythonhosted.org"' in standalone_section
+    assert 'lock.get("status") != "locked"' in standalone_section
+    assert "python scripts/build-standalone.py" in standalone_section
+    assert "--manager-binary" in standalone_section
+    assert "standalone-${{ matrix.target }}" in standalone_section
+    assert "RELEASE_SIGNING_KEY" not in standalone_section
+    assert workflow.count("secrets.RELEASE_SIGNING_KEY") == 1
+    assert "needs: [validate, standalone]" in publish_section
+    assert "--standalone-input-root .local/standalone-inputs" in publish_section
+    assert 'assets=("$dir"/*)' in publish_section and 'test "${#assets[@]}" -eq 19' in publish_section
+    assert publish_section.count("scripts/verify-public-release.py") == 2
+    assert publish_section.index('gh release download "$RELEASE_TAG"') < publish_section.index('--draft=false')
+    assert "python -B tests/docker-update-protocol-contract.py" in publish_section
+    assert "python -B tests/standalone-build-contract.py" in publish_section
+    assert "python -B tests/release-bundle-contract.py" in publish_section
+    assert {path.name for path in output.iterdir()} == set(VERIFIER.expected_content(repo.version)) | {
+        "artifacts.json", "artifacts.json.sig", "SHA256SUMS"
+    }
+    print("release bundle: workflow has native dual-architecture unsigned builds and release-job-only signing")
 
 
 def normal_and_tamper_contract(run: Path):
@@ -430,6 +538,46 @@ def normal_and_tamper_contract(run: Path):
     assert_success(result)
     release, expected, manifest_raw, signature_raw = verify_bundle(repo, output)
     workflow_contract(repo, output)
+    index_path = output / "artifacts.json"
+    original_index = index_path.read_bytes()
+    try:
+        index_path.write_bytes(original_index + b" ")
+        verifier_error(
+            "release_index_signature_invalid",
+            lambda: VERIFIER.verify(output, repo.version, repo.commit, output / f"xianyu-saas-{repo.version}.update-signing.pub"),
+        )
+    finally:
+        index_path.write_bytes(original_index)
+    architecture = "x86_64"
+    target = STANDALONE.target_name(architecture)
+    archive_name, standalone_manifest_name, _ = STANDALONE.standalone_asset_names(repo.version, architecture)
+    bound = json.loads((output / standalone_manifest_name).read_bytes())
+    bound["architecture"] = "aarch64"
+    try:
+        STANDALONE.validate_standalone_manifest(
+            bound,
+            expected_version=repo.version,
+            expected_target=target,
+            expected_artifact=archive_name,
+        )
+    except STANDALONE.StandaloneRuntimeError as exc:
+        assert exc.code == "standalone_runtime_architecture_mismatch"
+    else:
+        raise AssertionError("standalone manifest accepted another architecture")
+    linked = run / "linked-standalone.tar.gz"
+    with tarfile.open(linked, "w:gz") as archive:
+        info = tarfile.TarInfo("manager/xianyu-saas")
+        info.type = tarfile.SYMTYPE
+        info.linkname = "../outside"
+        archive.addfile(info)
+    verifier_error(
+        "release_archive_link_or_path_invalid",
+        lambda: VERIFIER.verify_tar(
+            linked,
+            {"manager/xianyu-saas": {"size": 0, "sha256": hashlib.sha256(b"").hexdigest(), "executable": True}},
+            standalone=True,
+        ),
+    )
     repeated, result = repo.build("repeat")
     assert_success(result)
     assert {p.name: p.read_bytes() for p in output.iterdir()} == {p.name: p.read_bytes() for p in repeated.iterdir()}
@@ -622,8 +770,9 @@ def dirty_and_atomic_contract(run: Path):
     cwd = Path.cwd()
     try:
         os.chdir(repo.root)
+        inputs = repo.standalone_inputs("HEAD")
         with patch.dict(os.environ, {"RELEASE_SIGNING_KEY": repo.encoded}), patch.object(BUILDER, "write_source_zip", side_effect=OSError("injected write failure")), contextlib.redirect_stderr(io.StringIO()) as errors:
-            assert BUILDER.main(["--output", ".local/releases/failure"]) == 1
+            assert BUILDER.main(["--output", ".local/releases/failure", "--standalone-input-root", str(inputs)]) == 1
         assert errors.getvalue().strip() == "release_build_failed"
     finally:
         os.chdir(cwd)

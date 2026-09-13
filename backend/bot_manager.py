@@ -44,7 +44,8 @@ from shop_sync import (
 TENANTS_ROOT = os.environ.get("SAAS_TENANTS_DIR", "/var/lib/xianyu-saas/tenants")
 BOT_ROOT = Path(os.environ.get("SAAS_BOT_ROOT", "/opt/xianyu-autoagent")).resolve()
 BOT_MAIN = str(BOT_ROOT / "main.py")
-BOT_PYTHON = str(BOT_ROOT / ".venv/bin/python")
+BOT_PYTHON = os.environ.get("SAAS_BOT_PYTHON", str(BOT_ROOT / ".venv/bin/python"))
+BOT_PYTHONPATH = os.environ.get("SAAS_BOT_PYTHONPATH")
 MAX_BOTS = int(os.environ.get("SAAS_MAX_BOTS", "15"))
 MEM_LIMIT_MB = int(os.environ.get("SAAS_BOT_MEM_MB", "400"))
 ACCESS_RECONCILE_SECONDS = max(
@@ -890,6 +891,8 @@ def _env_for(
             ),
         }
     )
+    if BOT_PYTHONPATH is not None:
+        env["PYTHONPATH"] = BOT_PYTHONPATH
     if mode == "rules_ai":
         if not internal_token:
             raise RuntimeError("rules_ai worker requires an internal AI token")

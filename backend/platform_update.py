@@ -39,6 +39,17 @@ from update_maintenance import (
     supports_maintenance_protocol,
     UpdateStateError,
 )
+from standalone_runtime import (
+    MANAGER_PROTOCOL,
+    STANDALONE_RELEASE_KIND,
+    StandaloneRuntimeError,
+    load_runtime_metadata,
+    normalize_architecture as _standalone_architecture,
+    release_kind,
+    standalone_asset_names,
+    target_name as standalone_target_name,
+    validate_standalone_manifest,
+)
 
 
 RELEASE_OWNER = "tswawa"
@@ -61,13 +72,19 @@ RELEASE_ASSET_PREFIX = "xianyu-saas"
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 MAX_RELEASE_METADATA_BYTES = 2 * 1024 * 1024
 MAX_MANIFEST_BYTES = 1024 * 1024
+MAX_STANDALONE_MANIFEST_BYTES = 8 * 1024 * 1024
 MAX_SIGNATURE_BYTES = 4096
 MAX_ARCHIVE_BYTES = 128 * 1024 * 1024
+MAX_STANDALONE_ARCHIVE_BYTES = 512 * 1024 * 1024
 MAX_UNPACKED_BYTES = 512 * 1024 * 1024
+MAX_STANDALONE_UNPACKED_BYTES = 1536 * 1024 * 1024
 MAX_FILE_BYTES = 64 * 1024 * 1024
+MAX_STANDALONE_FILE_BYTES = 256 * 1024 * 1024
 MAX_MAINTENANCE_SOURCE_BYTES = 256 * 1024
 MAX_UPDATER_BUNDLE_FILE_BYTES = 4 * 1024 * 1024
+MAX_MANAGER_BYTES = 128 * 1024 * 1024
 MAX_ARCHIVE_MEMBERS = 5000
+MAX_STANDALONE_ARCHIVE_MEMBERS = 20000
 MAX_RELEASE_NOTES_CHARS = 16_000
 MAX_PATH_LENGTH = 500
 MAX_PATH_COMPONENT = 240
@@ -79,7 +96,7 @@ SEMVER_RE = re.compile(
 )
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 ALLOWED_TOP_LEVEL_DIRS = frozenset(
-    {"backend", "frontend", "worker", "scripts", "deploy", "config", "docs", "tests"}
+    {"backend", "frontend", "worker", "scripts", "deploy", "config", "docs", "tests", "runtime", "manager"}
 )
 ALLOWED_ROOT_FILES = frozenset(
     {
@@ -123,19 +140,14 @@ DEPENDENCY_JSON_FIELDS = (
 )
 MAINTENANCE_MODULE_PATH = "backend/update_maintenance.py"
 SYSTEMD_INITIALIZATION_FILE = "initialization.json"
-SYSTEMD_UPDATER_PYTHON = "/opt/xianyu-saas/runtime/backend-venv/bin/python"
-SYSTEMD_UPDATER_ENTRYPOINT_RELATIVE = "deploy/updater/updater.py"
-SYSTEMD_UPDATER_BUNDLE_FILES = (
-    "backend/account_storage.py",
-    "backend/db.py",
-    "backend/docker_update_protocol.py",
-    "backend/platform_update.py",
-    "backend/runtime_settings.py",
-    "backend/update_maintenance.py",
-    "backend/version.py",
-    SYSTEMD_UPDATER_ENTRYPOINT_RELATIVE,
-)
-SYSTEMD_INITIALIZATION_KEYS = frozenset({
+SYSTEMD_MANAGER_RELEASES = Path("/opt/xianyu-saas/manager/releases")
+SYSTEMD_MANAGER_CURRENT = Path("/opt/xianyu-saas/manager/current")
+SYSTEMD_MANAGER_EXECUTABLE = SYSTEMD_MANAGER_CURRENT / "xianyu-saas"
+SYSTEMD_MANAGER_KEYS = frozenset({
+    "schema", "protocol", "public_key_sha256", "manager_version",
+    "manager_sha256", "platform", "architecture", "initialized_at",
+})
+LEGACY_SYSTEMD_INITIALIZATION_KEYS = frozenset({
     "schema", "protocol", "public_key_sha256", "bundle_sha256",
     "entrypoint_sha256", "initialized_at",
 })
@@ -226,6 +238,8 @@ class ReleaseInfo:
     manifest: ReleaseAsset
     signature: ReleaseAsset
     runtime_manifest: ReleaseAsset | None = None
+    kind: str = "source"
+    target: str = ""
 
 
 @dataclass(frozen=True)
@@ -400,9 +414,15 @@ def _request_bytes(session, url: str, *, max_bytes: int, asset: bool = False) ->
             close()
 
 
-def _download_asset_to_file(session, asset: ReleaseAsset, destination: Path) -> str:
+def _download_asset_to_file(
+    session,
+    asset: ReleaseAsset,
+    destination: Path,
+    *,
+    max_bytes: int = MAX_ARCHIVE_BYTES,
+) -> str:
     _validate_fixed_api_url(asset.api_url, asset=True)
-    if asset.size <= 0 or asset.size > MAX_ARCHIVE_BYTES:
+    if asset.size <= 0 or asset.size > max_bytes:
         raise PlatformUpdateError("update_download_too_large")
     response = _open_release_response(session, asset.api_url, asset=True, timeout=(5, 120))
     status_code = int(getattr(response, "status_code", 0) or 0)
@@ -417,7 +437,7 @@ def _download_asset_to_file(session, asset: ReleaseAsset, destination: Path) -> 
                 length = int(raw_length)
             except (TypeError, ValueError) as exc:
                 raise PlatformUpdateError("update_source_invalid") from exc
-            if length > asset.size or length > MAX_ARCHIVE_BYTES:
+            if length > asset.size or length > max_bytes:
                 raise PlatformUpdateError("update_download_too_large")
             if length < 0:
                 raise PlatformUpdateError("update_source_invalid")
@@ -434,7 +454,7 @@ def _download_asset_to_file(session, asset: ReleaseAsset, destination: Path) -> 
                     if not chunk:
                         continue
                     total += len(chunk)
-                    if total > MAX_ARCHIVE_BYTES or total > asset.size:
+                    if total > max_bytes or total > asset.size:
                         raise PlatformUpdateError("update_download_too_large")
                     digest.update(chunk)
                     output.write(chunk)
@@ -482,6 +502,24 @@ def _asset_names(version: str) -> tuple[str, str, str]:
     return f"{base}.tar.gz", f"{base}.manifest.json", f"{base}.manifest.sig"
 
 
+def _standalone_target() -> str:
+    try:
+        return standalone_target_name()
+    except StandaloneRuntimeError as exc:
+        raise PlatformUpdateError(exc.code) from exc
+
+
+def _standalone_asset_names(version: str) -> tuple[str, str, str]:
+    try:
+        return standalone_asset_names(version)
+    except StandaloneRuntimeError as exc:
+        raise PlatformUpdateError(exc.code) from exc
+
+
+def _systemd_release_kind() -> str:
+    return release_kind() if deployment_kind() == "systemd" else "source"
+
+
 def _parse_asset(raw, expected_name: str, max_size: int) -> ReleaseAsset:
     if not isinstance(raw, dict) or str(raw.get("name", "")) != expected_name:
         raise PlatformUpdateError("release_assets_invalid")
@@ -506,9 +544,15 @@ def _parse_release(raw, channel: str, *, deployment: str = "systemd") -> Release
     prerelease = bool(raw.get("prerelease") or parsed_version.prerelease)
     if channel == "stable" and prerelease:
         return None
+    kind = "source"
+    target = ""
     if deployment == "docker":
         from docker_update_protocol import docker_asset_names
         names = docker_asset_names(version)
+    elif deployment == "systemd" and _systemd_release_kind() == STANDALONE_RELEASE_KIND:
+        kind = STANDALONE_RELEASE_KIND
+        target = _standalone_target()
+        names = _standalone_asset_names(version)
     else:
         names = _asset_names(version)
     assets = raw.get("assets")
@@ -524,8 +568,10 @@ def _parse_release(raw, channel: str, *, deployment: str = "systemd") -> Release
         by_name[name] = asset
     if any(name not in by_name for name in names):
         raise PlatformUpdateError("release_assets_missing")
-    artifact = _parse_asset(by_name[names[0]], names[0], MAX_ARCHIVE_BYTES)
-    manifest = _parse_asset(by_name[names[1]], names[1], MAX_MANIFEST_BYTES)
+    archive_limit = MAX_STANDALONE_ARCHIVE_BYTES if kind == STANDALONE_RELEASE_KIND else MAX_ARCHIVE_BYTES
+    manifest_limit = MAX_STANDALONE_MANIFEST_BYTES if kind == STANDALONE_RELEASE_KIND else MAX_MANIFEST_BYTES
+    artifact = _parse_asset(by_name[names[0]], names[0], archive_limit)
+    manifest = _parse_asset(by_name[names[1]], names[1], manifest_limit)
     signature = _parse_asset(by_name[names[2]], names[2], MAX_SIGNATURE_BYTES)
     runtime_manifest = None
     if deployment == "docker":
@@ -545,6 +591,8 @@ def _parse_release(raw, channel: str, *, deployment: str = "systemd") -> Release
         manifest=manifest,
         signature=signature,
         runtime_manifest=runtime_manifest,
+        kind=kind,
+        target=target,
     )
 
 
@@ -817,6 +865,50 @@ def _systemd_updater_identity() -> tuple[str, str]:
     return hashlib.sha256(canonical).hexdigest(), entrypoint_sha256
 
 
+def _systemd_manager_identity() -> tuple[str, str, str]:
+    releases = Path(os.environ.get("SAAS_MANAGER_RELEASES_DIR", str(SYSTEMD_MANAGER_RELEASES)).strip())
+    current = Path(os.environ.get("SAAS_MANAGER_CURRENT", str(SYSTEMD_MANAGER_CURRENT)).strip())
+    executable = Path(os.environ.get("SAAS_MANAGER_EXECUTABLE", str(current / "xianyu-saas")).strip())
+    if (not releases.is_absolute() or not current.is_absolute() or not executable.is_absolute()
+            or ".." in releases.parts or ".." in current.parts or ".." in executable.parts
+            or current.parent != releases.parent or executable != current / "xianyu-saas"):
+        raise PlatformUpdateError("update_updater_identity_mismatch")
+    try:
+        _trusted_update_directory(releases)
+        _trusted_update_directory(current.parent)
+        link = current.lstat()
+        if not stat.S_ISLNK(link.st_mode) or link.st_uid != 0:
+            raise PlatformUpdateError("update_updater_identity_mismatch")
+        release_root = current.resolve(strict=True)
+        releases_root = releases.resolve(strict=True)
+        if release_root.parent != releases_root:
+            raise PlatformUpdateError("update_updater_identity_mismatch")
+        SemVer.parse(release_root.name)
+        _trusted_update_directory(release_root)
+        resolved_executable = executable.resolve(strict=True)
+        if resolved_executable != release_root / "xianyu-saas":
+            raise PlatformUpdateError("update_updater_identity_mismatch")
+        before = resolved_executable.lstat()
+        if (stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode)
+                or before.st_uid != 0 or before.st_nlink != 1
+                or stat.S_IMODE(before.st_mode) & 0o022
+                or not stat.S_IMODE(before.st_mode) & 0o111
+                or before.st_size <= 0 or before.st_size > MAX_MANAGER_BYTES):
+            raise PlatformUpdateError("update_updater_identity_mismatch")
+        payload = _read_secure_file(resolved_executable, MAX_MANAGER_BYTES)
+        after = resolved_executable.lstat()
+        if ((before.st_dev, before.st_ino, before.st_mode, before.st_uid, before.st_nlink,
+             before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+                != (after.st_dev, after.st_ino, after.st_mode, after.st_uid, after.st_nlink,
+                    after.st_size, after.st_mtime_ns, after.st_ctime_ns)):
+            raise PlatformUpdateError("update_updater_identity_mismatch")
+        return release_root.name, hashlib.sha256(payload).hexdigest(), _standalone_architecture()
+    except PlatformUpdateError:
+        raise
+    except (OSError, ValueError) as exc:
+        raise PlatformUpdateError("update_updater_identity_mismatch") from exc
+
+
 def read_systemd_initialization() -> dict:
     try:
         payload = read_trusted_json(status_directory() / SYSTEMD_INITIALIZATION_FILE)
@@ -824,33 +916,33 @@ def read_systemd_initialization() -> dict:
         raise PlatformUpdateError("update_state_invalid") from exc
     if payload is None:
         raise PlatformUpdateError("update_updater_not_initialized")
-    if not isinstance(payload, dict) or set(payload) != SYSTEMD_INITIALIZATION_KEYS:
+    if isinstance(payload, dict) and set(payload) == LEGACY_SYSTEMD_INITIALIZATION_KEYS:
+        raise PlatformUpdateError("update_installation_migration_required")
+    if not isinstance(payload, dict) or set(payload) != SYSTEMD_MANAGER_KEYS:
         raise PlatformUpdateError("update_state_invalid")
-    if type(payload.get("schema")) is not int or payload["schema"] != 1:
+    if type(payload.get("schema")) is not int or payload["schema"] != 2:
         raise PlatformUpdateError("update_state_invalid")
-    if type(payload.get("protocol")) is not int or payload["protocol"] != 1:
+    if type(payload.get("protocol")) is not int or payload["protocol"] != MANAGER_PROTOCOL:
         raise PlatformUpdateError("update_protocol_mismatch")
     stamp = payload.get("initialized_at")
     if (type(stamp) not in {int, float} or not math.isfinite(stamp) or stamp <= 0
+            or payload.get("platform") != "linux"
+            or payload.get("architecture") != _standalone_architecture()
             or any(not isinstance(payload.get(name), str) or not SHA256_RE.fullmatch(payload[name])
-                   for name in ("public_key_sha256", "bundle_sha256", "entrypoint_sha256"))):
+                   for name in ("public_key_sha256", "manager_sha256"))):
         raise PlatformUpdateError("update_state_invalid")
     key = load_public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
     if not secrets.compare_digest(payload["public_key_sha256"], hashlib.sha256(key).hexdigest()):
         raise PlatformUpdateError("update_public_key_mismatch")
-    try:
-        bundle_sha256, entrypoint_sha256 = _systemd_updater_identity()
-    except PlatformUpdateError as exc:
-        if exc.code == "update_updater_identity_mismatch":
-            raise
-        raise PlatformUpdateError("update_updater_identity_mismatch") from exc
-    if (not secrets.compare_digest(payload["bundle_sha256"], bundle_sha256)
-            or not secrets.compare_digest(payload["entrypoint_sha256"], entrypoint_sha256)):
+    manager_version, manager_sha256, architecture = _systemd_manager_identity()
+    if (payload.get("manager_version") != manager_version
+            or payload.get("architecture") != architecture
+            or not secrets.compare_digest(payload["manager_sha256"], manager_sha256)):
         raise PlatformUpdateError("update_updater_identity_mismatch")
     return {**payload, "initialized_at": float(stamp)}
 
 
-def _systemd_exec_start_matches(value: str, entrypoint: Path) -> bool:
+def _systemd_exec_start_matches(value: str, entrypoint: Path = SYSTEMD_MANAGER_EXECUTABLE) -> bool:
     text = str(value or "")
     if text.count("argv[]=") != 1 or text.count("path=") != 1:
         return False
@@ -865,12 +957,14 @@ def _systemd_exec_start_matches(value: str, entrypoint: Path) -> bool:
                 return False
             fields[key] = field.strip()
     return (
-        fields.get("path") == SYSTEMD_UPDATER_PYTHON
-        and fields.get("argv[]", "").split() == [SYSTEMD_UPDATER_PYTHON, str(entrypoint)]
+        fields.get("path") == str(entrypoint)
+        and fields.get("argv[]", "").split() == [str(entrypoint), "internal", "consume-intent"]
     )
 
 
 def _systemd_update_ready() -> None:
+    if _systemd_release_kind() != STANDALONE_RELEASE_KIND:
+        raise PlatformUpdateError("update_installation_migration_required")
     current = Path(os.environ.get("SAAS_CURRENT_LINK", "/opt/xianyu-saas/current"))
     releases = Path(os.environ.get("SAAS_RELEASES_DIR", "/opt/xianyu-saas/releases"))
     _trusted_update_directory(releases)
@@ -885,15 +979,26 @@ def _systemd_update_ready() -> None:
     if _public_key_file().lstat().st_uid != 0:
         raise PlatformUpdateError("update_public_key_invalid")
     read_systemd_initialization()
-    # A marker alone is not evidence that a deployment is a signed release.
     marker = _marker_payload(source)
-    if marker.get("schema") != 1 or marker.get("version") != VERSION:
+    if (marker.get("schema") != 1 or marker.get("version") != VERSION
+            or marker.get("kind") != STANDALONE_RELEASE_KIND
+            or marker.get("target") != _standalone_target()):
         raise PlatformUpdateError("update_installation_unavailable")
-    manifest = _read_secure_file(source / CACHED_MANIFEST_FILE, MAX_MANIFEST_BYTES)
+    manifest = _read_secure_file(source / CACHED_MANIFEST_FILE, MAX_STANDALONE_MANIFEST_BYTES)
     verify_manifest_signature(manifest, _read_secure_file(source / CACHED_SIGNATURE_FILE, MAX_SIGNATURE_BYTES))
-    _, files = parse_manifest(manifest, _release_from_marker(marker))
+    parsed, files = parse_manifest(manifest, _release_from_marker(marker))
     _require_maintenance_protocol(source, files)
     _verify_candidate_version(source, VERSION)
+    try:
+        runtime = load_runtime_metadata(
+            source,
+            expected_version=VERSION,
+            expected_architecture=str(parsed.get("architecture", "")),
+        )
+    except StandaloneRuntimeError as exc:
+        raise PlatformUpdateError(exc.code) from exc
+    if runtime.manager_protocol != MANAGER_PROTOCOL:
+        raise PlatformUpdateError("update_protocol_mismatch")
     _trusted_update_directory(_staging_root(), writable=True)
     _trusted_update_directory(_intent_file().parent, writable=True)
     watcher = _systemd_properties("xianyu-saas-updater.path")
@@ -903,7 +1008,10 @@ def _systemd_update_ready() -> None:
             or "xianyu-saas-updater.service" not in watcher.get("Triggers", "").split()
             or not re.search(r"(?:^|\s)" + re.escape(f"{_intent_file()} (PathExists)") + r"(?:$|\s)", watcher.get("Paths", ""))):
         raise PlatformUpdateError("update_service_unavailable")
-    if not _systemd_exec_start_matches(service.get("ExecStart", ""), _systemd_updater_entrypoint()):
+    manager_entrypoint = Path(
+        os.environ.get("SAAS_MANAGER_EXECUTABLE", str(SYSTEMD_MANAGER_EXECUTABLE)).strip()
+    )
+    if not _systemd_exec_start_matches(service.get("ExecStart", ""), manager_entrypoint):
         raise PlatformUpdateError("update_updater_identity_mismatch")
 
 
@@ -1082,8 +1190,14 @@ def _validate_release_path(raw_path: str, *, directory: bool = False) -> str:
     return path.as_posix()
 
 
-def _manifest_files(raw_files) -> dict[str, ManifestFile]:
-    if not isinstance(raw_files, list) or not raw_files or len(raw_files) > MAX_ARCHIVE_MEMBERS:
+def _manifest_files(
+    raw_files,
+    *,
+    max_members: int = MAX_ARCHIVE_MEMBERS,
+    max_file_bytes: int = MAX_FILE_BYTES,
+    max_unpacked_bytes: int = MAX_UNPACKED_BYTES,
+) -> dict[str, ManifestFile]:
+    if not isinstance(raw_files, list) or not raw_files or len(raw_files) > max_members:
         raise PlatformUpdateError("update_manifest_invalid")
     files: dict[str, ManifestFile] = {}
     folded: set[str] = set()
@@ -1100,11 +1214,11 @@ def _manifest_files(raw_files) -> dict[str, ManifestFile]:
         except (KeyError, TypeError, ValueError) as exc:
             raise PlatformUpdateError("update_manifest_invalid") from exc
         sha256 = str(raw.get("sha256", "")).lower()
-        if size < 0 or size > MAX_FILE_BYTES or not SHA256_RE.fullmatch(sha256):
+        if size < 0 or size > max_file_bytes or not SHA256_RE.fullmatch(sha256):
             raise PlatformUpdateError("update_manifest_invalid")
         executable = bool(raw.get("executable", False))
         total += size
-        if total > MAX_UNPACKED_BYTES:
+        if total > max_unpacked_bytes:
             raise PlatformUpdateError("update_archive_too_large")
         files[path] = ManifestFile(path, size, sha256, executable)
         folded.add(folded_path)
@@ -1116,7 +1230,8 @@ def parse_manifest(manifest_raw: bytes, release: ReleaseInfo) -> tuple[dict, dic
         manifest = json.loads(manifest_raw.decode("utf-8"))
     except (UnicodeError, json.JSONDecodeError) as exc:
         raise PlatformUpdateError("update_manifest_invalid") from exc
-    if not isinstance(manifest, dict) or manifest.get("schema") != 1:
+    expected_schema = 2 if release.kind == STANDALONE_RELEASE_KIND else 1
+    if not isinstance(manifest, dict) or manifest.get("schema") != expected_schema:
         raise PlatformUpdateError("update_manifest_invalid")
     if str(manifest.get("version", "")) != release.version:
         raise PlatformUpdateError("update_manifest_version_mismatch")
@@ -1129,7 +1244,24 @@ def parse_manifest(manifest_raw: bytes, release: ReleaseInfo) -> tuple[dict, dic
         raise PlatformUpdateError("update_manifest_invalid") from exc
     if not SHA256_RE.fullmatch(artifact_hash) or artifact_size != release.artifact.size:
         raise PlatformUpdateError("update_manifest_invalid")
-    files = _manifest_files(manifest.get("files"))
+    if release.kind == STANDALONE_RELEASE_KIND:
+        try:
+            validate_standalone_manifest(
+                manifest,
+                expected_version=release.version,
+                expected_target=release.target,
+                expected_artifact=release.artifact.name,
+            )
+        except StandaloneRuntimeError as exc:
+            raise PlatformUpdateError(exc.code) from exc
+        files = _manifest_files(
+            manifest.get("files"),
+            max_members=MAX_STANDALONE_ARCHIVE_MEMBERS,
+            max_file_bytes=MAX_STANDALONE_FILE_BYTES,
+            max_unpacked_bytes=MAX_STANDALONE_UNPACKED_BYTES,
+        )
+    else:
+        files = _manifest_files(manifest.get("files"))
     return manifest, files
 
 
@@ -1159,7 +1291,7 @@ def _write_member(source: BinaryIO, destination: Path, expected: ManifestFile) -
                 if not chunk:
                     break
                 total += len(chunk)
-                if total > expected.size or total > MAX_FILE_BYTES:
+                if total > expected.size:
                     raise PlatformUpdateError("update_archive_size_mismatch")
                 digest.update(chunk)
                 output.write(chunk)
@@ -1177,7 +1309,11 @@ def extract_verified_archive(
     archive_path: Path,
     candidate_root: Path,
     expected_files: dict[str, ManifestFile],
+    *,
+    standalone: bool = False,
 ) -> None:
+    max_members = MAX_STANDALONE_ARCHIVE_MEMBERS if standalone else MAX_ARCHIVE_MEMBERS
+    max_unpacked_bytes = MAX_STANDALONE_UNPACKED_BYTES if standalone else MAX_UNPACKED_BYTES
     try:
         with archive_path.open("rb") as probe:
             if probe.read(2) != b"\x1f\x8b":
@@ -1195,7 +1331,7 @@ def extract_verified_archive(
     try:
         for member in archive:
             member_count += 1
-            if member_count > MAX_ARCHIVE_MEMBERS:
+            if member_count > max_members:
                 raise PlatformUpdateError("update_archive_too_many_files")
             is_directory = member.isdir()
             path = _validate_release_path(member.name, directory=is_directory)
@@ -1219,7 +1355,7 @@ def extract_verified_archive(
             if expected is None or int(member.size) != expected.size:
                 raise PlatformUpdateError("update_archive_manifest_mismatch")
             total_size += int(member.size)
-            if total_size > MAX_UNPACKED_BYTES:
+            if total_size > max_unpacked_bytes:
                 raise PlatformUpdateError("update_archive_too_large")
             source = archive.extractfile(member)
             if source is None:
@@ -1358,8 +1494,11 @@ def stage_release(
     if SemVer.parse(release.version).compare(SemVer.parse(current_version)) <= 0:
         raise PlatformUpdateError("update_downgrade_rejected")
     session = session or requests.Session()
+    standalone = release.kind == STANDALONE_RELEASE_KIND
+    manifest_limit = MAX_STANDALONE_MANIFEST_BYTES if standalone else MAX_MANIFEST_BYTES
+    archive_limit = MAX_STANDALONE_ARCHIVE_BYTES if standalone else MAX_ARCHIVE_BYTES
     manifest_raw = _request_bytes(
-        session, release.manifest.api_url, max_bytes=MAX_MANIFEST_BYTES, asset=True
+        session, release.manifest.api_url, max_bytes=manifest_limit, asset=True
     )
     signature_raw = _request_bytes(
         session, release.signature.api_url, max_bytes=MAX_SIGNATURE_BYTES, asset=True
@@ -1373,14 +1512,37 @@ def stage_release(
         archive_path = stage / release.artifact.name
         candidate_root = stage / "candidate"
         candidate_root.mkdir(mode=0o700)
-        artifact_sha256 = _download_asset_to_file(session, release.artifact, archive_path)
+        artifact_sha256 = _download_asset_to_file(
+            session, release.artifact, archive_path, max_bytes=archive_limit
+        )
         if not secrets.compare_digest(artifact_sha256, str(manifest["artifact_sha256"])):
             raise PlatformUpdateError("update_artifact_hash_mismatch")
-        extract_verified_archive(archive_path, candidate_root, expected_files)
+        extract_verified_archive(
+            archive_path, candidate_root, expected_files, standalone=standalone
+        )
         if require_maintenance:
             _require_maintenance_protocol(candidate_root, expected_files)
         _verify_candidate_version(candidate_root, release.version)
-        _verify_dependency_stability(candidate_root, _source_root())
+        if standalone:
+            try:
+                runtime = load_runtime_metadata(
+                    candidate_root,
+                    expected_version=release.version,
+                    expected_architecture=manifest["architecture"],
+                )
+            except StandaloneRuntimeError as exc:
+                raise PlatformUpdateError(exc.code) from exc
+            if runtime.manager_protocol != manifest["manager_protocol"]:
+                raise PlatformUpdateError("standalone_manager_protocol_invalid")
+            manager = candidate_root / "manager" / "xianyu-saas"
+            try:
+                metadata = manager.lstat()
+            except OSError as exc:
+                raise PlatformUpdateError("standalone_manager_missing") from exc
+            if manager.is_symlink() or not manager.is_file() or not stat.S_IMODE(metadata.st_mode) & 0o111:
+                raise PlatformUpdateError("standalone_manager_invalid")
+        else:
+            _verify_dependency_stability(candidate_root, _source_root())
         _write_secure_file(candidate_root / CACHED_MANIFEST_FILE, manifest_raw)
         _write_secure_file(candidate_root / CACHED_SIGNATURE_FILE, signature_raw)
         _write_marker(
@@ -1393,6 +1555,8 @@ def stage_release(
                 "release_id": release.release_id,
                 "artifact": release.artifact.name,
                 "artifact_size": release.artifact.size,
+                "kind": release.kind,
+                "target": release.target,
             },
         )
         archive_path.unlink(missing_ok=True)
@@ -1689,8 +1853,19 @@ def _release_from_marker(marker: dict) -> ReleaseInfo:
         artifact_size = int(marker.get("artifact_size", -1))
     except (TypeError, ValueError) as exc:
         raise PlatformUpdateError("update_candidate_invalid") from exc
-    expected_names = _asset_names(version)
-    if artifact_name != expected_names[0] or artifact_size <= 0 or artifact_size > MAX_ARCHIVE_BYTES:
+    kind = str(marker.get("kind", "source"))
+    target = str(marker.get("target", ""))
+    if kind == STANDALONE_RELEASE_KIND:
+        if target != _standalone_target():
+            raise PlatformUpdateError("standalone_runtime_architecture_mismatch")
+        expected_names = _standalone_asset_names(version)
+        archive_limit = MAX_STANDALONE_ARCHIVE_BYTES
+    elif kind == "source":
+        expected_names = _asset_names(version)
+        archive_limit = MAX_ARCHIVE_BYTES
+    else:
+        raise PlatformUpdateError("update_candidate_invalid")
+    if artifact_name != expected_names[0] or artifact_size <= 0 or artifact_size > archive_limit:
         raise PlatformUpdateError("update_candidate_invalid")
     return ReleaseInfo(
         release_id=str(marker.get("release_id", ""))[:120],
@@ -1702,6 +1877,8 @@ def _release_from_marker(marker: dict) -> ReleaseInfo:
         artifact=ReleaseAsset(1, expected_names[0], artifact_size),
         manifest=ReleaseAsset(2, expected_names[1], 1),
         signature=ReleaseAsset(3, expected_names[2], 1),
+        kind=kind,
+        target=target,
     )
 
 
@@ -1718,15 +1895,18 @@ def load_verified_candidate(
         or (manifest_sha256 and str(marker.get("manifest_sha256", "")) != manifest_sha256)
     ):
         raise PlatformUpdateError("update_candidate_invalid")
-    manifest_raw = _read_secure_file(resolved / CACHED_MANIFEST_FILE, MAX_MANIFEST_BYTES)
+    release = _release_from_marker(marker)
+    standalone = release.kind == STANDALONE_RELEASE_KIND
+    manifest_limit = MAX_STANDALONE_MANIFEST_BYTES if standalone else MAX_MANIFEST_BYTES
+    manifest_raw = _read_secure_file(resolved / CACHED_MANIFEST_FILE, manifest_limit)
     signature_raw = _read_secure_file(resolved / CACHED_SIGNATURE_FILE, MAX_SIGNATURE_BYTES)
     if not secrets.compare_digest(
         hashlib.sha256(manifest_raw).hexdigest(), str(marker.get("manifest_sha256", ""))
     ):
         raise PlatformUpdateError("update_candidate_invalid")
     verify_manifest_signature(manifest_raw, signature_raw)
-    release = _release_from_marker(marker)
-    _, expected_files = parse_manifest(manifest_raw, release)
+    manifest, expected_files = parse_manifest(manifest_raw, release)
+    max_unpacked_bytes = MAX_STANDALONE_UNPACKED_BYTES if standalone else MAX_UNPACKED_BYTES
     seen_files: set[str] = set()
     total_size = 0
     for directory, directories, filenames in os.walk(resolved, topdown=True, followlinks=False):
@@ -1751,7 +1931,7 @@ def load_verified_candidate(
             if expected is None or int(metadata.st_size) != expected.size:
                 raise PlatformUpdateError("update_archive_manifest_mismatch")
             total_size += int(metadata.st_size)
-            if total_size > MAX_UNPACKED_BYTES:
+            if total_size > max_unpacked_bytes:
                 raise PlatformUpdateError("update_archive_too_large")
             digest = hashlib.sha256(_read_secure_file(child, expected.size)).hexdigest()
             if not secrets.compare_digest(digest, expected.sha256):
@@ -1760,7 +1940,19 @@ def load_verified_candidate(
     if seen_files != set(expected_files):
         raise PlatformUpdateError("update_archive_manifest_mismatch")
     _verify_candidate_version(resolved, str(version))
-    _verify_dependency_stability(resolved, _source_root())
+    if standalone:
+        try:
+            runtime = load_runtime_metadata(
+                resolved,
+                expected_version=str(version),
+                expected_architecture=str(manifest.get("architecture", "")),
+            )
+        except StandaloneRuntimeError as exc:
+            raise PlatformUpdateError(exc.code) from exc
+        if runtime.manager_protocol != manifest.get("manager_protocol"):
+            raise PlatformUpdateError("standalone_manager_protocol_invalid")
+    else:
+        _verify_dependency_stability(resolved, _source_root())
     return marker, expected_files
 
 
@@ -1782,6 +1974,16 @@ def available_rollback_versions(current_version: str) -> list[dict]:
     if not root.is_absolute() or not root.exists() or root.is_symlink() or not root.is_dir():
         return []
     current = SemVer.parse(current_version)
+    current_runtime = None
+    if release_kind() == STANDALONE_RELEASE_KIND:
+        try:
+            current_runtime = load_runtime_metadata(
+                _source_root(),
+                expected_version=current_version,
+                expected_architecture=_standalone_architecture(),
+            )
+        except StandaloneRuntimeError:
+            return []
     versions: list[tuple[SemVer, dict]] = []
     try:
         entries = tuple(root.iterdir())
@@ -1794,11 +1996,17 @@ def available_rollback_versions(current_version: str) -> list[dict]:
             parsed = SemVer.parse(path.name)
             _trusted_update_directory(path)
             marker = _marker_payload(path)
-            raw_manifest = _read_secure_file(path / CACHED_MANIFEST_FILE, MAX_MANIFEST_BYTES)
+            release = _release_from_marker(marker)
+            manifest_limit = (
+                MAX_STANDALONE_MANIFEST_BYTES
+                if release.kind == STANDALONE_RELEASE_KIND
+                else MAX_MANIFEST_BYTES
+            )
+            raw_manifest = _read_secure_file(path / CACHED_MANIFEST_FILE, manifest_limit)
             verify_manifest_signature(raw_manifest, _read_secure_file(path / CACHED_SIGNATURE_FILE, MAX_SIGNATURE_BYTES))
             if hashlib.sha256(raw_manifest).hexdigest() != marker.get("manifest_sha256"):
                 continue
-            _, files = parse_manifest(raw_manifest, _release_from_marker(marker))
+            manifest, files = parse_manifest(raw_manifest, release)
             for relative, expected in files.items():
                 file = path / relative
                 _trusted_update_directory(file.parent)
@@ -1809,7 +2017,22 @@ def available_rollback_versions(current_version: str) -> list[dict]:
                     raise PlatformUpdateError("update_candidate_invalid")
             _require_maintenance_protocol(path, files)
             _verify_candidate_version(path, path.name)
-            _verify_dependency_stability(path, _source_root())
+            if release.kind == STANDALONE_RELEASE_KIND:
+                runtime = load_runtime_metadata(
+                    path,
+                    expected_version=path.name,
+                    expected_architecture=_standalone_architecture(),
+                )
+                if (
+                    current_runtime is None
+                    or runtime.manager_protocol > MANAGER_PROTOCOL
+                    or runtime.update_data_version != current_runtime.update_data_version
+                    or runtime.manager_protocol != manifest.get("manager_protocol")
+                    or runtime.update_data_version != manifest.get("update_data_version")
+                ):
+                    continue
+            else:
+                _verify_dependency_stability(path, _source_root())
         except (PlatformUpdateError, OSError):
             continue
         if parsed.compare(current) >= 0:

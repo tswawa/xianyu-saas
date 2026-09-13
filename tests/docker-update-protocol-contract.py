@@ -88,6 +88,9 @@ class Fixture:
             "docs/assets/orders.png": b"public screenshot fixture\n",
             "tests/test_private_key.py": b"# Code, not a private key.\n",
             "deploy/update-signing.pub": base64.b64encode(self.public) + b"\n",
+            "deploy/runtime/backend.lock.json": b"{}\n",
+            "deploy/runtime/python-build-standalone.lock.json": b"{}\n",
+            "deploy/runtime/worker.lock.json": b"{}\n",
         }
         self.counter = 0
 

@@ -667,87 +667,71 @@ class PublicStateLogicContract(unittest.TestCase):
                 with self.assertRaises(protocol.PlatformUpdateError):
                     protocol.read_docker_capabilities()
 
-    def test_systemd_initialization_binds_key_bundle_entrypoint_and_fixed_exec(self):
+    def test_systemd_initialization_binds_key_manager_architecture_and_fixed_exec(self):
         key = Ed25519PrivateKey.generate().public_key()
         key_raw = key.public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
-        with tempfile.TemporaryDirectory(prefix="systemd-init-contract-") as temporary:
-            temporary = Path(temporary)
-            bundle_root = temporary / "updater"
-            status_root = temporary / "status"
-            for index, relative in enumerate(protocol.SYSTEMD_UPDATER_BUNDLE_FILES, 1):
-                path = bundle_root.joinpath(*relative.split("/"))
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_bytes(f"synthetic updater file {index}: {relative}\n".encode())
-                path.chmod(0o644)
-            entrypoint = bundle_root.joinpath(*protocol.SYSTEMD_UPDATER_ENTRYPOINT_RELATIVE.split("/"))
-            actual_lstat = Path.lstat
+        status_root = Path(tempfile.gettempdir()) / "systemd-manager-status"
+        manager = Path("/") / "opt" / "xianyu-saas" / "manager" / "current" / "xianyu-saas"
+        payload = {
+            "schema": 2,
+            "protocol": 1,
+            "public_key_sha256": hashlib.sha256(key_raw).hexdigest(),
+            "manager_version": VERSION,
+            "manager_sha256": "a" * 64,
+            "platform": "linux",
+            "architecture": "x86_64",
+            "initialized_at": 1.0,
+        }
+        expected_path = status_root / protocol.SYSTEMD_INITIALIZATION_FILE
 
-            def root_owned_read_only(path, *args, **kwargs):
-                metadata = actual_lstat(path, *args, **kwargs)
-                if path == bundle_root or bundle_root in path.parents:
-                    values = list(metadata)
-                    values[0] &= ~0o022
-                    values[4] = 0
-                    return os.stat_result(values)
-                return metadata
+        def read_payload(path):
+            self.assertEqual(Path(path), expected_path)
+            return dict(payload)
 
-            environment = {
-                "SAAS_UPDATER_BUNDLE_ROOT": str(bundle_root),
-                "SAAS_UPDATER_ENTRYPOINT": str(entrypoint),
-                "SAAS_UPDATE_STATUS_DIR": str(status_root),
+        with patch.dict(os.environ, {"SAAS_UPDATE_STATUS_DIR": str(status_root)}, clear=False), \
+             patch.object(protocol, "load_public_key", return_value=key), \
+             patch.object(protocol, "_standalone_architecture", return_value="x86_64"), \
+             patch.object(protocol, "_systemd_manager_identity", return_value=(VERSION, "a" * 64, "x86_64")):
+            with patch.object(protocol, "read_trusted_json", side_effect=read_payload):
+                self.assertEqual(protocol.read_systemd_initialization()["initialized_at"], 1.0)
+            for changed, code in (
+                ({"extra": True}, "update_state_invalid"),
+                ({"protocol": 2}, "update_protocol_mismatch"),
+                ({"public_key_sha256": "f" * 64}, "update_public_key_mismatch"),
+                ({"manager_version": "9.9.9"}, "update_updater_identity_mismatch"),
+                ({"manager_sha256": "f" * 64}, "update_updater_identity_mismatch"),
+                ({"platform": "windows"}, "update_state_invalid"),
+                ({"architecture": "aarch64"}, "update_state_invalid"),
+            ):
+                with self.subTest(changed=changed), \
+                     patch.object(protocol, "read_trusted_json", return_value={**payload, **changed}):
+                    with self.assertRaises(protocol.PlatformUpdateError) as error:
+                        protocol.read_systemd_initialization()
+                    self.assertEqual(error.exception.code, code)
+            legacy = {
+                "schema": 1,
+                "protocol": 1,
+                "public_key_sha256": payload["public_key_sha256"],
+                "bundle_sha256": "b" * 64,
+                "entrypoint_sha256": "c" * 64,
+                "initialized_at": 1.0,
             }
-            with patch.dict(os.environ, environment, clear=False), \
-                 patch.object(protocol, "_trusted_update_directory"), \
-                 patch.object(Path, "lstat", root_owned_read_only), \
-                 patch.object(protocol, "load_public_key", return_value=key):
-                bundle_sha256, entrypoint_sha256 = protocol._systemd_updater_identity()
-                payload = {
-                    "schema": 1,
-                    "protocol": 1,
-                    "public_key_sha256": hashlib.sha256(key_raw).hexdigest(),
-                    "bundle_sha256": bundle_sha256,
-                    "entrypoint_sha256": entrypoint_sha256,
-                    "initialized_at": 1.0,
-                }
-                expected_path = status_root / protocol.SYSTEMD_INITIALIZATION_FILE
+            with patch.object(protocol, "read_trusted_json", return_value=legacy):
+                with self.assertRaises(protocol.PlatformUpdateError) as error:
+                    protocol.read_systemd_initialization()
+                self.assertEqual(error.exception.code, "update_installation_migration_required")
+            with patch.object(protocol, "read_trusted_json", return_value=None):
+                with self.assertRaises(protocol.PlatformUpdateError) as error:
+                    protocol.read_systemd_initialization()
+                self.assertEqual(error.exception.code, "update_updater_not_initialized")
 
-                def read_payload(path):
-                    self.assertEqual(Path(path), expected_path)
-                    return dict(payload)
-
-                with patch.object(protocol, "read_trusted_json", side_effect=read_payload):
-                    self.assertEqual(protocol.read_systemd_initialization()["initialized_at"], 1.0)
-                for changed, code in (
-                    ({"extra": True}, "update_state_invalid"),
-                    ({"protocol": 2}, "update_protocol_mismatch"),
-                    ({"public_key_sha256": "f" * 64}, "update_public_key_mismatch"),
-                    ({"bundle_sha256": "f" * 64}, "update_updater_identity_mismatch"),
-                    ({"entrypoint_sha256": "f" * 64}, "update_updater_identity_mismatch"),
-                ):
-                    with self.subTest(changed=changed), \
-                         patch.object(protocol, "read_trusted_json", return_value={**payload, **changed}):
-                        with self.assertRaises(protocol.PlatformUpdateError) as error:
-                            protocol.read_systemd_initialization()
-                        self.assertEqual(error.exception.code, code)
-                with patch.object(protocol, "read_trusted_json", return_value=None):
-                    with self.assertRaises(protocol.PlatformUpdateError) as error:
-                        protocol.read_systemd_initialization()
-                    self.assertEqual(error.exception.code, "update_updater_not_initialized")
-                first = bundle_root.joinpath(*protocol.SYSTEMD_UPDATER_BUNDLE_FILES[0].split("/"))
-                first.write_bytes(first.read_bytes() + b"tampered")
-                with patch.object(protocol, "read_trusted_json", return_value=payload):
-                    with self.assertRaises(protocol.PlatformUpdateError) as error:
-                        protocol.read_systemd_initialization()
-                    self.assertEqual(error.exception.code, "update_updater_identity_mismatch")
-
-            valid_exec = (
-                f"{{ path={protocol.SYSTEMD_UPDATER_PYTHON} ; "
-                f"argv[]={protocol.SYSTEMD_UPDATER_PYTHON} {entrypoint} ; ignore_errors=no ; }}"
-            )
-            self.assertTrue(protocol._systemd_exec_start_matches(valid_exec, entrypoint))
-            self.assertFalse(protocol._systemd_exec_start_matches(
-                valid_exec.replace(str(entrypoint), str(entrypoint) + " --unexpected"), entrypoint,
-            ))
+        valid_exec = (
+            f"{{ path={manager} ; argv[]={manager} internal consume-intent ; ignore_errors=no ; }}"
+        )
+        self.assertTrue(protocol._systemd_exec_start_matches(valid_exec, manager))
+        self.assertFalse(protocol._systemd_exec_start_matches(
+            valid_exec.replace("consume-intent", "consume-intent --unexpected"), manager,
+        ))
 
     def test_status_projection_identity_and_terminal_semantics(self):
         operation = {"operation_id": "a" * 32, "action": "apply", "version": "1.1.0", "deployment": "docker"}
@@ -806,7 +790,8 @@ class MaintenanceAPILogicContract(unittest.TestCase):
     def test_maintenance_write_gate_keeps_health_version_and_admin_reads(self):
         namespace = {"threading": threading, "_business_write_lock": threading.Lock(), "_business_writes": 0,
                      "maintenance_active": lambda: True, "JSONResponse": JSONResponse, "HTTPException": HTTPException,
-                     "SESSION_COOKIE": "session", "os": os}
+                     "SESSION_COOKIE": "session", "PUBLIC_WEB_PREFIX": "/xianyu-saas",
+                     "PUBLIC_API_PREFIX": "/xianyu-saas/api/", "os": os}
         gate = app_function("security_headers", namespace)
         seen = []
         async def next_handler(request):

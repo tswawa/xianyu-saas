@@ -10,9 +10,11 @@ Group=xianyu-saas
 WorkingDirectory=/opt/xianyu-saas/current/backend
 EnvironmentFile=/etc/xianyu-saas.env
 Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONPATH=/opt/xianyu-saas/current/runtime/site/backend
 Environment=SAAS_CURRENT_ROOT=/opt/xianyu-saas/current
 Environment=SAAS_DEPLOYMENT_MODE=systemd
-ExecStart=/opt/xianyu-saas/runtime/backend-venv/bin/python -m job_consumer
+Environment=SAAS_RELEASE_KIND=standalone
+ExecStart=/opt/xianyu-saas/current/runtime/python/bin/python3 -m job_consumer
 
 Restart=on-failure
 RestartSec=5

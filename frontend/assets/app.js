@@ -4,7 +4,7 @@
 
   const API_PREFIX = "/xianyu-saas";
   const QR_LOGIN_POLL_MS = 1500;
-  const ASSET_VERSION = "20260913-01";
+  const ASSET_VERSION = "20260913-02";
   const AI_TEXT_PLACEHOLDERS = new Set(["无", "暂无", "没有", "未填写", "待填写", "待补充", "占位", "n/a", "na", "none", "null", "todo", "tbd"]);
   const ICONS = API_PREFIX + "/assets/icons.svg?v=" + ASSET_VERSION + "#";
   // 旧版视图 key → 新版视图 key（历史会话/书签兜底）。
@@ -3574,7 +3574,7 @@
     if (!pageItems.length) {
       if (grid) {
         grid.className = state.goodsViewMode === "list" ? "product-card-grid is-list-view" : "product-card-grid";
-        grid.innerHTML = '<div class="table-cell-empty" style="grid-column: 1 / -1; padding: 40px 16px; text-align: center; color: var(--muted);">' +
+        grid.innerHTML = '<div class="table-cell-empty product-grid-empty">' +
           (query || filterCat !== "all" ? "没有找到符合筛选条件的商品" : "暂无可展示的商品") + "</div>";
       }
       return;
@@ -3612,8 +3612,8 @@
           return '<div class="product-card" data-product-id="' + esc(itemId) + '">' +
             '<div class="product-card-cover">' +
             (image
-              ? '<img src="' + esc(image) + '" alt="' + esc(product.title || "") + '" loading="lazy" referrerpolicy="no-referrer" onerror="this.style.display=\'none\';if(this.nextElementSibling)this.nextElementSibling.style.display=\'flex\';">' +
-                '<span class="cover-monogram" style="display:none;" aria-hidden="true">' + esc(titleChar) + "</span>"
+              ? '<img src="' + esc(image) + '" alt="' + esc(product.title || "") + '" loading="lazy" referrerpolicy="no-referrer" data-image-fallback="product-cover">' +
+                '<span class="cover-monogram" hidden aria-hidden="true">' + esc(titleChar) + "</span>"
               : '<span class="cover-monogram" aria-hidden="true">' + esc(titleChar) + "</span>"
             ) +
             "</div>" +
@@ -4253,8 +4253,8 @@
       const tip = `${date || label} · 买家消息 ${buyerVal} 条 · 自动回复 ${replyVal} 条`;
       return '<div class="chart-bar" title="' + esc(tip) + '">' +
         '<div class="chart-bar-bars">' +
-          '<span class="chart-bar-fill is-buyer" style="height:' + buyerHeight + '%" title="买家消息: ' + buyerVal + '"></span>' +
-          '<span class="chart-bar-fill is-reply" style="height:' + replyHeight + '%" title="自动回复: ' + replyVal + '"></span>' +
+          '<svg class="chart-bar-fill is-buyer" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true"><rect x="0" y="' + (100 - buyerHeight) + '" width="100" height="' + buyerHeight + '" rx="10"></rect></svg>' +
+          '<svg class="chart-bar-fill is-reply" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true"><rect x="0" y="' + (100 - replyHeight) + '" width="100" height="' + replyHeight + '" rx="10"></rect></svg>' +
         '</div>' +
         '<span class="chart-bar-label">' + esc(label) + '</span></div>';
     }).join("");
@@ -4469,7 +4469,7 @@
     tbody.innerHTML = accounts.map((account) => {
       const isActive = account.key === state.activeAccountKey;
       const name = esc(account.name || account.key || "未命名店铺");
-      const activeTag = isActive ? ' <span class="badge badge-muted" style="margin-left:4px;">当前店</span>' : '';
+      const activeTag = isActive ? ' <span class="badge badge-muted resource-current-badge">当前店</span>' : '';
       return '<tr class="' + (isActive ? "resource-row-active" : "") + '">' +
         '<td><strong>' + name + '</strong>' + activeTag + '</td>' +
         '<td>' + formatWorkerStatusBadge(account) + '</td>' +
@@ -4504,7 +4504,7 @@
     tbody.innerHTML = accounts.map((account) => {
       const isActive = account.key === state.activeAccountKey;
       const name = esc(account.name || account.key || "未命名店铺");
-      const activeTag = isActive ? ' <span class="badge badge-muted" style="margin-left:4px;">当前店</span>' : '';
+      const activeTag = isActive ? ' <span class="badge badge-muted resource-current-badge">当前店</span>' : '';
       return '<tr class="' + (isActive ? "resource-row-active" : "") + '">' +
         '<td><strong>' + name + '</strong>' + activeTag + '</td>' +
         '<td>' + formatWorkerStatusBadge(account) + '</td>' +
@@ -4973,11 +4973,23 @@
     return looksLikeMediaJson(content) ? "" : content;
   }
 
+  function handleImageFallback(target) {
+    const mode = target?.dataset?.imageFallback || "";
+    if (!mode) return;
+    if (mode === "message-media") {
+      target.closest?.(".message-media-image")?.classList.add("is-broken");
+      target.remove?.();
+      return;
+    }
+    target.hidden = true;
+    if (target.nextElementSibling) target.nextElementSibling.hidden = false;
+  }
+
   function messageMediaMarkup(value, fallbackType = "", content = "") {
     return normaliseMessageMedia(value, fallbackType, content).map((item) => {
       const label = item.label || messageMediaTypeLabel(item.type);
       if (item.type === "image" && item.url) {
-        return '<a class="message-media-image" href="' + esc(item.url) + '" target="_blank" rel="noopener noreferrer"><img src="' + esc(item.url) + '" alt="' + esc(item.alt || "图片") + '" loading="lazy" referrerpolicy="no-referrer" onerror="this.closest(\'.message-media-image\').classList.add(\'is-broken\');this.remove();"><span>' + esc(label) + '</span></a>';
+        return '<a class="message-media-image" href="' + esc(item.url) + '" target="_blank" rel="noopener noreferrer"><img src="' + esc(item.url) + '" alt="' + esc(item.alt || "图片") + '" loading="lazy" referrerpolicy="no-referrer" data-image-fallback="message-media"><span>' + esc(label) + '</span></a>';
       }
       if (item.url) {
         return '<a class="message-media-link" href="' + esc(item.url) + '" target="_blank" rel="noopener noreferrer">' + esc(label) + ' · 查看</a>';
@@ -5037,7 +5049,7 @@
         const name = manualImageFileName(file);
         const placeholderMarkup = '<span class="reply-image-placeholder"' + (attachment?.previewUrl ? " hidden" : "") + '><svg class="icon"><use href="' + ICONS + 'file-text"></use></svg></span>';
         const previewMarkup = '<span class="reply-image-thumb">' + (attachment?.previewUrl
-          ? '<img src="' + esc(attachment.previewUrl) + '" alt="第 ' + (index + 1) + ' 张待发送图片" onerror="this.hidden=true;this.nextElementSibling.hidden=false">'
+          ? '<img src="' + esc(attachment.previewUrl) + '" alt="第 ' + (index + 1) + ' 张待发送图片" data-image-fallback="manual-reply">'
           : "") + placeholderMarkup + '</span>';
         const status = state.manualReply.uploadingIndex === index
           ? "正在上传"
@@ -5561,10 +5573,7 @@
       try {
         const input = document.createElement("input");
         input.value = value;
-        input.style.position = "fixed";
-        input.style.left = "-9999px";
-        input.style.top = "-9999px";
-        input.style.opacity = "0";
+        input.className = "clipboard-fallback-input";
         document.body.appendChild(input);
         input.focus();
         input.select();
@@ -7659,6 +7668,15 @@
     };
   }
 
+  function resizeOpsPrompt(input) {
+    if (!input) return;
+    const visualRows = String(input.value || "").split(/\r?\n/).reduce(
+      (total, line) => total + Math.max(1, Math.ceil(line.length / 46)),
+      0,
+    );
+    input.rows = Math.min(6, Math.max(3, visualRows));
+  }
+
   function resetOpsState() {
     if (state.ops?.pollTimer) {
       clearTimeout(state.ops.pollTimer);
@@ -7670,7 +7688,7 @@
     const input = $("#opsPromptInput");
     if (input) {
       input.value = "";
-      input.style.height = "auto";
+      resizeOpsPrompt(input);
     }
     renderOpsChat();
   }
@@ -7928,7 +7946,7 @@
       ops.pendingChat = null;
       if (input) {
         input.value = "";
-        input.style.height = "auto";
+        resizeOpsPrompt(input);
       }
 
       ops.messages.push({
@@ -9236,6 +9254,7 @@
   }
 
   function bindEvents() {
+    document.addEventListener("error", (event) => handleImageFallback(event.target), true);
     $("#loginTab").addEventListener("click", () => setAuthMode("login"));
     $("#registerTab").addEventListener("click", () => setAuthMode("register"));
     $("#bootstrapTab").addEventListener("click", () => setAuthMode("bootstrap"));
@@ -9333,11 +9352,7 @@
         void sendOpsChat();
       }
     });
-    $("#opsPromptInput").addEventListener("input", (e) => {
-      const target = e.target;
-      target.style.height = "auto";
-      target.style.height = Math.min(target.scrollHeight, 180) + "px";
-    });
+    $("#opsPromptInput").addEventListener("input", (e) => resizeOpsPrompt(e.target));
     $("#opsStopBtn").addEventListener("click", cancelOpsRun);
     $("#opsNewSessionBtn").addEventListener("click", createNewOpsSession);
     document.addEventListener("click", (e) => {
@@ -9347,8 +9362,7 @@
         if (input) {
           input.value = chip.dataset.fill;
           input.focus();
-          input.style.height = "auto";
-          input.style.height = Math.min(input.scrollHeight, 180) + "px";
+          resizeOpsPrompt(input);
         }
       }
       const retryBtn = e.target.closest(".ops-retry-btn");

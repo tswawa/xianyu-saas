@@ -18,13 +18,12 @@ Environment=SAAS_STATE_DIR=/var/lib/xianyu-saas
 Environment=SAAS_UPDATE_STAGING_DIR=/var/lib/xianyu-saas/update-staging
 Environment=SAAS_UPDATE_INTENT_FILE=/var/lib/xianyu-saas-updates/intent.json
 Environment=SAAS_UPDATER_STATE_DIR=/var/lib/xianyu-saas-updater
-Environment=SAAS_UPDATE_PUBLIC_KEY_FILE=/opt/xianyu-saas/updater/deploy/update-signing.pub
-Environment=SAAS_UPDATER_BUNDLE_ROOT=/opt/xianyu-saas/updater
-Environment=SAAS_UPDATER_ENTRYPOINT=/opt/xianyu-saas/updater/deploy/updater/updater.py
-# Install this independent, root-owned updater bundle once, including its
-# matching backend modules and pinned public key. It must not follow current
-# during code rollback and never imports candidate maintenance code.
-ExecStart=/opt/xianyu-saas/runtime/backend-venv/bin/python /opt/xianyu-saas/updater/deploy/updater/updater.py
+Environment=SAAS_RELEASE_KIND=standalone
+Environment=SAAS_UPDATE_PUBLIC_KEY_FILE=/etc/xianyu-saas/update-signing.pub
+Environment=SAAS_MANAGER_RELEASES_DIR=/opt/xianyu-saas/manager/releases
+Environment=SAAS_MANAGER_CURRENT=/opt/xianyu-saas/manager/current
+Environment=SAAS_MANAGER_EXECUTABLE=/opt/xianyu-saas/manager/current/xianyu-saas
+ExecStart=/opt/xianyu-saas/manager/current/xianyu-saas internal consume-intent
 StateDirectory=xianyu-saas-updater
 StateDirectoryMode=0700
 Restart=on-failure

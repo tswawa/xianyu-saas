@@ -124,7 +124,10 @@ for relative in PORTABLE_PATHS:
         if (
             not path.is_file()
             or path.name == Path(__file__).name
-            or relative_path == Path("tests/deploy-contract.py")
+            or relative_path in {
+                Path("tests/deploy-contract.py"),
+                Path("tests/systemd-installer-contract.py"),
+            }
         ):
             continue
         try:

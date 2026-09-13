@@ -71,6 +71,11 @@ PRIVATE_DATA = re.compile(
     r"products[._-]config|auth[._-]state|orders?|card[._-]codes|netdisk|卡密|网盘|订单)"
     r"(?:[._-]|$)"
 )
+PUBLIC_RUNTIME_LOCKS = frozenset({
+    "deploy/runtime/backend.lock.json",
+    "deploy/runtime/python-build-standalone.lock.json",
+    "deploy/runtime/worker.lock.json",
+})
 SOURCE_SUFFIXES = frozenset({
     ".py", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".sh", ".md", ".pub",
     ".html", ".css", ".svg", ".png", ".jpg", ".jpeg", ".webp", ".gif", ".avif",
@@ -203,6 +208,8 @@ def _source_path(path: str) -> None:
     for part in parts:
         if re.fullmatch(r"(?:con|prn|aux|nul|com[1-9¹²³]|lpt[1-9¹²³])(?:\..*)?", part, re.IGNORECASE):
             raise DockerUpdateError("docker_source_path_invalid")
+    if path in PUBLIC_RUNTIME_LOCKS:
+        return
     folded = tuple(part.casefold() for part in parts)
     name = folded[-1]
     if any(part in PRIVATE_PARTS for part in folded) or name in PRIVATE_NAMES:

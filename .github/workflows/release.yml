@@ -17,10 +17,158 @@ jobs:
     permissions:
       contents: read
 
-  publish:
+  standalone:
     needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x86_64
+            architecture: x86_64
+            runner: ubuntu-24.04
+          - target: linux-aarch64
+            architecture: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            backend/requirements.txt
+            deploy/runtime/backend.lock.json
+            deploy/runtime/worker.lock.json
+      - name: Verify native build architecture
+        env:
+          EXPECTED_ARCHITECTURE: ${{ matrix.architecture }}
+        run: |
+          python - <<'PY'
+          import os
+          import platform
+          aliases = {"amd64": "x86_64", "x64": "x86_64", "arm64": "aarch64"}
+          actual = aliases.get(platform.machine().strip().lower(), platform.machine().strip().lower())
+          if actual != os.environ["EXPECTED_ARCHITECTURE"]:
+              raise SystemExit(f"native architecture mismatch: {actual}")
+          PY
+      - name: Install fixed manager build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes binutils
+          python -m pip install "pyinstaller==6.16.0" -r backend/requirements.txt
+      - name: Build bootstrap manager
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          python -m PyInstaller --clean --noconfirm \
+            --distpath ".local/manager/$TARGET/dist" \
+            --workpath ".local/manager/$TARGET/work" \
+            deploy/manager/xianyu-saas-manager.spec
+          install -Dm755 ".local/manager/$TARGET/dist/xianyu-saas" ".local/standalone/$TARGET/manager"
+      - name: Download exact locked wheels
+        env:
+          ARCHITECTURE: ${{ matrix.architecture }}
+          WHEELHOUSE: .local/wheelhouse/${{ matrix.target }}
+        run: |
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          import urllib.parse
+          import urllib.request
+          from pathlib import Path
+
+          architecture = os.environ["ARCHITECTURE"]
+          wheelhouse = Path(os.environ["WHEELHOUSE"])
+          wheelhouse.mkdir(parents=True, exist_ok=True)
+          selected = {}
+          for service in ("backend", "worker"):
+              lock = json.loads(Path(f"deploy/runtime/{service}.lock.json").read_text(encoding="utf-8"))
+              if lock.get("status") != "locked":
+                  raise SystemExit("standalone_dependency_lock_incomplete")
+              if lock.get("schema") != 1 or lock.get("kind") != "python-wheel-lock" or lock.get("service") != service:
+                  raise SystemExit("standalone_dependency_lock_invalid")
+              for package in lock.get("packages", []):
+                  candidates = [item for item in package.get("artifacts", []) if architecture in item.get("architectures", []) or "any" in item.get("architectures", [])]
+                  if len(candidates) != 1:
+                      raise SystemExit("standalone_dependency_artifact_missing")
+                  item = candidates[0]
+                  filename = item.get("filename")
+                  url = item.get("url")
+                  parsed = urllib.parse.urlparse(url) if isinstance(url, str) else None
+                  if (not isinstance(filename, str) or Path(filename).name != filename or parsed is None
+                          or parsed.scheme != "https" or parsed.hostname != "files.pythonhosted.org"
+                          or urllib.parse.unquote(Path(parsed.path).name) != filename):
+                      raise SystemExit("standalone_dependency_lock_invalid")
+                  identity = (item.get("size"), item.get("sha256"), url)
+                  if filename in selected and selected[filename] != identity:
+                      raise SystemExit("standalone_dependency_lock_invalid")
+                  selected[filename] = identity
+          for filename, (size, expected, url) in sorted(selected.items()):
+              if not isinstance(size, int) or size <= 0 or not isinstance(expected, str) or len(expected) != 64:
+                  raise SystemExit("standalone_dependency_lock_invalid")
+              destination = wheelhouse / filename
+              digest = hashlib.sha256()
+              total = 0
+              request = urllib.request.Request(url, headers={"User-Agent": "xianyu-saas-release/1"})
+              with urllib.request.urlopen(request, timeout=60) as response, destination.open("xb") as output:
+                  while block := response.read(1024 * 1024):
+                      total += len(block)
+                      if total > size:
+                          raise SystemExit("standalone_dependency_hash_mismatch")
+                      digest.update(block)
+                      output.write(block)
+              if total != size or digest.hexdigest() != expected:
+                  raise SystemExit("standalone_dependency_hash_mismatch")
+          PY
+      - name: Build standalone runtime bundle
+        env:
+          ARCHITECTURE: ${{ matrix.architecture }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          python scripts/build-standalone.py \
+            --commit "$GITHUB_SHA" \
+            --architecture "$ARCHITECTURE" \
+            --wheelhouse ".local/wheelhouse/$TARGET" \
+            --manager-binary ".local/standalone/$TARGET/manager" \
+            --output ".local/standalone/$TARGET/bundle"
+      - name: Smoke test standalone runtime and manager
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          root=".local/standalone/$TARGET/bundle"
+          PYTHONPATH="$root/runtime/site/backend" "$root/runtime/python/bin/python3" -m pip check
+          PYTHONPATH="$root/runtime/site/worker" "$root/runtime/python/bin/python3" -m pip check
+          PYTHONPATH="$root/runtime/site/backend" "$root/runtime/python/bin/python3" -c "import fastapi,uvicorn,requests,cryptography"
+          PYTHONPATH="$root/runtime/site/worker" "$root/runtime/python/bin/python3" -c "import openai,websockets,loguru,dotenv,requests"
+          "$root/manager/xianyu-saas" internal self-check
+          ldd "$root/manager/xianyu-saas" | tee ".local/manager/$TARGET/ldd.txt"
+          if grep -F "not found" ".local/manager/$TARGET/ldd.txt"; then exit 1; fi
+      - name: Pack unsigned standalone handoff
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          epoch=$(git show -s --format=%ct "$GITHUB_SHA")
+          tar --sort=name --mtime="@$epoch" --owner=0 --group=0 --numeric-owner \
+            -C ".local/standalone/$TARGET" -cf ".local/standalone-$TARGET.tar" bundle manager
+      - name: Upload unsigned standalone handoff
+        uses: actions/upload-artifact@v4
+        with:
+          name: standalone-${{ matrix.target }}
+          path: .local/standalone-${{ matrix.target }}.tar
+          if-no-files-found: error
+          retention-days: 2
+
+  publish:
+    needs: [validate, standalone]
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 45
     permissions:
       contents: write
     steps:
@@ -51,63 +199,50 @@ jobs:
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
               output.write("version=" + version + "\n")
           PY
-      - name: Install packaging dependencies
+      - name: Install release verification dependencies
         run: python -m pip install -r backend/requirements.txt
-      - name: Verify signed source and release contracts
+      - name: Download x86_64 standalone handoff
+        uses: actions/download-artifact@v4
+        with:
+          name: standalone-linux-x86_64
+          path: .local/downloads/linux-x86_64
+      - name: Download aarch64 standalone handoff
+        uses: actions/download-artifact@v4
+        with:
+          name: standalone-linux-aarch64
+          path: .local/downloads/linux-aarch64
+      - name: Extract unsigned standalone handoffs
+        run: |
+          for target in linux-x86_64 linux-aarch64; do
+            mkdir -p ".local/standalone-inputs/$target"
+            tar -xf ".local/downloads/$target/standalone-$target.tar" -C ".local/standalone-inputs/$target"
+          done
+      - name: Verify release contracts
         run: |
           python -B tests/docker-update-protocol-contract.py
+          python -B tests/standalone-build-contract.py
           python -B tests/release-bundle-contract.py
-      - name: Build signed packages
+      - name: Build and sign complete release
         env:
           RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
           RELEASE_COMMIT: ${{ github.sha }}
           RELEASE_VERSION: ${{ steps.metadata.outputs.version }}
         run: |
-          python scripts/build-release.py --ref "$RELEASE_COMMIT" --output ".local/releases/$RELEASE_VERSION"
-      - name: Validate complete signed bundle
+          python scripts/build-release.py \
+            --ref "$RELEASE_COMMIT" \
+            --standalone-input-root .local/standalone-inputs \
+            --output ".local/releases/$RELEASE_VERSION"
+      - name: Validate complete signed release
         env:
+          RELEASE_COMMIT: ${{ github.sha }}
           RELEASE_VERSION: ${{ steps.metadata.outputs.version }}
         run: |
-          python -B - <<'PY'
-          import hashlib
-          import json
-          import os
-          import sys
-          import tempfile
-          from pathlib import Path
-          sys.path.insert(0, "backend")
-          from docker_update_protocol import docker_asset_names, verify_docker_manifest, extract_verified_source
-          version = os.environ["RELEASE_VERSION"]
-          base = "xianyu-saas-" + version
-          folder = Path(".local/releases") / version
-          source, descriptor, signature = docker_asset_names(version)
-          content = {base + ".tar.gz", base + ".manifest.json", base + ".manifest.sig",
-                     source, descriptor, signature, base + ".update-signing.pub", "release-notes.md"}
-          expected = content | {"artifacts.json", "SHA256SUMS"}
-          if len(expected) != 10 or {p.name for p in folder.iterdir()} != expected:
-              raise SystemExit("Release must contain exactly ten assets")
-          index = json.loads((folder / "artifacts.json").read_bytes())
-          if len(index["files"]) != 8 or {item["name"] for item in index["files"]} != content:
-              raise SystemExit("Release index must contain eight content assets")
-          for item in index["files"]:
-              path = folder / item["name"]
-              if path.stat().st_size != item["size"] or hashlib.sha256(path.read_bytes()).hexdigest() != item["sha256"]:
-                  raise SystemExit("Release index checksum mismatch")
-          lines = (folder / "SHA256SUMS").read_text().splitlines()
-          sums = dict(line.split("  ", 1)[::-1] for line in lines)
-          if len(lines) != 9 or set(sums) != expected - {"SHA256SUMS"}:
-              raise SystemExit("Release checksums must contain nine assets")
-          for name, digest in sums.items():
-              if hashlib.sha256((folder / name).read_bytes()).hexdigest() != digest:
-                  raise SystemExit("Release asset checksum mismatch")
-          manifest = verify_docker_manifest((folder / descriptor).read_bytes(), (folder / signature).read_bytes(),
-                                            Path("deploy/update-signing.pub").read_bytes(), version)
-          if manifest.commit != index["commit"] or manifest.runtime_manifest_sha256 != hashlib.sha256((folder / (base + ".manifest.json")).read_bytes()).hexdigest():
-              raise SystemExit("Docker and runtime release identity mismatch")
-          with tempfile.TemporaryDirectory(prefix="signed-source-check-") as private:
-              extract_verified_source(folder / source, Path(private) / "source", manifest)
-          PY
-      - name: Retain validated packages
+          python -B scripts/verify-public-release.py \
+            --directory ".local/releases/$RELEASE_VERSION" \
+            --version "$RELEASE_VERSION" \
+            --commit "$RELEASE_COMMIT" \
+            --public-key deploy/update-signing.pub
+      - name: Retain validated release
         uses: actions/upload-artifact@v4
         with:
           name: release-${{ github.ref_name }}
@@ -115,31 +250,18 @@ jobs:
           include-hidden-files: true
           if-no-files-found: error
           retention-days: 14
-      - name: Upload draft and publish complete release
+      - name: Upload draft, verify remote assets, and publish
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_COMMIT: ${{ github.sha }}
           RELEASE_VERSION: ${{ steps.metadata.outputs.version }}
         run: |
           set -euo pipefail
           dir=".local/releases/$RELEASE_VERSION"
-          base="xianyu-saas-$RELEASE_VERSION"
-          assets=(
-            "$dir/$base.tar.gz"
-            "$dir/$base.manifest.json"
-            "$dir/$base.manifest.sig"
-            "$dir/$base-source.zip"
-            "$dir/$base.docker.manifest.json"
-            "$dir/$base.docker.manifest.sig"
-            "$dir/$base.update-signing.pub"
-            "$dir/release-notes.md"
-            "$dir/artifacts.json"
-            "$dir/SHA256SUMS"
-          )
-          test "${#assets[@]}" -eq 10
-          for asset in "${assets[@]}"; do
-            test -s "$asset"
-          done
+          assets=("$dir"/*)
+          test "${#assets[@]}" -eq 19
+          for asset in "${assets[@]}"; do test -s "$asset"; done
           prerelease=(--prerelease=false)
           latest=(--latest)
           if [[ "$RELEASE_VERSION" == *-* ]]; then
@@ -156,15 +278,12 @@ jobs:
           else
             gh release create "$RELEASE_TAG" "${assets[@]}" --repo "$GITHUB_REPOSITORY" --draft --verify-tag --title "$RELEASE_TAG" --notes-file "$dir/release-notes.md" "${prerelease[@]}"
           fi
-          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json assets > "$RUNNER_TEMP/release-assets.json"
-          python - "$dir" "$RUNNER_TEMP/release-assets.json" <<'PY'
-          import json
-          import sys
-          from pathlib import Path
-          local = {path.name: path.stat().st_size for path in Path(sys.argv[1]).iterdir()}
-          uploaded = json.loads(Path(sys.argv[2]).read_text())["assets"]
-          remote = {asset["name"]: asset["size"] for asset in uploaded}
-          if len(local) != 10 or len(uploaded) != 10 or remote != local:
-              raise SystemExit("Draft must contain exactly the ten validated assets before publication")
-          PY
+          remote="$RUNNER_TEMP/verified-release"
+          mkdir "$remote"
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --dir "$remote"
+          python -B scripts/verify-public-release.py \
+            --directory "$remote" \
+            --version "$RELEASE_VERSION" \
+            --commit "$RELEASE_COMMIT" \
+            --public-key deploy/update-signing.pub
           gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false "${prerelease[@]}" "${latest[@]}"

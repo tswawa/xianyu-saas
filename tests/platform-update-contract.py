@@ -44,6 +44,7 @@ from cryptography.hazmat.primitives import serialization  # noqa: E402
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey  # noqa: E402
 
 from db import DB  # noqa: E402
+import platform_update as PLATFORM_UPDATE  # noqa: E402
 from platform_update import (  # noqa: E402
     CACHED_MANIFEST_FILE,
     CACHED_SIGNATURE_FILE,
@@ -52,12 +53,15 @@ from platform_update import (  # noqa: E402
     ReleaseAsset,
     ReleaseInfo,
     _asset_names,
+    _parse_release,
+    _standalone_asset_names,
     available_rollback_versions,
     fetch_release,
     inspect_releases,
     inspect_public_releases,
     update_capabilities,
     load_verified_candidate,
+    parse_manifest,
     stage_release,
     validate_candidate,
     write_update_intent,
@@ -73,7 +77,7 @@ PUBLIC_KEY_FILE.write_bytes(
         )
     )
 )
-PUBLIC_KEY_FILE.chmod(0o644)
+PUBLIC_KEY_FILE.chmod(0o444)
 
 
 class FakeResponse:
@@ -288,6 +292,47 @@ def release_metadata(release: ReleaseInfo) -> dict:
     }
 
 
+def standalone_manifest(release: ReleaseInfo) -> bytes:
+    runtime = {
+        "schema": 1,
+        "version": release.version,
+        "commit": "1" * 40,
+        "platform": "linux",
+        "architecture": "x86_64",
+        "target": "linux-x86_64",
+        "python_version": "3.12.14",
+        "python_build": "20260901-install_only_stripped",
+        "uv_version": "0.12.13",
+        "manager_protocol": 1,
+        "update_data_version": 1,
+        "backend_lock_sha256": "2" * 64,
+        "worker_lock_sha256": "3" * 64,
+    }
+    runtime_raw = json.dumps(runtime, sort_keys=True, separators=(",", ":")).encode()
+    manager_raw = b"#!/bin/sh\nexit 0\n"
+    manifest = {
+        "schema": 2,
+        "kind": "standalone",
+        "version": release.version,
+        "artifact": release.artifact.name,
+        "artifact_sha256": "4" * 64,
+        "artifact_size": release.artifact.size,
+        "platform": "linux",
+        "architecture": "x86_64",
+        "target": "linux-x86_64",
+        "manager_protocol": 1,
+        "update_data_version": 1,
+        "runtime": runtime,
+        "files": [
+            {"path": "runtime/runtime.json", "size": len(runtime_raw),
+             "sha256": hashlib.sha256(runtime_raw).hexdigest(), "executable": False},
+            {"path": "manager/xianyu-saas", "size": len(manager_raw),
+             "sha256": hashlib.sha256(manager_raw).hexdigest(), "executable": True},
+        ],
+    }
+    return json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
+
+
 def assert_error(code: str, operation) -> None:
     try:
         operation()
@@ -324,6 +369,84 @@ def install_signed_release(destination: Path, version: str, *, maintenance: byte
     (destination / MARKER_FILE).write_text(
         json.dumps(marker, sort_keys=True), encoding="utf-8"
     )
+    for internal in (CACHED_MANIFEST_FILE, CACHED_SIGNATURE_FILE, MARKER_FILE):
+        (destination / internal).chmod(0o600)
+
+
+def install_signed_standalone_release(
+    destination: Path,
+    version: str,
+    *,
+    update_data_version: int = 1,
+    manager_protocol: int = 1,
+) -> None:
+    architecture = PLATFORM_UPDATE._standalone_architecture()
+    target = f"linux-{architecture}"
+    artifact_name, _, _ = _standalone_asset_names(version)
+    runtime = {
+        "schema": 1,
+        "version": version,
+        "commit": "1" * 40,
+        "platform": "linux",
+        "architecture": architecture,
+        "target": target,
+        "python_version": "3.12.14",
+        "python_build": "20260901-install_only_stripped",
+        "uv_version": "0.12.13",
+        "manager_protocol": manager_protocol,
+        "update_data_version": update_data_version,
+        "backend_lock_sha256": "2" * 64,
+        "worker_lock_sha256": "3" * 64,
+    }
+    files = {
+        "package.json": (json.dumps({"name": "xianyu-saas", "version": version,
+                                      "dependencies": {"fixture": version}}, sort_keys=True).encode(), False),
+        "backend/version.py": (f'VERSION = "{version}"\nUPDATE_DATA_VERSION = {update_data_version}\n'.encode(), False),
+        "backend/update_maintenance.py": (b"MAINTENANCE_PROTOCOL = 1\n", False),
+        "runtime/runtime.json": (json.dumps(runtime, sort_keys=True, separators=(",", ":")).encode(), False),
+        "manager/xianyu-saas": (b"#!/bin/sh\nexit 0\n", True),
+    }
+    records = [
+        {"path": relative, "size": len(payload), "sha256": hashlib.sha256(payload).hexdigest(),
+         "executable": executable}
+        for relative, (payload, executable) in sorted(files.items())
+    ]
+    manifest = {
+        "schema": 2,
+        "kind": "standalone",
+        "version": version,
+        "artifact": artifact_name,
+        "artifact_sha256": "4" * 64,
+        "artifact_size": 8,
+        "platform": "linux",
+        "architecture": architecture,
+        "target": target,
+        "manager_protocol": manager_protocol,
+        "update_data_version": update_data_version,
+        "runtime": runtime,
+        "files": records,
+    }
+    manifest_raw = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
+    signature_raw = base64.b64encode(PRIVATE_KEY.sign(manifest_raw))
+    destination.mkdir(parents=True)
+    for relative, (payload, executable) in files.items():
+        path = destination / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(payload)
+        path.chmod(0o755 if executable else 0o644)
+    (destination / CACHED_MANIFEST_FILE).write_bytes(manifest_raw)
+    (destination / CACHED_SIGNATURE_FILE).write_bytes(signature_raw)
+    (destination / MARKER_FILE).write_text(json.dumps({
+        "schema": 1,
+        "version": version,
+        "channel": "stable",
+        "manifest_sha256": hashlib.sha256(manifest_raw).hexdigest(),
+        "release_id": f"standalone-{version}",
+        "artifact": artifact_name,
+        "artifact_size": 8,
+        "kind": "standalone",
+        "target": target,
+    }, sort_keys=True), encoding="utf-8")
     for internal in (CACHED_MANIFEST_FILE, CACHED_SIGNATURE_FILE, MARKER_FILE):
         (destination / internal).chmod(0o600)
 
@@ -443,6 +566,41 @@ def main() -> None:
     assert incomplete["status"] == "incomplete" and incomplete["available"] is True and release is None
     assert incomplete["version"] == "0.2.0" and incomplete["error_code"] == "release_assets_missing"
     assert inspect_metadata([release_metadata(stable)], current="0.3.0")[0]["status"] == "current"
+
+    standalone_names = (
+        "xianyu-saas-0.4.0-linux-x86_64.tar.gz",
+        "xianyu-saas-0.4.0-linux-x86_64.manifest.json",
+        "xianyu-saas-0.4.0-linux-x86_64.manifest.sig",
+    )
+    standalone_raw = {
+        "id": 400,
+        "tag_name": "v0.4.0",
+        "draft": False,
+        "prerelease": False,
+        "assets": [
+            {"id": 401, "name": standalone_names[0], "size": 256 * 1024 * 1024},
+            {"id": 402, "name": standalone_names[1], "size": 2 * 1024 * 1024},
+            {"id": 403, "name": standalone_names[2], "size": 64},
+        ],
+    }
+    with patch.dict(os.environ, {"SAAS_RELEASE_KIND": "standalone"}, clear=False), \
+         patch("platform_update._standalone_target", return_value="linux-x86_64"), \
+         patch("platform_update._standalone_asset_names", return_value=standalone_names):
+        standalone_release = _parse_release(standalone_raw, "stable", deployment="systemd")
+    assert standalone_release is not None
+    assert standalone_release.kind == "standalone" and standalone_release.target == "linux-x86_64"
+    parsed_standalone, standalone_files = parse_manifest(
+        standalone_manifest(standalone_release), standalone_release
+    )
+    assert parsed_standalone["schema"] == 2
+    assert set(standalone_files) == {"runtime/runtime.json", "manager/xianyu-saas"}
+    mismatched = json.loads(standalone_manifest(standalone_release))
+    mismatched["target"] = "linux-aarch64"
+    assert_error(
+        "standalone_runtime_architecture_mismatch",
+        lambda: parse_manifest(json.dumps(mismatched).encode(), standalone_release),
+    )
+
     with patch("platform_update.deployment_kind", return_value="docker"), patch("platform_update._systemd_update_ready") as probe:
         capabilities = update_capabilities()
         assert capabilities["check"] and not capabilities["apply"] and not capabilities["download"]
@@ -672,6 +830,27 @@ def main() -> None:
     assert rollback_candidates == [{
         "version": "0.4.7",
         "manifest_sha256": hashlib.sha256((trusted_rollback / CACHED_MANIFEST_FILE).read_bytes()).hexdigest(),
+    }]
+
+    standalone_releases = RUN_DIR / "standalone-rollback-releases"
+    standalone_current = standalone_releases / "0.5.0"
+    standalone_rollback = standalone_releases / "0.4.9"
+    install_signed_standalone_release(standalone_current, "0.5.0")
+    install_signed_standalone_release(standalone_rollback, "0.4.9")
+    install_signed_standalone_release(standalone_releases / "0.4.8", "0.4.8", update_data_version=2)
+    install_signed_standalone_release(standalone_releases / "0.4.7", "0.4.7", manager_protocol=2)
+    with patch.dict(os.environ, {
+        "SAAS_RELEASES_DIR": str(standalone_releases),
+        "SAAS_CURRENT_ROOT": str(standalone_current),
+        "SAAS_RELEASE_KIND": "standalone",
+    }, clear=False), patch.object(PLATFORM_UPDATE, "MAX_MANIFEST_BYTES", 64), \
+         trusted_rollback_fixture(standalone_releases):
+        standalone_candidates = available_rollback_versions("0.5.0")
+    assert standalone_candidates == [{
+        "version": "0.4.9",
+        "manifest_sha256": hashlib.sha256(
+            (standalone_rollback / CACHED_MANIFEST_FILE).read_bytes()
+        ).hexdigest(),
     }]
 
     if "--portable" in sys.argv:
@@ -906,16 +1085,21 @@ def main() -> None:
 
     for index, version in enumerate(("0.0.7", "0.0.8", "0.0.9"), start=1):
         release_dir = releases / version
-        release_dir.mkdir(exist_ok=True)
+        install_signed_release(release_dir, version)
         os.utime(release_dir, (1000 + index, 1000 + index))
+    foreign = releases / "9.9.9"
+    foreign.mkdir()
+    (foreign / "operator-owned.txt").write_text("must survive", encoding="utf-8")
+    os.utime(releases / "0.0.6", (800, 800))
     os.utime(old_release, (900, 900))
     updater.prune_releases(config)
     retained = {
         path.name for path in releases.iterdir()
         if path.is_dir() and not path.is_symlink() and not path.name.startswith(".")
     }
-    assert len(retained) == 3
-    assert "0.1.0" in retained, "the active release must be retained within the three-version cap"
+    assert retained == {"0.1.0", "0.0.8", "0.0.9", "9.9.9"}
+    assert (foreign / "operator-owned.txt").read_text(encoding="utf-8") == "must survive"
+    assert "0.1.0" in retained, "the active release must be retained within the verified three-version cap"
     print("platform update contract: ok")
 
 

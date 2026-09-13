@@ -9,6 +9,7 @@ import base64
 import binascii
 import gzip
 import hashlib
+import importlib.util
 import io
 import json
 import os
@@ -79,6 +80,15 @@ SECRET_PATTERNS = (
     re.compile(rb"sk-[A-Za-z0-9_-]{24,}"),
 )
 REQUIRED_LICENSES = ("LICENSE", "worker/LICENSE", "worker/NOTICE.md", "frontend/assets/OFL-NotoSansSC.txt")
+PUBLIC_RUNTIME_LOCKS = frozenset({
+    "deploy/runtime/backend.lock.json",
+    "deploy/runtime/python-build-standalone.lock.json",
+    "deploy/runtime/worker.lock.json",
+})
+STANDALONE_ARCHITECTURES = ("x86_64", "aarch64")
+STANDALONE_TARGETS = tuple(f"linux-{architecture}" for architecture in STANDALONE_ARCHITECTURES)
+MANAGER_PROTOCOL = 1
+REQUIRED_STANDALONE_ROOTS = frozenset({"backend", "frontend", "worker", "runtime", "manager"})
 
 
 def git_environment() -> dict[str, str]:
@@ -123,6 +133,8 @@ def canonical_path(path: str, *, max_length=500, max_component=240) -> None:
 
 def private_path(path: str) -> None:
     canonical_path(path)
+    if path in PUBLIC_RUNTIME_LOCKS:
+        return
     parts = tuple(part.casefold() for part in path.split("/"))
     name = parts[-1]
     if any(part in PRIVATE_PARTS for part in parts) or name in PRIVATE_NAMES:
@@ -179,8 +191,9 @@ def load_protocol(source: bytes):
     No verifier logic is copied, relaxed or replaced here.
     """
     constants = {
-        "RELEASE_ASSET_PREFIX", "MAX_MANIFEST_BYTES", "MAX_SIGNATURE_BYTES", "MAX_ARCHIVE_BYTES",
-        "MAX_UNPACKED_BYTES", "MAX_FILE_BYTES", "MAX_ARCHIVE_MEMBERS", "MAX_RELEASE_NOTES_CHARS",
+        "RELEASE_ASSET_PREFIX", "MAX_MANIFEST_BYTES", "MAX_STANDALONE_MANIFEST_BYTES", "MAX_SIGNATURE_BYTES", "MAX_ARCHIVE_BYTES",
+        "MAX_STANDALONE_ARCHIVE_BYTES", "MAX_UNPACKED_BYTES", "MAX_STANDALONE_UNPACKED_BYTES", "MAX_FILE_BYTES",
+        "MAX_STANDALONE_FILE_BYTES", "MAX_ARCHIVE_MEMBERS", "MAX_STANDALONE_ARCHIVE_MEMBERS", "MAX_RELEASE_NOTES_CHARS",
         "MAX_PATH_LENGTH", "MAX_PATH_COMPONENT", "SEMVER_RE", "SHA256_RE",
         "ALLOWED_TOP_LEVEL_DIRS", "ALLOWED_ROOT_FILES", "FORBIDDEN_PATH_PARTS",
     }
@@ -204,7 +217,13 @@ def load_protocol(source: bytes):
     if found != constants | definitions:
         raise BundleError("release_protocol_unsupported")
     module = types.ModuleType("_release_bundle_protocol")
-    module.__dict__.update(re=re, json=json, dataclass=dataclass, PurePosixPath=PurePosixPath)
+    module.__dict__.update(
+        re=re,
+        json=json,
+        dataclass=dataclass,
+        PurePosixPath=PurePosixPath,
+        STANDALONE_RELEASE_KIND="standalone",
+    )
     sys.modules[module.__name__] = module
     exec(compile(ast.Module(body=selected, type_ignores=[]), "backend/platform_update.py", "exec"), module.__dict__)
     return module
@@ -399,6 +418,133 @@ def asset_record(path: Path) -> dict:
     return {"name": path.name, "size": path.stat().st_size, "sha256": digest.hexdigest()}
 
 
+def standalone_protocol():
+    path = Path(__file__).resolve().parents[1] / "backend" / "standalone_runtime.py"
+    spec = importlib.util.spec_from_file_location("_release_standalone_runtime", path)
+    if spec is None or spec.loader is None:
+        raise BundleError("release_standalone_protocol_missing")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        raise BundleError("release_standalone_protocol_missing") from None
+    return module
+
+
+def read_standalone_tree(bundle: Path, seed: bytes, encoded: str) -> dict[str, tuple[bytes, bool]]:
+    if bundle.is_symlink() or not bundle.is_dir():
+        raise BundleError("release_standalone_input_invalid")
+    for required in REQUIRED_STANDALONE_ROOTS:
+        path = bundle / required
+        if path.is_symlink() or not path.is_dir():
+            raise BundleError("release_standalone_layout_invalid")
+    if (bundle / "app").exists() or (bundle / "app").is_symlink():
+        raise BundleError("release_standalone_layout_invalid")
+    files = {}
+    total = 0
+    for current, dirnames, filenames in os.walk(bundle, topdown=True, followlinks=False):
+        current_path = Path(current)
+        for dirname in dirnames:
+            path = current_path / dirname
+            if path.is_symlink():
+                raise BundleError("release_standalone_link_rejected")
+        for filename in filenames:
+            path = current_path / filename
+            try:
+                metadata = path.lstat()
+            except OSError:
+                raise BundleError("release_standalone_input_invalid") from None
+            if path.is_symlink() or not stat.S_ISREG(metadata.st_mode):
+                raise BundleError("release_standalone_link_rejected")
+            relative = path.relative_to(bundle).as_posix()
+            canonical_path(relative, max_length=1000)
+            top = PurePosixPath(relative).parts[0]
+            if top not in REQUIRED_STANDALONE_ROOTS and relative != "package.json":
+                raise BundleError("release_standalone_layout_invalid")
+            if relative in files:
+                raise BundleError("release_path_collision")
+            if metadata.st_size > 256 * 1024 * 1024:
+                raise BundleError("release_standalone_too_large")
+            payload = path.read_bytes()
+            if len(payload) != metadata.st_size:
+                raise BundleError("release_standalone_input_invalid")
+            if seed in payload or encoded.encode("ascii") in payload or any(pattern.search(payload) for pattern in SECRET_PATTERNS):
+                raise BundleError("release_secret_content_rejected")
+            total += len(payload)
+            if total > 1536 * 1024 * 1024 or len(files) >= 20000:
+                raise BundleError("release_standalone_too_large")
+            executable = bool(stat.S_IMODE(metadata.st_mode) & 0o111) or relative == "manager/xianyu-saas"
+            files[relative] = (payload, executable)
+    if not files:
+        raise BundleError("release_standalone_input_invalid")
+    return files
+
+
+def standalone_inputs(root: Path, version: str, commit: str, seed: bytes, encoded: str, runtime_protocol) -> dict[str, dict]:
+    if root.is_symlink() or not root.is_dir():
+        raise BundleError("release_standalone_inputs_missing")
+    if {path.name for path in root.iterdir()} != set(STANDALONE_TARGETS):
+        raise BundleError("release_standalone_inputs_missing")
+    result = {}
+    for architecture, target in zip(STANDALONE_ARCHITECTURES, STANDALONE_TARGETS):
+        directory = root / target
+        bundle = directory / "bundle"
+        manager = directory / "manager"
+        if directory.is_symlink() or not directory.is_dir() or {path.name for path in directory.iterdir()} != {"bundle", "manager"}:
+            raise BundleError("release_standalone_input_invalid")
+        files = read_standalone_tree(bundle, seed, encoded)
+        try:
+            runtime = json.loads(files["runtime/runtime.json"][0])
+            metadata = runtime_protocol.parse_runtime_metadata(
+                json.dumps(runtime, ensure_ascii=True, separators=(",", ":")),
+                expected_version=version,
+                expected_architecture=architecture,
+            )
+        except (KeyError, TypeError, ValueError, UnicodeError, runtime_protocol.StandaloneRuntimeError):
+            raise BundleError("release_standalone_runtime_invalid") from None
+        if metadata.commit != commit or metadata.target != target or metadata.manager_protocol != MANAGER_PROTOCOL:
+            raise BundleError("release_standalone_runtime_invalid")
+        try:
+            manager_metadata = manager.lstat()
+        except OSError:
+            raise BundleError("release_standalone_manager_invalid") from None
+        if (manager.is_symlink() or not stat.S_ISREG(manager_metadata.st_mode)
+                or not 0 < manager_metadata.st_size <= 512 * 1024 * 1024):
+            raise BundleError("release_standalone_manager_invalid")
+        manager_raw = manager.read_bytes()
+        embedded = files.get("manager/xianyu-saas")
+        if embedded is None or not embedded[1] or embedded[0] != manager_raw:
+            raise BundleError("release_standalone_manager_invalid")
+        if seed in manager_raw or encoded.encode("ascii") in manager_raw or any(pattern.search(manager_raw) for pattern in SECRET_PATTERNS):
+            raise BundleError("release_secret_content_rejected")
+        result[target] = {"architecture": architecture, "files": files, "runtime": runtime, "manager": manager_raw}
+    return result
+
+
+def content_metadata(version: str) -> dict[str, tuple[str, str]]:
+    base = f"xianyu-saas-{version}"
+    result = {
+        f"{base}.tar.gz": ("ota-archive", "source"),
+        f"{base}.manifest.json": ("ota-manifest", "source"),
+        f"{base}.manifest.sig": ("ota-signature", "source"),
+        f"{base}-source.zip": ("docker-source", "docker"),
+        f"{base}.docker.manifest.json": ("docker-manifest", "docker"),
+        f"{base}.docker.manifest.sig": ("docker-signature", "docker"),
+        f"{base}.update-signing.pub": ("update-public-key", "all"),
+        "release-notes.md": ("release-notes", "all"),
+    }
+    for architecture, target in zip(STANDALONE_ARCHITECTURES, STANDALONE_TARGETS):
+        standalone_base = f"{base}-{target}"
+        result.update({
+            f"{standalone_base}.tar.gz": ("standalone-archive", target),
+            f"{standalone_base}.manifest.json": ("standalone-manifest", target),
+            f"{standalone_base}.manifest.sig": ("standalone-signature", target),
+            standalone_base: ("bootstrap-manager", target),
+        })
+    return result
+
+
 def build(args, encoded: str | None) -> dict:
     root = Path(git(Path.cwd(), "rev-parse", "--show-toplevel").stdout.decode("utf-8").strip()).resolve()
     commit = git(root, "rev-parse", "--verify", "--end-of-options", f"{args.ref}^{{commit}}").stdout.decode("ascii").strip()
@@ -433,6 +579,17 @@ def build(args, encoded: str | None) -> dict:
     if derived != public_raw:
         raise BundleError("release_public_key_mismatch")
     scan_payloads(files, seed, encoded)
+    runtime_protocol = standalone_protocol()
+    protocol.validate_standalone_manifest = runtime_protocol.validate_standalone_manifest
+    protocol.StandaloneRuntimeError = runtime_protocol.StandaloneRuntimeError
+    standalone_root = Path(args.standalone_input_root)
+    if not standalone_root.is_absolute():
+        standalone_root = root / standalone_root
+    standalone_root = Path(os.path.abspath(standalone_root))
+    local_root = root / ".local"
+    if local_root not in standalone_root.parents:
+        raise BundleError("release_standalone_input_invalid")
+    inputs = standalone_inputs(standalone_root, version, commit, seed, encoded, runtime_protocol)
     epoch = release_epoch(root, commit)
     files["backend/build-info.json"] = (json_bytes({
         "version": version, "commit": commit, "dirty": False,
@@ -442,10 +599,15 @@ def build(args, encoded: str | None) -> dict:
         raise BundleError("release_too_large")
     ota = {}
     for path, value in files.items():
+        if path in PUBLIC_RUNTIME_LOCKS:
+            continue
         try:
             protocol._validate_release_path(path)
         except protocol.PlatformUpdateError as exc:
-            if exc.code == "update_archive_path_invalid" or (exc.code == "update_runtime_path_rejected" and path.endswith(".example")):
+            if (
+                exc.code == "update_archive_path_invalid"
+                or (exc.code == "update_runtime_path_rejected" and (path.endswith(".example") or path in PUBLIC_RUNTIME_LOCKS))
+            ):
                 continue
             raise BundleError("release_private_path_rejected") from None
         ota[path] = value
@@ -497,14 +659,95 @@ def build(args, encoded: str | None) -> dict:
         (stage / f"xianyu-saas-{version}.docker.manifest.sig").write_bytes(docker_signature)
         (stage / f"xianyu-saas-{version}.update-signing.pub").write_bytes(files[args.public_key_file][0])
         (stage / "release-notes.md").write_bytes(notes)
-        records = [asset_record(path) for path in sorted(stage.iterdir())]
-        result = {"schema": 1, "version": version, "commit": commit,
-                  "public_key_fingerprint": "sha256:" + hashlib.sha256(public_raw).hexdigest(), "files": records}
-        (stage / "artifacts.json").write_bytes(json_bytes(result))
-        # The index describes eight content assets. Checksums cover those plus the index;
-        # neither metadata file pretends it can contain its own recursive hash.
-        checksummed = sorted([*records, asset_record(stage / "artifacts.json")], key=lambda entry: entry["name"])
-        (stage / "SHA256SUMS").write_bytes("".join(f'{entry["sha256"]}  {entry["name"]}\n' for entry in checksummed).encode("utf-8"))
+        for target in STANDALONE_TARGETS:
+            standalone = inputs[target]
+            architecture = standalone["architecture"]
+            artifact_name = f"xianyu-saas-{version}-{target}.tar.gz"
+            manifest_name = f"xianyu-saas-{version}-{target}.manifest.json"
+            signature_name = f"xianyu-saas-{version}-{target}.manifest.sig"
+            manager_name = f"xianyu-saas-{version}-{target}"
+            write_tar(stage / artifact_name, standalone["files"], epoch)
+            archive_record = asset_record(stage / artifact_name)
+            if archive_record["size"] > 512 * 1024 * 1024:
+                raise BundleError("release_standalone_too_large")
+            standalone_manifest = {
+                "schema": 2,
+                "kind": "standalone",
+                "version": version,
+                "artifact": artifact_name,
+                "artifact_sha256": archive_record["sha256"],
+                "artifact_size": archive_record["size"],
+                "platform": "linux",
+                "architecture": architecture,
+                "target": target,
+                "manager_protocol": MANAGER_PROTOCOL,
+                "update_data_version": standalone["runtime"]["update_data_version"],
+                "runtime": standalone["runtime"],
+                "files": [
+                    {"path": path, "size": len(payload), "sha256": hashlib.sha256(payload).hexdigest(), "executable": executable}
+                    for path, (payload, executable) in sorted(standalone["files"].items())
+                ],
+            }
+            try:
+                runtime_protocol.validate_standalone_manifest(
+                    standalone_manifest,
+                    expected_version=version,
+                    expected_target=target,
+                    expected_artifact=artifact_name,
+                )
+            except runtime_protocol.StandaloneRuntimeError:
+                raise BundleError("release_standalone_manifest_invalid") from None
+            standalone_raw = json_bytes(standalone_manifest)
+            if len(standalone_raw) > protocol.MAX_STANDALONE_MANIFEST_BYTES:
+                raise BundleError("release_standalone_too_large")
+            standalone_release = protocol.ReleaseInfo(
+                "offline", version, f"v{version}", "", "", bool(protocol.SemVer.parse(version).prerelease),
+                protocol.ReleaseAsset(1, artifact_name, archive_record["size"]),
+                protocol.ReleaseAsset(2, manifest_name, len(standalone_raw)),
+                protocol.ReleaseAsset(3, signature_name, 88),
+                kind="standalone", target=target,
+            )
+            protocol.parse_manifest(standalone_raw, standalone_release)
+            standalone_signature = base64.b64encode(key.sign(standalone_raw))
+            key.public_key().verify(base64.b64decode(standalone_signature, validate=True), standalone_raw)
+            (stage / manifest_name).write_bytes(standalone_raw)
+            (stage / signature_name).write_bytes(standalone_signature)
+            manager_path = stage / manager_name
+            manager_path.write_bytes(standalone["manager"])
+            manager_path.chmod(0o755)
+        metadata = content_metadata(version)
+        if {path.name for path in stage.iterdir()} != set(metadata):
+            raise BundleError("release_asset_set_invalid")
+        records = []
+        for path in sorted(stage.iterdir()):
+            kind, target = metadata[path.name]
+            records.append({**asset_record(path), "kind": kind, "target": target, "manager_protocol": MANAGER_PROTOCOL})
+        result = {
+            "schema": 2,
+            "version": version,
+            "commit": commit,
+            "manager_protocol": MANAGER_PROTOCOL,
+            "public_key_fingerprint": "sha256:" + hashlib.sha256(public_raw).hexdigest(),
+            "files": records,
+        }
+        index_raw = json_bytes(result)
+        (stage / "artifacts.json").write_bytes(index_raw)
+        (stage / "artifacts.json.sig").write_bytes(base64.b64encode(key.sign(index_raw)))
+        checksummed = sorted(
+            [asset_record(path) for path in stage.iterdir()],
+            key=lambda entry: entry["name"],
+        )
+        (stage / "SHA256SUMS").write_bytes(
+            "".join(f'{entry["sha256"]}  {entry["name"]}\n' for entry in checksummed).encode("utf-8")
+        )
+        verifier = Path(__file__).with_name("verify-public-release.py")
+        verification = subprocess.run(
+            [sys.executable, "-B", str(verifier), "--directory", str(stage), "--version", version,
+             "--commit", commit, "--public-key", str(stage / f"xianyu-saas-{version}.update-signing.pub")],
+            cwd=root, capture_output=True, env=git_environment(), timeout=120, check=False,
+        )
+        if verification.returncode != 0:
+            raise BundleError("release_verification_failed")
         ensure_empty_output(output)
         if output.exists():
             output.rmdir()
@@ -521,6 +764,7 @@ def main(argv=None) -> int:
     parser.add_argument("--output", help="Ignored directory below .local/releases/ (default: version)")
     parser.add_argument("--signing-key-env", default="RELEASE_SIGNING_KEY", help="Environment variable holding a standard Base64 32-byte Ed25519 seed")
     parser.add_argument("--public-key-file", default="deploy/update-signing.pub", help="Public key path inside the selected commit")
+    parser.add_argument("--standalone-input-root", required=True, help="Ignored root containing linux-*/bundle and linux-*/manager inputs")
     args = parser.parse_args(argv)
     if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", args.signing_key_env):
         print("release_signing_key_env_invalid", file=sys.stderr)

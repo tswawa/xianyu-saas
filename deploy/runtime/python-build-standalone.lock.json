@@ -1,0 +1,23 @@
+{
+  "schema": 1,
+  "provider": "astral-sh/python-build-standalone",
+  "release": "20260901",
+  "python_version": "3.12.14",
+  "flavor": "install_only_stripped",
+  "assets": {
+    "x86_64": {
+      "filename": "cpython-3.12.14+20260901-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz",
+      "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20260901/cpython-3.12.14%2B20260901-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz",
+      "size": 34143368,
+      "sha256": "72748da13197c1fb161e3afeef20a6a385ff24f2165e6e2758e47008e7faba4c",
+      "archive_root": "python"
+    },
+    "aarch64": {
+      "filename": "cpython-3.12.14+20260901-aarch64-unknown-linux-gnu-install_only_stripped.tar.gz",
+      "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20260901/cpython-3.12.14%2B20260901-aarch64-unknown-linux-gnu-install_only_stripped.tar.gz",
+      "size": 29199399,
+      "sha256": "577b4bec0793ad1ff0cbff9adbd0df078eddde38a4c41bf5d83ad381a85ee39d",
+      "archive_root": "python"
+    }
+  }
+}

@@ -3,8 +3,10 @@
 
 from __future__ import annotations
 
-import sys
+import json
 import os
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -18,8 +20,104 @@ sys.path.insert(0, str(ROOT / "backend"))
 import bot_manager  # noqa: E402
 
 
+def _isolated_bot_config(**overrides: str) -> dict:
+    env = dict(os.environ)
+    for name in ("SAAS_BOT_ROOT", "SAAS_BOT_PYTHON", "SAAS_BOT_PYTHONPATH"):
+        env.pop(name, None)
+    env.update(overrides)
+    source = (
+        "import json, sys; "
+        f"sys.path.insert(0, {str(ROOT / 'backend')!r}); "
+        "import bot_manager; "
+        "print(json.dumps({"
+        "'root': str(bot_manager.BOT_ROOT), "
+        "'python': bot_manager.BOT_PYTHON, "
+        "'pythonpath': bot_manager.BOT_PYTHONPATH"
+        "}))"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", source],
+        cwd=str(ROOT),
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return json.loads(result.stdout.strip().splitlines()[-1])
+
+
+def _test_worker_runtime_configuration() -> None:
+    user_id = 77
+
+    # Without the standalone overrides, the Docker/development layout keeps
+    # using the worker-local virtualenv interpreter exactly as before.
+    fallback_root = (ROOT / "worker").resolve()
+    fallback = _isolated_bot_config(SAAS_BOT_ROOT=str(fallback_root))
+    assert fallback == {
+        "root": str(fallback_root),
+        "python": str(fallback_root / ".venv/bin/python"),
+        "pythonpath": None,
+    }, fallback
+
+    # A standalone release can share its versioned interpreter while keeping
+    # the existing argv, cwd and PID identity contract. Its dependency tree is
+    # explicitly isolated from the API process' inherited PYTHONPATH.
+    current_root = Path("/") / "opt" / "xianyu-saas" / "current"
+    explicit_python = str(current_root / "runtime/python/bin/python3")
+    worker_pythonpath = str(current_root / "runtime/site/worker")
+    explicit = _isolated_bot_config(
+        SAAS_BOT_ROOT=str(current_root / "worker"),
+        SAAS_BOT_PYTHON=explicit_python,
+        SAAS_BOT_PYTHONPATH=worker_pythonpath,
+    )
+    assert explicit["python"] == explicit_python
+    assert explicit["pythonpath"] == worker_pythonpath
+
+    with tempfile.TemporaryDirectory(prefix="xianyu-worker-runtime-") as root:
+        tenants_root = Path(root) / "tenants"
+        worker_root = Path(root) / "worker"
+        worker_root.mkdir()
+        with patch.object(bot_manager, "TENANTS_ROOT", str(tenants_root)):
+            bot_manager.ensure_dir(user_id, initialize=True)
+            with (
+                patch.object(bot_manager, "BOT_PYTHONPATH", None),
+                patch.dict(os.environ, {"PYTHONPATH": "api-parent-path"}, clear=False),
+            ):
+                assert bot_manager._env_for(user_id)["PYTHONPATH"] == "api-parent-path"
+
+            fake_process = Mock(pid=49001)
+            with (
+                patch.object(bot_manager, "BOT_ROOT", worker_root),
+                patch.object(bot_manager, "BOT_MAIN", str(worker_root / "main.py")),
+                patch.object(bot_manager, "BOT_PYTHON", explicit_python),
+                patch.object(bot_manager, "BOT_PYTHONPATH", worker_pythonpath),
+                patch.dict(os.environ, {"PYTHONPATH": "api-parent-path"}, clear=False),
+                patch.object(bot_manager, "_revoke"),
+                patch.object(bot_manager, "_limit", return_value=None),
+                patch.object(bot_manager.subprocess, "Popen", return_value=fake_process) as spawn,
+            ):
+                process, token, log_file = bot_manager._spawn_process(
+                    user_id,
+                    "rules",
+                    (user_id, "default"),
+                    {"worker_memory_mib": 400},
+                )
+            try:
+                assert process is fake_process
+                assert token is None
+                argv = spawn.call_args.args[0]
+                options = spawn.call_args.kwargs
+                assert argv == [explicit_python, str(worker_root / "main.py")]
+                assert options["cwd"] == str(worker_root)
+                assert options["start_new_session"] is True
+                assert options["env"]["PYTHONPATH"] == worker_pythonpath
+            finally:
+                log_file.close()
+
+
 def main() -> None:
     user_id = 77
+    _test_worker_runtime_configuration()
 
     # A verified deterministic worker can be attached without spawning a
     # second process.  The adopted handle participates in normal status code.

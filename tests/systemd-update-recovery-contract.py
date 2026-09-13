@@ -40,7 +40,9 @@ def static_contracts() -> None:
     for name in ("_directory_fd", "_read_protected_file", "_read_private_json", "_parse_intent",
                  "_open_journal", "_save_journal", "_recover", "_publish_state", "initialize_layout",
                  "import_trusted_baseline", "_parse_cli", "_supports_signed_maintenance_protocol",
-                 "_installed_bundle_identity", "_trusted_public_current_version"):
+                 "_installed_bundle_identity", "_installed_manager_identity", "materialize_manager",
+                 "_current_manager_journal_identity", "_handoff_manager",
+                 "_verify_standalone_upgrade", "_trusted_public_current_version"):
         assert name in functions, name
     parser = ast.get_source_segment(source, functions["_parse_intent"])
     assert all(f'"{channel}"' in parser for channel in ("release", "stable", "beta"))
@@ -57,6 +59,8 @@ def static_contracts() -> None:
     assert "UPDATE platform_updates SET status" in status_writer
     health = ast.get_source_segment(source, functions["check_health"])
     assert "asset_version.strip()" in health
+    pruner = ast.get_source_segment(source, functions["prune_releases"])
+    assert "verify_existing_release(config, path.name)" in pruner
     assert "import fcntl" in source and "fcntl.flock" in source
     assert "from update_maintenance import supports_maintenance_protocol" in source
     assert "BASELINE_IMPORT_OPTION" in source and "extract_verified_archive" in source
@@ -68,24 +72,30 @@ def static_contracts() -> None:
     assert 'config.status_dir / "initialization.json"' in initializer
     assert all(name in initializer for name in (
         '"schema"', '"protocol"', '"public_key_sha256"', '"bundle_sha256"',
-        '"entrypoint_sha256"', '"initialized_at"'
+        '"entrypoint_sha256"', '"manager_version"', '"manager_sha256"',
+        '"platform"', '"architecture"', '"initialized_at"'
     ))
     assert "UPDATER_BUNDLE_FILES" in bundle_identity and "load_public_key" in bundle_identity
     assert "verify_manifest_signature" in baseline_import and "_copy_protected_archive" in baseline_import
+    processor = ast.get_source_segment(source, functions["process_intent"])
+    assert processor.index('journal["previous_manager_identity"]') < processor.index("materialize_manager(target)")
+    assert processor.index("materialize_manager(target)") < processor.index("_handoff_manager(")
+    assert processor.index("_handoff_manager(") < processor.index("initialize_layout(config)")
     assert all(forbidden not in baseline_import for forbidden in (
         "switch_current(", "stop_services(", "start_services(", "run_migrations(", "backup_database("
     ))
     service = (ROOT / "deploy/systemd/xianyu-saas-updater.service").read_text(encoding="utf-8")
     watcher = (ROOT / "deploy/systemd/xianyu-saas-updater.path").read_text(encoding="utf-8")
-    bundle_root = PurePosixPath("/") / "opt" / "xianyu-saas" / "updater"
-    updater_binary = str(bundle_root / "deploy" / "updater" / "updater.py")
-    public_key = str(bundle_root / "deploy" / "update-signing.pub")
+    manager_root = PurePosixPath("/") / "opt" / "xianyu-saas" / "manager"
+    updater_binary = str(manager_root / "current" / "xianyu-saas")
+    public_key = str(PurePosixPath("/") / "etc" / "xianyu-saas" / "update-signing.pub")
     intent = str(PurePosixPath("/") / "var" / "lib" / "xianyu-saas-updates" / "intent.json")
     active = str(PurePosixPath("/") / "var" / "lib" / "xianyu-saas-updater" / "active.json")
-    assert updater_binary in service
+    assert f"ExecStart={updater_binary} internal consume-intent" in service
     assert f"Environment=SAAS_UPDATE_PUBLIC_KEY_FILE={public_key}" in service
-    assert f"Environment=SAAS_UPDATER_BUNDLE_ROOT={bundle_root}" in service
-    assert f"Environment=SAAS_UPDATER_ENTRYPOINT={updater_binary}" in service
+    assert f"Environment=SAAS_MANAGER_CURRENT={manager_root / 'current'}" in service
+    assert f"Environment=SAAS_MANAGER_EXECUTABLE={updater_binary}" in service
+    assert "Environment=SAAS_RELEASE_KIND=standalone" in service
     assert "Restart=on-failure" in service and "StateDirectoryMode=0700" in service
     assert f"PathExists={active}" in watcher
     assert f"PathExists={intent}" in watcher
@@ -622,6 +632,35 @@ def initialization_identity_contracts(updater):
         intent, _ = updater.claim_intent(f.config)
         assert intent.expected_current_version == "0.1.0"
         assert f.journal()["current_version"] == "0.1.0"
+
+    with fixture(updater, maintenance=True) as f:
+        manager_releases = f.root / "manager/releases"
+        manager_release = manager_releases / "0.2.0"
+        manager_release.mkdir(parents=True)
+        manager_releases.parent.chmod(0o755)
+        manager_releases.chmod(0o755)
+        manager_release.chmod(0o755)
+        manager = manager_release / "xianyu-saas"
+        manager.write_bytes(b"synthetic trusted manager\n")
+        manager.chmod(0o755)
+        manager_current = manager_releases.parent / "current"
+        manager_current.symlink_to(Path("releases") / manager_release.name)
+        with patch.dict(os.environ, {
+            "SAAS_MANAGER_RELEASES_DIR": str(manager_releases),
+            "SAAS_MANAGER_CURRENT": str(manager_current),
+            "SAAS_MANAGER_EXECUTABLE": str(manager_current / "xianyu-saas"),
+        }), patch.object(updater, "_release_runtime_metadata", return_value=object()):
+            updater.initialize_layout(f.config)
+        payload = json.loads((f.config.status_dir / "initialization.json").read_text(encoding="utf-8"))
+        assert set(payload) == {
+            "schema", "protocol", "public_key_sha256", "manager_version",
+            "manager_sha256", "platform", "architecture", "initialized_at",
+        }
+        assert payload["schema"] == 2 and payload["protocol"] == updater.MANAGER_PROTOCOL
+        assert payload["manager_version"] == "0.2.0"
+        assert payload["manager_sha256"] == hashlib.sha256(manager.read_bytes()).hexdigest()
+        assert payload["platform"] == "linux"
+        assert payload["architecture"] == updater.normalize_architecture()
 
     with fixture(updater, maintenance=False, initialize=False) as f:
         expect_error(
@@ -1221,6 +1260,73 @@ else: raise AssertionError('app wrote private journal')
     print("systemd root-owned metadata/non-root reader contract: passed")
 
 
+def standalone_manager_refresh_contract(updater):
+    with fixture(updater) as f:
+        events = []
+        previous_manager_identity = {
+            "version": "0.1.0", "protocol": 1, "sha256": "a" * 64,
+            "path": str(f.root / "manager/releases/0.1.0"),
+        }
+        manager_identity = {
+            "version": "0.2.0", "protocol": 1, "sha256": "b" * 64,
+            "path": str(f.root / "manager/releases/0.2.0"),
+        }
+
+        def materialize(target):
+            events.append(("materialize", target.name, tuple(f.runner.commands)))
+            return dict(manager_identity)
+
+        def initialize(config):
+            events.append(("initialize", config.current_link.resolve().name, tuple(f.runner.commands)))
+
+        with patch.object(updater, "_verify_standalone_upgrade", return_value=True), \
+             patch.object(updater, "_current_manager_journal_identity", return_value=previous_manager_identity), \
+             patch.object(updater, "materialize_manager", side_effect=materialize), \
+             patch.object(updater, "initialize_layout", side_effect=initialize):
+            f.write_intent()
+            assert f.run()["status"] == "succeeded"
+        assert [event[0] for event in events] == ["materialize", "initialize"]
+        assert events[1][1] == "0.1.0"
+        assert not events[1][2]
+        assert f.journal()["previous_manager_identity"] == previous_manager_identity
+        assert f.journal()["manager_identity"] == manager_identity
+
+        manager_releases = f.root / "manager/releases"
+        old_manager = manager_releases / "0.1.0"
+        new_manager = manager_releases / "0.2.0"
+        for root, payload in ((old_manager, b"old manager\n"), (new_manager, b"new manager\n")):
+            root.mkdir(parents=True, exist_ok=True)
+            root.chmod(0o755)
+            (root / "xianyu-saas").write_bytes(payload)
+            (root / "xianyu-saas").chmod(0o755)
+        manager_releases.chmod(0o755)
+        manager_releases.parent.chmod(0o755)
+        current = manager_releases.parent / "current"
+        current.symlink_to(new_manager)
+        restored = []
+
+        def restored_initialization(_config):
+            assert current.resolve() == old_manager.resolve()
+            restored.append(True)
+
+        manager_environment = {
+            "SAAS_MANAGER_RELEASES_DIR": str(manager_releases),
+            "SAAS_MANAGER_CURRENT": str(current),
+            "SAAS_MANAGER_EXECUTABLE": str(current / "xianyu-saas"),
+        }
+        with patch.dict(os.environ, manager_environment), \
+             patch.object(updater.sys, "frozen", True, create=True), \
+             patch.object(updater.os, "execve", side_effect=OSError("synthetic exec failure")), \
+             patch.object(updater, "initialize_layout", side_effect=restored_initialization):
+            expect_error(
+                "standalone_manager_handoff_failed",
+                lambda: updater._handoff_manager(f.config, manager_identity, previous_manager_identity),
+            )
+        assert restored == [True]
+        assert current.resolve() == old_manager.resolve()
+    print("systemd standalone manager switch, handoff recovery and initialization refresh passed")
+
+
 def main():
     static_contracts()
     if sys.platform != "linux":
@@ -1229,6 +1335,7 @@ def main():
     updater = load_updater()
     baseline_import_contracts(updater)
     initialization_identity_contracts(updater)
+    standalone_manager_refresh_contract(updater)
     signature_channels_and_permissions(updater)
     rejection_and_recovery_contracts(updater)
     runtime_backup_contracts(updater)

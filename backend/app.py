@@ -1,7 +1,7 @@
-"""xianyu-saas API service.
+"""xianyu-saas web/API service.
 
-Static files are intentionally served by nginx from ``frontend/``.  This
-process exposes JSON APIs and a loopback-only platform model proxy.
+The ASGI application serves the public frontend directly while retaining the
+optional nginx deployment contract and loopback-only internal endpoints.
 """
 
 from __future__ import annotations
@@ -23,11 +23,12 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
-from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from access import account_payload, has_permission, is_platform_admin, plan_for
@@ -196,6 +197,136 @@ TRUSTED_PROXY_IPS = {
     for item in os.environ.get("SAAS_TRUSTED_PROXY_IPS", "127.0.0.1,::1").split(",")
     if item.strip()
 }
+PUBLIC_WEB_PREFIX = "/xianyu-saas"
+PUBLIC_API_PREFIX = f"{PUBLIC_WEB_PREFIX}/api/"
+DEFAULT_REQUEST_BODY_LIMIT = 16 * 1024 * 1024
+AUTH_REQUEST_BODY_LIMIT = 32 * 1024
+SENSITIVE_REQUEST_BODY_LIMIT = 8 * 1024
+SHOP_LOGIN_REQUEST_BODY_LIMIT = 1024
+STATIC_SECURITY_HEADERS = {
+    "Content-Security-Policy": (
+        "default-src 'self'; base-uri 'none'; connect-src 'self'; font-src 'self'; "
+        "form-action 'self'; frame-ancestors 'none'; img-src 'self'; object-src 'none'; "
+        "script-src 'self'; style-src 'self'"
+    ),
+    "Permissions-Policy": "camera=(), geolocation=(), microphone=()",
+    "Referrer-Policy": "same-origin",
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+}
+
+
+def _locate_frontend_root() -> Path | None:
+    candidates = []
+    configured_root = os.environ.get("SAAS_CURRENT_ROOT", "").strip()
+    if configured_root:
+        candidates.append(Path(configured_root) / "frontend")
+    candidates.append(Path(__file__).resolve().parents[1] / "frontend")
+
+    seen = set()
+    for candidate in candidates:
+        try:
+            resolved = candidate.expanduser().resolve(strict=True)
+        except OSError:
+            continue
+        identity = os.path.normcase(str(resolved))
+        if identity in seen:
+            continue
+        seen.add(identity)
+        if (resolved / "index.html").is_file() and (resolved / "assets").is_dir():
+            return resolved
+    return None
+
+
+FRONTEND_ROOT = _locate_frontend_root()
+FRONTEND_ASSETS_ROOT = FRONTEND_ROOT / "assets" if FRONTEND_ROOT is not None else None
+
+
+def _static_response_headers(cache_control: str) -> dict[str, str]:
+    return {**STATIC_SECURITY_HEADERS, "Cache-Control": cache_control}
+
+
+def _static_not_found() -> PlainTextResponse:
+    return PlainTextResponse(
+        "Not found",
+        status_code=404,
+        headers=_static_response_headers("no-store"),
+    )
+
+
+def _rewrite_public_api_scope(scope: dict) -> bool:
+    path = str(scope.get("path", ""))
+    if not path.startswith(PUBLIC_API_PREFIX):
+        return False
+    mapped_path = path[len(PUBLIC_WEB_PREFIX):]
+    if any(part in {".", ".."} for part in mapped_path.split("/")):
+        return False
+    raw_path = scope.get("raw_path")
+    if raw_path is not None:
+        if not isinstance(raw_path, bytes):
+            return False
+        raw_target = raw_path.partition(b"?")[0]
+        raw_prefix = PUBLIC_API_PREFIX.encode("ascii")
+        if not raw_target.startswith(raw_prefix):
+            return False
+        scope["raw_path"] = raw_target[len(PUBLIC_WEB_PREFIX):]
+    scope["path"] = mapped_path
+    return True
+
+
+def _request_body_limit(path: str) -> int:
+    if path in {"/api/auth/login", "/api/auth/register", "/api/auth/bootstrap"}:
+        return AUTH_REQUEST_BODY_LIMIT
+    if path == "/api/admin/confirm" or path.startswith("/api/admin/updates/"):
+        return SENSITIVE_REQUEST_BODY_LIMIT
+    if path in {"/api/bot/login/start", "/api/bot/login/complete"} or path.startswith("/api/bot/login/"):
+        return SHOP_LOGIN_REQUEST_BODY_LIMIT
+    return DEFAULT_REQUEST_BODY_LIMIT
+
+
+async def _enforce_request_body_limit(request: Request, path: str) -> JSONResponse | None:
+    maximum = _request_body_limit(path)
+    declared = request.headers.get("content-length", "").strip()
+    if declared:
+        if len(declared) > 20 or not declared.isascii() or not declared.isdigit():
+            return JSONResponse(
+                status_code=400,
+                content={"detail": {"code": "request_length_invalid", "message": "请求长度无效"}},
+                headers={"Connection": "close"},
+            )
+        if int(declared) > maximum:
+            return JSONResponse(
+                status_code=413,
+                content={"detail": {"code": "request_body_too_large", "message": "请求内容过大"}},
+                headers={"Connection": "close"},
+            )
+
+    chunks = []
+    total = 0
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > maximum:
+            return JSONResponse(
+                status_code=413,
+                content={"detail": {"code": "request_body_too_large", "message": "请求内容过大"}},
+                headers={"Connection": "close"},
+            )
+        chunks.append(chunk)
+    request._body = b"".join(chunks)
+    return None
+
+
+def _restore_public_api_redirect(location: str) -> str:
+    parsed = urlsplit(str(location or ""))
+    if parsed.path != "/api" and not parsed.path.startswith("/api/"):
+        return location
+    return urlunsplit((
+        parsed.scheme,
+        parsed.netloc,
+        f"{PUBLIC_WEB_PREFIX}{parsed.path}",
+        parsed.query,
+        parsed.fragment,
+    ))
 
 
 def _acquire_api_process_lock():
@@ -281,6 +412,25 @@ async def service_lifespan(_app):
 
 
 app = FastAPI(title="xianyu-saas-api", docs_url=None, redoc_url=None, lifespan=service_lifespan)
+
+
+@app.api_route(f"{PUBLIC_WEB_PREFIX}/", methods=["GET", "HEAD"], include_in_schema=False)
+def public_frontend_index():
+    if FRONTEND_ROOT is None:
+        return _static_not_found()
+    return FileResponse(
+        FRONTEND_ROOT / "index.html",
+        media_type="text/html",
+        headers=_static_response_headers("no-cache"),
+    )
+
+
+if FRONTEND_ASSETS_ROOT is not None:
+    app.mount(
+        f"{PUBLIC_WEB_PREFIX}/assets",
+        StaticFiles(directory=FRONTEND_ASSETS_ROOT, check_dir=True),
+        name="xianyu-saas-assets",
+    )
 
 
 @app.exception_handler(RequestValidationError)
@@ -463,22 +613,77 @@ def _normalize_origin(value: str | None) -> str | None:
     if not value:
         return None
     parsed = urlsplit(value.strip())
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+    try:
+        hostname = parsed.hostname
+        parsed.port
+    except ValueError:
         return None
-    return f"{parsed.scheme}://{parsed.netloc}"
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.netloc
+        or not hostname
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        return None
+    return f"{parsed.scheme.lower()}://{parsed.netloc.lower()}"
+
+
+def _request_host_parts(value: str | None) -> tuple[str, str] | None:
+    candidate = str(value or "").split(",", 1)[0].strip().lower()
+    if not candidate or any(character in candidate for character in "\r\n/\\"):
+        return None
+    parsed = urlsplit(f"//{candidate}")
+    try:
+        hostname = parsed.hostname
+        parsed.port
+    except ValueError:
+        return None
+    if not hostname or parsed.username is not None or parsed.password is not None:
+        return None
+    return candidate, hostname.lower()
+
+
+def _browser_host_trusted(value: str | None) -> bool:
+    parts = _request_host_parts(value)
+    if parts is None:
+        return False
+    netloc, hostname = parts
+    if netloc in TRUSTED_BROWSER_HOSTS or hostname in TRUSTED_BROWSER_HOSTS:
+        return True
+    try:
+        ipaddress.ip_address(hostname)
+    except ValueError:
+        return False
+    return True
+
+
+def _loopback_host(value: str | None) -> bool:
+    parts = _request_host_parts(value)
+    if parts is None:
+        return False
+    _netloc, hostname = parts
+    if hostname == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(hostname).is_loopback
+    except ValueError:
+        return False
 
 
 def _request_host_candidates(request: Request) -> list[str]:
     hosts: list[str] = []
-    for raw in (
-        request.headers.get("x-forwarded-host"),
-        request.headers.get("host"),
-        request.url.netloc,
-    ):
-        if not raw:
+    direct_host = request.headers.get("host") or request.url.netloc
+    raw_candidates = []
+    if _loopback_host(direct_host):
+        raw_candidates.append(request.headers.get("x-forwarded-host"))
+    raw_candidates.extend((direct_host, request.url.netloc))
+    for raw in raw_candidates:
+        parts = _request_host_parts(raw)
+        if parts is None:
             continue
-        candidate = raw.split(",", 1)[0].strip().lower()
-        if candidate and candidate not in hosts:
+        candidate, _hostname = parts
+        if candidate not in hosts:
             hosts.append(candidate)
     return hosts
 
@@ -496,13 +701,13 @@ def _configured_public_origin(request: Request) -> str | None:
     configured = _normalize_origin(PUBLIC_ORIGIN)
     if configured is not None:
         return configured
-    hosts = _request_host_candidates(request)
-    if not hosts:
+    host = next((item for item in _request_host_candidates(request) if _browser_host_trusted(item)), "")
+    if not host:
         return None
-    scheme = (request.headers.get("x-forwarded-proto") or request.url.scheme or "http").split(",", 1)[0].strip().lower()
+    scheme = str(request.url.scheme or "http").strip().lower()
     if scheme not in {"http", "https"}:
         scheme = "http"
-    return f"{scheme}://{hosts[0]}"
+    return f"{scheme}://{host}"
 
 
 _BROWSER_LOG_REDACTIONS = (
@@ -543,7 +748,12 @@ def _require_browser_write_origin(request: Request) -> None:
     configured_origin = _configured_public_origin(request)
     supplied_origins = _request_origin_candidates(request)
     if supplied_origins:
-        if configured_origin is not None and supplied_origins[0] != configured_origin:
+        if configured_origin is None:
+            raise HTTPException(
+                403,
+                detail={"code": "browser_origin_untrusted", "message": "无法确认浏览器写入来源"},
+            )
+        if supplied_origins[0] != configured_origin:
             raise HTTPException(
                 403,
                 detail={"code": "browser_origin_mismatch", "message": "浏览器写入来源不匹配"},
@@ -571,11 +781,44 @@ def _require_public_write_origin(request: Request) -> None:
 async def security_headers(request: Request, call_next):
     global _business_writes
     method = request.method.upper()
+    request_scope = getattr(request, "scope", None)
+    original_path = str(
+        request_scope.get("path", request.url.path)
+        if isinstance(request_scope, dict)
+        else request.url.path
+    )
     response = None
+    if original_path == PUBLIC_WEB_PREFIX:
+        response = RedirectResponse(
+            f"{PUBLIC_WEB_PREFIX}/",
+            status_code=308,
+            headers=_static_response_headers("no-store"),
+        )
+    elif original_path.startswith(PUBLIC_API_PREFIX):
+        if not isinstance(request_scope, dict) or not _rewrite_public_api_scope(request_scope):
+            response = _static_not_found()
+    elif original_path.startswith(f"{PUBLIC_WEB_PREFIX}/"):
+        static_path_allowed = (
+            original_path == f"{PUBLIC_WEB_PREFIX}/"
+            or original_path.startswith(f"{PUBLIC_WEB_PREFIX}/assets/")
+        )
+        if method not in {"GET", "HEAD"} or not static_path_allowed:
+            response = _static_not_found()
+
+    path = str(request_scope.get("path", original_path)) if isinstance(request_scope, dict) else original_path
+    if (
+        response is None
+        and isinstance(request_scope, dict)
+        and method not in {"GET", "HEAD", "OPTIONS"}
+        and path.startswith("/api/")
+    ):
+        response = await _enforce_request_body_limit(request, path)
+
     counted = False
     if (
-        method not in {"GET", "HEAD", "OPTIONS"}
-        and request.url.path.startswith("/api/")
+        response is None
+        and method not in {"GET", "HEAD", "OPTIONS"}
+        and path.startswith("/api/")
         and request.cookies.get(SESSION_COOKIE)
         and os.environ.get("SAAS_TESTING") != "1"
     ):
@@ -587,8 +830,8 @@ async def security_headers(request: Request, call_next):
                 status_code=exc.status_code,
                 headers=exc.headers,
             )
-    control_write = (request.url.path in {"/api/auth/login", "/api/auth/logout", "/api/admin/confirm"}
-                     or request.url.path.startswith("/api/admin/updates/"))
+    control_write = (path in {"/api/auth/login", "/api/auth/logout", "/api/admin/confirm"}
+                     or path.startswith("/api/admin/updates/"))
     if response is None and method not in {"GET", "HEAD", "OPTIONS"} and not control_write:
         with _business_write_lock:
             if maintenance_active():
@@ -604,6 +847,26 @@ async def security_headers(request: Request, call_next):
         if counted:
             with _business_write_lock:
                 _business_writes -= 1
+    if original_path.startswith(PUBLIC_API_PREFIX) and response.status_code in {301, 302, 307, 308}:
+        location = response.headers.get("Location", "")
+        restored = _restore_public_api_redirect(location)
+        if restored != location:
+            response.headers["Location"] = restored
+
+    public_static = (
+        original_path == f"{PUBLIC_WEB_PREFIX}/"
+        or original_path.startswith(f"{PUBLIC_WEB_PREFIX}/assets/")
+    )
+    if public_static:
+        for name, value in STATIC_SECURITY_HEADERS.items():
+            response.headers.setdefault(name, value)
+        if response.status_code < 400:
+            response.headers["Cache-Control"] = (
+                "no-cache"
+                if original_path == f"{PUBLIC_WEB_PREFIX}/"
+                else "public, max-age=604800, immutable"
+            )
+
     response.headers.setdefault("Cache-Control", "no-store")
     response.headers.setdefault("X-Content-Type-Options", "nosniff")
     response.headers.setdefault("X-Frame-Options", "DENY")

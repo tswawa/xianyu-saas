@@ -51,6 +51,15 @@ if str(BACKEND_ROOT) not in sys.path:
 
 from db import DB  # noqa: E402
 from update_maintenance import supports_maintenance_protocol  # noqa: E402
+from standalone_runtime import (  # noqa: E402
+    MANAGER_PROTOCOL,
+    STANDALONE_RELEASE_KIND,
+    StandaloneRuntimeError,
+    load_runtime_metadata,
+    normalize_architecture,
+    release_kind,
+    standalone_asset_names,
+)
 from platform_update import (  # noqa: E402
     CACHED_MANIFEST_FILE,
     CACHED_SIGNATURE_FILE,
@@ -59,6 +68,11 @@ from platform_update import (  # noqa: E402
     MAX_ARCHIVE_BYTES,
     MAX_FILE_BYTES,
     MAX_MANIFEST_BYTES,
+    MAX_MANAGER_BYTES,
+    MAX_STANDALONE_ARCHIVE_BYTES,
+    MAX_STANDALONE_FILE_BYTES,
+    MAX_STANDALONE_MANIFEST_BYTES,
+    MAX_STANDALONE_UNPACKED_BYTES,
     MAX_SIGNATURE_BYTES,
     PlatformUpdateError,
     ReleaseAsset,
@@ -91,6 +105,9 @@ JOURNAL_MAX_BYTES = 4 * 1024 * 1024
 MAINTENANCE_MODULE = "backend/update_maintenance.py"
 BASELINE_IMPORT_OPTION = "--import-trusted-baseline"
 SYSTEMD_UPDATER_PROTOCOL = 1
+MANAGER_RELEASES_DIR = Path("/opt/xianyu-saas/manager/releases")
+MANAGER_CURRENT_LINK = Path("/opt/xianyu-saas/manager/current")
+MANAGER_EXECUTABLE = MANAGER_CURRENT_LINK / "xianyu-saas"
 UPDATER_BUNDLE_FILES = (
     "backend/account_storage.py",
     "backend/db.py",
@@ -607,11 +624,13 @@ def _open_journal(config: Config, intent: Intent, *, enforce_expiry: bool = Fals
         now = time.time()
         if intent.requested_at > now + INTENT_FUTURE_SKEW_SECONDS or now - intent.requested_at > config.intent_max_age_seconds:
             raise UpdaterError("update_intent_expired")
+    installed = current_release(config)
+    current_version = verify_existing_release(config, installed.name).name
+    if intent.expected_current_version and current_version != intent.expected_current_version:
+        raise UpdaterError("update_current_version_changed")
     journal = {"schema": 1, "operation_id": intent.operation_id, "intent": payload,
                "phase": "queued", "status": "queued", "error_code": "",
-               "current_version": _trusted_public_current_version(
-                   config, intent.expected_current_version
-               ),
+               "current_version": current_version,
                "maintenance_active": False, "accepted_at": time.time()}
     _save_journal(config, journal)
     _atomic_json(nonce_path, {"schema": 1, "operation_id": intent.operation_id})
@@ -695,6 +714,58 @@ def _configured_entrypoint(bundle_root: Path) -> Path:
     ):
         raise UpdaterError("update_updater_identity_invalid")
     return entrypoint
+
+
+def _installed_manager_identity() -> dict:
+    """Hash the root-owned manager selected by the fixed current symlink."""
+    current = Path(os.environ.get("SAAS_MANAGER_CURRENT", str(MANAGER_CURRENT_LINK)).strip())
+    executable = Path(os.environ.get("SAAS_MANAGER_EXECUTABLE", str(current / "xianyu-saas")).strip())
+    releases = Path(os.environ.get("SAAS_MANAGER_RELEASES_DIR", str(MANAGER_RELEASES_DIR)).strip())
+    if (not current.is_absolute() or not executable.is_absolute() or not releases.is_absolute()
+            or ".." in current.parts or ".." in executable.parts or ".." in releases.parts
+            or executable != current / "xianyu-saas"):
+        raise UpdaterError("update_updater_identity_invalid")
+    try:
+        _secure_directory(releases, 0o755)
+        _secure_directory(current.parent, 0o755)
+        link = current.lstat()
+        if not stat.S_ISLNK(link.st_mode) or link.st_uid != 0:
+            raise UpdaterError("update_updater_identity_invalid")
+        release_root = current.resolve(strict=True)
+        if release_root.parent != releases.resolve(strict=True):
+            raise UpdaterError("update_updater_identity_invalid")
+        SemVer.parse(release_root.name)
+        _secure_directory(release_root, 0o755)
+        path = executable.resolve(strict=True)
+        if path != release_root / "xianyu-saas":
+            raise UpdaterError("update_updater_identity_invalid")
+        before = path.lstat()
+        if (stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode)
+                or before.st_uid != 0 or before.st_nlink != 1
+                or stat.S_IMODE(before.st_mode) & 0o022
+                or not stat.S_IMODE(before.st_mode) & 0o111
+                or before.st_size <= 0 or before.st_size > MAX_MANAGER_BYTES):
+            raise UpdaterError("update_updater_identity_invalid")
+        raw = _read_protected_file(path, MAX_MANAGER_BYTES, private=False)
+        after = path.lstat()
+        if _file_identity(before) != _file_identity(after):
+            raise UpdaterError("update_updater_identity_invalid")
+        key_raw = load_public_key().public_bytes(
+            serialization.Encoding.Raw, serialization.PublicFormat.Raw
+        )
+    except PlatformUpdateError as exc:
+        raise UpdaterError(exc.code) from exc
+    except (OSError, ValueError) as exc:
+        raise UpdaterError("update_updater_identity_invalid") from exc
+    return {
+        "manager_version": release_root.name,
+        "manager_sha256": hashlib.sha256(raw).hexdigest(),
+        "manager_protocol": MANAGER_PROTOCOL,
+        "manager_path": str(release_root),
+        "platform": "linux",
+        "architecture": normalize_architecture(),
+        "public_key_sha256": hashlib.sha256(key_raw).hexdigest(),
+    }
 
 
 def _installed_bundle_identity() -> dict:
@@ -1037,11 +1108,13 @@ def _load_release_manifest(release_root: Path, version: str) -> dict[str, object
     if marker.get("schema") != 1 or str(marker.get("version", "")) != version:
         raise UpdaterError("update_release_invalid")
     try:
+        release = _release_from_marker(marker)
+        manifest_limit = MAX_STANDALONE_MANIFEST_BYTES if release.kind == STANDALONE_RELEASE_KIND else MAX_MANIFEST_BYTES
         manifest_raw = _read_protected_file(
-            release_root / CACHED_MANIFEST_FILE, 1024 * 1024, private=False
+            release_root / CACHED_MANIFEST_FILE, manifest_limit, private=False
         )
         signature_raw = _read_protected_file(
-            release_root / CACHED_SIGNATURE_FILE, 4096, private=False
+            release_root / CACHED_SIGNATURE_FILE, MAX_SIGNATURE_BYTES, private=False
         )
         verify_manifest_signature(manifest_raw, signature_raw)
     except PlatformUpdateError as exc:
@@ -1051,7 +1124,6 @@ def _load_release_manifest(release_root: Path, version: str) -> dict[str, object
     ):
         raise UpdaterError("update_release_invalid")
     try:
-        release = _release_from_marker(marker)
         manifest, expected_files = parse_manifest(manifest_raw, release)
     except PlatformUpdateError as exc:
         raise UpdaterError(exc.code) from exc
@@ -1072,7 +1144,7 @@ def _copy_file_verified(source: Path, destination: Path, expected: dict) -> None
         expected_digest = str(expected["sha256"])
     except (KeyError, TypeError, ValueError) as exc:
         raise UpdaterError("update_manifest_invalid") from exc
-    if size < 0 or size > MAX_FILE_BYTES or len(expected_digest) != 64:
+    if size < 0 or size > MAX_STANDALONE_FILE_BYTES or len(expected_digest) != 64:
         raise UpdaterError("update_manifest_invalid")
     try:
         source_metadata = source.lstat()
@@ -1194,6 +1266,132 @@ def materialize_release(config: Config, intent: Intent) -> Path:
     if str(marker.get("version", "")) != intent.version:
         raise UpdaterError("update_candidate_invalid")
     return final
+
+
+def _manager_layout() -> tuple[Path, Path]:
+    releases = Path(os.environ.get("SAAS_MANAGER_RELEASES_DIR", str(MANAGER_RELEASES_DIR)).strip())
+    current = Path(os.environ.get("SAAS_MANAGER_CURRENT", str(MANAGER_CURRENT_LINK)).strip())
+    if (not releases.is_absolute() or not current.is_absolute() or ".." in releases.parts
+            or ".." in current.parts or current.parent != releases.parent):
+        raise UpdaterError("update_updater_identity_invalid")
+    return releases, current
+
+
+def _switch_release_link(current: Path, releases: Path, target: Path) -> None:
+    releases_resolved = releases.resolve(strict=True)
+    target_resolved = target.resolve(strict=True)
+    if target_resolved.parent != releases_resolved or target.is_symlink() or not target.is_dir():
+        raise UpdaterError("update_updater_identity_invalid")
+    temporary = current.with_name(f".{current.name}.{os.getpid()}.{time.time_ns()}.tmp")
+    temporary.unlink(missing_ok=True)
+    os.symlink(str(target_resolved), temporary)
+    try:
+        os.replace(temporary, current)
+        _fsync_directory(current.parent)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def materialize_manager(release: Path) -> dict:
+    release_payload = _load_release_manifest(release, release.name)
+    expected = release_payload["expected_files"].get("manager/xianyu-saas")
+    metadata = _release_runtime_metadata(release)
+    if expected is None or metadata is None:
+        raise UpdaterError("standalone_manager_missing")
+    if metadata.manager_protocol > MANAGER_PROTOCOL:
+        raise UpdaterError("standalone_manager_protocol_unsupported")
+    releases, current = _manager_layout()
+    _secure_directory(releases, 0o755)
+    final = releases / release.name
+    candidate = release / "manager" / "xianyu-saas"
+    if final.exists() or final.is_symlink():
+        if final.is_symlink() or not final.is_dir():
+            raise UpdaterError("standalone_manager_invalid")
+        executable = final / "xianyu-saas"
+        raw = _read_protected_file(executable, MAX_MANAGER_BYTES, private=False)
+        if len(raw) != expected.size or hashlib.sha256(raw).hexdigest() != expected.sha256:
+            raise UpdaterError("standalone_manager_invalid")
+    else:
+        temporary = releases / f".{release.name}.{os.getpid()}.{time.time_ns()}.partial"
+        if temporary.exists() or temporary.is_symlink():
+            raise UpdaterError("standalone_manager_invalid")
+        _secure_directory(temporary, 0o755)
+        try:
+            _copy_file_verified(
+                candidate,
+                temporary / "xianyu-saas",
+                {"path": "manager/xianyu-saas", "size": expected.size,
+                 "sha256": expected.sha256, "executable": True},
+            )
+            os.chmod(temporary / "xianyu-saas", 0o755)
+            os.replace(temporary, final)
+            _fsync_directory(releases)
+        except BaseException:
+            shutil.rmtree(temporary, ignore_errors=True)
+            raise
+    executable = final / "xianyu-saas"
+    digest = hashlib.sha256(_read_protected_file(executable, MAX_MANAGER_BYTES, private=False)).hexdigest()
+    try:
+        completed = subprocess.run(
+            [str(executable), "internal", "self-check"],
+            cwd="/",
+            env={"PATH": "/usr/bin:/bin", "LANG": "C", "SAAS_UPDATE_PUBLIC_KEY_FILE": str(_public_key_file())},
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if completed.returncode != 0 or len(completed.stdout.encode("utf-8")) > 64 * 1024:
+            raise UpdaterError("standalone_manager_self_check_failed")
+        report = json.loads(completed.stdout)
+    except (OSError, subprocess.SubprocessError, UnicodeError, json.JSONDecodeError) as exc:
+        raise UpdaterError("standalone_manager_self_check_failed") from exc
+    if (not isinstance(report, dict) or report.get("ok") is not True
+            or report.get("version") != release.name
+            or report.get("manager_protocol") != metadata.manager_protocol
+            or report.get("sha256") != digest):
+        raise UpdaterError("standalone_manager_self_check_failed")
+    _switch_release_link(current, releases, final)
+    return {"version": release.name, "protocol": metadata.manager_protocol, "sha256": digest, "path": str(final)}
+
+
+def _current_manager_journal_identity() -> dict:
+    identity = _installed_manager_identity()
+    return {
+        "version": identity["manager_version"],
+        "protocol": identity["manager_protocol"],
+        "sha256": identity["manager_sha256"],
+        "path": identity["manager_path"],
+    }
+
+
+def _handoff_manager(config: Config, current: dict, previous: dict) -> None:
+    """Exec the newly selected frozen manager; restore the old link if exec fails."""
+    if not getattr(sys, "frozen", False):
+        return
+    target = Path(str(current.get("path", ""))) / "xianyu-saas"
+    try:
+        running = Path("/proc/self/exe").resolve(strict=True)
+        executable = target.resolve(strict=True)
+    except OSError as exc:
+        raise UpdaterError("standalone_manager_handoff_failed") from exc
+    if running == executable:
+        return
+    try:
+        os.execve(str(executable), [str(executable), "internal", "resume"], dict(os.environ))
+        failure = OSError("manager exec returned")
+    except OSError as exc:
+        failure = exc
+    try:
+        releases, manager_current = _manager_layout()
+        previous_root = Path(str(previous.get("path", ""))).resolve(strict=True)
+        if previous_root.parent != releases.resolve(strict=True):
+            raise UpdaterError("standalone_manager_handoff_failed")
+        _switch_release_link(manager_current, releases, previous_root)
+        initialize_layout(config)
+    except Exception as restore_error:
+        raise UpdaterError("standalone_manager_handoff_recovery_failed") from restore_error
+    raise UpdaterError("standalone_manager_handoff_failed") from failure
 
 
 def verify_existing_release(config: Config, version: str) -> Path:
@@ -1446,16 +1644,60 @@ def start_services(config: Config, runner: SystemRunner) -> None:
     runner.run(["systemctl", "start", config.consumer_service])
 
 
+def _release_runtime_metadata(release: Path):
+    runtime_file = release / "runtime" / "runtime.json"
+    if not runtime_file.exists():
+        return None
+    try:
+        return load_runtime_metadata(release, expected_version=release.name)
+    except StandaloneRuntimeError as exc:
+        raise UpdaterError(exc.code) from exc
+
+
+def _verify_standalone_upgrade(target: Path, old_release: Path) -> bool:
+    target_metadata = _release_runtime_metadata(target)
+    old_metadata = _release_runtime_metadata(old_release)
+    if target_metadata is None and old_metadata is None:
+        return False
+    if target_metadata is None or old_metadata is None:
+        raise UpdaterError("update_installation_migration_required")
+    if target_metadata.architecture != old_metadata.architecture:
+        raise UpdaterError("standalone_runtime_architecture_mismatch")
+    if target_metadata.update_data_version != old_metadata.update_data_version:
+        raise UpdaterError("standalone_data_migration_required")
+    if target_metadata.manager_protocol > MANAGER_PROTOCOL:
+        raise UpdaterError("standalone_manager_protocol_unsupported")
+    return True
+
+
 def run_migrations(release: Path, config: Config, runner: SystemRunner) -> None:
+    del runner
+    metadata = _release_runtime_metadata(release)
+    python = Path(sys.executable)
+    extra_environment = {}
+    if metadata is not None:
+        python = release / "runtime" / "python" / "bin" / "python3"
+        site = release / "runtime" / "site" / "backend"
+        try:
+            python_metadata = python.lstat()
+            site_metadata = site.lstat()
+        except OSError as exc:
+            raise UpdaterError("standalone_runtime_invalid") from exc
+        if (python.is_symlink() or not stat.S_ISREG(python_metadata.st_mode)
+                or not stat.S_IMODE(python_metadata.st_mode) & 0o111
+                or site.is_symlink() or not stat.S_ISDIR(site_metadata.st_mode)):
+            raise UpdaterError("standalone_runtime_invalid")
+        extra_environment["PYTHONPATH"] = str(site)
     command = [
-        sys.executable,
+        str(python),
         "-c",
         "from db import DB; database = DB(); assert database.is_ready()",
     ]
     environment = _child_environment({"SAAS_DB": str(config.database_path),
                                       "SAAS_STATE_DIR": str(config.state_dir),
                                       "SAAS_TENANTS_DIR": str(config.tenants_dir),
-                                      "SAAS_RESTORE_WORKERS": "0"})
+                                      "SAAS_RESTORE_WORKERS": "0",
+                                      **extra_environment})
     identity = {}
     if os.geteuid() == 0 and config.intent_owner_uid not in {None, 0}:
         identity = {"user": config.intent_owner_uid, "group": pwd.getpwuid(config.intent_owner_uid).pw_gid, "extra_groups": []}
@@ -1614,9 +1856,10 @@ def prune_releases(config: Config) -> None:
             continue
         try:
             SemVer.parse(path.name)
-        except PlatformUpdateError:
+            verified = verify_existing_release(config, path.name)
+        except (PlatformUpdateError, UpdaterError):
             continue
-        releases.append(path)
+        releases.append(verified)
     releases.sort(key=lambda path: path.stat().st_mtime, reverse=True)
     keep: set[Path] = set()
     if current is not None:
@@ -1676,14 +1919,11 @@ def _safe_error(exc: Exception) -> str:
 
 
 def _trusted_public_current_version(config: Config, preferred: str = "") -> str:
-    if preferred:
-        try:
-            SemVer.parse(preferred)
-            return preferred
-        except PlatformUpdateError:
-            return ""
     try:
         current = current_release(config)
+        if preferred:
+            SemVer.parse(preferred)
+            return preferred if current.name == preferred else ""
         return verify_existing_release(config, current.name).name
     except (UpdaterError, PlatformUpdateError, OSError):
         return ""
@@ -2017,8 +2257,23 @@ def process_intent(
         target = _verify_code_identity(config, journal["target_identity"])
         if not journal.get("dependencies_checked"):
             _transition(config, journal, database, "preflighting")
-            _verify_dependency_stability(target, old_release)
+            standalone = _verify_standalone_upgrade(target, old_release)
+            if not standalone:
+                _verify_dependency_stability(target, old_release)
+            elif intent.action == "apply":
+                if "previous_manager_identity" not in journal:
+                    journal["previous_manager_identity"] = _current_manager_journal_identity()
+                    _save_journal(config, journal)
+                journal["manager_identity"] = materialize_manager(target)
+                _save_journal(config, journal)
+                _handoff_manager(
+                    config,
+                    journal["manager_identity"],
+                    journal["previous_manager_identity"],
+                )
+                initialize_layout(config)
             _secure_directory(config.backup_dir)
+            journal["standalone_release"] = standalone
             journal["dependencies_checked"] = True
             _save_journal(config, journal)
         if not journal.get("maintenance_active"):
@@ -2169,7 +2424,8 @@ def initialize_layout(config: Config) -> None:
         current, current_manifest["expected_files"], protected=True
     ):
         raise UpdaterError("update_maintenance_protocol_unsupported")
-    identity = _installed_bundle_identity()
+    standalone = _release_runtime_metadata(current) is not None
+    identity = _installed_manager_identity() if standalone else _installed_bundle_identity()
     _prepare_private(config)
     # The IPC root must not be replaceable by the app. Only this explicit
     # installation command changes its group/mode, never the business state.
@@ -2184,16 +2440,29 @@ def initialize_layout(config: Config) -> None:
         os.close(descriptor)
     _secure_directory(config.status_dir, 0o755)
     _secure_directory(config.status_dir / "operations", 0o755)
-    _atomic_json(
-        config.status_dir / "initialization.json",
-        {
+    if standalone:
+        initialization = {
+            "schema": 2,
+            "protocol": MANAGER_PROTOCOL,
+            "public_key_sha256": identity["public_key_sha256"],
+            "manager_version": identity["manager_version"],
+            "manager_sha256": identity["manager_sha256"],
+            "platform": identity["platform"],
+            "architecture": identity["architecture"],
+            "initialized_at": time.time(),
+        }
+    else:
+        initialization = {
             "schema": 1,
             "protocol": SYSTEMD_UPDATER_PROTOCOL,
             "public_key_sha256": identity["public_key_sha256"],
             "bundle_sha256": identity["bundle_sha256"],
             "entrypoint_sha256": identity["entrypoint_sha256"],
             "initialized_at": time.time(),
-        },
+        }
+    _atomic_json(
+        config.status_dir / "initialization.json",
+        initialization,
         public=True,
     )
 
@@ -2295,7 +2564,10 @@ def main() -> int:
         return 0
     except (UpdaterError, PlatformUpdateError, OSError, sqlite3.Error, ValueError) as exc:
         if (lock_descriptor is not None and intent is None
-                and getattr(exc, "code", "") in {"update_intent_invalid", "update_file_changed", "update_intent_expired", "update_nonce_conflict", "update_recovery_required"}):
+                and getattr(exc, "code", "") in {
+                    "update_intent_invalid", "update_file_changed", "update_intent_expired",
+                    "update_nonce_conflict", "update_recovery_required", "update_signature_invalid",
+                }):
             try:
                 if _discard_rejected_intent(config, _safe_error(exc)):
                     return 0
