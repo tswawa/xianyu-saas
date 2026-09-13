@@ -77,7 +77,9 @@ SECRET_PATTERNS = (
     re.compile(rb"github_pat_[A-Za-z0-9_]{20,}"),
     re.compile(rb"ghp_[A-Za-z0-9]{20,}"),
     re.compile(rb"AKIA[0-9A-Z]{16}"),
-    re.compile(rb"sk-[A-Za-z0-9_-]{24,}"),
+    # pip's vendored SPDX table contains the public identifier
+    # "sk-linking-protocols-exception"; keep real token-shaped values blocked.
+    re.compile(rb"sk-(?!linking-protocols-exception(?:[^A-Za-z0-9_-]|$))[A-Za-z0-9_-]{24,}"),
 )
 REQUIRED_LICENSES = ("LICENSE", "worker/LICENSE", "worker/NOTICE.md", "frontend/assets/OFL-NotoSansSC.txt")
 PUBLIC_RUNTIME_LOCKS = frozenset({

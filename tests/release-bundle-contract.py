@@ -223,6 +223,7 @@ class Repository:
                 "frontend/index.html": b"<!doctype html><title>standalone</title>\n",
                 "worker/main.py": b"WORKER = True\n",
                 "runtime/python/bin/python3": b"#!/bin/sh\nexit 0\n",
+                "runtime/python/lib/python3.12/site-packages/pip/_vendor/packaging/licenses/_spdx.py": b'EXCEPTIONS = {"sk-linking-protocols-exception": 0}\n',
                 "runtime/site/backend/fixture.py": b"BACKEND_DEP = True\n",
                 "runtime/site/worker/fixture.py": b"WORKER_DEP = True\n",
                 "runtime/runtime.json": BUILDER.json_bytes(runtime),
@@ -710,14 +711,16 @@ def privacy_contract(run: Path):
     repo = Repository(run / "products")
     repo.change("worker/products_config.json", b'{"types": [{"id": "real-item"}]}\n')
     assert_rejected(repo, "release_products_template_invalid")
-    for index, kind in enumerate(("private-key", "active-seed", "provider-secret")):
+    for index, kind in enumerate(("private-key", "active-seed", "github-secret", "openai-secret")):
         repo = Repository(run / f"content-{index}")
         if kind == "private-key":
             payload = Ed25519PrivateKey.generate().private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption())
         elif kind == "active-seed":
             payload = repo.encoded.encode()
-        else:
+        elif kind == "github-secret":
             payload = ("gh" + "p_" + "x" * 32).encode()
+        else:
+            payload = ("sk-" + "A" * 32).encode()
         repo.change("frontend/assets/innocent.txt", payload)
         assert_rejected(repo, "release_secret_content_rejected")
     repo = Repository(run / "license")
