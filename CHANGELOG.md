@@ -2,7 +2,15 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号按 [Semantic Versioning](https://semver.org/lang/zh-CN/) 管理。
 
-> 说明：当前工程代码版本为 `0.3.1`。文中的历史记录反映内部开发基线与功能演进。
+> 说明：当前工程代码版本为 `0.4.0`。文中的历史记录反映内部开发基线与功能演进。
+
+## [0.4.0] - 2026-09-13
+
+- 新增 Linux x86_64 与 aarch64 架构独立安装包（standalone bundle）及配套的稳定 updater manager。
+- 首次安装无需预装系统级 Python、Node.js、Nginx 或 Docker，仅需具备 systemd 环境、root 执行权限以及网络连接。
+- 网页端升级机制保持完整流程保障，涵盖已签名 GitHub Release 验签、维护态隔离、自动备份与迁移、原子版本切换、健康检查以及失败自动回退。
+- 支持从既有源码部署或旧版 systemd 架构平滑迁移，完整保留既有环境配置与业务数据。
+- 建议在生产环境执行迁移或升级前，先在测试机器完成完整数据备份与升级验证。
 
 ## [0.3.1] - 2026-09-13
 
