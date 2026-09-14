@@ -342,6 +342,7 @@ class Fixture:
         )
         self.environment = {"SAAS_CURRENT_ROOT": str(current), "SAAS_UPDATE_STAGING_DIR": str(self.config.staging_dir),
                             "SAAS_UPDATE_PUBLIC_KEY_FILE": str(keyfile), "SAAS_UPDATE_INTENT_FILE": str(self.config.intent_file),
+                            "SAAS_UPDATE_STATUS_DIR": str(self.config.status_dir),
                             "SAAS_UPDATER_STATE_DIR": str(self.config.private_state_dir),
                             "SAAS_UPDATER_BUNDLE_ROOT": str(updater.SCRIPT_ROOT), "SAAS_UPDATER_ENTRYPOINT": str(updater.SCRIPT_PATH),
                             "SAAS_TESTING": "1",

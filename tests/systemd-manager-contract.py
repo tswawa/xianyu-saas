@@ -184,10 +184,21 @@ def internal_mapping_contracts():
             return 0
 
     original_argv = sys.argv
-    with patch.dict(os.environ, {"SAAS_CURRENT_ROOT": "/attacker", "SAAS_API_SERVICE": "attacker.service"}, clear=False):
+    inherited_database = ROOT / ".local/manager-contract/inherited.db"
+    inherited_tenants = ROOT / ".local/manager-contract/inherited-tenants"
+    with patch.dict(os.environ, {
+        "SAAS_CURRENT_ROOT": "/attacker",
+        "SAAS_API_SERVICE": "attacker.service",
+        "SAAS_ENV": "development",
+        "SAAS_TESTING": "1",
+        "SAAS_DB": str(inherited_database),
+        "SAAS_TENANTS_DIR": str(inherited_tenants),
+    }, clear=False):
         result = invoke_updater("import-baseline", paths, loader=lambda: FakeUpdater)
         assert os.environ["SAAS_CURRENT_ROOT"] == "/attacker"
         assert os.environ["SAAS_API_SERVICE"] == "attacker.service"
+        assert os.environ["SAAS_ENV"] == "development"
+        assert os.environ["SAAS_TESTING"] == "1"
     assert result["ok"] is True
     argv, environment = observations[0]
     assert argv == updater_arguments("import-baseline", paths)
@@ -195,6 +206,8 @@ def internal_mapping_contracts():
     assert Path(environment["SAAS_CURRENT_ROOT"]) == CURRENT_LINK
     assert Path(environment["SAAS_RELEASES_DIR"]) == RELEASES_DIR
     assert Path(environment["SAAS_STATE_DIR"]) == STATE_DIR
+    assert Path(environment["SAAS_DB"]) == inherited_database
+    assert Path(environment["SAAS_TENANTS_DIR"]) == inherited_tenants
     assert Path(environment["SAAS_UPDATE_INTENT_FILE"]) == UPDATE_QUEUE_DIR / "intent.json"
     assert Path(environment["SAAS_UPDATER_STATE_DIR"]) == UPDATER_STATE_DIR
     assert Path(environment["SAAS_MANAGER_RELEASES_DIR"]) == MANAGER_RELEASES_DIR
@@ -203,8 +216,32 @@ def internal_mapping_contracts():
     assert environment["SAAS_UPDATE_HEALTH_BASE_URL"] == "http://127.0.0.1:8096/"
     assert environment["SAAS_UPDATE_PUBLIC_BASE_URL"] == "http://127.0.0.1:8096/xianyu-saas/"
     assert environment["SAAS_RELEASE_KIND"] == "standalone"
+    assert environment["SAAS_ENV"] == "production"
     assert environment["SAAS_TESTING"] == "0"
     assert sys.argv is original_argv
+
+    database = ROOT / ".local/manager-contract/saas.db"
+    tenants = ROOT / ".local/manager-contract/tenants"
+    invoke_updater(
+        "initialize",
+        loader=lambda: FakeUpdater,
+        environment_overrides={"SAAS_DB": str(database), "SAAS_TENANTS_DIR": str(tenants)},
+    )
+    _, environment = observations[1]
+    assert Path(environment["SAAS_DB"]) == database
+    assert Path(environment["SAAS_TENANTS_DIR"]) == tenants
+    expect_error(
+        "manager_internal_invalid",
+        lambda: invoke_updater(
+            "initialize", loader=lambda: FakeUpdater,
+            environment_overrides={"SAAS_API_SERVICE": "attacker.service"},
+        ),
+    )
+    with patch.dict(os.environ, {"SAAS_DB": "relative.db"}, clear=False):
+        expect_error(
+            "manager_internal_invalid",
+            lambda: invoke_updater("resume", loader=lambda: FakeUpdater),
+        )
 
     invoked = []
     dispatch(

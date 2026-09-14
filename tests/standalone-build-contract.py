@@ -117,6 +117,7 @@ def fixture(run: Path):
             "python/bin/python3": b"",
             "python/lib/python3.12/os.py": b"name = 'posix'\n",
             "python/lib/python3.12/__pycache__/os.cpython-312.pyc": b"cache",
+            "python/share/terminfo/61/ansi": b"terminal database fixture\n",
         },
         kinds={"python/bin/python3": (tarfile.SYMTYPE, "python3.12", 0, 0)},
     )
@@ -217,6 +218,7 @@ def success_contract(run: Path) -> None:
     assert not (output / "app").exists()
     assert (output / "runtime/python/bin/python3").is_file()
     assert (output / "runtime/python/bin/python3").read_bytes() == (output / "runtime/python/bin/python3.12").read_bytes()
+    assert not any(path.name.casefold() == "terminfo" for path in (output / "runtime/python").rglob("*"))
     assert (output / "runtime/site/backend/backend_dep/__init__.py").is_file()
     assert (output / "runtime/site/worker/worker_dep/__init__.py").is_file()
     assert (output / "manager/xianyu-saas").read_bytes() == manager.read_bytes()

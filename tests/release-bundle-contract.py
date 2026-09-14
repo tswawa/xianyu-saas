@@ -235,7 +235,7 @@ class Repository:
                 path = bundle / name
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_bytes(payload)
-                if name in {"runtime/python/bin/python3", "manager/xianyu-saas"}:
+                if name == "manager/xianyu-saas":
                     path.chmod(0o755)
             bootstrap = directory / "manager"
             bootstrap.write_bytes(manager)
@@ -490,6 +490,11 @@ def verify_bundle(repo: Repository, output: Path, *, epoch=EPOCH):
             assert archive.extractfile("manager/xianyu-saas").read() == (output / manager_name).read_bytes()
             assert json.loads(archive.extractfile("runtime/runtime.json").read()) == standalone_manifest["runtime"]
         assert {item["path"] for item in standalone_manifest["files"]} == paths
+        by_path = {item["path"]: item for item in standalone_manifest["files"]}
+        assert by_path["runtime/python/bin/python3"]["executable"] is True
+        assert by_path["manager/xianyu-saas"]["executable"] is True
+        with tarfile.open(output / archive_name, "r:gz") as archive:
+            assert stat.S_IMODE(archive.getmember("runtime/python/bin/python3").mode) == 0o755
     assert set(BUILDER.REQUIRED_LICENSES) <= set(expected)
     VERIFIER.verify(output, repo.version, repo.commit, output / f"{base}.update-signing.pub")
     return release, expected, manifest_raw, signature_raw
@@ -506,9 +511,16 @@ def workflow_contract(repo: Repository, output: Path):
     assert "target: linux-x86_64" in standalone_section and "architecture: x86_64" in standalone_section
     assert "target: linux-aarch64" in standalone_section and "architecture: aarch64" in standalone_section
     assert "runner: ubuntu-24.04-arm" in standalone_section
+    assert "manager_platform: linux/amd64" in standalone_section
+    assert "manager_platform: linux/arm64" in standalone_section
+    assert "python:3.12.14-slim-bookworm@sha256:782412e85d0f0984994c290652577d4018aff08145c85b262bb63dc0c7522254" in standalone_section
+    assert 'docker run --rm --platform "$MANAGER_PLATFORM"' in standalone_section
+    assert "--env TARGET" in standalone_section
     assert 'pyinstaller==6.16.0' in standalone_section
-    assert "apt-get install --yes binutils" in standalone_section
+    assert "apt-get install --yes --no-install-recommends binutils" in standalone_section
     assert 'dist/xianyu-saas" ".local/standalone/$TARGET/manager"' in standalone_section
+    assert 'internal self-check > /tmp/manager-self-check.json' in standalone_section
+    assert 'sudo chown -R "$(id -u):$(id -g)"' in standalone_section
     assert 'parsed.hostname != "files.pythonhosted.org"' in standalone_section
     assert 'lock.get("status") != "locked"' in standalone_section
     assert "python scripts/build-standalone.py" in standalone_section

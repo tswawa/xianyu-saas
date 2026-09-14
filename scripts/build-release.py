@@ -434,7 +434,12 @@ def standalone_protocol():
     return module
 
 
-def read_standalone_tree(bundle: Path, seed: bytes, encoded: str) -> dict[str, tuple[bytes, bool]]:
+def read_standalone_tree(
+    bundle: Path,
+    seed: bytes,
+    encoded: str,
+    source_executables: set[str],
+) -> dict[str, tuple[bytes, bool]]:
     if bundle.is_symlink() or not bundle.is_dir():
         raise BundleError("release_standalone_input_invalid")
     for required in REQUIRED_STANDALONE_ROOTS:
@@ -476,14 +481,30 @@ def read_standalone_tree(bundle: Path, seed: bytes, encoded: str) -> dict[str, t
             total += len(payload)
             if total > 1536 * 1024 * 1024 or len(files) >= 20000:
                 raise BundleError("release_standalone_too_large")
-            executable = bool(stat.S_IMODE(metadata.st_mode) & 0o111) or relative == "manager/xianyu-saas"
+            runtime_python = bool(re.fullmatch(
+                r"runtime/python/bin/python(?:3(?:\.[0-9]+)?)?", relative
+            ))
+            executable = (
+                bool(stat.S_IMODE(metadata.st_mode) & 0o111)
+                or relative in source_executables
+                or relative == "manager/xianyu-saas"
+                or runtime_python
+            )
             files[relative] = (payload, executable)
     if not files:
         raise BundleError("release_standalone_input_invalid")
     return files
 
 
-def standalone_inputs(root: Path, version: str, commit: str, seed: bytes, encoded: str, runtime_protocol) -> dict[str, dict]:
+def standalone_inputs(
+    root: Path,
+    version: str,
+    commit: str,
+    seed: bytes,
+    encoded: str,
+    runtime_protocol,
+    source_executables: set[str],
+) -> dict[str, dict]:
     if root.is_symlink() or not root.is_dir():
         raise BundleError("release_standalone_inputs_missing")
     if {path.name for path in root.iterdir()} != set(STANDALONE_TARGETS):
@@ -495,7 +516,7 @@ def standalone_inputs(root: Path, version: str, commit: str, seed: bytes, encode
         manager = directory / "manager"
         if directory.is_symlink() or not directory.is_dir() or {path.name for path in directory.iterdir()} != {"bundle", "manager"}:
             raise BundleError("release_standalone_input_invalid")
-        files = read_standalone_tree(bundle, seed, encoded)
+        files = read_standalone_tree(bundle, seed, encoded, source_executables)
         try:
             runtime = json.loads(files["runtime/runtime.json"][0])
             metadata = runtime_protocol.parse_runtime_metadata(
@@ -591,7 +612,10 @@ def build(args, encoded: str | None) -> dict:
     local_root = root / ".local"
     if local_root not in standalone_root.parents:
         raise BundleError("release_standalone_input_invalid")
-    inputs = standalone_inputs(standalone_root, version, commit, seed, encoded, runtime_protocol)
+    source_executables = {path for path, (_payload, executable) in files.items() if executable}
+    inputs = standalone_inputs(
+        standalone_root, version, commit, seed, encoded, runtime_protocol, source_executables
+    )
     epoch = release_epoch(root, commit)
     files["backend/build-info.json"] = (json_bytes({
         "version": version, "commit": commit, "dirty": False,

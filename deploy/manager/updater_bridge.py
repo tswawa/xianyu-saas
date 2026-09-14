@@ -29,6 +29,29 @@ _INTERNAL_ARGUMENTS = {
     "initialize": ("--initialize",),
     "resume": (),
 }
+_PATH_ENVIRONMENT_OVERRIDES = frozenset({"SAAS_DB", "SAAS_TENANTS_DIR"})
+
+
+def _environment_overrides(values: dict[str, str] | None) -> dict[str, str]:
+    result = {}
+    for name, raw in (values or {}).items():
+        value = str(raw)
+        path = Path(value)
+        if (
+            name not in _PATH_ENVIRONMENT_OVERRIDES or not value or "\x00" in value
+            or not path.is_absolute() or ".." in path.parts
+        ):
+            raise ManagerError("manager_internal_invalid")
+        result[name] = value
+    return result
+
+
+def _inherited_path_environment() -> dict[str, str]:
+    return _environment_overrides({
+        name: os.environ[name]
+        for name in _PATH_ENVIRONMENT_OVERRIDES
+        if os.environ.get(name)
+    })
 
 
 def updater_arguments(action: str, arguments: tuple[Path, ...] = ()) -> tuple[str, ...]:
@@ -53,6 +76,7 @@ def invoke_updater(
     arguments: tuple[Path, ...] = (),
     *,
     loader: Callable[[], object] = _load_updater,
+    environment_overrides: dict[str, str] | None = None,
 ) -> dict:
     argv = updater_arguments(action, arguments)
     root = resource_root()
@@ -82,8 +106,11 @@ def invoke_updater(
         "SAAS_UPDATE_PUBLIC_KEY_FILE": str(root / PUBLIC_KEY_RELATIVE),
         "SAAS_UPDATER_BUNDLE_ROOT": str(root),
         "SAAS_UPDATER_ENTRYPOINT": str(root / "deploy/updater/updater.py"),
+        "SAAS_ENV": "production",
         "SAAS_TESTING": "0",
     }
+    environment.update(_inherited_path_environment())
+    environment.update(_environment_overrides(environment_overrides))
     previous_argv = sys.argv
     previous_environment = {name: os.environ.get(name) for name in environment}
     try:

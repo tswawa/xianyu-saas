@@ -516,6 +516,26 @@ def install_dependencies(items: list[tuple[dict, dict, Path]], destination: Path
     return components
 
 
+def remove_runtime_terminfo(root: Path) -> None:
+    """Drop terminal databases that contain case-colliding Linux paths.
+
+    The standalone services do not launch interactive terminal applications, and
+    GitHub artifact transport cannot safely round-trip terminfo trees containing
+    names that differ only by case.  Remove only directories named ``terminfo``
+    below the bundled Python runtime; all other runtime data remains untouched.
+    """
+    for current, dirnames, _filenames in os.walk(root, topdown=True, followlinks=False):
+        current_path = Path(current)
+        for dirname in tuple(dirnames):
+            if dirname.casefold() != "terminfo":
+                continue
+            path = current_path / dirname
+            if path.is_symlink() or not path.is_dir():
+                raise StandaloneError("standalone_final_link_rejected")
+            shutil.rmtree(path)
+            dirnames.remove(dirname)
+
+
 def remove_caches(root: Path) -> None:
     directories = []
     for current, dirnames, filenames in os.walk(root, topdown=True, followlinks=False):
@@ -709,6 +729,7 @@ def build(args) -> Path:
             required_root=pbs_asset["archive_root"],
             materialize_symlinks=True,
         )
+        remove_runtime_terminfo(python_root)
         if not any(path in {"bin/python", "bin/python3", "python.exe"} or re.fullmatch(r"bin/python3\.[0-9]+", path) for path in extracted):
             raise StandaloneError("standalone_python_tree_invalid")
         dependency_data = {}

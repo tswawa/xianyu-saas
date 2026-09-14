@@ -44,7 +44,7 @@ def _absolute_path(value: str) -> PurePosixPath:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = SafeArgumentParser(prog="xianyu-saas-manager", allow_abbrev=False)
+    parser = SafeArgumentParser(prog="xianyu-saas", allow_abbrev=False)
     parser.add_argument("--version", action="version", version=MANAGER_VERSION)
     commands = parser.add_subparsers(dest="command", required=True, parser_class=SafeArgumentParser)
     install = commands.add_parser("install", allow_abbrev=False)

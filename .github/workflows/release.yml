@@ -26,9 +26,11 @@ jobs:
           - target: linux-x86_64
             architecture: x86_64
             runner: ubuntu-24.04
+            manager_platform: linux/amd64
           - target: linux-aarch64
             architecture: aarch64
             runner: ubuntu-24.04-arm
+            manager_platform: linux/arm64
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     permissions:
@@ -57,20 +59,31 @@ jobs:
           if actual != os.environ["EXPECTED_ARCHITECTURE"]:
               raise SystemExit(f"native architecture mismatch: {actual}")
           PY
-      - name: Install fixed manager build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes binutils
-          python -m pip install "pyinstaller==6.16.0" -r backend/requirements.txt
-      - name: Build bootstrap manager
+      - name: Build bootstrap manager on Debian 12
         env:
           TARGET: ${{ matrix.target }}
+          MANAGER_PLATFORM: ${{ matrix.manager_platform }}
+          MANAGER_BUILD_IMAGE: python:3.12.14-slim-bookworm@sha256:782412e85d0f0984994c290652577d4018aff08145c85b262bb63dc0c7522254
         run: |
-          python -m PyInstaller --clean --noconfirm \
-            --distpath ".local/manager/$TARGET/dist" \
-            --workpath ".local/manager/$TARGET/work" \
-            deploy/manager/xianyu-saas-manager.spec
-          install -Dm755 ".local/manager/$TARGET/dist/xianyu-saas" ".local/standalone/$TARGET/manager"
+          docker run --rm --platform "$MANAGER_PLATFORM" \
+            --env TARGET \
+            --env PYTHONDONTWRITEBYTECODE=1 \
+            --volume "$GITHUB_WORKSPACE:/workspace" \
+            --workdir /workspace \
+            "$MANAGER_BUILD_IMAGE" \
+            /bin/sh -eu -c '
+              apt-get update
+              apt-get install --yes --no-install-recommends binutils
+              rm -rf /var/lib/apt/lists/*
+              python -m pip install --no-cache-dir "pyinstaller==6.16.0" -r backend/requirements.txt
+              python -m PyInstaller --clean --noconfirm \
+                --distpath ".local/manager/$TARGET/dist" \
+                --workpath ".local/manager/$TARGET/work" \
+                deploy/manager/xianyu-saas-manager.spec
+              install -Dm755 ".local/manager/$TARGET/dist/xianyu-saas" ".local/standalone/$TARGET/manager"
+              ".local/standalone/$TARGET/manager" internal self-check > /tmp/manager-self-check.json
+            '
+          sudo chown -R "$(id -u):$(id -g)" ".local/manager/$TARGET" ".local/standalone/$TARGET"
       - name: Download exact locked wheels
         env:
           ARCHITECTURE: ${{ matrix.architecture }}

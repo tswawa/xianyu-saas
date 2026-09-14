@@ -584,6 +584,7 @@ def main() -> None:
         ],
     }
     with patch.dict(os.environ, {"SAAS_RELEASE_KIND": "standalone"}, clear=False), \
+         patch("platform_update.deployment_kind", return_value="systemd"), \
          patch("platform_update._standalone_target", return_value="linux-x86_64"), \
          patch("platform_update._standalone_asset_names", return_value=standalone_names):
         standalone_release = _parse_release(standalone_raw, "stable", deployment="systemd")
@@ -825,6 +826,7 @@ def main() -> None:
         b"MAINTENANCE_PROTOCOL = 1\n# changed after signing\n"
     )
     with patch.dict(os.environ, {"SAAS_RELEASES_DIR": str(portable_releases)}, clear=False), \
+         patch("platform_update.deployment_kind", return_value="systemd"), \
          trusted_rollback_fixture(portable_releases):
         rollback_candidates = available_rollback_versions("0.5.0")
     assert rollback_candidates == [{
@@ -843,7 +845,8 @@ def main() -> None:
         "SAAS_RELEASES_DIR": str(standalone_releases),
         "SAAS_CURRENT_ROOT": str(standalone_current),
         "SAAS_RELEASE_KIND": "standalone",
-    }, clear=False), patch.object(PLATFORM_UPDATE, "MAX_MANIFEST_BYTES", 64), \
+    }, clear=False), patch("platform_update.deployment_kind", return_value="systemd"), \
+         patch.object(PLATFORM_UPDATE, "MAX_MANIFEST_BYTES", 64), \
          trusted_rollback_fixture(standalone_releases):
         standalone_candidates = available_rollback_versions("0.5.0")
     assert standalone_candidates == [{
@@ -1014,12 +1017,12 @@ def main() -> None:
     materialized = updater.materialize_release(config, update_intent)
     assert materialized == releases / "0.2.0"
     updater.verify_existing_release(config, "0.2.0")
-    with trusted_rollback_fixture(releases):
+    with patch("platform_update.deployment_kind", return_value="systemd"), trusted_rollback_fixture(releases):
         assert available_rollback_versions("0.1.0") == [], "newer releases are not rollback targets"
     updater.switch_current(config, materialized)
     assert updater.current_release(config) == materialized.resolve()
     install_signed_release(releases / "0.0.6", "0.0.6", maintenance=False)
-    with trusted_rollback_fixture(releases):
+    with patch("platform_update.deployment_kind", return_value="systemd"), trusted_rollback_fixture(releases):
         rollback_candidates = available_rollback_versions("0.2.0")
     assert not any(x["version"] == "0.0.6" for x in rollback_candidates), "signed pre-maintenance code is not an automatic rollback baseline"
     assert rollback_candidates == [{"version": "0.1.0", "manifest_sha256": hashlib.sha256((old_release / CACHED_MANIFEST_FILE).read_bytes()).hexdigest()}]
