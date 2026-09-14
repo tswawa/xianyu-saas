@@ -32,7 +32,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from access import account_payload, has_permission, is_platform_admin, plan_for
-from account_storage import AccountStorage, AccountStorageError, DEFAULT_ACCOUNT_ID, normalize_account_key
+from account_storage import AccountStorage, AccountStorageError, AccountStorageRecoveryError, DEFAULT_ACCOUNT_ID, normalize_account_key
 from account_leases import AccountLease, AccountLeaseError, acquire_account_lease
 from fulfillment_config import (
     FulfillmentConfig, FulfillmentConfigError,
@@ -5327,19 +5327,16 @@ def _save_cards_locked(body: CardsIn, user, account):
     if not codes:
         codes = _read_codes(user["id"], account_key)
     try:
-        write_secret(
-            user["id"],
-            "redeem_codes.json",
-            json.dumps(codes, ensure_ascii=False),
-            account_key,
-        )
-        write_secret(
-            user["id"],
-            "card_pool.json",
-            json.dumps({"name": name, "note": note}, ensure_ascii=False),
-            account_key,
-        )
-    except OSError as error:
+        with AccountStorage().compensating_write(
+            user["id"], account_key, ("redeem_codes.json", "card_pool.json")
+        ) as write:
+            write("redeem_codes.json", json.dumps(codes, ensure_ascii=False))
+            write("card_pool.json", json.dumps({"name": name, "note": note}, ensure_ascii=False))
+    except AccountStorageRecoveryError as error:
+        raise HTTPException(
+            503, "卡密保存失败且旧数据未能恢复，请人工核对卡池文件后再操作"
+        ) from error
+    except (OSError, AccountStorageError) as error:
         raise HTTPException(503, "卡密保存失败，请稍后重试") from error
     payload = _cards_payload(codes, name=name, note=note)
     return {"ok": True, **payload}

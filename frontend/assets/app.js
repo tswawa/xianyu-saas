@@ -6866,6 +6866,7 @@
     messages: {
       loading: "正在获取版本与更新状态...", unchecked: "尚未检查更新", no_update: "当前已是最新版本，无需更新",
       updater_missing: "未检测到独立更新器，请参考文档为当前环境安装并启动更新组件", source_manual: "源码部署不支持网页自动升级，请拉取最新代码手动构建",
+      readiness_unknown: "当前环境暂不具备网页更新条件，具体原因未识别，请参考部署文档或联系维护者",
       preparing: "正在下载并校验升级制品，请稍候...", confirm_password: "升级需要验证管理员身份，请输入当前管理员密码", risk_required: "请勾选确认已知晓升级风险",
       reconnecting: "服务正在重启与健康检查，正在尝试重新连接...", completed: "系统升级已完成，请重新加载界面以应用最新资源", restored: "升级未完成，系统已安全回退至上一稳定版本",
       failed: "升级失败，请查看下方具体原因或服务端日志", probe_failed: "版本检查失败，无法连接到更新源", probe_cooldown: "检查过于频繁，请稍后再试",
@@ -6911,7 +6912,7 @@
       update_journal_invalid: "更新事务日志损坏或不合法", update_nonce_conflict: "更新凭据标识冲突，请重试", update_recovery_required: "系统处于异常恢复状态，请先执行故障恢复",
       update_current_missing: "未找到现役版本软链接", update_current_invalid: "现役版本软链接目标无效", update_archive_path_invalid: "升级归档包内路径不合法",
       update_runtime_path_rejected: "升级包内包含受保护或不允许的文件路径", update_lock_invalid: "更新锁文件无效", update_already_running: "已有更新任务正在运行中",
-      update_updater_not_initialized: "独立更新器尚未完成可信初始化，请先在服务端完成基线初始化", update_updater_identity_mismatch: "独立更新器文件身份与初始化记录不一致，已被系统拒绝",
+      update_installation_migration_required: "当前安装尚未满足受管更新要求，需先完成安装迁移后才能使用网页更新", update_updater_not_initialized: "独立更新器尚未完成可信初始化，请先在服务端完成基线初始化", update_updater_identity_mismatch: "独立更新器文件身份与初始化记录不一致，已被系统拒绝",
       update_compose_not_initialized: "Docker 更新器尚未完成 Compose 部署配置登记，请先在宿主机执行初始化登记", update_compose_unavailable: "Docker Compose 插件不可用或未正确安装", update_compose_version_mismatch: "Docker Compose 插件版本不符合要求（须为 5.5.1）",
       update_compose_registration_invalid: "Compose 部署登记记录格式无效或已损坏", update_compose_config_invalid: "Compose 配置文件格式无效或解析失败", update_compose_configuration_unsupported: "Compose 配置包含不受支持的拓扑结构、依赖或字段",
       update_compose_config_mismatch: "输入的 Compose 配置与当前运行的容器不匹配", update_compose_config_changed: "Compose 部署配置发生未登记的变更", update_compose_resource_changed: "数据卷、网络或挂载身份发生未登记的变更",
@@ -7064,7 +7065,7 @@
     text("#updateDeployment", UPDATE_UI_COPY.deployments[caps.deployment === "docker" ? "docker_compose" : caps.deployment] || UPDATE_UI_COPY.deployments.unknown);
     text("#updateReleaseNotes", session.stage?.release_notes || check.release_notes || state.version?.release_notes || "");
     let readiness = !session.docs.badgeLoaded ? UPDATE_UI_COPY.messages.loading : !updateActionAllowed("apply")
-      ? (caps.deployment === "source" ? UPDATE_UI_COPY.messages.source_manual : updateErrorMessage({ code: caps.reason || caps.error_code }, "updater_missing"))
+      ? (caps.deployment === "source" ? UPDATE_UI_COPY.messages.source_manual : updateErrorMessage({ code: caps.reason || caps.error_code }, "readiness_unknown"))
       : target ? "" : check.status === "current" ? UPDATE_UI_COPY.messages.no_update : UPDATE_UI_COPY.messages.unchecked;
     const probe = state.versionUpdate?.update_probe || state.version?.update_probe;
     if (probe?.state === "error") readiness = updateErrorMessage(probe, "probe_failed");
@@ -7416,8 +7417,8 @@
     if (rollbackBtn) {
       rollbackBtn.disabled = !canRollback;
       const caps = updateCapabilities();
-      if (!canRollback && caps.reason) {
-        rollbackBtn.title = updateErrorMessage({ code: caps.reason || caps.error_code }, "updater_missing");
+      if (!canRollback) {
+        rollbackBtn.title = updateErrorMessage({ code: caps.reason || caps.error_code }, "readiness_unknown");
       } else {
         rollbackBtn.removeAttribute("title");
       }

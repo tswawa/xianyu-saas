@@ -9,39 +9,55 @@
 ### 1. 基础环境
 - 安装 Docker 20.10+ 及 Docker Compose v2。
 
-### 2. 获取代码与配置环境
+### 2. 获取代码
 ```bash
 git clone https://github.com/tswawa/xianyu-saas.git /srv/xianyu-saas
 cd /srv/xianyu-saas
-
-# 复制生产环境变量模板
-cp config/saas.env.docker.example config/saas.env
 ```
 
-根据实际网络拓扑编辑 `config/saas.env`：
+### 3. 一键安装并验收（推荐）
+```bash
+sudo bash deploy/docker-install.sh
+```
+
+脚本在全新安装时按固定顺序完成：缺失时从示例创建 `config/saas.env`（0600，同时通过 `SAAS_ENV_FILE` 作为服务 env_file，`--env-file` 可同时替换插值与容器环境来源）；渲染 `docker-compose.yml` + `docker-compose.updates.yml` 并构建镜像；把仓库内置的 `deploy/update-signing.pub` 复制为容器内 root 拥有的本地副本（`./.local/docker-install/`）；仅为全新 `./data` 目录设置容器用户属主（非递归，不改动已有数据）；启动应用与独立更新器；等待容器和 `/health` 健康后执行一次性更新器登记；最后在应用容器内调用 `platform_update.update_capabilities()` 验收真实更新就绪能力。
+
+- **信任来源**：只信任当前源码检出自带的公钥；脚本不会从发布资产下载替换公钥。请通过 HTTPS 克隆官方仓库并核对来源后再运行；已登记部署若要更换公钥必须先人工处理，脚本不会静默替换。
+- **幂等与升级保护**：检测到受管安装（更新器容器、受管镜像或更新器私有卷）后不再构建；已由网页更新过的受管镜像不会被重建或降级。受管重跑只校验并启动既有容器（停止的容器用 `docker start` 保留原镜像与配置），缺失或部分状态会明确报错，不会补建、重新登记或删除任何东西。
+- **重跑不应用新配置**：受管重跑不会读取当前检出的 compose/env 变更应用到运行容器；调整端口、挂载、环境等需要人工维护。本地 compose 只用于解析项目与执行 `config`/`exec`。
+- **Linux 与本地引擎**：安装脚本只支持 Linux Bash 与本地 Linux Docker 引擎；不支持 `DOCKER_HOST`/远程 `DOCKER_CONTEXT`，请使用真实 Linux 路径（Windows 请用 WSL Linux 环境）。
+- **超时与诊断**：容器与更新就绪都有上限（默认 300 秒，可用 `--timeout` 调整）；失败信息包含安全的原因码，详细排查使用 `docker compose logs`。
+
+安装成功后可访问：
+- **Web 控制台访问入口**：`http://127.0.0.1:4173/xianyu-saas/`
+- **控制面健康检查接口**：`http://127.0.0.1:8096/health`
+
+根据实际网络拓扑编辑 `config/saas.env`（安装脚本只在缺失时创建）：
 - `SAAS_PUBLIC_ORIGIN`：本机测试使用 `http://127.0.0.1:4173`。经由 Nginx 等反向代理对外提供服务时，填写浏览器实际访问的完整来源（例如 `https://xianyu.example.com`，包含协议与端口，不带末尾路径）；
 - `SAAS_TRUSTED_HOSTS`：填写允许的 Host 列表，多个以英文逗号分隔（例如 `127.0.0.1:4173,xianyu.example.com`）；
 - `SAAS_COOKIE_SECURE`：对外启用 HTTPS 时设置为 `1`；纯 HTTP 内部调试设置为 `0`；
 - `SAAS_AI_MASTER_KEY`：填写用于服务端加密保存 API Key 的主密钥（32 字节随机值做标准 Base64 编码，编码后长度 44 字符，可通过命令 `python3 -c "import secrets, base64; print(base64.b64encode(secrets.token_bytes(32)).decode())"` 生成）；
+- 受管安装的重复执行只校验并启动既有容器，不会把当前检出或 `config/saas.env` 的新配置应用到运行容器；调整端口、挂载、环境等需要人工维护（必要时按维护窗口重建，并保留数据与更新器私有状态）。
 
-### 3. 构建与启动容器
+### 4. 手工源码开发与旧式启动
+不使用独立更新器、仅做本地源码开发时，仍可按原方式手工启动（此路径不安装网页升级能力）：
 ```bash
+cp config/saas.env.docker.example config/saas.env
 docker compose up -d --build
 ```
-
-- **Web 控制台访问入口**：`http://127.0.0.1:4173/xianyu-saas/`
-- **控制面健康检查接口**：`http://127.0.0.1:8096/health`
 - **业务数据持久化**：SQLite 数据库、店铺会话、配置文件与卡密库存统一挂载在宿主机 `./data` 目录，容器更新与镜像重建不丢失数据。
 
 服务默认绑定宿主机回环地址。如果需要远程访问，请通过受控反向代理（如 Nginx）暴露服务，并确保反代配置透传真实的 Host 与 Origin 请求头，浏览器访问地址必须与 `SAAS_PUBLIC_ORIGIN` 完全一致。
 
-### 4. 日志查看与停止服务
+### 5. 查看日志、暂停应用与恢复
 ```bash
-# 查看实时日志
-docker compose logs -f
+# 查看实时日志（config/saas.env 仅 root 可读，建议 sudo）
+sudo docker logs -f xianyu-saas
 
-# 停止容器运行
-docker compose down
+# 暂停应用，保留原容器、镜像和配置
+sudo docker stop xianyu-saas
+# 恢复既有受管容器并确认更新能力
+sudo bash deploy/docker-install.sh
 ```
 
 ---
@@ -112,7 +128,7 @@ ln -sfn /srv/xianyu-saas/runtime/worker-venv /srv/xianyu-saas/current/worker/.ve
 
 在 Windows 系统上，请使用 Docker Desktop 运行：
 
-- **Docker Desktop Compose 运行（推荐方式）**：安装 Windows 版 Docker Desktop 并启用 Docker Compose v2，按照方式一的 Docker Compose 流程启动与维护容器；
+- **推荐方式**：安装 Windows 版 Docker Desktop 并启用 Linux 容器模式，在 WSL2 的 Linux 环境（真实 Linux 路径）中克隆源码并执行 `sudo bash deploy/docker-install.sh`，按方式一的流程启动与验收容器。安装脚本只支持本地 Linux Docker 引擎与 Linux 路径语义，不支持在 PowerShell 或 Git Bash 中直接运行；
 - **运行限制说明**：Windows 宿主机通过 Docker Linux 容器运行完整后端；Worker 进程与控制面依赖 Linux 的 `resource` 模块、`/proc` 状态接口、`setsid` 会话隔离、`fcntl` 文件锁与 `prlimit`（`RLIMIT_AS`）资源配额限制，不支持 Windows 原生直接运行依赖上述特性的全部服务，请使用容器化方案运行。
 
 ---
@@ -151,18 +167,19 @@ ln -sfn /srv/xianyu-saas/runtime/worker-venv /srv/xianyu-saas/current/worker/.ve
    ```
 5. **注意事项**：业务数据存储以应用容器实际 `/data` 挂载为准（依据部署环境可能是本地 bind 挂载或具名卷 named volume，例如本机覆盖配置采用的具名卷），升级时严格保留该数据卷，禁止使用 `-v` 参数清理容器。因镜像基于本地源码构建，不可使用 `docker compose pull` 更新业务代码。
 
-#### 2. 独立 Docker 更新器组件（0.3.0 开发中能力）
-为支持网页管理员受控升级与可信校验，项目提供可选的独立更新器覆盖配置 `docker-compose.updates.yml`。该能力目前处于开发与离线单体测试阶段，所有真实 Docker Engine 动态验收测试仍未运行，不可标记为已通过。旧版（v0.2.0 与 v0.2.2）不具备本次受控更新能力，首次接入需要已经运行的新版应用容器与独立更新器。
+#### 2. 独立 Docker 更新器组件
+为支持网页管理员受控升级与可信校验，项目通过独立更新器覆盖配置 `docker-compose.updates.yml` 提供受控升级。推荐安装路径是 `deploy/docker-install.sh`：它统一完成镜像构建、公钥预装、一次性登记与就绪验收，重复执行不会重建或降级受管镜像。2026-09-14 已在独立 Linux Docker Engine 中验收实际应用的完整构建安装、网页资源与更新能力、运行中重跑和停止后恢复；另以签名测试应用验收升级、启动失败回退、配置和新增数据保留。该记录不代表真实业务店铺或线上发布验收。以下内容说明底层机制与手工接入边界；旧版（v0.2.0 与 v0.2.2）不具备本次受控更新能力，首次接入需要已经运行的新版应用容器与独立更新器。
 
 - **架构、工具链与权限隔离**：
   - **工具链版本规范**：更新器容器内 Docker CLI 保持 28.3.3，Buildx 保持 0.26.1（CLI 与 Buildx 均未升级）；仅通过单独官方固定的 `docker:29.8.0-cli` 构建阶段引入官方 Compose 5.5.1，并在镜像构建时严格校验插件版本；
   - **官方 Compose 执行层分工**：由官方 Compose 负责候选镜像构建、目标单应用服务（`--no-deps`）的停止、重建与失败时切回旧镜像；更新器保留签名校验、维护排空、执行状态及健康检查，不再复制全量业务数据或运行数据迁移预演。配置检查复用同一份运行配置摘要，不另存容器快照指纹；
   - **覆盖配置顺序规则**：`docker-compose.updates.yml` 必须置于所有用户本地覆盖文件之后最后叠加（`docker compose -f docker-compose.yml -f <用户覆盖配置> -f docker-compose.updates.yml ...`）。该文件仅补充受控更新所需字段，不强制 `container_name`，保留用户原有端口、数据卷、资源配额与 `extra_hosts`；文件内 `volumes: !override` 会替换前面的挂载列表，最终配置必须同时保有应用数据挂载（`/data`）、更新 IPC 卷与受信公钥，严禁将包含 `!override` 的自定义配置置于 `docker-compose.updates.yml` 之后；
-  - **公钥安全配置**：必须配置 `SAAS_UPDATE_PUBLIC_KEY_HOST_FILE` 指向宿主机预先可信安装的公钥文件；系统仅信任本地预装公钥，绝不自动信任远端随行下载的公钥；
+  - **公钥安全配置**：必须配置 `SAAS_UPDATE_PUBLIC_KEY_HOST_FILE` 指向宿主机预先可信安装的公钥文件，且该文件在容器内必须是 root 拥有、非符号链接且不可被 group/other 改写；系统仅信任本地预装公钥，绝不自动信任远端随行下载的公钥。`deploy/docker-install.sh` 默认把仓库内置的 `deploy/update-signing.pub` 复制成受管副本再挂载，因此操作者无需手工准备；手工接入时请自行保证上述属主与权限要求；
   - **Socket 挂载与权限事实**：Web 应用容器绝不挂载 Docker socket。仅独立更新器辅助容器（`xianyu-updater`）挂载宿主机 `/var/run/docker.sock`；挂载声明中的 `read_only: true` 属于文件系统挂载属性，更新器仍可通过 UNIX socket 通信调用 Docker 守护进程的高权限管理 API，更新器属于受信任的高权限核心组件；
   - **网络与权限收敛**：更新器容器不向外暴露任何网络端口与管理 API，使用 `network_mode: bridge` 保障 Buildx 客户端出站访问公开镜像仓库鉴权，丢弃多余 Linux 权限，Web 应用仅向受限的共享 IPC 卷提交请求。
 
 - **受控初始化与配置登记（Docker 子命令 `initialize`）**：
+  - **安装脚本已内置**：`deploy/docker-install.sh` 会使用同一组 `-p`、`--project-directory`、`--env-file` 与配置文件顺序自动执行下述登记，并在登记后等待真实更新就绪；下列手工命令用于自定义布局或人工排查，必须与安装脚本保持相同的参数与文件顺序；
   - **登记原理与凭据保护**：更新器依赖宿主机当前生效的完整 Compose 项目配置开展受控编排。解析后的配置 JSON 可能包含数据库密码或业务凭据，**严禁将其打印到终端、提交至代码仓库或记录到公开日志**。登记过程通过标准输入将原始字节流直接传递至更新器私有卷中安全保存，宿主机无需常驻额外守护进程、镜像仓库或管理面板；
   - **参数一致性要求**：调用端必须提供完整且两侧完全一致的 `-p <项目名>`、工作目录、`--env-file` 及所有配置文件列表（`updates` 覆盖文件位于最后），不得猜测项目名称或数据卷名称。输入配置与当前运行容器不匹配时（首次登记时同样执行严格比对），命令将直接报错中止。环境变量插值仅读取命令当前运行环境及 CLI `--env-file`，单纯服务内部的 `env_file` 指令不作为 `${...}` 的插值来源；
   - **标准登记执行命令**：
@@ -184,7 +201,7 @@ ln -sfn /srv/xianyu-saas/runtime/worker-venv /srv/xianyu-saas/current/worker/.ve
     docker compose "${COMPOSE_ARGS[@]}" config --format json | \
       docker compose "${COMPOSE_ARGS[@]}" exec -T xianyu-updater python docker_updater.py initialize
     ```
-  - **Windows 跨平台输入约束**：Windows 宿主机环境必须使用原生 Git Bash 执行管道传递，确保以原始 UTF-8 字节流传递 JSON，不得声称任意 PowerShell 文本管道均能安全可用（避免文本转码与回车换行损坏）；向容器传递 Linux 路径参数时须声明 `MSYS_NO_PATHCONV=1` 防止路径转换。若宿主机缺少 Docker Compose 插件，应按照官方文档安装，不可使用无法提供 compose 子命令的伪装配置；
+  - **非 Linux 宿主的输入约束**：Windows 等非 Linux 宿主必须通过 WSL2 的 Linux 环境与真实 Linux 路径执行，不要依赖 PowerShell/Windows 文本管道转换（避免文本转码与回车换行损坏）；`deploy/docker-install.sh` 已在 Linux 内完成登记管道，手工命令仅在自定义布局时使用，同样应在 Linux 环境中执行；若宿主机缺少 Docker Compose 插件，应按照官方文档安装，不可使用无法提供 compose 子命令的伪装配置；
   - **首次接入与配置漂移边界**：`initialize` 属于一次性受控登记命令，若更新器私有卷中已存在任何登记记录、操作日志（journal）或更新历史，命令均直接返回冲突并拒绝执行；系统未提供 `refresh` 或 `reconfigure` 命令。一旦部署配置、数据卷、网络或挂载身份发生未登记的配置漂移，系统将暂停网页升级并转交维护者排查重新接入；处理过程中**必须完整保留原私有状态、历史记录与备份，严禁删除私有卷强行绕过**；
 
 - **单应用依赖边界与操作限制**：

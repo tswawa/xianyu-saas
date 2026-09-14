@@ -17,6 +17,7 @@ import os
 import re
 import stat
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Union
 
@@ -37,6 +38,20 @@ _BytesLike = Union[bytes, bytearray, memoryview]
 
 class AccountStorageError(ValueError):
     """Raised when an account or storage path is invalid or unsafe."""
+
+
+class AccountStorageRecoveryError(AccountStorageError):
+    """Raised when a compensating write could not restore every snapshot.
+
+    ``files`` holds the single-component names whose saved state could not be
+    put back.  Callers must not report the original operation as saved or as
+    cleanly rolled back; the stored data needs manual inspection.
+    """
+
+    def __init__(self, files, errors=()):
+        self.files = tuple(str(name) for name in files)
+        self.errors = tuple(errors)
+        super().__init__("cannot restore storage files: " + ", ".join(self.files))
 
 
 def _root_path(value: str | os.PathLike[str] | None) -> Path:
@@ -305,6 +320,107 @@ class AccountStorage:
     # Concise alias for callers that keep the destination path themselves.
     atomic_write = atomic_write_path
 
+    @contextmanager
+    def compensating_write(self, user_id, account_id, names):
+        """Publish a small set of files, restoring snapshots on a caught error.
+
+        Snapshots (exact bytes, or absence) are captured through
+        :meth:`_file_path` before the caller writes anything, so an unsafe or
+        unreadable target aborts the block without touching any file.  The
+        caller writes only through the yielded ``write(name, content)``
+        callable.  If the block raises, every target that differs from its
+        snapshot is restored: saved bytes are rewritten, and a target that was
+        absent is removed only while it still holds this operation's payload
+        as a regular file.  Even when one restore fails the other targets are
+        still attempted, then :class:`AccountStorageRecoveryError` is raised
+        with the names that could not be restored.
+
+        This recovers from caught exceptions only.  It is not crash or
+        power-loss atomicity and it does not hide the first file from readers
+        while the second one is being written.
+        """
+        paths = {}
+        snapshots = {}
+        for name in names:
+            if name in paths:
+                raise AccountStorageError("duplicate file name")
+            path = self._file_path(user_id, account_id, name)
+            paths[name] = path
+            snapshots[name] = self._snapshot_file(path)
+        attempted = {}
+
+        def write(name, content):
+            path = paths.get(name)
+            if path is None:
+                raise AccountStorageError("file is not part of this write")
+            payload = _coerce_bytes(content)
+            attempted[name] = payload
+            return self.atomic_write_path(path, payload)
+
+        try:
+            yield write
+        except Exception as error:
+            failed = []
+            errors = []
+            for name, path in paths.items():
+                try:
+                    self._restore_file(path, snapshots[name], attempted.get(name))
+                except Exception as restore_error:
+                    failed.append(name)
+                    errors.append(restore_error)
+            if failed:
+                raise AccountStorageRecoveryError(failed, errors) from error
+            raise
+
+    def _snapshot_file(self, path: Path) -> bytes | None:
+        """Return the exact bytes of a regular storage file, or None if absent."""
+        try:
+            info = os.lstat(path)
+        except FileNotFoundError:
+            return None
+        except OSError as error:
+            raise AccountStorageError("cannot inspect storage file for recovery") from error
+        if not stat.S_ISREG(info.st_mode):
+            raise AccountStorageError("storage file must be a regular file")
+        try:
+            with path.open("rb") as stream:
+                return stream.read()
+        except OSError as error:
+            raise AccountStorageError("cannot read storage file for recovery") from error
+
+    def _restore_file(self, path: Path, original: bytes | None, attempted: bytes | None) -> None:
+        """Put one snapshot back, refusing unsafe or foreign content."""
+        _ensure_no_symlink_components(path.parent, self.root)
+        try:
+            info = os.lstat(path)
+        except FileNotFoundError:
+            info = None
+        except OSError as error:
+            raise AccountStorageError("cannot inspect storage file during recovery") from error
+        if info is not None and not stat.S_ISREG(info.st_mode):
+            raise AccountStorageError("storage file must be a regular file")
+        if original is None:
+            if info is None:
+                return
+            try:
+                with path.open("rb") as stream:
+                    current = stream.read()
+            except OSError as error:
+                raise AccountStorageError("cannot read storage file during recovery") from error
+            if attempted is None or current != attempted:
+                raise AccountStorageError("refusing to remove a file not created by this write")
+            path.unlink()
+            return
+        if info is not None:
+            try:
+                with path.open("rb") as stream:
+                    current = stream.read()
+            except OSError as error:
+                raise AccountStorageError("cannot read storage file during recovery") from error
+            if current == original:
+                return
+        self.atomic_write_path(path, original)
+
     def write_file(self, user_id, account_id, name, data, *, encoding: str = "utf-8") -> Path:
         return self.atomic_write_path(
             self._file_path(user_id, account_id, name), data, encoding=encoding
@@ -398,6 +514,7 @@ def atomic_write(
 __all__ = [
     "AccountStorage",
     "AccountStorageError",
+    "AccountStorageRecoveryError",
     "DEFAULT_ACCOUNT_ID",
     "DEFAULT_TENANTS_ROOT",
     "PRIVATE_DIR_MODE",

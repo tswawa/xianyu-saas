@@ -98,33 +98,35 @@
 
 ## 快速上手
 
-项目源码可通过 `git clone` 获取，也可从 [GitHub Releases](https://github.com/tswawa/xianyu-saas/releases) 下载包含完整构建文件与文档的官方源码包 `xianyu-saas-0.2.2-source.zip`（供 Docker 构建与手动部署；GitHub 自动生成的源码包缺少部分构建校验，建议优先使用官方附件）。
+以下安装入口以当前仓库完整源码为准；历史发布包不一定包含 `deploy/docker-install.sh`，请按下方命令获取源码。
 
 ### 方式一：Docker Compose 部署（推荐）
 
-该方式适用于 Linux 服务器或本地环境，容器内已预装全部运行环境。
+该方式适用于 Linux 服务器或 Docker Desktop 的 Linux 容器模式，容器内已预装全部运行环境。从官方仓库检出完整源码后，一条命令完成应用与独立更新器的安装：
 
 ```bash
 git clone https://github.com/tswawa/xianyu-saas.git
 cd xianyu-saas
 
-# 复制容器环境变量文件
-cp config/saas.env.docker.example config/saas.env
-
-# 构建并启动服务
-docker compose up -d --build
+# 安装、启动并以真实更新就绪能力验收
+sudo bash deploy/docker-install.sh
 ```
+
+脚本在全新安装时按顺序：缺失时从示例创建 `config/saas.env`；使用 `docker-compose.yml` 与 `docker-compose.updates.yml` 构建并启动应用与独立更新器；把仓库内置的 `deploy/update-signing.pub` 复制成容器内 root 拥有的本地副本；仅为全新 `./data` 目录设置容器用户属主；完成一次性更新器登记后，调用应用侧 `platform_update.update_capabilities()` 验收真正的更新就绪能力——不会仅凭 `/health` 成功就报告安装完成。
 
 - **访问地址**：`http://127.0.0.1:4173/xianyu-saas/`
-- **数据目录**：SQLite 数据库与各店铺配置文件默认保存在项目根目录的 `./data` 目录中。
+- **数据目录**：SQLite 数据库与各店铺配置文件默认保存在项目根目录的 `./data` 目录中；网页升级只切换镜像，不恢复或覆盖业务数据。
+- **信任来源**：只信任当前源码检出自带的公钥（`deploy/update-signing.pub`）；不会从发布资产自动下载替换公钥。请通过 HTTPS 克隆官方仓库并核对来源后再运行。
+- **重复执行**：脚本是幂等的；检测到已登记的受管安装后只校验并启动既有容器，不会重建或降级已由网页更新过的受管镜像，也不会删除更新器私有状态；本地 compose/环境文件变更不会被自动应用，需要人工维护。
 
-管理容器命令：
+查看应用日志、暂停应用与恢复（保留原容器）：
 ```bash
-docker compose logs -f
-docker compose down
+sudo docker logs -f xianyu-saas
+sudo docker stop xianyu-saas
+sudo bash deploy/docker-install.sh
 ```
 
-- **版本更新说明**：服务端默认每 6 小时低频探测新版本一次（全站共享数据库缓存，不自动静默安装），已登录页面在可见时每 5 分钟读取本地缓存并在版本徽标变黄提示。标准升级流程通过宿主机重新构建容器完成，详见 [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md)；新版本规划的独立更新器配置（`docker-compose.updates.yml`）支持带数据冷备与镜像回滚保护的受控升级（真实 Linux/Docker 端到端验收仍在等待隔离引擎环境）。
+- **版本更新说明**：服务端默认每 6 小时低频探测新版本一次（全站共享数据库缓存，不自动静默安装），已登录页面在可见时每 5 分钟读取本地缓存并在版本徽标变黄提示。通过上述安装脚本完成更新器登记后，管理员可在工作台内受控升级；升级执行与回滚边界详见 [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md)。
 
 ### 方式二：Linux 本地源码开发
 
@@ -151,7 +153,7 @@ npm run dev
 ### 方式三：Windows 环境部署
 
 在 Windows 系统上，请使用 Docker Desktop 运行：
-- 安装 Windows 版 Docker Desktop（开启 Compose v2 支持），在 PowerShell 或 Git Bash 中执行前述 Docker Compose 命令启动容器。
+- 安装 Windows 版 Docker Desktop 并启用 Linux 容器模式；必须在 WSL2 的 Linux 环境（真实 Linux 路径）中克隆源码并执行 `sudo bash deploy/docker-install.sh`，Docker Desktop 会复用同一 Linux 引擎。安装脚本只支持本地 Linux Docker 引擎与 Linux 路径语义，不支持在 PowerShell 或 Git Bash 中直接运行；
 - Windows 宿主机通过 Docker Linux 容器运行完整后端；Worker 及控制面依赖 Linux 内核接口（如 `fcntl`、`/proc`、`RLIMIT_AS`、`setsid` 等），不支持 Windows 原生直接运行全部服务。
 
 ---

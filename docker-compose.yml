@@ -13,7 +13,9 @@ services:
       - "127.0.0.1:4173:4173"
       - "127.0.0.1:8096:8096"
     env_file:
-      - config/saas.env
+      # 默认使用 config/saas.env；deploy/docker-install.sh 会用绝对路径导出
+      # SAAS_ENV_FILE，使 --env-file 同时作用于 Compose 插值与容器 env_file。
+      - ${SAAS_ENV_FILE:-config/saas.env}
     environment:
       SAAS_DB: /data/saas.db
       SAAS_TENANTS_DIR: /data/tenants

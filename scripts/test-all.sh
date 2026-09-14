@@ -17,6 +17,7 @@ npm run test:repository
 npm run test:syntax
 npm run test:auth
 npm run test:update
+npm run test:update-copy
 npm run test:release
 npm run test:settings
 npm run test:resources
@@ -36,7 +37,9 @@ npm run test:manual-reply
 npm run test:analytics
 npm run test:product-batch
 npm run test:templates-cards
+npm run test:card-pool-save
 npm run test:deploy
+npm run test:docker-install
 npm run test:worker
 npm run test:ui
 SAAS_UI_SCOPE=home-alerts npm run test:ui
