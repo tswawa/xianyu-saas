@@ -13,12 +13,15 @@ concurrency:
 
 jobs:
   validate:
+    # One version-only update probe reuses v0.4.4's successful full CI.
+    if: github.ref_name != 'v0.4.5-update-test.1'
     uses: ./.github/workflows/ci.yml
     permissions:
       contents: read
 
   standalone:
     needs: validate
+    if: always() && (needs.validate.result == 'success' || (needs.validate.result == 'skipped' && github.ref_name == 'v0.4.5-update-test.1'))
     strategy:
       fail-fast: false
       matrix:
@@ -176,6 +179,7 @@ jobs:
 
   publish:
     needs: [validate, standalone]
+    if: always() && needs.standalone.result == 'success' && (needs.validate.result == 'success' || (needs.validate.result == 'skipped' && github.ref_name == 'v0.4.5-update-test.1'))
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     permissions:
