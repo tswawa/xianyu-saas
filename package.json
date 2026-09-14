@@ -46,6 +46,6 @@
     "test:syntax": "python3 -m py_compile backend/*.py tests/*.py deploy/manager/*.py deploy/updater/updater.py scripts/build-release.py scripts/build-standalone.py scripts/verify-public-release.py worker/*.py worker/utils/*.py worker/scripts/*.py worker/tests/*.py && node --check frontend/assets/app.js && node --check scripts/dev-server.mjs && node --check tests/ui-check.mjs"
   },
   "devDependencies": {
-    "playwright": "1.55.1"
+    "playwright": "1.63.0"
   }
 }
