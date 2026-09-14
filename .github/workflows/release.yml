@@ -65,6 +65,7 @@ jobs:
           MANAGER_PLATFORM: ${{ matrix.manager_platform }}
           MANAGER_BUILD_IMAGE: python:3.12.14-slim-bookworm@sha256:782412e85d0f0984994c290652577d4018aff08145c85b262bb63dc0c7522254
         run: |
+          mkdir -p ".local/manager/$TARGET" ".local/standalone/$TARGET"
           docker run --rm --platform "$MANAGER_PLATFORM" \
             --env TARGET \
             --env PYTHONDONTWRITEBYTECODE=1 \
