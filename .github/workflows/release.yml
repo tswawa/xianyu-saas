@@ -74,7 +74,6 @@ jobs:
             /bin/sh -eu -c '
               apt-get update
               apt-get install --yes --no-install-recommends binutils
-              rm -rf /var/lib/apt/lists/*
               python -m pip install --no-cache-dir "pyinstaller==6.16.0" -r backend/requirements.txt
               python -m PyInstaller --clean --noconfirm \
                 --distpath ".local/manager/$TARGET/dist" \
