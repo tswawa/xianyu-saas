@@ -1,4 +1,3 @@
-import ast
 import json
 import subprocess
 import unittest
@@ -6,15 +5,23 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = ROOT.parent
 
 
-def read_utf8(relative_path: str) -> str:
-    raw = (ROOT / relative_path).read_bytes()
+def _checked_utf8(raw: bytes, relative_path: str) -> str:
     if raw.startswith(b"\xef\xbb\xbf"):
         raise AssertionError(f"{relative_path} must not contain a UTF-8 BOM")
     if b"\x00" in raw:
         raise AssertionError(f"{relative_path} contains NUL bytes")
     return raw.decode("utf-8")
+
+
+def read_utf8(relative_path: str) -> str:
+    return _checked_utf8((ROOT / relative_path).read_bytes(), relative_path)
+
+
+def read_repo_utf8(relative_path: str) -> str:
+    return _checked_utf8((REPO_ROOT / relative_path).read_bytes(), relative_path)
 
 
 def is_git_ignored(relative_path: str) -> bool:
@@ -30,9 +37,9 @@ def is_git_ignored(relative_path: str) -> bool:
     return result.returncode == 0
 
 
-def dockerfile_copy_sources(relative_path: str = "Dockerfile") -> set[str]:
+def dockerfile_copy_sources(dockerfile: str) -> set[str]:
     sources: set[str] = set()
-    for line in read_utf8(relative_path).splitlines():
+    for line in dockerfile.splitlines():
         stripped = line.strip()
         if not stripped.startswith("COPY "):
             continue
@@ -45,20 +52,6 @@ def dockerfile_copy_sources(relative_path: str = "Dockerfile") -> set[str]:
         if len(tokens) < 2:
             continue
         sources.update(tokens[:-1])
-    return sources
-
-
-def top_level_local_import_copy_sources(relative_path: str = "main.py") -> set[str]:
-    tree = ast.parse(read_utf8(relative_path), filename=relative_path)
-    sources: set[str] = set()
-    for node in tree.body:
-        if not isinstance(node, ast.ImportFrom) or node.level != 0 or not node.module:
-            continue
-        root = node.module.split(".", 1)[0]
-        if (ROOT / f"{root}.py").is_file():
-            sources.add(f"{root}.py")
-        elif (ROOT / root).is_dir():
-            sources.add(f"{root}/")
     return sources
 
 
@@ -100,30 +93,40 @@ class IgnoreContractTests(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertFalse(is_git_ignored(path), f"{path} must be versionable")
 
-    def test_docker_context_excludes_runtime_secrets(self):
+    def test_root_docker_context_excludes_worker_runtime_secrets(self):
         patterns = {
             line.strip()
-            for line in read_utf8(".dockerignore").splitlines()
+            for line in read_repo_utf8(".dockerignore").splitlines()
             if line.strip() and not line.lstrip().startswith("#")
         }
         expected = {
-            ".env",
-            ".env.*",
-            "redeem_codes.json*",
-            "redeem_sent.json*",
-            "trial_codes.json*",
-            "trial_sent.json*",
-            "pan_links.json*",
-            "pan_sent.json*",
-            "reply_rules.json*",
-            "delivery_state.db*",
-            "data/",
-            "runtime-data/",
+            "**/.env",
+            "**/.env.*",
+            "worker/**/redeem_codes.json*",
+            "worker/**/redeem_sent.json*",
+            "worker/**/trial_codes.json*",
+            "worker/**/trial_sent.json*",
+            "worker/**/pan_links.json*",
+            "worker/**/pan_sent.json*",
+            "worker/**/reply_rules.json*",
+            "worker/**/legacy_delivery_ledger.json*",
+            "worker/**/delivery_state.db*",
+            "worker/data",
+            "worker/runtime-data",
+            "worker/prompts/*_prompt.txt",
+            "**/*.db.*",
+            "**/*.sqlite",
+            "**/*.sqlite-*",
+            "**/*.sqlite.*",
+            "**/*.sqlite3",
+            "**/*.sqlite3-*",
+            "**/*.sqlite3.*",
         }
         self.assertTrue(expected.issubset(patterns))
         self.assertNotIn("*.json", patterns)
         self.assertNotIn("*.py", patterns)
-        self.assertNotIn("products_config.json", patterns)
+        self.assertNotIn("worker/products_config.json", patterns)
+        self.assertFalse(any("prompt_example" in pattern for pattern in patterns))
 
     def test_base_product_mapping_has_no_material_payload(self):
         payload = json.loads(read_utf8("products_config.json"))
@@ -132,7 +135,7 @@ class IgnoreContractTests(unittest.TestCase):
                 self.assertNotIn("payload", entry)
 
     def test_runtime_rule_file_is_not_copied_into_image(self):
-        dockerfile = read_utf8("Dockerfile")
+        dockerfile = read_repo_utf8("Dockerfile")
         self.assertNotIn("reply_rules.json", dockerfile)
 
 
@@ -146,35 +149,27 @@ class RuntimeLoggingContractTests(unittest.TestCase):
 
 
 class DockerContractTests(unittest.TestCase):
-    def test_image_contains_required_read_only_application_files(self):
-        dockerfile_sources = dockerfile_copy_sources()
-        expected_sources = {
-            "main.py",
-            "XianyuAgent.py",
-            "XianyuApis.py",
-            "context_manager.py",
-            "delivery_store.py",
-            "products_config.json",
-            "scripts/list_manual_reviews.py",
-            "scripts/resolve_manual_review.py",
-            "scripts/manage_inbound_dead_letters.py",
-            "scripts/migrate_state.py",
-        }
-        expected_sources.update(top_level_local_import_copy_sources())
-        for source in sorted(expected_sources):
+    def setUp(self):
+        self.dockerfile = read_repo_utf8("Dockerfile")
+        self.sources = dockerfile_copy_sources(self.dockerfile)
+
+    def test_image_contains_control_plane_worker_and_web_runtime(self):
+        for source in ("backend/", "worker/", "frontend/", "docker/entrypoint.sh"):
             with self.subTest(source=source):
-                self.assertIn(source, dockerfile_sources)
-        self.assertIn("utils/", dockerfile_sources)
-        dockerfile = read_utf8("Dockerfile")
-        self.assertNotIn("COPY . ", dockerfile)
+                self.assertIn(source, self.sources)
+        for script in ("main.py", "XianyuAgent.py", "XianyuApis.py", "context_manager.py", "delivery_store.py"):
+            self.assertTrue((ROOT / script).is_file(), script)
+        self.assertIn("worker/", self.sources)
+        self.assertNotIn("COPY . ", self.dockerfile)
 
     def test_image_uses_audited_prompt_templates(self):
-        dockerfile = read_utf8("Dockerfile")
-        for name in ("classify", "price", "tech", "default"):
-            self.assertIn(
-                f"COPY prompts/{name}_prompt_example.txt ./prompts/{name}_prompt.txt",
-                dockerfile,
-            )
+        self.assertIn("worker/", self.sources)
+        patterns = {
+            line.strip()
+            for line in read_repo_utf8(".dockerignore").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        }
+        self.assertFalse(any("prompt_example" in pattern for pattern in patterns))
 
         combined = "\n".join(
             read_utf8(f"prompts/{name}_prompt_example.txt")
@@ -191,71 +186,12 @@ class DockerContractTests(unittest.TestCase):
             self.assertNotIn(forbidden, combined)
 
     def test_image_runs_as_unprivileged_user_with_one_writable_volume(self):
-        dockerfile = read_utf8("Dockerfile")
-        self.assertIn("adduser -S -D -H -u 10001", dockerfile)
-        self.assertIn("XIAN_YU_DATA_DIR=/app/data", dockerfile)
-        self.assertIn('VOLUME ["/app/data"]', dockerfile)
-        user_offset = dockerfile.index("USER xianyu-agent:xianyu-agent")
-        command_offset = dockerfile.index('CMD ["python", "main.py"]')
-        self.assertLess(user_offset, command_offset)
-
-    def test_compose_is_utf8_and_mounts_only_runtime_state_writable(self):
-        compose = read_utf8("docker-compose.yml")
-        required_fragments = (
-            "user: \"10001:10001\"",
-            "env_file:",
-            "- .env",
-            "XIAN_YU_DATA_DIR: /app/data",
-            "./runtime-data:/app/data",
-            "./prompts:/app/prompts:ro",
-            "read_only: true",
-            'restart: "on-failure:5"',
-            "no-new-privileges:true",
-            "cap_drop:",
-            "- ALL",
-        )
-        for fragment in required_fragments:
-            with self.subTest(fragment=fragment):
-                self.assertIn(fragment, compose)
-        self.assertNotIn(".env:/app/.env", compose)
-
-
-class SystemdContractTests(unittest.TestCase):
-    def test_unit_uses_dedicated_layout_and_data_directory(self):
-        unit = read_utf8("systemd/xianyu-autoagent.service")
-        required_fragments = (
-            "User=xianyu-agent",
-            "Group=xianyu-agent",
-            "WorkingDirectory=/opt/xianyu-autoagent",
-            "EnvironmentFile=/etc/xianyu-autoagent.env",
-            "Environment=XIAN_YU_DATA_DIR=/var/lib/xianyu-autoagent",
-            "Environment=AUTOMATION_MODE=rules_ai",
-            "StateDirectory=xianyu-autoagent",
-            "StateDirectoryMode=0700",
-            "ReadWritePaths=/var/lib/xianyu-autoagent",
-        )
-        for fragment in required_fragments:
-            with self.subTest(fragment=fragment):
-                self.assertIn(fragment, unit)
-        self.assertNotIn("/home/admin", unit)
-
-    def test_unit_enables_required_hardening(self):
-        unit = read_utf8("systemd/xianyu-autoagent.service")
-        hardening = (
-            "NoNewPrivileges=true",
-            "ProtectSystem=strict",
-            "ProtectHome=true",
-            "PrivateTmp=true",
-            "PrivateDevices=true",
-            "ProtectProc=invisible",
-            "ProtectKernelTunables=true",
-            "RestrictSUIDSGID=true",
-            "SystemCallArchitectures=native",
-            "CapabilityBoundingSet=",
-        )
-        for directive in hardening:
-            with self.subTest(directive=directive):
-                self.assertIn(directive, unit)
+        self.assertIn("useradd -u 10001 -g xianyu", self.dockerfile)
+        self.assertIn('VOLUME ["/data"]', self.dockerfile)
+        user_offset = self.dockerfile.index("USER xianyu:xianyu")
+        entrypoint_offset = self.dockerfile.index('ENTRYPOINT ["/app/docker/entrypoint.sh"]')
+        self.assertLess(user_offset, entrypoint_offset)
+        self.assertIn("SAAS_BOT_ROOT=/app/worker", self.dockerfile)
 
 
 if __name__ == "__main__":

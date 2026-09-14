@@ -24,12 +24,35 @@ deploy
 !LICENSE
 !LICENSING.md
 !CHANGELOG.md
-backend/build-info.json
+# Release 源码包内的 backend/build-info.json 必须进入构建上下文：
+# 无 Git 检出时 Dockerfile 的 --write-build-info 会保留其中的同版本发布元数据。
 *.log
 *.db
 *.db-*
 config/saas.env
 worker/.env
+# Worker 运行期敏感文件与本地状态不得进入构建上下文；模板与示例保留。
+worker/data
+worker/logs
+worker/backups
+worker/images
+worker/prompts/*_prompt.txt
+worker/**/redeem_codes.json*
+worker/**/redeem_sent.json*
+worker/**/trial_codes.json*
+worker/**/trial_sent.json*
+worker/**/pan_links.json*
+worker/**/pan_sent.json*
+worker/**/reply_rules.json*
+worker/**/legacy_delivery_ledger.json*
+worker/**/delivery_state.db*
+**/*.db.*
+**/*.sqlite
+**/*.sqlite-*
+**/*.sqlite.*
+**/*.sqlite3
+**/*.sqlite3-*
+**/*.sqlite3.*
 # 本地更新 IPC、日志、备份和签名私钥绝不进入任一构建上下文。
 update-ipc
 updater-state

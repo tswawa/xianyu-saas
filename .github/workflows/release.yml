@@ -240,7 +240,8 @@ jobs:
           python scripts/build-release.py \
             --ref "$RELEASE_COMMIT" \
             --standalone-input-root .local/standalone-inputs \
-            --output ".local/releases/$RELEASE_VERSION"
+            --output ".local/releases/$RELEASE_VERSION" \
+            --notes-output ".local/releases/$RELEASE_VERSION-release-notes.md"
       - name: Validate complete signed release
         env:
           RELEASE_COMMIT: ${{ github.sha }}
@@ -268,8 +269,10 @@ jobs:
         run: |
           set -euo pipefail
           dir=".local/releases/$RELEASE_VERSION"
+          notes_file=".local/releases/$RELEASE_VERSION-release-notes.md"
+          test -s "$notes_file"
           assets=("$dir"/*)
-          test "${#assets[@]}" -eq 19
+          test "${#assets[@]}" -eq 14
           for asset in "${assets[@]}"; do test -s "$asset"; done
           prerelease=(--prerelease=false)
           latest=(--latest)
@@ -283,9 +286,9 @@ jobs:
               exit 1
             fi
             gh release upload "$RELEASE_TAG" "${assets[@]}" --repo "$GITHUB_REPOSITORY" --clobber
-            gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --title "$RELEASE_TAG" --notes-file "$dir/release-notes.md"
+            gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --title "$RELEASE_TAG" --notes-file "$notes_file"
           else
-            gh release create "$RELEASE_TAG" "${assets[@]}" --repo "$GITHUB_REPOSITORY" --draft --verify-tag --title "$RELEASE_TAG" --notes-file "$dir/release-notes.md" "${prerelease[@]}"
+            gh release create "$RELEASE_TAG" "${assets[@]}" --repo "$GITHUB_REPOSITORY" --draft --verify-tag --title "$RELEASE_TAG" --notes-file "$notes_file" "${prerelease[@]}"
           fi
           remote="$RUNNER_TEMP/verified-release"
           mkdir "$remote"

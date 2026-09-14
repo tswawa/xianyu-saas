@@ -12,6 +12,7 @@ import re
 import stat
 import sys
 import tarfile
+import tempfile
 import zipfile
 from pathlib import Path, PurePosixPath
 
@@ -23,7 +24,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "backend"))
 
-from docker_update_protocol import DockerUpdateError, docker_asset_names, verify_docker_manifest
+from docker_update_protocol import DockerUpdateError, docker_asset_names, extract_verified_source, verify_docker_manifest
 from standalone_runtime import (
     MANAGER_PROTOCOL,
     SUPPORTED_ARCHITECTURES,
@@ -43,6 +44,15 @@ VERSION_RE = re.compile(
     r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$"
 )
 REQUIRED_STANDALONE_ROOTS = frozenset({"backend", "frontend", "worker", "runtime", "manager"})
+REQUIRED_DOCKER_INSTALL_FILES = (
+    "Dockerfile",
+    "docker/entrypoint.sh",
+    "deploy/docker-install.sh",
+    "docker-compose.yml",
+    "docker-compose.updates.yml",
+    "config/saas.env.docker.example",
+    "deploy/update-signing.pub",
+)
 
 
 class VerificationError(RuntimeError):
@@ -112,17 +122,14 @@ def verify_signature(key: Ed25519PublicKey, payload: bytes, signature: bytes, co
 
 def expected_content(version: str) -> dict[str, dict]:
     base = f"xianyu-saas-{version}"
-    ota = (f"{base}.tar.gz", f"{base}.manifest.json", f"{base}.manifest.sig")
     docker = docker_asset_names(version)
     result = {
-        ota[0]: {"kind": "ota-archive", "target": "source"},
-        ota[1]: {"kind": "ota-manifest", "target": "source"},
-        ota[2]: {"kind": "ota-signature", "target": "source"},
         docker[0]: {"kind": "docker-source", "target": "docker"},
         docker[1]: {"kind": "docker-manifest", "target": "docker"},
         docker[2]: {"kind": "docker-signature", "target": "docker"},
-        f"{base}.update-signing.pub": {"kind": "update-public-key", "target": "all"},
-        "release-notes.md": {"kind": "release-notes", "target": "all"},
+        # The schema-1 runtime inventory stays published unsigned; the signed
+        # docker manifest binds it through runtime_manifest_sha256.
+        f"{base}.manifest.json": {"kind": "runtime-manifest", "target": "docker"},
     }
     for architecture in sorted(SUPPORTED_ARCHITECTURES):
         target = target_name(architecture)
@@ -204,37 +211,42 @@ def verify_tar(path: Path, expected: dict[str, dict], *, standalone: bool) -> di
 
 def verify_source_zip(path: Path, version: str) -> None:
     prefix = f"xianyu-saas-{version}/"
+    required = {f"{prefix}{name}" for name in REQUIRED_DOCKER_INSTALL_FILES}
     try:
         with zipfile.ZipFile(path) as archive:
             entries = archive.infolist()
             if not entries:
                 raise VerificationError("docker_source_invalid")
+            present = {}
             for entry in entries:
                 mode = entry.external_attr >> 16
                 if (not entry.filename.startswith(prefix) or entry.filename == prefix
                         or not stat.S_ISREG(mode) or "\\" in entry.filename
                         or any(part in {"", ".", ".."} for part in PurePosixPath(entry.filename).parts)):
                     raise VerificationError("docker_source_invalid")
+                if entry.filename in required:
+                    present[entry.filename] = entry.file_size
+            if set(present) != required or any(size <= 0 for size in present.values()):
+                raise VerificationError("docker_source_invalid")
     except VerificationError:
         raise
     except (OSError, zipfile.BadZipFile, OverflowError):
         raise VerificationError("docker_source_invalid") from None
 
 
-def verify_legacy(folder: Path, version: str, commit: str, key: Ed25519PublicKey, public_raw: bytes) -> None:
+def verify_docker(folder: Path, version: str, commit: str, public_raw: bytes) -> None:
+    """Verify the signed Docker descriptor, runtime inventory binding and source package."""
     base = f"xianyu-saas-{version}"
-    archive_name = f"{base}.tar.gz"
-    manifest_name = f"{base}.manifest.json"
-    signature_name = f"{base}.manifest.sig"
-    manifest, manifest_raw = json_value(folder / manifest_name, "release_manifest_invalid")
-    verify_signature(key, manifest_raw, (folder / signature_name).read_bytes(), "release_manifest_signature_invalid")
-    if (not isinstance(manifest, dict) or set(manifest) != {"schema", "version", "artifact", "artifact_sha256", "artifact_size", "files"}
-            or manifest.get("schema") != 1 or manifest.get("version") != version or manifest.get("artifact") != archive_name):
-        raise VerificationError("release_manifest_invalid")
-    record = asset_record(folder / archive_name)
-    if manifest.get("artifact_sha256") != record["sha256"] or manifest.get("artifact_size") != record["size"]:
-        raise VerificationError("release_manifest_invalid")
-    verify_tar(folder / archive_name, manifest_files(manifest.get("files"), "release_manifest_invalid"), standalone=False)
+    runtime_name = f"{base}.manifest.json"
+    runtime_manifest, runtime_raw = json_value(folder / runtime_name, "docker_runtime_manifest_invalid")
+    if (not isinstance(runtime_manifest, dict)
+            or set(runtime_manifest) != {"schema", "version", "artifact", "artifact_sha256", "artifact_size", "files"}
+            or runtime_manifest.get("schema") != 1 or runtime_manifest.get("version") != version
+            or runtime_manifest.get("artifact") != f"{base}.tar.gz"
+            or not SHA256_RE.fullmatch(str(runtime_manifest.get("artifact_sha256", "")))
+            or type(runtime_manifest.get("artifact_size")) is not int or runtime_manifest["artifact_size"] < 1):
+        raise VerificationError("docker_runtime_manifest_invalid")
+    runtime_files = manifest_files(runtime_manifest.get("files"), "docker_runtime_manifest_invalid")
     source_name, docker_manifest_name, docker_signature_name = docker_asset_names(version)
     docker_payload, docker_raw = json_value(folder / docker_manifest_name, "docker_manifest_invalid")
     try:
@@ -248,7 +260,35 @@ def verify_legacy(folder: Path, version: str, commit: str, key: Ed25519PublicKey
         raise VerificationError(exc.code) from None
     if parsed.commit != commit or docker_payload.get("commit") != commit:
         raise VerificationError("docker_manifest_invalid")
+    if hashlib.sha256(runtime_raw).hexdigest() != parsed.runtime_manifest_sha256:
+        raise VerificationError("docker_manifest_invalid")
+    source_record = asset_record(folder / source_name)
+    if source_record["sha256"] != parsed.source_sha256 or source_record["size"] != parsed.source_size:
+        raise VerificationError("docker_manifest_invalid")
     verify_source_zip(folder / source_name, version)
+    # ZIP metadata preserves Unix modes even when extracted on Windows.
+    with zipfile.ZipFile(folder / source_name) as archive:
+        source_modes = {entry.filename: entry.external_attr >> 16 for entry in archive.infolist()}
+    # Re-run the real protocol extractor and compare every runtime manifest
+    # record against the actual signed source payload (hash, size, executable).
+    try:
+        with tempfile.TemporaryDirectory(prefix="release-runtime-") as temporary:
+            source_root = extract_verified_source(folder / source_name, Path(temporary) / "source", parsed)
+            for item in runtime_files.values():
+                candidate = source_root.joinpath(*PurePosixPath(item["path"]).parts)
+                try:
+                    metadata = candidate.lstat()
+                except OSError:
+                    raise VerificationError("docker_runtime_manifest_invalid") from None
+                if (candidate.is_symlink() or not stat.S_ISREG(metadata.st_mode)
+                        or metadata.st_size != item["size"]
+                        or bool(source_modes.get(f"{base}/{item['path']}", 0) & 0o111) != item["executable"]
+                        or sha256_file(candidate) != item["sha256"]):
+                    raise VerificationError("docker_runtime_manifest_invalid")
+    except DockerUpdateError as exc:
+        raise VerificationError(exc.code) from None
+    except OSError:
+        raise VerificationError("docker_source_invalid") from None
 
 
 def verify_standalone(folder: Path, version: str, commit: str, architecture: str, key: Ed25519PublicKey) -> None:
@@ -296,7 +336,7 @@ def verify(folder: Path, version: str, commit: str, public_key_path: Path) -> di
     except OSError:
         raise VerificationError("release_directory_invalid") from None
     content = expected_content(version)
-    expected_names = set(content) | {"artifacts.json", "artifacts.json.sig", "SHA256SUMS"}
+    expected_names = set(content) | {"artifacts.json", "artifacts.json.sig"}
     actual_names = {path.name for path in folder.iterdir()}
     if actual_names != expected_names:
         raise VerificationError("release_asset_set_invalid")
@@ -323,23 +363,7 @@ def verify(folder: Path, version: str, commit: str, public_key_path: Path) -> di
         indexed[name] = item
     if set(indexed) != set(content):
         raise VerificationError("release_index_invalid")
-    try:
-        lines = (folder / "SHA256SUMS").read_text(encoding="utf-8").splitlines()
-        checksums = {}
-        for line in lines:
-            digest, name = line.split("  ", 1)
-            if name in checksums or not SHA256_RE.fullmatch(digest):
-                raise ValueError
-            checksums[name] = digest
-    except (OSError, UnicodeError, ValueError):
-        raise VerificationError("release_checksums_invalid") from None
-    expected_checksums = expected_names - {"SHA256SUMS"}
-    if set(checksums) != expected_checksums:
-        raise VerificationError("release_checksums_invalid")
-    for name, digest in checksums.items():
-        if sha256_file(folder / name) != digest:
-            raise VerificationError("release_checksums_invalid")
-    verify_legacy(folder, version, commit, key, public_raw)
+    verify_docker(folder, version, commit, public_raw)
     for architecture in sorted(SUPPORTED_ARCHITECTURES):
         verify_standalone(folder, version, commit, architecture, key)
     return {"schema": 1, "version": version, "commit": commit, "assets": len(expected_names)}

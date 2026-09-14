@@ -1,6 +1,8 @@
-# Ubuntu / Debian 开发环境搭建指南
+# Ubuntu / Debian 源码开发环境搭建指南
 
-本文档介绍如何在全新的 Ubuntu 或 Debian 系统上搭建 xianyu-saas 的本地源码开发与测试验证环境。
+本文档面向需要修改代码或调试系统的开发者，介绍如何在全新的 Ubuntu 或 Debian 系统上搭建 xianyu-saas 的本地源码开发与测试验证环境。
+
+> **普通用户安装入口提示**：若仅需部署和使用 xianyu-saas，请勿通过克隆源码搭建开发环境。普通用户请直接前往 [GitHub Releases](https://github.com/tswawa/xianyu-saas/releases) 下载对应架构的 Ubuntu 安装器（`xianyu-saas-<version>-linux-x86_64` 或 `xianyu-saas-<version>-linux-aarch64`）执行原生安装，或使用推荐的 Docker 部署。详见 [README.md](../README.md) 与 [DEPLOYMENT.md](DEPLOYMENT.md)。
 
 ## 1. 系统要求与工具准备
 

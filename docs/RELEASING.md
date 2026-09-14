@@ -1,108 +1,121 @@
 # 维护者发布指南
 
-本文档为项目维护者提供版本发布、签名打包与资产分发的操作规程。
+本文档为项目维护者提供版本发布、签名打包、CI 流水线及公开发布资产的核对规范。
 
 ## 1. 版本号一致性要求
 
-在准备发布新版本时，需确保以下文件中的版本与资产标识保持一致：
+准备发布新版本时，需确保以下文件中的版本号保持一致：
 
 - `package.json` 中的 `version` 字段；
-- `package-lock.json` 中的根 `version` 以及 `packages[""]["version"]`；
+- `package-lock.json` 中的根 `version` 与 `packages[""]["version"]`；
 - `backend/version.py` 中的 `VERSION` 常量；
-- 前端静态资产版本号：`backend/version.py` 中的 `ASSET_VERSION`、`frontend/assets/app.js` 中的 `ASSET_VERSION` 以及 `frontend/index.html` 中各静态资源链接的 `?v=` 查询串。
+- 前端静态资产标识：`backend/version.py` 的 `ASSET_VERSION`、`frontend/assets/app.js` 的 `ASSET_VERSION` 以及 `frontend/index.html` 中各静态资源链接的 `?v=` 参数。
 
-Docker 网页更新还会检查 `backend/version.py` 的 `UPDATE_DATA_VERSION`：相同的正整数表示这些版本能够双向读写同一份业务数据。数据库、配置或凭据格式发生不兼容变更时必须递增，不能重复使用旧值，并在发布说明中写明人工迁移步骤。标记缺失或不同会拒绝自动更新和回退；这是发布者的兼容性声明，不是对迁移脚本的自动证明。Docker 更新器不再自动冷备或预演全量业务数据，日常备份仍由部署者负责。
+`backend/version.py` 中的 `UPDATE_DATA_VERSION`：
+- 表示各版本能否双向兼容读写同一份业务数据（SQLite 数据库与存储目录）；
+- 数据库结构或存储格式不兼容时必须递增，并于发布说明写明人工迁移指引；
+- 相同版本号允许自动更新和回退；数值不匹配或缺失时，更新器拒绝自动更新并保持停机前状态；
+- Docker 升级不自动备份数据库，维护前需自行备份 `./data` 目录；Ubuntu 原生升级包含数据库备份步骤（数据保存在 `/var/lib/xianyu-saas`）。建议维护者日常做好冷备份。
 
-## 2. 发布前检查与门禁流程
+---
 
-1. **更新日志维护**：在 `CHANGELOG.md` 中添加对应版本的正式章节（例如 `## [<version>] - YYYY-MM-DD`），准确记录本次版本的新增功能、变更事项与问题修复；
-2. **本地测试验证**：运行全套测试套件并确保全部通过：
-   ```bash
-   npm test
-   python tests/repository-contract.py
-   git diff --check
-   ```
-3. **主分支 CI 验证**：将代码提交并推送到 `main` 分支，等待 GitHub Actions 的 `ci.yml` 工作流完整执行通过；
-4. **推送版本标签**：确认主分支 CI 通过后，创建并推送对应的版本标签：
-   ```bash
-   VERSION=0.2.2
-   git tag "v${VERSION}"
-   git push origin "v${VERSION}"
-   ```
+## 2. 自动化发布流水线
 
-## 3. 自动化发布流水线
+项目的持续发布由 GitHub Actions 工作流 [`.github/workflows/release.yml`](../.github/workflows/release.yml) 承载，在推送 `v*` 标签时触发。流水线分为三个串行阶段：
 
-GitHub Actions 工作流 [`.github/workflows/release.yml`](../.github/workflows/release.yml) 在检测到 `v*` 格式的标签推送时触发：
+### 阶段一：CI 自动化验证 (`validate`)
+复用 `.github/workflows/ci.yml`，执行自动化单元测试与仓库合规检查。
 
-1. **流水线复用**：首先调用 `.github/workflows/ci.yml` 复用全套自动化测试；
-2. **签名打包**：测试通过后，在 Ubuntu 环境下调用 `scripts/build-release.py`，从当前 commit 对应的 Git blob 构建签名发布包；
-3. **草稿发布与校验**：通过 GitHub CLI（`gh`）先创建 Draft Release，上传全套 8 项发布产物并校验文件非空，确认无误后正式发布。
+### 阶段二：原生运行时构建 (`standalone`)
+通过矩阵任务在 Ubuntu 24.04（x86_64）与 Ubuntu 24.04 ARM（aarch64）原生构建机上并行执行：
+1. **构建引导管理器**：在 Debian 12 容器（`python:3.12.14-slim-bookworm`）内使用 PyInstaller 构建对应架构的无后缀引导管理器可执行文件（`xianyu-saas`），并执行 `internal self-check`；
+2. **下载锁定依赖 Wheel**：读取 `deploy/runtime/backend.lock.json` 与 `worker.lock.json`，核验哈希并下载锁定的预编译依赖包；
+3. **构建运行时归档包**：运行 `scripts/build-standalone.py`，组合 Python 运行时、项目代码、依赖包及管理器；
+4. **运行时冒烟测试**：在宿主环境验证依赖完整性（`pip check`、核心模块导入、`ldd` 动态链接库检查）；
+5. **打包并上传未签名中间产物**：打包为 `standalone-<target>.tar` 供发布阶段使用。
 
-## 4. 签名密钥规范与安全存储
+### 阶段三：签名、验证与发布 (`publish`)
+在 Ubuntu 24.04 上执行最终打包与发布：
+1. 校验 Release Tag 与 `package.json` 版本号匹配；
+2. 解压两架构的未签名 standalone 中间产物；
+3. 执行发布契约测试：`docker-update-protocol-contract.py`、`standalone-build-contract.py`、`release-bundle-contract.py`；
+4. 调用 `scripts/build-release.py` 执行签名与打包；
+5. 调用 `scripts/verify-public-release.py` 在本地验证完整制品签名与清单一致性；
+6. 使用 GitHub CLI 创建 Draft Release，上传 14 项发布资产；
+7. 将远端资产下载至隔离临时目录，再次运行 `scripts/verify-public-release.py` 验证远端上传资产的完整性；
+8. 验证全部通过后，将 Draft 状态切换为正式发布（`draft=false`）。
 
-系统采用 Ed25519 算法对发布归档清单进行数字签名，确保 OTA 更新分发链路的完整性。
+---
+
+## 3. 签名密钥规范与安全约束
+
+系统采用 Ed25519 算法对发布资产清单进行数字签名，保证更新分发链路的真实性与完整性。
 
 ### 密钥规范
-- **环境变量名称**：`RELEASE_SIGNING_KEY`；
-- **私钥格式**：32 字节 Ed25519 随机种子经标准 Base64 编码（长度为 44 字符的标准 Base64 字符串，不采用 URL-safe 变体）；
-- **公钥文件**：公钥以 PEM 格式保存在公开仓库的 [`deploy/update-signing.pub`](../deploy/update-signing.pub) 中。
+- **环境变量**：`RELEASE_SIGNING_KEY`；
+- **私钥格式**：32 字节 Ed25519 随机种子经标准 Base64 编码（长度 44 字符，非 URL-safe 变体）；
+- **公钥文件**：PEM 格式公钥保存在仓库内 [`deploy/update-signing.pub`](../deploy/update-signing.pub)。
 
 ### 安全约束
-- 自动发版流水线直接读取 GitHub Actions Secret（`RELEASE_SIGNING_KEY`）；
-- 当前维护者若在本地保存离线凭据副本，可采用 Windows DPAPI 加密存储（绑定当前 Windows 操作系统账户，不提供跨机器恢复保证）。该加密方式属于当前维护者的本机保管方案，其他环境遵循各自平台的密钥安全规范即可；
-- 公开仓库与发布源码包严禁包含任何真实私钥或示例私钥文件；严禁擅自修改已发布的公钥。
+- GitHub Actions 流水线从 Repository Secret（`RELEASE_SIGNING_KEY`）读取私钥；
+- 代码仓库与发布资产中严禁包含任何私钥明文；
+- 验签公钥随安装包内置，程序不自动从远程下载替换本地受信公钥，也不提供动态替换公钥的途径。
 
-## 5. 本地构建与打包命令
+---
 
-在维护者本地或离线环境中执行签名打包时，使用以下命令：
+## 4. 本地构建与验证命令
+
+维护者在本地离线排查或构建发布包时，可使用以下命令：
 
 ```bash
-VERSION=0.2.2
-python scripts/build-release.py --ref HEAD --output ".local/releases/${VERSION}"
+# 准备环境变量（32 字节 Base64 编码私钥种子）
+export RELEASE_SIGNING_KEY="..."
+
+# 执行构建并签名（输出目录必须在 .local/releases/ 下）
+python scripts/build-release.py \
+  --ref HEAD \
+  --standalone-input-root .local/standalone-inputs \
+  --output ".local/releases/0.4.4" \
+  --notes-output ".local/releases/0.4.4-release-notes.md"
+
+# 验证发布资产完整性与数字签名
+python scripts/verify-public-release.py \
+  --directory ".local/releases/0.4.4" \
+  --version "0.4.4" \
+  --commit "$(git rev-parse HEAD)" \
+  --public-key deploy/update-signing.pub
 ```
 
-构建脚本执行以下约束校验：
-- 从环境变量 `RELEASE_SIGNING_KEY` 读取 Base64 编码的私钥种子；
-- 从指定 commit（例如 `HEAD`）内部读取 `deploy/update-signing.pub`，验证公私钥严格配对；
-- 检查已跟踪的工作区状态，若存在未提交的已跟踪修改则中止打包；
-- 输出目录必须位于已配置忽略的 `.local/releases/` 路径下，若目标目录已存在且非空则拒绝覆盖。
+---
 
-## 6. 发布产物清单
+## 5. 公开发布资产结构（共 14 项）
 
-### 已发布版本（v0.2.2 历史事实）
-历史发布的 `v0.2.2` 包含 8 项标准官方产物：
-1. `xianyu-saas-<version>.tar.gz`：OTA 升级归档，适配 systemd 更新器白名单规范；
-2. `xianyu-saas-<version>.manifest.json`：归档清单，记录 OTA 包元数据与文件哈希；
-3. `xianyu-saas-<version>.manifest.sig`：对 `manifest.json` 的 Ed25519 签名；
-4. `xianyu-saas-<version>-source.zip`：完整源码包，包含对应 Git commit 的全部源码、Docker 构建文件与文档；
-5. `xianyu-saas-<version>.update-signing.pub`：构建时从 commit 中提取的签名公钥副本；
-6. `release-notes.md`：从 `CHANGELOG.md` 中提取的当前版本更新说明；
-7. `artifacts.json`：构建元数据汇总文件，包含公钥指纹以及 6 项内容资产的大小与校验和；
-8. `SHA256SUMS`：包含 6 项内容资产与 `artifacts.json` 共 7 项文件的 SHA-256 校验清单，不包含自身散列。
+正式发布 Release 包含以下 14 项公开文件。签名和清单由安装程序与更新程序自动核验，正文仅突出三个供用户下载的入口：
 
-### 后续正式版本（0.3.0+ 规划）
-未来正式版本扩展为 10 项标准产物（新增 2 项 Docker 升级签名资产）：
-1. `xianyu-saas-<version>.tar.gz`
-2. `xianyu-saas-<version>.manifest.json`
-3. `xianyu-saas-<version>.manifest.sig`
-4. `xianyu-saas-<version>-source.zip`
-5. `xianyu-saas-<version>.docker.manifest.json`：Docker 升级清单，将完整源码包与构建输入绑定至版本、提交散列、源码哈希与尺寸；
-6. `xianyu-saas-<version>.docker.manifest.sig`：对 `docker.manifest.json` 的 Ed25519 签名；
-7. `xianyu-saas-<version>.update-signing.pub`
-8. `release-notes.md`
-9. `artifacts.json`：汇总 8 项内容资产元数据（含上述 2 项 Docker 资产）；
-10. `SHA256SUMS`：覆盖除自身外的全部 9 项文件的 SHA-256 校验清单。
+| 序号 | 文件名 | 归属类别 | 用途说明 |
+| --- | --- | --- | --- |
+| 1 | `xianyu-saas-<version>-source.zip` | Docker | **用户入口 1**：Docker 源码安装包（含安装脚本与构建依赖） |
+| 2 | `xianyu-saas-<version>.docker.manifest.json` | Docker | Docker 升级描述清单（绑定源码哈希与构建输入） |
+| 3 | `xianyu-saas-<version>.docker.manifest.sig` | Docker | Docker 升级清单的 Ed25519 数字签名 |
+| 4 | `xianyu-saas-<version>.manifest.json` | Docker | 运行时文件清单（由 Docker 清单通过哈希认证） |
+| 5 | `xianyu-saas-<version>-linux-x86_64` | Ubuntu x86_64 | **用户入口 2**：x86_64 引导管理器（无后缀可执行程序） |
+| 6 | `xianyu-saas-<version>-linux-x86_64.tar.gz` | Ubuntu x86_64 | x86_64 原生独立运行时压缩包 |
+| 7 | `xianyu-saas-<version>-linux-x86_64.manifest.json` | Ubuntu x86_64 | x86_64 运行时清单文件 |
+| 8 | `xianyu-saas-<version>-linux-x86_64.manifest.sig` | Ubuntu x86_64 | x86_64 运行时清单的 Ed25519 数字签名 |
+| 9 | `xianyu-saas-<version>-linux-aarch64` | Ubuntu ARM64 | **用户入口 3**：ARM64 引导管理器（无后缀可执行程序） |
+| 10 | `xianyu-saas-<version>-linux-aarch64.tar.gz` | Ubuntu ARM64 | ARM64 原生独立运行时压缩包 |
+| 11 | `xianyu-saas-<version>-linux-aarch64.manifest.json` | Ubuntu ARM64 | ARM64 运行时清单文件 |
+| 12 | `xianyu-saas-<version>-linux-aarch64.manifest.sig` | Ubuntu ARM64 | ARM64 运行时清单的 Ed25519 数字签名 |
+| 13 | `artifacts.json` | 发布索引 | 全量发布资产目录（Schema 2）、公钥指纹与散列汇总 |
+| 14 | `artifacts.json.sig` | 发布索引 | `artifacts.json` 的 Ed25519 数字签名 |
 
-### 指纹与完整性校验规则
-- `artifacts.json` 中的 `public_key_fingerprint` 定义为原始 32 字节 Ed25519 公钥二进制数据的 SHA-256 哈希（格式为 `sha256:<hex>`）。该指纹计算对象为解码后的原始公钥字节，不采用 PEM 文本文件的散列；
-- 下载发布资产的使用者可通过标准工具核验资产完整性：
-  ```bash
-  sha256sum -c SHA256SUMS
-  ```
+> **已清理的旧资产与更新通道说明**：外置独立公钥、独立 release-notes.md 与 SHA256SUMS 等重复校验附件已由 `artifacts.json` 及其签名归并；旧版源码 OTA（tar.gz 及其独立签名）通道停止发布，不再提供自动更新协议，既有依赖旧源码 OTA 的历史实例需由维护者人工迁移。
 
-## 7. 运行端更新与环境约束
+---
 
-- **systemd 部署模式**：运行端首次接入须由 root 使用生产虚拟环境 Python，依序完成独立更新器组件安装、离线基线导入（`--import-trusted-baseline` 传入刚好三个绝对资产路径，经本地预装公钥验签与 AST 静态语法核验 `MAINTENANCE_PROTOCOL=1`，不自动切换 current/不触碰业务数据）、人工切换现役软链接，以及通过显式受控环境变量执行 `--initialize`（配置 sticky `01770` 专用 IPC 目录并原子写入严格六字段的可信接入记录 `initialization.json`，校验 API 公钥、独立 bundle 固定 8 文件与 entrypoint，作为控制面放行升级的门禁）；实际路径需与服务模板及环境变量严格同步。本机仅静态与便携测试通过，真实 Linux/systemd 端到端动态验收仍在等待隔离验证环境；
-- **Docker 部署模式**：通用方式仍支持管理员在宿主机通过 `docker compose up -d --build` 手动构建升级；新规划的 `docker-compose.updates.yml` 独立更新器引入官方 Compose 5.5.1 执行层（Docker CLI 28.3.3 与 Buildx 0.26.1 保持固定），依赖 Docker Engine API v1.47，作为受信任的高权限组件挂载宿主机 Docker socket（`read_only` 属于文件系统挂载属性，更新器仍可借由 UNIX socket 调用高权限 Docker 引擎管理 API 完成镜像构建与重编排），Web 容器不挂载 socket。首次接入通过标准输入原字节向 `initialize` 子命令登记完整 Compose 配置，回滚支持重新创建旧版容器（容器 ID 可变，原配置与数据卷保持，绝不覆盖业务数据）。升级期间不支持并行执行外部容器变更，检测到配置漂移时保留维护现场转人工排查。所有真实 Linux/Docker 环境端到端验收仍在等待隔离引擎环境；
-- **生产环境验收**：代码与打包阶段的离线测试不能代替真实闲鱼账号会话、真实第三方大模型接口以及真实订单履约流程的现场验证；
-- **部署与权限参考**：完整的生产环境配置、数据卷挂载及权限要求参见 [`docs/DEPLOYMENT.md`](DEPLOYMENT.md)。
+## 6. 运行端与维护者边界说明
+
+- **安装入口与更新入口分离**：普通用户首次安装使用上述 3 个入口文件；已登记实例后续直接通过 Web 控制台执行网页更新；
+- **重复执行安装脚本**：`deploy/docker-install.sh` 具备幂等性，对已登记容器仅做校验和启动，不覆盖升级镜像，也不应用新环境变量；
+- **回滚与数据持久化**：升级失败时切回旧镜像重建容器，绝不覆盖业务数据；
+- **未覆盖场景说明**：目前已通过真实 Docker 安装、就绪验收、重跑与停止恢复，以及测试应用升级与回滚的验证；真实闲鱼店铺业务、旧版本直装迁移及正式 Release 浏览器点击升级仍待后续实际运行检验。

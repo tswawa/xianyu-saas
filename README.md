@@ -98,41 +98,84 @@
 
 ## 快速上手
 
-以下安装入口以当前仓库完整源码为准；历史发布包不一定包含 `deploy/docker-install.sh`，请按下方命令获取源码。
+项目提供两种生产部署方式：**Docker 部署（推荐）** 与 **Ubuntu 原生安装（支持 x86_64 与 ARM64）**。
+
+请从官方 [GitHub Releases](https://github.com/tswawa/xianyu-saas/releases) 下载固定版本的发布文件，普通用户无需使用 Git 克隆开发分支：
+
+| 部署方式 | 适用环境 | Release 下载入口 |
+| --- | --- | --- |
+| Docker 部署（推荐） | Linux 服务器、Docker Desktop + WSL2 | `xianyu-saas-<version>-source.zip` |
+| Ubuntu 原生安装（x86_64） | Ubuntu 22.04 / 24.04、Debian 12（x86_64） | `xianyu-saas-<version>-linux-x86_64` |
+| Ubuntu 原生安装（ARM64） | Ubuntu 22.04 / 24.04、Debian 12（ARM64） | `xianyu-saas-<version>-linux-aarch64` |
+
+> 提示：推荐下载项目发布的 `xianyu-saas-<version>-source.zip`。它包含构建元数据并与签名清单绑定；GitHub 自动打包的 Source code 不包含发布构建信息。其余清单与签名附件由安装程序和更新器自动调用，无需手动下载。
 
 ### 方式一：Docker Compose 部署（推荐）
 
-该方式适用于 Linux 服务器或 Docker Desktop 的 Linux 容器模式，容器内已预装全部运行环境。从官方仓库检出完整源码后，一条命令完成应用与独立更新器的安装：
+该方式适用于 Linux 服务器或 Windows 下的 Docker Desktop（需在 WSL2 Linux 文件系统中运行）。系统需具备 `curl`、`unzip`，以及支持 Engine API v1.47 的 Linux Docker Engine 与 Compose 插件。
+
+安装脚本在本地根据源码构建镜像，不提供预构建镜像，也不从公开镜像仓库拉取业务镜像。
 
 ```bash
-git clone https://github.com/tswawa/xianyu-saas.git
-cd xianyu-saas
+# 1. 从 GitHub Releases 下载版本化源码包（以 0.4.4 为例）
+curl -fLO https://github.com/tswawa/xianyu-saas/releases/download/v0.4.4/xianyu-saas-0.4.4-source.zip
 
-# 安装、启动并以真实更新就绪能力验收
+# 2. 解压并进入解压目录
+unzip -q xianyu-saas-0.4.4-source.zip
+cd xianyu-saas-0.4.4
+
+# 3. 执行安装脚本
 sudo bash deploy/docker-install.sh
 ```
 
-脚本在全新安装时按顺序：缺失时从示例创建 `config/saas.env`；使用 `docker-compose.yml` 与 `docker-compose.updates.yml` 构建并启动应用与独立更新器；把仓库内置的 `deploy/update-signing.pub` 复制成容器内 root 拥有的本地副本；仅为全新 `./data` 目录设置容器用户属主；完成一次性更新器登记后，调用应用侧 `platform_update.update_capabilities()` 验收真正的更新就绪能力——不会仅凭 `/health` 成功就报告安装完成。
-
 - **访问地址**：`http://127.0.0.1:4173/xianyu-saas/`
-- **数据目录**：SQLite 数据库与各店铺配置文件默认保存在项目根目录的 `./data` 目录中；网页升级只切换镜像，不恢复或覆盖业务数据。
-- **信任来源**：只信任当前源码检出自带的公钥（`deploy/update-signing.pub`）；不会从发布资产自动下载替换公钥。请通过 HTTPS 克隆官方仓库并核对来源后再运行。
-- **重复执行**：脚本是幂等的；检测到已登记的受管安装后只校验并启动既有容器，不会重建或降级已由网页更新过的受管镜像，也不会删除更新器私有状态；本地 compose/环境文件变更不会被自动应用，需要人工维护。
+- **数据目录**：SQLite 数据库与各店铺配置文件保存在项目根目录下的 `./data` 目录中。
+- **环境要求**：必须在本地 Linux 或 WSL2 Linux 文件系统中执行，不支持在 Windows PowerShell 或 Git Bash 中直接运行。在 Windows 上使用时，请安装 Windows 版 Docker Desktop 并启用 Linux 容器模式，在 WSL2 的 Linux 文件系统路径中下载解压并运行。Worker 及控制面依赖 Linux 内核接口（如 `fcntl`、`/proc`、`RLIMIT_AS`、`setsid` 等），不支持 Windows 原生直接运行全部服务。
+- **重复执行**：脚本具备幂等性。检测到已登记的受管安装后，仅校验并启动既有容器（`docker start`），不会重建镜像或覆盖现有业务数据；修改环境变量或 Compose 配置后，`docker start` 不会加载新配置，需由维护者按实际运行镜像、挂载和更新器登记关系人工维护，不能直接拿旧源码重新构建覆盖升级后的镜像。
 
-查看应用日志、暂停应用与恢复（保留原容器）：
+查看应用日志、暂停应用与恢复：
 ```bash
 sudo docker logs -f xianyu-saas
 sudo docker stop xianyu-saas
 sudo bash deploy/docker-install.sh
 ```
 
-- **版本更新说明**：服务端默认每 6 小时低频探测新版本一次（全站共享数据库缓存，不自动静默安装），已登录页面在可见时每 5 分钟读取本地缓存并在版本徽标变黄提示。通过上述安装脚本完成更新器登记后，管理员可在工作台内受控升级；升级执行与回滚边界详见 [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md)。
+- **版本更新说明**：通过上述安装脚本完成更新器登记后，管理员可在工作台内受控升级。升级只切换镜像，保留业务数据；失败自动回滚代码。Docker 升级时不自动备份数据库，维护前请自行备份 `./data` 目录。升级与回滚边界详见 [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md)。
 
-### 方式二：Linux 本地源码开发
+### 方式二：Ubuntu 原生安装（x86_64 / ARM64）
 
-适用于需要修改后端或前端源码的开发者。
+适用于直接使用 systemd 管理服务的 Ubuntu 22.04、24.04 或 Debian 12 系统。系统需具备 `systemd`、`systemd-analyze`、`useradd` 以及用于下载的 `curl`。
 
-系统要求：Linux（Ubuntu 22.04+ 或 Debian 12）、Python 3.10+、Node.js 20+、npm 10+。
+下载对应系统架构的管理器文件（无后缀可执行文件），择一执行：
+
+```bash
+# x86_64 架构：
+curl -fLO https://github.com/tswawa/xianyu-saas/releases/download/v0.4.4/xianyu-saas-0.4.4-linux-x86_64
+chmod +x xianyu-saas-0.4.4-linux-x86_64
+sudo ./xianyu-saas-0.4.4-linux-x86_64 install --version 0.4.4
+```
+
+```bash
+# ARM64 架构：
+curl -fLO https://github.com/tswawa/xianyu-saas/releases/download/v0.4.4/xianyu-saas-0.4.4-linux-aarch64
+chmod +x xianyu-saas-0.4.4-linux-aarch64
+sudo ./xianyu-saas-0.4.4-linux-aarch64 install --version 0.4.4
+```
+
+- **访问地址**：`http://127.0.0.1:8096/xianyu-saas/`
+- **数据与配置**：数据保存在 `/var/lib/xianyu-saas`，配置文件位于 `/etc/xianyu-saas.env`。
+- **系统服务**：安装后由 systemd 管理 `xianyu-saas.service`、`xianyu-saas-consumer.service`、`xianyu-saas-updater.service` 与 `xianyu-saas-updater.path`。
+- **日常维护**：安装完成后直接使用系统已注册的管理器命令进行维护：
+  ```bash
+  sudo xianyu-saas status
+  sudo xianyu-saas restart
+  sudo xianyu-saas doctor
+  ```
+- **说明**：管理器文件本身是独立的引导安装程序，不是包含全量依赖的离线大包；执行时会拉取并校验签名运行包。升级时原生更新器包含数据库备份步骤。
+
+### 源码开发指南（仅限开发者）
+
+适用于需要修改后端或前端源码的开发者：
 
 ```bash
 git clone https://github.com/tswawa/xianyu-saas.git
@@ -141,20 +184,11 @@ cd xianyu-saas
 # 初始化 Python 虚拟环境与前端开发环境
 ./scripts/bootstrap-dev.sh
 
-# 可选：仅在需要运行端到端浏览器测试时安装 Chromium
-npx playwright install --with-deps chromium
-
 # 启动全栈开发服务
 npm run dev
 ```
 
-如需在 Linux 服务器上以独立守护进程模式部署生产环境，请参阅 [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) 配置 systemd 与 Nginx 服务。生产环境直接由 Nginx 承载静态资源，无需在服务器安装 Node.js 或 Chromium。
-
-### 方式三：Windows 环境部署
-
-在 Windows 系统上，请使用 Docker Desktop 运行：
-- 安装 Windows 版 Docker Desktop 并启用 Linux 容器模式；必须在 WSL2 的 Linux 环境（真实 Linux 路径）中克隆源码并执行 `sudo bash deploy/docker-install.sh`，Docker Desktop 会复用同一 Linux 引擎。安装脚本只支持本地 Linux Docker 引擎与 Linux 路径语义，不支持在 PowerShell 或 Git Bash 中直接运行；
-- Windows 宿主机通过 Docker Linux 容器运行完整后端；Worker 及控制面依赖 Linux 内核接口（如 `fcntl`、`/proc`、`RLIMIT_AS`、`setsid` 等），不支持 Windows 原生直接运行全部服务。
+详细本地开发指南参见 [`docs/NEW_UBUNTU_HANDOFF.md`](docs/NEW_UBUNTU_HANDOFF.md)。
 
 ---
 
@@ -162,7 +196,7 @@ npm run dev
 
 系统默认配置（`SAAS_BOOTSTRAP_ENABLED=0`）首次创建管理员流程如下：
 
-1. **注册首位管理员**：首次启动后，访问 `http://127.0.0.1:4173/xianyu-saas/`，数据库为空时页面会自动显示「创建首个管理员账号」。在此处填写管理员用户名并设置不少于 12 位的密码。该首次注册不受 `SAAS_ALLOW_REGISTRATION=0` 的限制。
+1. **注册首位管理员**：首次启动后，访问 `http://127.0.0.1:4173/xianyu-saas/`（Docker）或 `http://127.0.0.1:8096/xianyu-saas/`（Ubuntu 原生），数据库为空时页面会自动显示「创建首个管理员账号」。在此处填写管理员用户名并设置不少于 12 位的密码。该首次注册不受 `SAAS_ALLOW_REGISTRATION=0` 的限制。
 2. **初始化数据**：提交后创建管理员账号、默认店铺与基础配置。支持接纳空目录与纯默认残留，拒绝已有业务数据或损坏配置，接入并发回滚保护。权限边界保持独立不变。初始化成功后自动登录。
 3. **安全提示**：空数据库允许首次访问者创建管理员。在将服务公开暴露到公网之前，必须先在本地或受信网络中完成首位管理员注册。
 4. **后续注册限制**：首位管理员创建完成后，后续公开注册默认关闭。若需允许其他用户注册，必须在环境变量中设置 `SAAS_ALLOW_REGISTRATION=1`，同时在工作台系统设置中打开注册开关。
@@ -217,7 +251,7 @@ docs/                 部署指南、权限模型与系统架构设计文档
 ### 安装与部署
 - [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md)：生产环境部署指南（Docker Compose 与 systemd 守护进程）。
 - [`docs/ACCESS_MODEL.md`](docs/ACCESS_MODEL.md)：账号角色、数据隔离与权限边界说明。
-- [`docs/NEW_UBUNTU_HANDOFF.md`](docs/NEW_UBUNTU_HANDOFF.md)：Ubuntu / Debian 源码开发环境搭建指南。
+- [`docs/NEW_UBUNTU_HANDOFF.md`](docs/NEW_UBUNTU_HANDOFF.md)：Ubuntu / Debian 源码开发环境搭建指南（仅限开发者）。
 
 ### 架构与开发
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)：系统架构设计、进程模型与数据流说明。
@@ -226,10 +260,8 @@ docs/                 部署指南、权限模型与系统架构设计文档
 - [`CONTRIBUTING.md`](CONTRIBUTING.md)：代码贡献规范与本地回归测试门禁。
 - [`.github/PULL_REQUEST_TEMPLATE.md`](.github/PULL_REQUEST_TEMPLATE.md)：Pull Request 提交模板与自查清单。
 
-### 历史与规划
+### 版本与发布
 - [`CHANGELOG.md`](CHANGELOG.md)：版本变更与发布历史记录。
-- [`docs/PLAN.md`](docs/PLAN.md)：系统里程碑与功能演进计划。
-- [`docs/BACKEND-ROADMAP.md`](docs/BACKEND-ROADMAP.md)：后端核心能力演进路线。
 - [`docs/PUBLIC_RELEASE_CHECKLIST.md`](docs/PUBLIC_RELEASE_CHECKLIST.md)：开源发布前检查清单。
 - [`docs/RELEASING.md`](docs/RELEASING.md)：版本发布与构建维护指南。
 

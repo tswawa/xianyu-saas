@@ -136,6 +136,8 @@ for relative in PORTABLE_PATHS:
             text = path.read_text(encoding="utf-8")
         except UnicodeDecodeError:
             continue
+        # Standard application/updater paths are portable, unlike private host paths.
+        text = re.sub(r"/var/lib/xianyu-(?:saas|updater)(?=$|[/\s`'\"，。；）)])", "<application-state>", text)
         for fragment in HOST_SPECIFIC_PATHS:
             assert fragment not in text, f"host-specific path in {path.relative_to(ROOT)}: {fragment}"
 

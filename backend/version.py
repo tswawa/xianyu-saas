@@ -10,8 +10,8 @@ from pathlib import Path
 
 
 # Must match package.json; image builds validate this before publication.
-VERSION = "0.4.3"
-ASSET_VERSION = "20260913-02"
+VERSION = "0.4.4"
+ASSET_VERSION = "20260914-01"
 RELEASE_CHANNEL = "release"
 # Same value promises bidirectional data compatibility for Docker updates.
 # Increment for breaking database, configuration or credential format changes.
@@ -43,6 +43,28 @@ def _build_time(value) -> str:
     except (TypeError, ValueError):
         pass
     return ""
+
+
+def _merged_build_info(existing: dict, commit: str, dirty: bool | None, build_time: str) -> dict:
+    """Merge build arguments with same-version packaged metadata.
+
+    A Release source ZIP ships ``backend/build-info.json`` with release
+    provenance, but the Dockerfile runs ``--write-build-info`` in an image
+    without a Git checkout. Explicit ``SAAS_BUILD_COMMIT``/``SAAS_BUILD_DIRTY``
+    arguments always win; when they are absent or unknown, valid same-version
+    packaged fields are retained instead of being erased. The existing file is
+    parsed as JSON only, never executed, and its presence is not a trust claim.
+    """
+    if commit:
+        return {"version": VERSION, "commit": commit, "build_time": build_time, "dirty": dirty}
+    retained = existing if isinstance(existing, dict) else {}
+    retained_dirty = retained.get("dirty") if isinstance(retained.get("dirty"), bool) else None
+    return {
+        "version": VERSION,
+        "commit": _commit(retained.get("commit")),
+        "build_time": _build_time(retained.get("build_time")) or build_time,
+        "dirty": dirty if dirty is not None else retained_dirty,
+    }
 
 
 _INFO = _build_info()
@@ -94,10 +116,11 @@ if __name__ == "__main__":
     package = json.loads((ROOT / "package.json").read_text(encoding="utf-8"))
     if package.get("version") != VERSION:
         raise SystemExit("package.json and backend/version.py versions must match")
-    dirty = os.environ.get("SAAS_BUILD_DIRTY", "unknown").strip().lower()
-    BUILD_INFO_FILE.write_text(json.dumps({
-        "version": VERSION,
-        "commit": _commit(os.environ.get("SAAS_BUILD_COMMIT")),
-        "build_time": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "dirty": True if dirty == "true" else False if dirty == "false" else None,
-    }, sort_keys=True) + "\n", encoding="utf-8")
+    dirty_value = os.environ.get("SAAS_BUILD_DIRTY", "unknown").strip().lower()
+    record = _merged_build_info(
+        _build_info(),
+        _commit(os.environ.get("SAAS_BUILD_COMMIT")),
+        True if dirty_value == "true" else False if dirty_value == "false" else None,
+        datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    )
+    BUILD_INFO_FILE.write_text(json.dumps(record, sort_keys=True) + "\n", encoding="utf-8")

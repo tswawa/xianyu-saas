@@ -22,6 +22,7 @@ import tarfile
 import tempfile
 import types
 import unicodedata
+import uuid
 import zipfile
 import zlib
 from dataclasses import dataclass
@@ -82,6 +83,15 @@ SECRET_PATTERNS = (
     re.compile(rb"sk-(?!linking-protocols-exception(?:[^A-Za-z0-9_-]|$))[A-Za-z0-9_-]{24,}"),
 )
 REQUIRED_LICENSES = ("LICENSE", "worker/LICENSE", "worker/NOTICE.md", "frontend/assets/OFL-NotoSansSC.txt")
+REQUIRED_DOCKER_INSTALL_FILES = (
+    "Dockerfile",
+    "docker/entrypoint.sh",
+    "deploy/docker-install.sh",
+    "docker-compose.yml",
+    "docker-compose.updates.yml",
+    "config/saas.env.docker.example",
+    "deploy/update-signing.pub",
+)
 PUBLIC_RUNTIME_LOCKS = frozenset({
     "deploy/runtime/backend.lock.json",
     "deploy/runtime/python-build-standalone.lock.json",
@@ -198,6 +208,7 @@ def load_protocol(source: bytes):
         "MAX_STANDALONE_FILE_BYTES", "MAX_ARCHIVE_MEMBERS", "MAX_STANDALONE_ARCHIVE_MEMBERS", "MAX_RELEASE_NOTES_CHARS",
         "MAX_PATH_LENGTH", "MAX_PATH_COMPONENT", "SEMVER_RE", "SHA256_RE",
         "ALLOWED_TOP_LEVEL_DIRS", "ALLOWED_ROOT_FILES", "FORBIDDEN_PATH_PARTS",
+        "RELEASE_OWNER", "RELEASE_REPOSITORY",
     }
     definitions = {
         "PlatformUpdateError", "SemVer", "ReleaseAsset", "ReleaseInfo", "ManifestFile",
@@ -280,6 +291,85 @@ def release_version(files: dict, protocol) -> str:
         raise BundleError("release_version_invalid") from None
 
 
+RELEASE_GUIDE_TEMPLATE = """# xianyu-saas {version} 发布说明
+
+官方仓库：https://github.com/tswawa/xianyu-saas
+
+本版本提供 Docker（推荐）与 Ubuntu 原生安装两种方式。普通用户通过下方下载入口安装即可；其余附件由安装器和更新器自动调用，无需手动下载。
+
+## 用户下载入口
+
+| 部署方式 | 适用环境 | 下载文件 |
+| --- | --- | --- |
+| Docker 部署（推荐） | Linux 服务器、Docker Desktop + WSL2 | [`xianyu-saas-{version}-source.zip`](https://github.com/tswawa/xianyu-saas/releases/download/v{version}/xianyu-saas-{version}-source.zip) |
+| Ubuntu 原生安装（x86_64） | Ubuntu 22.04 / 24.04、Debian 12（x86_64） | [`xianyu-saas-{version}-linux-x86_64`](https://github.com/tswawa/xianyu-saas/releases/download/v{version}/xianyu-saas-{version}-linux-x86_64) |
+| Ubuntu 原生安装（ARM64） | Ubuntu 22.04 / 24.04、Debian 12（ARM64） | [`xianyu-saas-{version}-linux-aarch64`](https://github.com/tswawa/xianyu-saas/releases/download/v{version}/xianyu-saas-{version}-linux-aarch64) |
+
+> 提示：推荐下载项目发布的 `xianyu-saas-{version}-source.zip`。它包含构建元数据并与签名清单绑定；GitHub 自动打包的 Source code 不包含发布构建信息。
+
+---
+
+## 首次安装
+
+### 1. Docker 部署（推荐）
+
+系统需具备 `curl`、`unzip`，以及支持 Engine API v1.47 的 Linux Docker Engine 与 Compose 插件。在本地 Linux 终端或 WSL2 Linux 文件系统中执行：
+
+```bash
+curl -fLO https://github.com/tswawa/xianyu-saas/releases/download/v{version}/xianyu-saas-{version}-source.zip
+unzip -q xianyu-saas-{version}-source.zip
+cd xianyu-saas-{version}
+sudo bash deploy/docker-install.sh
+```
+
+- **访问地址**：`http://127.0.0.1:4173/xianyu-saas/`
+- **数据路径**：业务数据保存在项目目录下的 `./data`
+
+---
+
+### 2. Ubuntu 原生安装（x86_64 与 ARM64 择一执行）
+
+支持 Ubuntu 22.04、24.04 及 Debian 12。系统需具备 `systemd`、`systemd-analyze`、`useradd` 和 `curl`。根据机器架构选择对应的安装命令执行：
+
+**x86_64 架构：**
+```bash
+curl -fLO https://github.com/tswawa/xianyu-saas/releases/download/v{version}/xianyu-saas-{version}-linux-x86_64
+chmod +x xianyu-saas-{version}-linux-x86_64
+sudo ./xianyu-saas-{version}-linux-x86_64 install --version {version}
+```
+
+**ARM64 架构：**
+```bash
+curl -fLO https://github.com/tswawa/xianyu-saas/releases/download/v{version}/xianyu-saas-{version}-linux-aarch64
+chmod +x xianyu-saas-{version}-linux-aarch64
+sudo ./xianyu-saas-{version}-linux-aarch64 install --version {version}
+```
+
+- **访问地址**：`http://127.0.0.1:8096/xianyu-saas/`
+- **数据路径**：数据保存在 `/var/lib/xianyu-saas`，配置文件位于 `/etc/xianyu-saas.env`
+- **日常维护**：安装后使用统一的 `sudo xianyu-saas status`、`start`、`stop`、`restart`、`doctor` 管理服务
+
+---
+
+## 已有用户更新
+
+- **网页更新**：已完成登记的 Docker 与 Ubuntu 实例，在网页控制台的版本更新页面执行升级。升级只切换代码与镜像，保留业务数据；若启动失败自动回滚代码。
+- **Docker 重复运行**：对已登记的 Docker 实例，重复执行 `deploy/docker-install.sh` 只会检查并启动现有容器，不会重建镜像、不加载本地新配置，也不会覆盖业务数据。常规暂停只需 `docker stop xianyu-saas`，恢复直接重新运行安装脚本。Docker 升级时不自动备份数据库，维护前请自行备份 `./data` 目录。
+- **Ubuntu 备份与恢复**：原生更新器执行升级时包含数据库备份步骤，配置位于 `/etc/xianyu-saas.env`。仍建议维护者在操作前做好数据备份。
+- **历史未登记实例**：未经安装器初始化的旧版容器或早期源码运行实例不在网页自动升级支持范围内，需由维护者参考文档手动迁移。
+
+---
+
+## 附件说明
+
+本版本发布附件共 14 项（包括 Docker 源码包与清单、Ubuntu 双架构管理器与运行时包、发布索引及签名）。其余清单与签名附件供安装器和更新器自动校验使用，完整说明见维护文档 `docs/RELEASING.md`。"""
+
+
+def release_guide(version: str, protocol) -> str:
+    """Render the reviewed installation guide with the release version."""
+    return RELEASE_GUIDE_TEMPLATE.replace("{version}", version).strip()
+
+
 def release_notes(files: dict, version: str, protocol) -> bytes:
     try:
         document = files["CHANGELOG.md"][0].decode("utf-8")
@@ -291,9 +381,13 @@ def release_notes(files: dict, version: str, protocol) -> bytes:
     section = document[headings[0].end():]
     end = re.search(r"^##\s", section, re.MULTILINE)
     body = section[:end.start() if end else len(section)].strip()
-    if not body or len(body) > protocol.MAX_RELEASE_NOTES_CHARS:
+    if not body:
         raise BundleError("release_notes_invalid")
-    return (body.replace("\r\n", "\n") + "\n").encode("utf-8")
+    notes = release_guide(version, protocol) + "\n\n## 本次版本变更\n\n" + body + "\n"
+    notes = notes.replace("\r\n", "\n").rstrip("\n") + "\n"
+    if len(notes) > protocol.MAX_RELEASE_NOTES_CHARS:
+        raise BundleError("release_notes_invalid")
+    return notes.encode("utf-8")
 
 
 def signing_key(encoded: str | None) -> tuple[Ed25519PrivateKey, bytes]:
@@ -375,6 +469,57 @@ def output_path(root: Path, supplied: str | None, version: str) -> Path:
 def ensure_empty_output(path: Path) -> None:
     if path.is_symlink() or (path.exists() and (not path.is_dir() or any(path.iterdir()))):
         raise BundleError("release_output_not_empty")
+
+
+def _reject_linked_ancestors(path: Path) -> None:
+    current = path
+    while True:
+        if current.is_symlink() or (hasattr(current, "is_junction") and current.is_junction()):
+            raise BundleError("release_notes_output_invalid")
+        parent = current.parent
+        if parent == current:
+            break
+        current = parent
+
+
+def notes_output_path(root: Path, supplied: str | None, output: Path) -> Path:
+    """Resolve a fresh notes path that can never overwrite repo source or release assets."""
+    candidate = Path(supplied) if supplied else output.parent / (output.name + "-release-notes.md")
+    if not candidate.is_absolute():
+        candidate = root / candidate
+    candidate = Path(os.path.abspath(candidate))
+    if candidate == output or output in candidate.parents:
+        raise BundleError("release_notes_output_invalid")
+    if candidate == root or root in candidate.parents:
+        ignored = root / ".local"
+        if candidate == ignored or ignored not in candidate.parents:
+            raise BundleError("release_notes_output_invalid")
+    _reject_linked_ancestors(candidate)
+    # A pre-existing notes path is never overwritten, so build cleanup can only
+    # ever remove the file this build created.
+    if candidate.exists():
+        raise BundleError("release_notes_output_invalid")
+    candidate.parent.mkdir(parents=True, exist_ok=True)
+    return candidate
+
+
+def write_notes_output(path: Path, payload: bytes) -> None:
+    temporary = path.with_name("." + path.name + "." + uuid.uuid4().hex)
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            descriptor = -1
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            raise BundleError("release_notes_output_invalid") from None
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        temporary.unlink(missing_ok=True)
 
 
 def write_tar(path: Path, files: dict, epoch: int) -> None:
@@ -548,14 +693,12 @@ def standalone_inputs(
 def content_metadata(version: str) -> dict[str, tuple[str, str]]:
     base = f"xianyu-saas-{version}"
     result = {
-        f"{base}.tar.gz": ("ota-archive", "source"),
-        f"{base}.manifest.json": ("ota-manifest", "source"),
-        f"{base}.manifest.sig": ("ota-signature", "source"),
         f"{base}-source.zip": ("docker-source", "docker"),
         f"{base}.docker.manifest.json": ("docker-manifest", "docker"),
         f"{base}.docker.manifest.sig": ("docker-signature", "docker"),
-        f"{base}.update-signing.pub": ("update-public-key", "all"),
-        "release-notes.md": ("release-notes", "all"),
+        # The schema-1 runtime inventory stays published unsigned; the signed
+        # Docker manifest binds it through runtime_manifest_sha256.
+        f"{base}.manifest.json": ("runtime-manifest", "docker"),
     }
     for architecture, target in zip(STANDALONE_ARCHITECTURES, STANDALONE_TARGETS):
         standalone_base = f"{base}-{target}"
@@ -588,7 +731,7 @@ def build(args, encoded: str | None) -> dict:
     for required in REQUIRED_LICENSES:
         if required not in files or not files[required][0].strip():
             raise BundleError("release_license_missing")
-    for required in ("Dockerfile", "docker/entrypoint.sh"):
+    for required in REQUIRED_DOCKER_INSTALL_FILES:
         if required not in files or not files[required][0].strip():
             raise BundleError("release_docker_source_missing")
     version = release_version(files, protocol)
@@ -640,12 +783,19 @@ def build(args, encoded: str | None) -> dict:
     if any(path not in ota for path in REQUIRED_LICENSES):
         raise BundleError("release_license_missing")
     output = output_path(root, args.output, version)
+    notes_path = notes_output_path(root, args.notes_output, output)
     output.parent.mkdir(parents=True, exist_ok=True)
     stage = Path(tempfile.mkdtemp(prefix=f".{version}-", dir=output.parent))
     try:
         artifact_name, manifest_name, signature_name = protocol._asset_names(version)
-        write_tar(stage / artifact_name, ota, epoch)
-        archive_record = asset_record(stage / artifact_name)
+        # A temporary source tar only computes the runtime inventory's historical
+        # artifact fields for the schema-1 manifest kept above. The tar and its
+        # detached signature are never published: deployed Docker clients bind
+        # this manifest through the signed docker manifest's runtime hash.
+        temporary_tar = stage / artifact_name
+        write_tar(temporary_tar, ota, epoch)
+        archive_record = asset_record(temporary_tar)
+        temporary_tar.unlink()
         if archive_record["size"] > protocol.MAX_ARCHIVE_BYTES:
             raise BundleError("release_too_large")
         manifest = {
@@ -662,12 +812,7 @@ def build(args, encoded: str | None) -> dict:
                                        protocol.ReleaseAsset(2, manifest_name, len(manifest_raw)),
                                        protocol.ReleaseAsset(3, signature_name, 88))
         protocol.parse_manifest(manifest_raw, release)
-        signature = base64.b64encode(key.sign(manifest_raw))
-        key.public_key().verify(base64.b64decode(signature, validate=True), manifest_raw)
-        if len(signature) > protocol.MAX_SIGNATURE_BYTES:
-            raise BundleError("release_signature_too_large")
         (stage / manifest_name).write_bytes(manifest_raw)
-        (stage / signature_name).write_bytes(signature)
         source_name = f"xianyu-saas-{version}-source.zip"
         write_source_zip(stage / source_name, files, version, epoch)
         source_record = asset_record(stage / source_name)
@@ -683,8 +828,6 @@ def build(args, encoded: str | None) -> dict:
         key.public_key().verify(base64.b64decode(docker_signature, validate=True), docker_manifest_raw)
         (stage / f"xianyu-saas-{version}.docker.manifest.json").write_bytes(docker_manifest_raw)
         (stage / f"xianyu-saas-{version}.docker.manifest.sig").write_bytes(docker_signature)
-        (stage / f"xianyu-saas-{version}.update-signing.pub").write_bytes(files[args.public_key_file][0])
-        (stage / "release-notes.md").write_bytes(notes)
         for target in STANDALONE_TARGETS:
             standalone = inputs[target]
             architecture = standalone["architecture"]
@@ -759,25 +902,28 @@ def build(args, encoded: str | None) -> dict:
         index_raw = json_bytes(result)
         (stage / "artifacts.json").write_bytes(index_raw)
         (stage / "artifacts.json.sig").write_bytes(base64.b64encode(key.sign(index_raw)))
-        checksummed = sorted(
-            [asset_record(path) for path in stage.iterdir()],
-            key=lambda entry: entry["name"],
-        )
-        (stage / "SHA256SUMS").write_bytes(
-            "".join(f'{entry["sha256"]}  {entry["name"]}\n' for entry in checksummed).encode("utf-8")
-        )
         verifier = Path(__file__).with_name("verify-public-release.py")
-        verification = subprocess.run(
-            [sys.executable, "-B", str(verifier), "--directory", str(stage), "--version", version,
-             "--commit", commit, "--public-key", str(stage / f"xianyu-saas-{version}.update-signing.pub")],
-            cwd=root, capture_output=True, env=git_environment(), timeout=120, check=False,
-        )
+        # Historical releases must use the selected Git blob, never a dirty key
+        # from the current checkout. Keep this verifier input outside the assets.
+        with tempfile.TemporaryDirectory(prefix="release-verification-", dir=output.parent) as verification_dir:
+            verification_key = Path(verification_dir) / "update-signing.pub"
+            verification_key.write_bytes(files[args.public_key_file][0])
+            verification = subprocess.run(
+                [sys.executable, "-B", str(verifier), "--directory", str(stage), "--version", version,
+                 "--commit", commit, "--public-key", str(verification_key)],
+                cwd=root, capture_output=True, env=git_environment(), timeout=120, check=False,
+            )
         if verification.returncode != 0:
             raise BundleError("release_verification_failed")
         ensure_empty_output(output)
-        if output.exists():
-            output.rmdir()
-        os.rename(stage, output)
+        write_notes_output(notes_path, notes)
+        try:
+            if output.exists():
+                output.rmdir()
+            os.rename(stage, output)
+        except BaseException:
+            notes_path.unlink(missing_ok=True)
+            raise
         return result
     finally:
         if stage.exists():
@@ -788,6 +934,7 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--ref", default="HEAD", help="Git commit or ref; never package worktree contents")
     parser.add_argument("--output", help="Ignored directory below .local/releases/ (default: version)")
+    parser.add_argument("--notes-output", help="Release notes path outside the published asset directory (default: ignored sibling of --output)")
     parser.add_argument("--signing-key-env", default="RELEASE_SIGNING_KEY", help="Environment variable holding a standard Base64 32-byte Ed25519 seed")
     parser.add_argument("--public-key-file", default="deploy/update-signing.pub", help="Public key path inside the selected commit")
     parser.add_argument("--standalone-input-root", required=True, help="Ignored root containing linux-*/bundle and linux-*/manager inputs")

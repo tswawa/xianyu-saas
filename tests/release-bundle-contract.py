@@ -10,6 +10,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import socket
 import stat
 import subprocess
@@ -150,6 +151,9 @@ class Repository:
             "CHANGELOG.md": f"# Changes\n\n## [Unreleased]\n\nDo not publish this.\n\n## [{version}] - 2023-11-14\n\n### Added\n\n- Release fixture only.\n\n## [0.0.1]\n\nOld notes.\n".encode(),
             "Dockerfile": b"FROM scratch\nCOPY . /app\n",
             "docker-compose.yml": b"services: {}\n",
+            "docker-compose.updates.yml": b"services: {}\n",
+            "deploy/docker-install.sh": b"#!/bin/sh\n# fixture docker installer\nexit 0\n",
+            "config/saas.env.docker.example": b"SAAS_ENV=production\n",
             "docker/entrypoint.sh": b"#!/bin/sh\nexit 0\n",
             "docs/DEPLOYMENT.md": b"Docker and manual deployment fixture.\n",
             "docs/assets/readme/orders.png": b"public documentation screenshot fixture\n",
@@ -262,6 +266,10 @@ class Repository:
             assert secret not in result.stdout + result.stderr, "CLI output leaked a generated test secret"
         return output, result
 
+    def notes_path(self, label="bundle", *, default_output=False):
+        name = self.version if default_output else label
+        return self.root / ".local" / "releases" / (name + "-release-notes.md")
+
 
 def assert_success(result):
     assert result.returncode == 0, result.stderr.decode("utf-8", "replace")
@@ -343,20 +351,64 @@ class OfflineSession:
         return Response(self.responses[url])
 
 
-def verify_bundle(repo: Repository, output: Path, *, epoch=EPOCH):
-    names = UPDATER._asset_names(repo.version)
+def assert_generated_notes(repo: Repository, notes_path: Path) -> None:
+    notes = notes_path.read_text(encoding="utf-8")
+    base = f"xianyu-saas-{repo.version}"
+    download = f"https://github.com/{UPDATER.RELEASE_OWNER}/{UPDATER.RELEASE_REPOSITORY}/releases/download/v{repo.version}"
+    assert notes.startswith(f"# xianyu-saas {repo.version} 发布说明")
+    install_section = notes.index("## 首次安装")
+    native_section = notes.index("### 2. Ubuntu 原生安装")
+    update_section = notes.index("## 已有用户更新")
+    changes_section = notes.index("## 本次版本变更")
+    attachments_section = notes.index("## 附件说明")
+    assert install_section < native_section < update_section < attachments_section < changes_section
+    assert notes.count("## 附件说明") == 1
+    for name in (f"{base}-source.zip", f"{base}-linux-x86_64", f"{base}-linux-aarch64"):
+        assert f"{download}/{name}" in notes, name
+    assert "sudo bash deploy/docker-install.sh" in notes
+    assert f"sudo ./{base}-linux-x86_64 install" in notes
+    assert f"`{base}-linux-aarch64`" in notes
+    assert f"install --version {repo.version}" in notes
+    assert "### Added\n\n- Release fixture only." in notes
+    assert "Source code" in notes
+    assert len(notes) <= UPDATER.MAX_RELEASE_NOTES_CHARS
+
+
+def verify_bundle(repo: Repository, output: Path, *, notes_path=None, epoch=EPOCH):
     base = f"xianyu-saas-{repo.version}"
     docker_names = DOCKER.docker_asset_names(repo.version)
     content = VERIFIER.expected_content(repo.version)
-    expected_assets = set(content) | {"artifacts.json", "artifacts.json.sig", "SHA256SUMS"}
-    assert len(content) == 16 and len(expected_assets) == 19
+    expected_assets = set(content) | {"artifacts.json", "artifacts.json.sig"}
+    assert len(content) == 12 and len(expected_assets) == 14
     assert {path.name for path in output.iterdir()} == expected_assets
     release_metadata = {"id": 1, "tag_name": f"v{repo.version}", "prerelease": "-" in repo.version,
                         "assets": [{"id": index + 1, "name": name, "size": (output / name).stat().st_size}
                                    for index, name in enumerate(sorted(expected_assets))]}
-    for assets in (release_metadata["assets"], [item for item in release_metadata["assets"] if item["name"] not in docker_names[1:]]):
-        legacy_release = UPDATER._parse_release({**release_metadata, "assets": assets}, "release")
-        assert (legacy_release.artifact.name, legacy_release.manifest.name, legacy_release.signature.name) == names
+    # Real deployed clients: the Docker descriptor and the per-architecture
+    # standalone records must still parse from the reduced attachment set.
+    docker_release = UPDATER._parse_release(release_metadata, "release", deployment="docker")
+    assert (docker_release.artifact.name, docker_release.manifest.name, docker_release.signature.name) == docker_names
+    assert docker_release.runtime_manifest is not None
+    assert docker_release.runtime_manifest.name == f"{base}.manifest.json"
+    for architecture in ("x86_64", "aarch64"):
+        with patch.object(UPDATER, "deployment_kind", return_value="systemd"), \
+                patch.object(UPDATER, "release_kind", return_value="standalone"), \
+                patch.object(STANDALONE.platform, "machine", return_value=architecture):
+            standalone_release = UPDATER._parse_release(release_metadata, "release", deployment="systemd")
+        assert standalone_release is not None and standalone_release.kind == "standalone"
+        assert (
+            standalone_release.artifact.name,
+            standalone_release.manifest.name,
+            standalone_release.signature.name,
+        ) == STANDALONE.standalone_asset_names(repo.version, architecture)
+    # The retired source-OTA channel must fail closed instead of accepting a partial set.
+    with patch.object(UPDATER, "release_kind", return_value="source"):
+        try:
+            UPDATER._parse_release(release_metadata, "release", deployment="systemd")
+        except UPDATER.PlatformUpdateError as exc:
+            assert exc.code == "release_assets_missing"
+        else:
+            raise AssertionError("source OTA discovery must reject the reduced inventory")
     index_raw = (output / "artifacts.json").read_bytes()
     index = json.loads(index_raw)
     assert set(index) == {"schema", "version", "commit", "manager_protocol", "public_key_fingerprint", "files"}
@@ -379,90 +431,57 @@ def verify_bundle(repo: Repository, output: Path, *, epoch=EPOCH):
         ):
             assert MANAGER_INSTALLER._select_record(manager_index, name, kind, architecture).name == name
     repo.key.public_key().verify(base64.b64decode((output / "artifacts.json.sig").read_bytes(), validate=True), index_raw)
-    checksums = dict(line.split("  ", 1)[::-1] for line in (output / "SHA256SUMS").read_text().splitlines())
-    assert len(checksums) == len((output / "SHA256SUMS").read_text().splitlines()) == len(expected_assets) - 1
-    assert set(checksums) == expected_assets - {"SHA256SUMS"}
-    for name, checksum in checksums.items():
-        assert hashlib.sha256((output / name).read_bytes()).hexdigest() == checksum
-    assert (output / "release-notes.md").read_bytes() == b"### Added\n\n- Release fixture only.\n"
-    assert (output / f"{base}.update-signing.pub").read_bytes() == repo.files["deploy/update-signing.pub"]
-    manifest_raw = (output / names[1]).read_bytes()
-    signature_raw = (output / names[2]).read_bytes()
-    assert len(base64.b64decode(signature_raw, validate=True)) == 64
-    assert signature_raw == base64.b64encode(repo.key.sign(manifest_raw)), "legacy OTA signature format changed"
+    for absent in ("SHA256SUMS", f"{base}.update-signing.pub", f"{base}.manifest.sig", "release-notes.md", f"{base}.tar.gz"):
+        assert not (output / absent).exists(), absent
+    if notes_path is not None:
+        assert_generated_notes(repo, notes_path)
     docker_raw = (output / docker_names[1]).read_bytes()
     docker_signature = (output / docker_names[2]).read_bytes()
     docker_manifest = DOCKER.verify_docker_manifest(docker_raw, docker_signature, repo.public, repo.version)
+    runtime_manifest_raw = (output / f"{base}.manifest.json").read_bytes()
+    runtime_manifest = json.loads(runtime_manifest_raw)
     assert json.loads(docker_raw) == {
         "schema": 1, "protocol": 1, "version": repo.version, "commit": repo.commit,
         "source": BUILDER.asset_record(output / docker_names[0]),
-        "runtime_manifest_sha256": hashlib.sha256(manifest_raw).hexdigest(),
+        "runtime_manifest_sha256": hashlib.sha256(runtime_manifest_raw).hexdigest(),
     }
+    assert runtime_manifest["schema"] == 1 and runtime_manifest["version"] == repo.version
+    assert runtime_manifest["artifact"] == f"{base}.tar.gz"
+    assert set(runtime_manifest) == {"schema", "version", "artifact", "artifact_sha256", "artifact_size", "files"}
+    assert len(runtime_manifest["artifact_sha256"]) == 64 and runtime_manifest["artifact_size"] > 0
     source_root = DOCKER.extract_verified_source(output / docker_names[0], output.parent / (output.name + "-docker"), docker_manifest)
     assert source_root.name == base
-    assert (source_root / "Dockerfile").read_bytes() == repo.files["Dockerfile"]
-    assert (source_root / "docker/entrypoint.sh").read_bytes() == repo.files["docker/entrypoint.sh"]
+    for name in BUILDER.REQUIRED_DOCKER_INSTALL_FILES:
+        assert (source_root / name).read_bytes() == repo.files[name], name
     assert set(docker_manifest.__dict__) == {"version", "commit", "source_name", "source_size", "source_sha256", "runtime_manifest_sha256", "protocol"}
-    release = UPDATER.ReleaseInfo("fixture", repo.version, f"v{repo.version}", "", "", "-" in repo.version,
-                                  UPDATER.ReleaseAsset(1, names[0], (output / names[0]).stat().st_size),
-                                  UPDATER.ReleaseAsset(2, names[1], len(manifest_raw)),
-                                  UPDATER.ReleaseAsset(3, names[2], len(signature_raw)))
-    parsed, expected = UPDATER.parse_manifest(manifest_raw, release)
-    assert parsed["artifact_sha256"] == hashlib.sha256((output / names[0]).read_bytes()).hexdigest()
-    assert parsed["artifact_size"] == (output / names[0]).stat().st_size
-    assert set(parsed) == {"schema", "version", "artifact", "artifact_sha256", "artifact_size", "files"}
-    public_file = output / f"{base}.update-signing.pub"
-    public_file.chmod(0o644)
-    with public_key_environment(public_file):
-        UPDATER.verify_manifest_signature(manifest_raw, signature_raw)
-        updater_error("update_signature_invalid", lambda: UPDATER.verify_manifest_signature(manifest_raw + b" ", signature_raw))
-        modified_sig = bytearray(base64.b64decode(signature_raw))
-        modified_sig[0] ^= 1
-        updater_error("update_signature_invalid", lambda: UPDATER.verify_manifest_signature(manifest_raw, base64.b64encode(modified_sig)))
-    with tarfile.open(output / names[0], "r:gz") as archive:
-        members = archive.getmembers()
-        assert [member.name for member in members] == sorted(expected)
-        for member in members:
-            assert member.isfile() and not member.issym() and not member.islnk()
-            assert member.mtime == epoch and member.uid == member.gid == 0
-            assert not member.uname and not member.gname
-            assert UPDATER._validate_release_path(member.name) == member.name
-            item = expected[member.name]
-            payload = archive.extractfile(member).read()
-            assert item.size == len(payload) and item.sha256 == hashlib.sha256(payload).hexdigest()
-            assert member.mode == (0o755 if item.executable else 0o644)
-            if member.name != "backend/build-info.json":
-                assert payload == repo.files[member.name]
-            assert repo.seed not in payload and repo.encoded.encode() not in payload
-    assert expected["scripts/check.sh"].executable is True
-    assert expected["frontend/index.html"].executable is False
-    extracted = output.parent / (output.name + "-extracted")
-    extracted.mkdir()
-    UPDATER.extract_verified_archive(output / names[0], extracted, expected)
-    info = json.loads((extracted / "backend/build-info.json").read_bytes())
-    assert info == {"version": repo.version, "commit": repo.commit, "dirty": False,
-                    "build_time": BUILDER.datetime.fromtimestamp(epoch, BUILDER.timezone.utc).isoformat(timespec="seconds")}
-    if os.name != "nt":
-        assert stat.S_IMODE((extracted / "scripts/check.sh").stat().st_mode) == 0o755
-        assert stat.S_IMODE((extracted / "frontend/index.html").stat().st_mode) == 0o644
-    source_only = {
-        "Dockerfile", "docker-compose.yml", "docker/entrypoint.sh", "LICENSING.md", "CONTRIBUTING.md",
-        ".github/workflows/ci.yml", "worker/.env.example", *BUILDER.PUBLIC_RUNTIME_LOCKS,
-    }
-    assert not set(expected) & source_only
+    modified = bytearray(base64.b64decode(docker_signature))
+    modified[0] ^= 1
+    try:
+        DOCKER.verify_docker_manifest(docker_raw, base64.b64encode(modified), repo.public, repo.version)
+    except DOCKER.DockerUpdateError as exc:
+        assert exc.code == "docker_signature_invalid", exc.code
+    else:
+        raise AssertionError("tampered Docker signature accepted")
+    source_payloads = {}
     with zipfile.ZipFile(output / f"{base}-source.zip") as archive:
         prefix = base + "/"
         paths = {entry.filename.removeprefix(prefix) for entry in archive.infolist()}
         assert paths == set(repo.files) | {"backend/build-info.json"}
-        assert source_only | set(BUILDER.REQUIRED_LICENSES) <= paths
+        assert set(BUILDER.REQUIRED_LICENSES) <= paths
+        assert set(BUILDER.REQUIRED_DOCKER_INSTALL_FILES) <= paths
         for entry in archive.infolist():
             assert entry.filename.startswith(prefix) and stat.S_ISREG(entry.external_attr >> 16)
             relative = entry.filename.removeprefix(prefix)
             executable = relative in {"scripts/check.sh", "docker/entrypoint.sh"}
             assert stat.S_IMODE(entry.external_attr >> 16) == (0o755 if executable else 0o644)
             payload = archive.read(entry)
-            assert payload == ((extracted / relative).read_bytes() if relative == "backend/build-info.json" else repo.files[relative])
+            source_payloads[relative] = payload
+            if relative != "backend/build-info.json":
+                assert payload == repo.files[relative]
             assert repo.seed not in payload and repo.encoded.encode() not in payload
+    info = json.loads(source_payloads["backend/build-info.json"])
+    assert info == {"version": repo.version, "commit": repo.commit, "dirty": False,
+                    "build_time": BUILDER.datetime.fromtimestamp(epoch, BUILDER.timezone.utc).isoformat(timespec="seconds")}
     for architecture in ("x86_64", "aarch64"):
         target = STANDALONE.target_name(architecture)
         archive_name, standalone_manifest_name, standalone_signature_name = STANDALONE.standalone_asset_names(repo.version, architecture)
@@ -495,9 +514,11 @@ def verify_bundle(repo: Repository, output: Path, *, epoch=EPOCH):
         assert by_path["manager/xianyu-saas"]["executable"] is True
         with tarfile.open(output / archive_name, "r:gz") as archive:
             assert stat.S_IMODE(archive.getmember("runtime/python/bin/python3").mode) == 0o755
-    assert set(BUILDER.REQUIRED_LICENSES) <= set(expected)
-    VERIFIER.verify(output, repo.version, repo.commit, output / f"{base}.update-signing.pub")
-    return release, expected, manifest_raw, signature_raw
+    with tempfile.TemporaryDirectory(prefix="release-contract-public-") as temporary:
+        trusted_public = Path(temporary) / "update-signing.pub"
+        trusted_public.write_bytes(base64.b64encode(repo.public))
+        VERIFIER.verify(output, repo.version, repo.commit, trusted_public)
+    return runtime_manifest, source_payloads
 
 
 def workflow_contract(repo: Repository, output: Path):
@@ -531,14 +552,19 @@ def workflow_contract(repo: Repository, output: Path):
     assert workflow.count("secrets.RELEASE_SIGNING_KEY") == 1
     assert "needs: [validate, standalone]" in publish_section
     assert "--standalone-input-root .local/standalone-inputs" in publish_section
-    assert 'assets=("$dir"/*)' in publish_section and 'test "${#assets[@]}" -eq 19' in publish_section
+    assert '--notes-output ".local/releases/$RELEASE_VERSION-release-notes.md"' in publish_section
+    assert 'assets=("$dir"/*)' in publish_section and 'test "${#assets[@]}" -eq 14' in publish_section
+    assert 'notes_file=".local/releases/$RELEASE_VERSION-release-notes.md"' in publish_section
+    assert 'test -s "$notes_file"' in publish_section
+    assert '--notes-file "$notes_file"' in publish_section
+    assert '--notes-file "$dir/release-notes.md"' not in publish_section
     assert publish_section.count("scripts/verify-public-release.py") == 2
     assert publish_section.index('gh release download "$RELEASE_TAG"') < publish_section.index('--draft=false')
     assert "python -B tests/docker-update-protocol-contract.py" in publish_section
     assert "python -B tests/standalone-build-contract.py" in publish_section
     assert "python -B tests/release-bundle-contract.py" in publish_section
     assert {path.name for path in output.iterdir()} == set(VERIFIER.expected_content(repo.version)) | {
-        "artifacts.json", "artifacts.json.sig", "SHA256SUMS"
+        "artifacts.json", "artifacts.json.sig"
     }
     print("release bundle: workflow has native dual-architecture unsigned builds and release-job-only signing")
 
@@ -550,7 +576,29 @@ def normal_and_tamper_contract(run: Path):
     repo.write("untracked-secret.txt", repo.seed)
     output, result = repo.build(default_output=True)
     assert_success(result)
-    release, expected, manifest_raw, signature_raw = verify_bundle(repo, output)
+    runtime_manifest, source_payloads = verify_bundle(
+        repo, output, notes_path=repo.notes_path(default_output=True)
+    )
+    expected = {
+        item["path"]: UPDATER.ManifestFile(item["path"], item["size"], item["sha256"], item["executable"])
+        for item in runtime_manifest["files"]
+    }
+    ota_files = {
+        item["path"]: (source_payloads[item["path"]], bool(item["executable"]))
+        for item in runtime_manifest["files"]
+    }
+    tar_name, manifest_name, signature_name = UPDATER._asset_names(repo.version)
+    ota_tar = run / f"synthetic-{tar_name}"
+    BUILDER.write_tar(ota_tar, ota_files, EPOCH)
+    ota_manifest_raw = BUILDER.json_bytes(runtime_manifest)
+    ota_signature_raw = base64.b64encode(repo.key.sign(ota_manifest_raw))
+    ota_release = UPDATER.ReleaseInfo(
+        "fixture", repo.version, f"v{repo.version}", "", "", False,
+        UPDATER.ReleaseAsset(1, tar_name, ota_tar.stat().st_size),
+        UPDATER.ReleaseAsset(2, manifest_name, len(ota_manifest_raw)),
+        UPDATER.ReleaseAsset(3, signature_name, len(ota_signature_raw)),
+    )
+    UPDATER.parse_manifest(ota_manifest_raw, ota_release)
     workflow_contract(repo, output)
     index_path = output / "artifacts.json"
     original_index = index_path.read_bytes()
@@ -558,7 +606,7 @@ def normal_and_tamper_contract(run: Path):
         index_path.write_bytes(original_index + b" ")
         verifier_error(
             "release_index_signature_invalid",
-            lambda: VERIFIER.verify(output, repo.version, repo.commit, output / f"xianyu-saas-{repo.version}.update-signing.pub"),
+            lambda: VERIFIER.verify(output, repo.version, repo.commit, repo.root / "deploy/update-signing.pub"),
         )
     finally:
         index_path.write_bytes(original_index)
@@ -595,9 +643,10 @@ def normal_and_tamper_contract(run: Path):
     repeated, result = repo.build("repeat")
     assert_success(result)
     assert {p.name: p.read_bytes() for p in output.iterdir()} == {p.name: p.read_bytes() for p in repeated.iterdir()}
+    assert_generated_notes(repo, repo.notes_path("repeat"))
     override, result = repo.build("epoch", changes={"SOURCE_DATE_EPOCH": "1720000000"})
     assert_success(result)
-    verify_bundle(repo, override, epoch=1720000000)
+    verify_bundle(repo, override, notes_path=repo.notes_path("epoch"), epoch=1720000000)
     override_again, result = repo.build("epoch-repeat", changes={"SOURCE_DATE_EPOCH": "1720000000"})
     assert_success(result)
     assert {p.name: p.read_bytes() for p in override.iterdir()} == {p.name: p.read_bytes() for p in override_again.iterdir()}
@@ -606,9 +655,11 @@ def normal_and_tamper_contract(run: Path):
     _, result = repo.build("empty")
     assert_success(result)
     before = {p.name: p.read_bytes() for p in output.iterdir()}
+    notes_before = repo.notes_path(default_output=True).read_bytes()
     _, result = repo.build(default_output=True)
     assert result.returncode != 0 and result.stderr.strip() == b"release_output_not_empty"
     assert before == {p.name: p.read_bytes() for p in output.iterdir()}
+    assert repo.notes_path(default_output=True).read_bytes() == notes_before
     assert_rejected(repo, "release_timestamp_invalid", changes={"SOURCE_DATE_EPOCH": "not-a-date"})
     assert_rejected(repo, "release_timestamp_invalid", changes={"SOURCE_DATE_EPOCH": "4294967296"})
     _, result = repo.build("bad-output", extra=("--output", str(repo.root / "public-assets")))
@@ -616,7 +667,7 @@ def normal_and_tamper_contract(run: Path):
     assert not (repo.root / "public-assets").exists()
     # Change the actual payload but preserve member names and sizes: extraction must hash.
     bad_tar = run / "tampered.tar.gz"
-    with tarfile.open(output / release.artifact.name, "r:gz") as source, tarfile.open(bad_tar, "w:gz") as target:
+    with tarfile.open(ota_tar, "r:gz") as source, tarfile.open(bad_tar, "w:gz") as target:
         for member in source:
             payload = source.extractfile(member).read()
             if member.name == "frontend/index.html":
@@ -625,24 +676,25 @@ def normal_and_tamper_contract(run: Path):
     bad_extract = run / "bad-extract"
     bad_extract.mkdir()
     updater_error("update_archive_hash_mismatch", lambda: UPDATER.extract_verified_archive(bad_tar, bad_extract, expected))
-    bad_manifest = json.loads(manifest_raw)
+    bad_manifest = json.loads(ota_manifest_raw)
     bad_manifest["files"][0]["path"] = "../outside"
-    updater_error("update_archive_path_invalid", lambda: UPDATER.parse_manifest(BUILDER.json_bytes(bad_manifest), release))
+    updater_error("update_archive_path_invalid", lambda: UPDATER.parse_manifest(BUILDER.json_bytes(bad_manifest), ota_release))
     responses = {
-        release.artifact.api_url: (output / release.artifact.name).read_bytes(),
-        release.manifest.api_url: manifest_raw, release.signature.api_url: signature_raw,
+        ota_release.artifact.api_url: ota_tar.read_bytes(),
+        ota_release.manifest.api_url: ota_manifest_raw,
+        ota_release.signature.api_url: ota_signature_raw,
     }
-    public_file = output / f"xianyu-saas-{repo.version}.update-signing.pub"
+    public_file = repo.root / "deploy/update-signing.pub"
     with public_key_environment(public_file), patch.dict(os.environ, {
         "SAAS_UPDATE_STAGING_DIR": str(run / "staging"), "SAAS_CURRENT_ROOT": str(repo.root),
     }):
-        staged = UPDATER.stage_release(release, "stable", "0.1.0", session=OfflineSession(responses))
+        staged = UPDATER.stage_release(ota_release, "stable", "0.1.0", session=OfflineSession(responses))
         assert Path(staged["candidate_path"]).is_dir()
         broken = dict(responses)
-        archive_raw = bytearray(broken[release.artifact.api_url])
+        archive_raw = bytearray(broken[ota_release.artifact.api_url])
         archive_raw[-1] ^= 1
-        broken[release.artifact.api_url] = bytes(archive_raw)
-        updater_error("update_artifact_hash_mismatch", lambda: UPDATER.stage_release(release, "stable", "0.1.0", session=OfflineSession(broken)))
+        broken[ota_release.artifact.api_url] = bytes(archive_raw)
+        updater_error("update_artifact_hash_mismatch", lambda: UPDATER.stage_release(ota_release, "stable", "0.1.0", session=OfflineSession(broken)))
     print("release bundle: reproducibility, assets, real verifier and tampering passed")
 
 
@@ -650,7 +702,7 @@ def key_and_version_contract(run: Path):
     repo = Repository(run / "keys", public_pem=True)
     output, result = repo.build()
     assert_success(result)
-    verify_bundle(repo, output)
+    verify_bundle(repo, output, notes_path=repo.notes_path())
     assert_rejected(repo, "release_signing_key_missing", changes={"RELEASE_SIGNING_KEY": None})
     for bad in ("invalid-base64!", base64.b64encode(b"short").decode(), repo.encoded + "\n"):
         assert_rejected(repo, "release_signing_key_invalid", changes={"RELEASE_SIGNING_KEY": bad})
@@ -681,8 +733,8 @@ def key_and_version_contract(run: Path):
     prerelease = Repository(run / "prerelease", version="0.3.0-rc.1+build.2")
     output, result = prerelease.build()
     assert_success(result)
-    verify_bundle(prerelease, output)
-    for index, name in enumerate(("Dockerfile", "docker/entrypoint.sh")):
+    verify_bundle(prerelease, output, notes_path=prerelease.notes_path())
+    for index, name in enumerate(BUILDER.REQUIRED_DOCKER_INSTALL_FILES):
         incomplete = Repository(run / f"docker-input-{index}")
         incomplete.change(name, b"")
         assert_rejected(incomplete, "release_docker_source_missing")
@@ -692,7 +744,7 @@ def key_and_version_contract(run: Path):
     literal.files["backend/version.py"] = literal_source
     output, result = literal.build()
     assert_success(result)
-    verify_bundle(literal, output)
+    verify_bundle(literal, output, notes_path=literal.notes_path())
     for payload in (f'"""VERSION = "{VERSION}"\n"""\nVERSION = "0.3.0"\n'.encode(),
                     f'VERSION = "{VERSION}"\nVERSION = "0.3.0"\n'.encode(), b"VERSION = current_version()\n"):
         literal.change("backend/version.py", payload)
@@ -703,7 +755,7 @@ def key_and_version_contract(run: Path):
     repetitive.files["frontend/assets/repeated.txt"] = payload
     output, result = repetitive.build()
     assert_success(result)
-    verify_bundle(repetitive, output)
+    verify_bundle(repetitive, output, notes_path=repetitive.notes_path())
     with zipfile.ZipFile(output / DOCKER.docker_asset_names(repetitive.version)[0]) as source:
         assert source.getinfo(f"xianyu-saas-{repetitive.version}/frontend/assets/repeated.txt").compress_type == zipfile.ZIP_STORED
     print("release bundle: key validation, static commit versions and required Docker inputs passed")
@@ -781,7 +833,7 @@ def dirty_and_atomic_contract(run: Path):
     output, result = repo.build("historical", ref=old_commit)
     assert_success(result)
     repo.commit = old_commit
-    verify_bundle(repo, output)
+    verify_bundle(repo, output, notes_path=repo.notes_path("historical"))
     repo = Repository(run / "atomic")
     cwd = Path.cwd()
     try:
@@ -790,6 +842,11 @@ def dirty_and_atomic_contract(run: Path):
         with patch.dict(os.environ, {"RELEASE_SIGNING_KEY": repo.encoded}), patch.object(BUILDER, "write_source_zip", side_effect=OSError("injected write failure")), contextlib.redirect_stderr(io.StringIO()) as errors:
             assert BUILDER.main(["--output", ".local/releases/failure", "--standalone-input-root", str(inputs)]) == 1
         assert errors.getvalue().strip() == "release_build_failed"
+        with patch.dict(os.environ, {"RELEASE_SIGNING_KEY": repo.encoded}), patch.object(BUILDER.os, "rename", side_effect=OSError("injected publication failure")), contextlib.redirect_stderr(io.StringIO()) as errors:
+            assert BUILDER.main(["--output", ".local/releases/rename-failure", "--standalone-input-root", str(inputs)]) == 1
+        assert errors.getvalue().strip() == "release_build_failed"
+        assert not (repo.root / ".local/releases/rename-failure").exists()
+        assert not repo.notes_path("rename-failure").exists(), "failed publication must remove its notes file"
     finally:
         os.chdir(cwd)
     assert not (repo.root / ".local/releases/failure").exists()
@@ -804,6 +861,134 @@ def dirty_and_atomic_contract(run: Path):
     print("release bundle: dirty HEAD, historical blobs, overwrite and atomic cleanup passed")
 
 
+def notes_and_metadata_contract(run: Path):
+    repo = Repository(run / "notes-oversized")
+    oversized = "### Added\n\n- " + "x" * (UPDATER.MAX_RELEASE_NOTES_CHARS + 1)
+    repo.change("CHANGELOG.md", f"# Changes\n\n## [{repo.version}] - 2023-11-14\n\n{oversized}\n".encode())
+    assert_rejected(repo, "release_notes_invalid")
+
+    repo = Repository(run / "notes-path")
+    assert_rejected(
+        repo,
+        "release_notes_output_invalid",
+        label="notes-in-assets",
+        extra=("--notes-output", ".local/releases/notes-in-assets/release-notes.md"),
+    )
+    assert_rejected(repo, "release_notes_output_invalid", label="notes-source", extra=("--notes-output", "README.md"))
+    # A pre-existing notes file is never overwritten.
+    existing = repo.root / ".local" / "releases" / "existing-notes.md"
+    existing.parent.mkdir(parents=True, exist_ok=True)
+    existing.write_text("keep me\n", encoding="utf-8")
+    assert_rejected(
+        repo,
+        "release_notes_output_invalid",
+        label="notes-existing",
+        extra=("--notes-output", str(existing)),
+    )
+    assert existing.read_text(encoding="utf-8") == "keep me\n"
+    # A file created after path validation must also survive publication.
+    raced = BUILDER.notes_output_path(repo.root, str(existing.with_name("raced.md")), existing.parent / "assets")
+    raced.write_text("other writer\n", encoding="utf-8")
+    try:
+        BUILDER.write_notes_output(raced, b"replacement\n")
+    except BUILDER.BundleError as exc:
+        assert str(exc) == "release_notes_output_invalid"
+    else:
+        raise AssertionError("concurrent notes output was overwritten")
+    assert raced.read_text(encoding="utf-8") == "other writer\n"
+    # A symlinked ancestor must not redirect notes outside the allowed scope.
+    link = repo.root / ".local" / "releases-link"
+    try:
+        link.symlink_to(repo.root / ".local" / "releases", target_is_directory=True)
+    except (OSError, NotImplementedError):
+        print("release bundle: notes symlink rejection skipped (host needs symlink privilege)")
+    else:
+        assert_rejected(
+            repo,
+            "release_notes_output_invalid",
+            label="notes-symlink",
+            extra=("--notes-output", str(link / "linked-notes.md")),
+        )
+    output, result = repo.build("notes-explicit")
+    assert_success(result)
+    assert_generated_notes(repo, repo.notes_path("notes-explicit"))
+    custom = repo.root / ".local" / "releases" / "custom-notes.md"
+    output, result = repo.build("notes-custom", extra=("--notes-output", str(custom)))
+    assert_success(result)
+    assert_generated_notes(repo, custom)
+    assert not (output / "release-notes.md").exists()
+
+    # A Release source ZIP has no .git: explicit build arguments win, otherwise the
+    # packaged same-version build info must survive the Dockerfile write step.
+    repo = Repository(run / "no-git")
+    version_source = (ROOT / "backend/version.py").read_text(encoding="utf-8")
+    version_source = re.sub(r'^VERSION = "[^"]+"', f'VERSION = "{repo.version}"', version_source, flags=re.MULTILINE)
+    repo.change("backend/version.py", version_source.encode("utf-8"))
+    output, result = repo.build()
+    assert_success(result)
+    source = run / "no-git-source"
+    with zipfile.ZipFile(output / f"xianyu-saas-{repo.version}-source.zip") as archive:
+        archive.extractall(source)
+    root = source / f"xianyu-saas-{repo.version}"
+    build_info = root / "backend/build-info.json"
+    packaged = json.loads(build_info.read_bytes())
+    assert packaged["version"] == repo.version and packaged["commit"] == repo.commit and packaged["dirty"] is False
+
+    env = clean_environment()
+    env["SAAS_BUILD_DIRTY"] = "unknown"
+    result = subprocess.run([sys.executable, "-B", "backend/version.py", "--write-build-info"],
+                            cwd=root, env=env, capture_output=True, timeout=30)
+    assert result.returncode == 0, result.stderr.decode("utf-8", "replace")
+    assert json.loads(build_info.read_bytes()) == packaged, "no-Git build must retain packaged same-version metadata"
+
+    override_env = dict(env, SAAS_BUILD_COMMIT="a" * 40, SAAS_BUILD_DIRTY="true")
+    result = subprocess.run([sys.executable, "-B", "backend/version.py", "--write-build-info"],
+                            cwd=root, env=override_env, capture_output=True, timeout=30)
+    assert result.returncode == 0, result.stderr.decode("utf-8", "replace")
+    overridden = json.loads(build_info.read_bytes())
+    assert overridden["commit"] == "a" * 40 and overridden["dirty"] is True
+
+    build_info.write_text(json.dumps({
+        "version": "9.9.9", "commit": "b" * 40, "build_time": packaged["build_time"], "dirty": False,
+    }) + "\n", encoding="utf-8")
+    result = subprocess.run([sys.executable, "-B", "backend/version.py", "--write-build-info"],
+                            cwd=root, env=env, capture_output=True, timeout=30)
+    assert result.returncode == 0, result.stderr.decode("utf-8", "replace")
+    replaced = json.loads(build_info.read_bytes())
+    assert replaced["version"] == repo.version and replaced["commit"] == "" and replaced["dirty"] is None
+
+    dockerignore = {line.strip() for line in (ROOT / ".dockerignore").read_text(encoding="utf-8").splitlines()
+                    if line.strip() and not line.lstrip().startswith("#")}
+    assert "backend/build-info.json" not in dockerignore, "packaged metadata must reach the Docker build context"
+
+    # The signed public verifier rejects a source package without installer inputs.
+    assert BUILDER.REQUIRED_DOCKER_INSTALL_FILES == VERIFIER.REQUIRED_DOCKER_INSTALL_FILES
+    prefix = f"xianyu-saas-{repo.version}/"
+    def zip_entry(name):
+        entry = zipfile.ZipInfo(prefix + name)
+        entry.create_system = 3
+        entry.external_attr = (stat.S_IFREG | 0o644) << 16
+        return entry
+    complete = run / "complete-source.zip"
+    with zipfile.ZipFile(complete, "w") as archive:
+        for name in BUILDER.REQUIRED_DOCKER_INSTALL_FILES:
+            archive.writestr(zip_entry(name), b"content\n")
+    VERIFIER.verify_source_zip(complete, repo.version)
+    for name in BUILDER.REQUIRED_DOCKER_INSTALL_FILES:
+        partial = run / ("missing-" + name.replace("/", "-") + ".zip")
+        with zipfile.ZipFile(partial, "w") as archive:
+            for other in BUILDER.REQUIRED_DOCKER_INSTALL_FILES:
+                if other != name:
+                    archive.writestr(zip_entry(other), b"content\n")
+        verifier_error("docker_source_invalid", lambda partial=partial: VERIFIER.verify_source_zip(partial, repo.version))
+    empty = run / "empty-installer.zip"
+    with zipfile.ZipFile(empty, "w") as archive:
+        for name in BUILDER.REQUIRED_DOCKER_INSTALL_FILES:
+            archive.writestr(zip_entry(name), b"" if name == "Dockerfile" else b"content\n")
+    verifier_error("docker_source_invalid", lambda: VERIFIER.verify_source_zip(empty, repo.version))
+    print("release bundle: notes policy, no-Git build metadata and required installer files passed")
+
+
 def main():
     with tempfile.TemporaryDirectory(prefix="xianyu-release-contract-") as temporary:
         run = Path(temporary)
@@ -812,6 +997,7 @@ def main():
             key_and_version_contract(run)
             privacy_contract(run)
             dirty_and_atomic_contract(run)
+            notes_and_metadata_contract(run)
     print("release bundle contract: ok (temporary keys/repos only; real updater verified)")
 
 

@@ -2,7 +2,31 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号按 [Semantic Versioning](https://semver.org/lang/zh-CN/) 管理。
 
-> 说明：当前工程代码版本为 `0.4.3`。文中的历史记录反映内部开发基线与功能演进。
+> 说明：当前工程代码版本为 `0.4.4`。文中的历史记录反映内部开发基线与功能演进。
+
+## [0.4.4] - 2026-09-14
+
+本版本整合 Docker 安装器、实现卡密保存写入失败恢复，优化更新就绪提示，并重新整理 GitHub Releases 发布产物结构。本批改动未重新实现 Ubuntu 更新架构（继续沿用已验证的引导管理器与独立运行包架构）。
+
+### 新增
+
+- **Docker 安装器整合与就绪验收**：新增并完善 `deploy/docker-install.sh`。从 Release 源码包构建应用与独立更新器镜像，将包内受信任公钥预装为容器内 root 拥有的副本（0644），仅为全新数据目录设置容器用户属主；在一次性登记（`initialize`）后调用应用侧 `platform_update.update_capabilities()` 验收真实更新就绪能力，避免仅凭 `/health` 误判。重复运行已登记安装只校验并启动既有容器（`docker start`），不重建、不应用新 env/Compose、不覆盖升级镜像或现有数据。
+- **Release 下载入口与产物整理**：公开附件整理为 14 项，正文突出三个用户下载入口（Docker `source.zip`、Ubuntu x86_64 管理器、Ubuntu ARM64 管理器）；其余清单与签名由程序自动核验，用户无需手动下载。移除旧源码 OTA tar.gz 及其独立签名、外置公钥文件、重复 release-notes.md 附件与 SHA256SUMS。
+- **发布说明自动生成**：Release 说明改由发布脚本 `scripts/build-release.py` 自动生成，内嵌版本固定的下载表格、首次安装命令、已有用户更新指引与附件校验说明。
+
+### 修复
+
+- **卡密保存写入失败恢复**：卡密（`redeem_codes.json`）与卡池（`card_pool.json`）两个文件的保存改用补偿写入上下文（`AccountStorage.compensating_write`）。任一文件写入异常时自动恢复旧快照字节、移除本次新建的文件；若补偿恢复失败抛出 `AccountStorageRecoveryError`（HTTP 503），明确提示人工核对，避免部分写入破坏数据一致性。
+- **更新提示与更新能力状态区分**：前端 `UPDATE_UI_COPY` 增加 `update_installation_migration_required` 状态提示；更新能力不可用时统一回退至明确的原因提示，避免未就绪时错误显示“未检测到独立更新器”。
+- **无 Git 源码包构建元数据保留**：Release 源码包在 Docker 构建时保留包内同版本的构建元数据（提交哈希、时间戳、干净标记），显式构建参数优先，避免安装镜像丢失发布版本信息。
+- **前端静态资源标识刷新**：统一刷新静态资源版本标识为 `20260914-01`，确保浏览器脚本与样式缓存正确更新。
+
+### 已知限制与边界
+
+- **架构延续说明**：Ubuntu 原生更新架构本批未重新实现，继续沿用 v0.4.2 引入的引导管理器与独立运行包。
+- **自动升级范围**：既有未接入独立更新器的 Docker 源码部署、systemd 部署与普通源码运行不会因升级到 0.4.4 自动获得网页升级能力，仍需按部署文档人工维护；本版本不包含自动迁移。
+- **数据保留与容器行为边界**：Docker 网页升级只切换运行镜像，受管重跑仅校验并启动既有容器（不切换镜像、不加载新配置）；挂载的 `./data` 业务数据始终保留。Docker 升级时不自动备份数据库，升级前需自行冷备 `./data` 目录；Ubuntu 原生升级包含数据库备份步骤（数据保存在 `/var/lib/xianyu-saas`）。
+- **运行环境限制**：Docker 更新器固定要求 Docker Engine API v1.47；安装脚本仅支持 Linux 或 WSL2 Linux 环境中的本地 Docker 引擎，不支持在 Windows PowerShell 或远程 Docker 上下文中直接运行。Ubuntu 原生安装器仅支持 Ubuntu 22.04、24.04 与 Debian 12。
 
 ## [0.4.3] - 2026-09-14
 

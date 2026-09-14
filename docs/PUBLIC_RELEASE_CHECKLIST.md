@@ -1,45 +1,35 @@
 # 公开发布自检清单
 
-在对外发布新版本或向开源社区提交代码前，请按照本清单逐项核对，确保代码整洁、安全合规。
+维护者在整批构建完成、正式发布版本前按本清单逐项核对。详细构建流程与技术约束见 [`docs/RELEASING.md`](RELEASING.md)。
 
-## 1. 敏感信息与安全自查
+## 1. 敏感信息与安全合规
 - [ ] 工作区与 Git 提交历史中无真实 API Key、密码、Token、平台 Cookie 或私人凭据；
 - [ ] 代码与测试夹具中无真实买家信息、真实订单号、商业卡密明文或私人网盘链接；
 - [ ] `.gitignore` 与 `.dockerignore` 正常生效，`data/` 目录、本地运行日志及临时文件未被提交；
-- [ ] 真实生产环境配置与私有凭据不纳入 Git，仅保留合法的示例与模板配置，无私有域名、生产私有路径或特定主机硬编码路径。
+- [ ] 仅保留合法的示例与模板配置，无私有域名或特定主机硬编码路径。
 
-## 2. 开源合规与许可证检查
+## 2. 开源合规与许可证
 - [ ] 根目录 `LICENSE`（GPL-3.0-only）完整；
 - [ ] `LICENSING.md`、`worker/NOTICE.md` 与字体开源许可证（`frontend/assets/OFL-NotoSansSC.txt`）齐全规范；
 - [ ] 文档包含免责声明，明确提示使用者遵守平台规则与法律法规。
 
-## 3. 自动化门禁测试
-- [ ] 运行并通过全套单元测试套件：`npm test`（专项测试不能代替全套测试）；
-- [ ] 运行并通过仓库合规检查：`python3 tests/repository-contract.py`；
-- [ ] 运行并通过代码语法与编译检查：`npm run test:syntax`；
-- [ ] 运行并通过核心契约测试套件：`npm run test:api`、`npm run test:auth`、`npm run test:settings`、`npm run test:resources`；
-- [ ] 运行并通过 Worker 单元测试：`npm run test:worker`；
-- [ ] 检查代码格式与空白符差异：`git diff --check`。
+## 3. 版本号一致性
+- [ ] `package.json`、`package-lock.json` 与 `backend/version.py` 版本号一致（当前为 `0.4.4`）；
+- [ ] `backend/version.py`、`frontend/assets/app.js` 与 `frontend/index.html` 静态资产版本标识一致；
+- [ ] `backend/version.py` 的 `UPDATE_DATA_VERSION` 声明与当前业务数据读写兼容性一致。
 
-## 4. 管理员初始化与环境配置验证
-- [ ] 环境变量格式：`SAAS_AI_MASTER_KEY` 采用 32 字节随机二进制经标准 Base64 编码（44 字符，示例：`base64.b64encode(os.urandom(32)).decode()`），不能配置任意非规范字符串；
-- [ ] 默认模式验证：在 `SAAS_BOOTSTRAP_ENABLED=0` 且数据库为空时，首位管理员可通过网页界面直接注册；布尔开关 `SAAS_ALLOW_REGISTRATION=0` 不影响首位管理员注册；初始化与后续注册支持补齐空目录与纯默认配置残留，拒绝业务数据与符号链接，具备并发回滚保护；
-- [ ] 引导模式验证：在 `SAAS_BOOTSTRAP_ENABLED=1` 时，首位管理员注册需通过 `SAAS_BOOTSTRAP_TOKEN_FILE` 提供的一次性服务引导令牌完成；
-- [ ] 后续注册限制：系统已有管理员后，新用户注册同时受布尔开关环境变量 `SAAS_ALLOW_REGISTRATION` 与系统管理后台注册开关控制。
+## 4. 门禁验证与发布流水线
+- [ ] 整批改动完成后在本地集中验证：按本批改动风险针对性运行相关测试，并执行 `git diff --check` 确认无格式或空白问题；
+- [ ] 推送待发布的 `v*` 标签后，由 `.github/workflows/release.yml` 的 `validate` 阶段统一执行完整 CI 检查，且 `validate` 与 `standalone` 阶段全部通过。
 
-## 5. 容器与部署验证
-- [ ] Docker 镜像构建正常：`docker compose build`；
-- [ ] 容器启动后健康检查正常响应：`GET /health` 返回 200；
-- [ ] 挂载数据卷 `./data` 能持久化数据库与各店铺配置文件；
-- [ ] Windows 部署说明明确通过 Docker Linux 容器运行完整服务，不宣称 Windows 原生直接运行依赖 `fcntl` 等内核特性的全部服务；
-- [ ] （0.3.0 规划）Docker 更新器组件 `docker-compose.updates.yml` 语法与权限规范校验正常；引入官方 Compose 5.5.1 执行层（CLI 28.3.3、Buildx 0.26.1 保持固定），依赖 Docker Engine API v1.47，Web 容器不挂载 Docker socket，仅独立更新器作为受信高权限组件挂载 `/var/run/docker.sock`（挂载属性 `read_only` 仍可调用 Docker 管理 API）；宿主机支持以 stdin 原字节执行 `initialize` 配置登记；回滚支持重新创建旧版容器（容器 ID 可变，配置与数据卷保留，绝不覆盖业务数据）；注意：所有真实 Linux/Docker 容器升级与回滚端到端验收目前仍在等待隔离引擎/CI 环境，不可提前标记为已通过；
-- [ ] （0.3.0 规划）systemd 独立更新服务与基线接入规范核验正常；首次接入须由 root 依序完成独立 bundle 安装、离线 `--import-trusted-baseline`（AST 静态语法核验 `MAINTENANCE_PROTOCOL=1`，不自动切换 current/不触碰业务数据）、人工切换现役软链接及显式受控环境变量 `--initialize` 生成严格六字段的可信接入记录（`status/initialization.json`，匹配公钥、固定 8 文件 bundle 与 entrypoint，作为控制面放行升级的门禁）；真实 Linux/systemd 运行端动态验收仍在等待隔离环境，不可提前标记为已通过。
+## 5. 14 项发布资产完整性与签名
+- [ ] Docker 资产 4 项完整（`source.zip`、`.docker.manifest.json`、`.docker.manifest.sig`、`.manifest.json`）；
+- [ ] Ubuntu x86_64 资产 4 项完整（管理器、`.tar.gz`、`.manifest.json`、`.manifest.sig`）；
+- [ ] Ubuntu ARM64 资产 4 项完整（管理器、`.tar.gz`、`.manifest.json`、`.manifest.sig`）；
+- [ ] 发布索引 2 项完整（`artifacts.json`、`artifacts.json.sig`）；
+- [ ] 流水线中 `scripts/verify-public-release.py` 在本地打包后及远端上传后二次下载核验均成功通过。
 
-## 6. 版本发布与制品完整性检查
-- [ ] 版本号一致性：`package.json`、`package-lock.json` 与 `backend/version.py` 版本号一致（当前为 `0.2.2`，开发中规划为 `0.3.0`）；
-- [ ] 签名密钥分离：签名私钥由 GitHub Actions secret `RELEASE_SIGNING_KEY` 托管，公钥保存于 `deploy/update-signing.pub`，严禁将私钥打入任何安装包或源码；
-- [ ] 自动化打包工作流：明确 `main` 分支 CI 成功后方可推送版本标签（不能预先勾选成功或提前推签）；标签推送后触发 `.github/workflows/release.yml`，复用 CI 验证并自动执行 `scripts/build-release.py` 生成发布草稿；
-- [ ] 历史发版资产（v0.2.2 共 8 项）：`xianyu-saas-0.2.2.tar.gz`、`manifest.json`、`manifest.sig`、`source.zip`、`update-signing.pub`、`release-notes.md`、`artifacts.json`、`SHA256SUMS`（`SHA256SUMS` 覆盖 6 项内容资产与 `artifacts.json` 共 7 项制品，不含自身）；
-- [ ] 后续正式发版资产（0.3.0+ 规划共 10 项）：在原有 8 项基础上增加对应版本的 `.docker.manifest.json` 与 `.docker.manifest.sig`；`artifacts.json` 记录 8 项内容资产元数据；`SHA256SUMS` 覆盖除自身外的全部 9 项文件；
-- [ ] 资产用途明确：`source.zip` 包含完整安全源码，用于 Docker 或手动部署；`tar.gz` + `manifest.json` + `manifest.sig` 专供签名 systemd 更新器；`.docker.manifest.json` + `.sig` 专供 Docker 独立更新器校验；
-- [ ] 校验和与公钥指纹：`artifacts.json` 中的 `public_key_fingerprint` 为原始 32 字节 Ed25519 公钥二进制的 SHA-256 摘要（带 `sha256:` 前缀，与直接计算 PEM 文本哈希不同）。
+## 6. 发布页面与说明核对
+- [ ] GitHub Release 正文包含三个明确的用户下载入口（Docker `source.zip`、Ubuntu x86_64 管理器、Ubuntu ARM64 管理器）；
+- [ ] 包含 Docker 首次安装步骤、Ubuntu 安装步骤、已有用户网页更新说明与备份提醒；
+- [ ] 确认 Release 状态已由 Draft 转为正式发布（`draft=false`）。
