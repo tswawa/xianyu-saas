@@ -42,11 +42,6 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-          cache: pip
-          cache-dependency-path: |
-            backend/requirements.txt
-            deploy/runtime/backend.lock.json
-            deploy/runtime/worker.lock.json
       - name: Verify native build architecture
         env:
           EXPECTED_ARCHITECTURE: ${{ matrix.architecture }}
