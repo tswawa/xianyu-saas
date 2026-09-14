@@ -461,6 +461,8 @@ def new_installer(
         updater_initializer=callback,
         clock=lambda: 1789257600,
     )
+    if os.name == "posix" and os.geteuid() != 0:
+        installer._acquire_update_lock = lambda: os.open(os.devnull, os.O_RDONLY)
     return installer, filesystem, command_adapter, network, bundles, initializations
 
 
