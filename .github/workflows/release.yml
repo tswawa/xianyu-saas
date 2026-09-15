@@ -167,7 +167,7 @@ jobs:
           tar --sort=name --mtime="@$epoch" --owner=0 --group=0 --numeric-owner \
             -C ".local/standalone/$TARGET" -cf ".local/standalone-$TARGET.tar" bundle manager
       - name: Upload unsigned standalone handoff
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: standalone-${{ matrix.target }}
           path: .local/standalone-${{ matrix.target }}.tar
@@ -252,7 +252,7 @@ jobs:
             --commit "$RELEASE_COMMIT" \
             --public-key deploy/update-signing.pub
       - name: Retain validated release
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: release-${{ github.ref_name }}
           path: .local/releases/${{ steps.metadata.outputs.version }}/
