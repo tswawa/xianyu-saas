@@ -326,6 +326,19 @@ class OperationsContract(unittest.TestCase):
         self.assertEqual(self.backend.requests[row["operation_id"]], original)
         self.assertEqual(len(self.backend.requests), 1)
 
+    def test_same_operation_queued_between_availability_reads_is_retryable(self):
+        row = self.prepare()
+        token = self.confirm(row)
+        queued = self.db.queue_update_operation(row["operation_id"], token, self.uid,
+                                                self.session, action="apply", version=row["version"])
+        self.assertIsNotNone(queued)
+        self.assertIsNotNone(self.db.active_platform_update())
+        with patch.object(self.db, "active_update_operation", side_effect=[None, queued]):
+            self.service._require_available("apply", operation_id=row["operation_id"])
+        with patch.object(self.db, "active_update_operation", side_effect=[None, None]):
+            self.assertCode("update_busy", lambda: self.service._require_available(
+                "apply", operation_id=row["operation_id"]))
+
     def test_parallel_submit_is_one_operation_and_single_use_for_new_action(self):
         row = self.prepare()
         token = self.confirm(row)

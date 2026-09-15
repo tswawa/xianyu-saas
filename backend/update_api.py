@@ -85,7 +85,12 @@ class UpdateAPI:
         # Keep deployments with an old v1 request fail-closed until it completes.
         legacy = self.db.active_platform_update()
         if active is None and legacy is not None:
-            raise protocol.PlatformUpdateError("update_busy")
+            # Another submit may have committed the operation and its legacy
+            # mirror between the two reads. A retry of that same operation is
+            # still allowed; an actual legacy request remains fail-closed.
+            active = self.db.active_update_operation()
+            if active is None or active["operation_id"] != operation_id:
+                raise protocol.PlatformUpdateError("update_busy")
         return result
 
     def _validate(self, row):
