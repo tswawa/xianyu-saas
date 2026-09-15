@@ -1037,8 +1037,14 @@ class Installer:
         )
         release = _json_object(self.network.fetch(release_url, MAX_INDEX_BYTES), "manager_release_metadata_invalid")
         tag = release.get("tag_name")
+        # An explicitly requested version may be a prerelease: the manager always
+        # requests its own build tag, and the release notes document
+        # `install --version <prerelease>` for update testing. The implicit
+        # `releases/latest` feed stays stable-only, because GitHub's latest never
+        # points at a prerelease and we refuse an unexpected one.
         if (
-            release.get("draft") is not False or release.get("prerelease") is not False
+            release.get("draft") is not False
+            or (requested_version is None and release.get("prerelease") is not False)
             or not isinstance(tag, str) or not tag.startswith("v") or not VERSION_RE.fullmatch(tag[1:])
             or (requested_version is not None and tag != f"v{requested_version}")
         ):

@@ -320,6 +320,7 @@ def build_release(
     *,
     path_override: str | None = None,
     mutate_records=None,
+    prerelease: bool = False,
 ):
     payloads = {}
     records = []
@@ -374,7 +375,7 @@ def build_release(
     metadata = json_bytes({
         "tag_name": f"v{version}",
         "draft": False,
-        "prerelease": False,
+        "prerelease": prerelease,
         "assets": [{"name": name, "browser_download_url": prefix + name} for name in names],
     })
     responses = {
@@ -386,11 +387,12 @@ def build_release(
     return metadata, responses, bundles
 
 
-def release_fixture(*, app_version=APP_VERSION, path_override=None, mutate_app_records=None, extra_version=None):
+def release_fixture(*, app_version=APP_VERSION, path_override=None, mutate_app_records=None, extra_version=None,
+                    prerelease=False):
     key = Ed25519PrivateKey.generate()
     public = key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
     public_encoded = base64.b64encode(public) + b"\n"
-    _, manager_responses, _ = build_release(key, MANAGER_VERSION, MANAGER)
+    _, manager_responses, _ = build_release(key, MANAGER_VERSION, MANAGER, prerelease=prerelease)
     app_manager = LEGACY_MANAGER if app_version == LEGACY_VERSION else APP_MANAGER
     app_metadata, app_responses, bundles = build_release(
         key,
@@ -398,6 +400,7 @@ def release_fixture(*, app_version=APP_VERSION, path_override=None, mutate_app_r
         app_manager,
         path_override=path_override,
         mutate_records=mutate_app_records,
+        prerelease=prerelease,
     )
     responses = {**manager_responses, **app_responses}
     if extra_version:
@@ -439,6 +442,7 @@ def new_installer(
     initializer=None,
     path_override=None,
     mutate_app_records=None,
+    prerelease=False,
 ):
     manager = root / "bootstrap-manager"
     manager.parent.mkdir(parents=True, exist_ok=True)
@@ -448,6 +452,7 @@ def new_installer(
             app_version=app_version,
             path_override=path_override,
             mutate_app_records=mutate_app_records,
+            prerelease=prerelease,
         )
     filesystem = DryFilesystem()
     command_adapter = commands or DryCommands()
@@ -1183,6 +1188,24 @@ def preflight_boundaries(run: Path) -> None:
     print("installer: fresh-only port and occupied launcher preflight boundaries passed")
 
 
+def prerelease_version_routing(run: Path) -> None:
+    # The manager always requests its own build tag, and the release notes
+    # document `install --version <prerelease>` for update testing, so an
+    # explicitly requested prerelease must install. The implicit latest feed
+    # stays stable-only.
+    installer, _, _, _, _, _ = new_installer(
+        run / "prerelease-explicit", app_version="9.8.7-test.1", prerelease=True,
+    )
+    result = installer.install(architecture="x86_64", version="9.8.7-test.1")
+    assert result["ok"] is True and result["version"] == "9.8.7-test.1"
+
+    latest_installer, _, _, _, _, _ = new_installer(
+        run / "prerelease-latest", app_version="9.8.7-test.1", prerelease=True,
+    )
+    expect_error("manager_release_metadata_invalid", lambda: latest_installer.install(architecture="x86_64"))
+    print("installer: explicit prerelease install works; implicit latest stays stable-only")
+
+
 def static_boundaries() -> None:
     source = (ROOT / "deploy/manager/installer.py").read_text(encoding="utf-8")
     assert "shell=True" not in source
@@ -1220,6 +1243,7 @@ def main() -> None:
         tampering_and_danger_fail_before_stop(run)
         updater_lock_contract(run)
         preflight_boundaries(run)
+        prerelease_version_routing(run)
     print("systemd installer contract: passed")
 
 
