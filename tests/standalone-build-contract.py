@@ -104,6 +104,7 @@ def fixture(run: Path):
         "backend/main.py": b"VALUE = 1\n",
         "backend/__pycache__/old.cpython-312.pyc": b"cache",
         "frontend/index.html": b"<!doctype html><title>fixture</title>\n",
+        "docker/launcher.sh": b"#!/bin/sh\nexit 0\n",
         "worker/requirements.txt": worker_requirements,
         "worker/main.py": b"VALUE = 2\n",
         "worker/.env.example": b"COOKIES_STR=\nAPI_KEY=\n",
@@ -214,6 +215,9 @@ def success_contract(run: Path) -> None:
     assert (output / "backend/main.py").is_file()
     assert (output / "frontend/index.html").is_file()
     assert (output / "worker/main.py").is_file()
+    assert (output / "docker/launcher.sh").read_bytes() == b"#!/bin/sh\nexit 0\n"
+    if os.name == "posix":
+        assert stat.S_IMODE((output / "docker/launcher.sh").stat().st_mode) == 0o755
     assert not (output / "worker/.env.example").exists()
     assert not (output / "app").exists()
     assert (output / "runtime/python/bin/python3").is_file()
