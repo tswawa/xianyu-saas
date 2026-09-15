@@ -141,32 +141,35 @@ for directive in (
     assert directive in generic, directive
 assert "# Reject /xianyu-saas/internal/*" in LOCATIONS
 assert "location ^~ /xianyu-saas/ {\n    return 404;\n}" in LOCATIONS
-for header in (
-    "Content-Security-Policy",
-    "Permissions-Policy",
-    "Referrer-Policy",
-    "X-Content-Type-Options",
-    "X-Frame-Options",
-):
-    assert header in LOCATIONS, header
+# Frontend is served by the control plane from the active code directory
+# (built-in file updates switch the store/current pointer); nginx only proxies.
+assert "proxy_pass http://127.0.0.1:8096/xianyu-saas/;" in LOCATIONS
+assert "proxy_pass http://127.0.0.1:8096/xianyu-saas/assets/;" in LOCATIONS
+assert "alias /opt/xianyu-saas/current/frontend" not in LOCATIONS
 
 api_exec = next(line for line in SERVICE.splitlines() if line.startswith("ExecStart="))
-assert "uvicorn app:app" in api_exec
-assert "--proxy-headers" in api_exec
-assert "--forwarded-allow-ips=127.0.0.1" in api_exec
-assert "--limit-concurrency 100" in api_exec
-assert "--backlog 128" in api_exec
-assert "--workers" not in api_exec
-assert "--preload" not in api_exec
+assert api_exec == "ExecStart=/opt/xianyu-saas/current/docker/launcher.sh"
+LAUNCHER = (ROOT / "docker/launcher.sh").read_text(encoding="utf-8")
+assert "--proxy-headers" in LAUNCHER
+assert "--forwarded-allow-ips=127.0.0.1" in LAUNCHER
+assert "--limit-concurrency 100" in LAUNCHER
+assert "--backlog 128" in LAUNCHER
+assert "--workers" not in LAUNCHER
+assert "--preload" not in LAUNCHER
 for unit in (SERVICE, CONSUMER_SERVICE):
     assert "WorkingDirectory=/opt/xianyu-saas/current/backend" in unit
     assert "Environment=SAAS_CURRENT_ROOT=/opt/xianyu-saas/current" in unit
     assert "Environment=SAAS_RELEASE_KIND=standalone" in unit
     assert "Environment=PYTHONPATH=/opt/xianyu-saas/current/runtime/site/backend" in unit
-    assert "ExecStart=/opt/xianyu-saas/current/runtime/python/bin/python3" in unit
     assert "ReadWritePaths=/var/lib/xianyu-saas" in unit
     assert "ProtectSystem=strict" in unit
     assert "UMask=0077" in unit
+assert "ExecStart=/opt/xianyu-saas/current/runtime/python/bin/python3 -m job_consumer" in CONSUMER_SERVICE
+assert "Conflicts=xianyu-saas-consumer.service" in SERVICE
+assert "Environment=SAAS_APP_CODE_DIR=/var/lib/xianyu-saas/app-code" in SERVICE
+assert "Environment=SAAS_LAUNCH_PYTHON=/opt/xianyu-saas/current/runtime/python/bin/python3" in SERVICE
+assert "Environment=SAAS_LAUNCH_WORKER_PYTHONPATH_EXTRA=/opt/xianyu-saas/current/runtime/site/worker" in SERVICE
+assert "ConditionPathExists=!/var/lib/xianyu-saas/app-code/launcher.json" in CONSUMER_SERVICE
 assert "Environment=SAAS_BOT_PYTHON=/opt/xianyu-saas/current/runtime/python/bin/python3" in SERVICE
 assert "Environment=SAAS_BOT_PYTHONPATH=/opt/xianyu-saas/current/runtime/site/worker" in SERVICE
 assert "Environment=SAAS_UPDATE_PUBLIC_KEY_FILE=/etc/xianyu-saas/update-signing.pub" in SERVICE

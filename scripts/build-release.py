@@ -100,7 +100,7 @@ PUBLIC_RUNTIME_LOCKS = frozenset({
 STANDALONE_ARCHITECTURES = ("x86_64", "aarch64")
 STANDALONE_TARGETS = tuple(f"linux-{architecture}" for architecture in STANDALONE_ARCHITECTURES)
 MANAGER_PROTOCOL = 1
-REQUIRED_STANDALONE_ROOTS = frozenset({"backend", "frontend", "worker", "runtime", "manager"})
+REQUIRED_STANDALONE_ROOTS = frozenset({"backend", "frontend", "worker", "runtime", "manager", "docker"})
 
 
 def git_environment() -> dict[str, str]:

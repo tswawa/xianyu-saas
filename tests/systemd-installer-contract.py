@@ -267,6 +267,7 @@ def make_archive(
         ).encode(),
         "backend/update_maintenance.py": b"MAINTENANCE_PROTOCOL = 1\n",
         "worker/main.py": b"VALUE = 'worker'\n",
+        "docker/launcher.sh": b"#!/bin/sh\nexit 0\n",
         "frontend/index.html": b"<!doctype html><title>fixture</title>\n",
         "runtime/python/bin/python3": b"#!/bin/sh\nexit 0\n",
         "runtime/python/bin/python3.12": b"#!/bin/sh\nexit 0\n",
@@ -289,7 +290,7 @@ def make_archive(
         for name, payload in sorted(files.items()):
             info = tarfile.TarInfo(name)
             info.size = len(payload)
-            executable = name == "manager/xianyu-saas"
+            executable = name in {"manager/xianyu-saas", "docker/launcher.sh"}
             info.mode = 0o755 if executable else 0o644
             archive.addfile(info, io.BytesIO(payload))
             manifest_files.append({
@@ -385,7 +386,7 @@ def build_release(
     return metadata, responses, bundles
 
 
-def release_fixture(*, app_version=APP_VERSION, path_override=None, mutate_app_records=None):
+def release_fixture(*, app_version=APP_VERSION, path_override=None, mutate_app_records=None, extra_version=None):
     key = Ed25519PrivateKey.generate()
     public = key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
     public_encoded = base64.b64encode(public) + b"\n"
@@ -399,6 +400,9 @@ def release_fixture(*, app_version=APP_VERSION, path_override=None, mutate_app_r
         mutate_records=mutate_app_records,
     )
     responses = {**manager_responses, **app_responses}
+    if extra_version:
+        _, extra_responses, _ = build_release(key, extra_version, APP_MANAGER)
+        responses.update(extra_responses)
     responses[f"{GITHUB_API_ROOT}/releases/latest"] = app_metadata
     return public_encoded, responses, bundles
 
@@ -459,6 +463,7 @@ def new_installer(
         executable=manager,
         public_key=public,
         updater_initializer=callback,
+        update_capability_probe=lambda account, root: True,
         clock=lambda: 1789257600,
     )
     if os.name == "posix" and os.geteuid() != 0:
@@ -638,9 +643,12 @@ def successful_transaction_and_repeat(run: Path) -> None:
         assert (paths.systemd_dir / unit).read_bytes() == (ROOT / "deploy/systemd" / unit).read_bytes()
     assert commands.availability_checks == [SYSTEMD_BIN, SYSTEMD_ANALYZE_BIN, USERADD_BIN]
     assert (SYSTEMD_BIN, "daemon-reload") in commands.commands
-    assert (SYSTEMD_BIN, "enable", *START_UNITS) in commands.commands
+    # The shipped units run the built-in launcher: only the API unit is enabled
+    # and started; the legacy consumer/updater units are disabled and untouched.
+    assert (SYSTEMD_BIN, "enable", API_SERVICE) in commands.commands
+    assert (SYSTEMD_BIN, "disable", CONSUMER_SERVICE, UPDATER_PATH_UNIT) in commands.commands
     assert (SYSTEMD_BIN, "start", API_SERVICE) in commands.commands
-    assert (SYSTEMD_BIN, "start", CONSUMER_SERVICE, UPDATER_PATH_UNIT) in commands.commands
+    assert (SYSTEMD_BIN, "start", CONSUMER_SERVICE, UPDATER_PATH_UNIT) not in commands.commands
     assert not any(command[:2] == (SYSTEMD_BIN, "stop") for command in commands.commands)
     maintenance = json.loads((paths.update_queue_dir / "status/maintenance.json").read_bytes())
     assert maintenance["active"] is False and maintenance["phase"] == "succeeded"
@@ -655,8 +663,33 @@ def successful_transaction_and_repeat(run: Path) -> None:
     repeated = installer.install(architecture="x86_64")
     assert repeated["status"] == "already_installed"
     assert repeated["version"] == APP_VERSION and repeated["manager_version"] == MANAGER_VERSION
-    assert network.requests == requests_before and commands.commands == commands_before
+    assert network.requests == requests_before
+    assert commands.commands == commands_before + [(SYSTEMD_BIN, "start", API_SERVICE)]
     print("installer: manager/app version split, fresh transaction and idempotency passed")
+
+
+def managed_runtime_upgrade_and_readiness(run: Path) -> None:
+    target = "9.8.8"
+    public, responses, bundles = release_fixture(extra_version=target)
+    installer, filesystem, commands, network, _, _ = new_installer(
+        run / "managed-upgrade", public=public, responses=responses, bundles=bundles)
+    installer.install(architecture="x86_64", version=APP_VERSION)
+    write_database(installer.paths.state_dir / "saas.db", "keep through runtime upgrade")
+    (installer.paths.state_dir / "tenants").mkdir(exist_ok=True)
+    before = (installer.paths.state_dir / "saas.db").read_bytes()
+    link = installer._file_update_store_link()
+    web_code = link.parent / "releases/9.8.8-preview.1"
+    (web_code / "backend").mkdir(parents=True)
+    (web_code / "backend/app.py").write_text("# signed-code fixture\n")
+    link.symlink_to("releases/9.8.8-preview.1")
+    assert installer._file_update_pointer_state() == str(web_code.resolve())
+    result = installer.install(architecture="x86_64", version=target)
+    assert result["version"] == target
+    assert not link.is_symlink(), "new runtime was shadowed by old web code"
+    assert (installer.paths.state_dir / "saas.db").read_bytes() == before
+    installer.update_capability_probe = lambda *_: False
+    expect_error("manager_update_ready_failed", lambda: installer.install(architecture="x86_64"))
+    print("installer: signed runtime upgrade preserves data, resets older web code and requires readiness on rerun")
 
 
 def existing_environment_is_never_overwritten(run: Path) -> None:
@@ -712,7 +745,8 @@ def signed_unmanaged_adoption(run: Path) -> None:
     requests_before = list(network.requests)
     commands_before = list(commands.commands)
     assert installer.install(architecture="x86_64")["status"] == "already_installed"
-    assert network.requests == requests_before and commands.commands == commands_before
+    assert network.requests == requests_before
+    assert commands.commands == commands_before + [(SYSTEMD_BIN, "start", API_SERVICE)]
     print("installer: signed unmanaged v0.4.0 adoption and repeat passed")
 
 
@@ -837,7 +871,8 @@ def legacy_migrations(run: Path) -> None:
         requests_before = list(network.requests)
         commands_before = list(commands.commands)
         assert installer.install(architecture="x86_64")["status"] == "already_installed"
-        assert network.requests == requests_before and commands.commands == commands_before
+        assert network.requests == requests_before
+        assert commands.commands == commands_before + [(SYSTEMD_BIN, "start", API_SERVICE)]
     print("installer: /opt and /srv v0.4.0 migrations preserve data and become idempotent")
 
 
@@ -1174,6 +1209,7 @@ def main() -> None:
     with tempfile.TemporaryDirectory(prefix="xianyu-installer-contract-") as temporary:
         run = Path(temporary)
         successful_transaction_and_repeat(run)
+        managed_runtime_upgrade_and_readiness(run)
         existing_environment_is_never_overwritten(run)
         architecture_selection(run)
         signed_unmanaged_adoption(run)

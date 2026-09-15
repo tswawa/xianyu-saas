@@ -109,6 +109,8 @@
 | Ubuntu 原生安装（ARM64） | Ubuntu 22.04 / 24.04、Debian 12（ARM64） | `xianyu-saas-<version>-linux-aarch64` |
 
 > 提示：推荐下载项目发布的 `xianyu-saas-<version>-source.zip`。它包含构建元数据并与签名清单绑定；GitHub 自动打包的 Source code 不包含发布构建信息。其余清单与签名附件由安装程序和更新器自动调用，无需手动下载。
+>
+> **说明**：本次重构的默认内置文件更新与监督启动器机制**尚未正式对外发布**（已有公开的 0.4.4 与 0.4.5-update-test.1 发布包不包含此内置机制）。内部已通过真实 Docker 容器网页升级与数据保留验收，待新版本发布后即可使用。
 
 ### 方式一：Docker Compose 部署（推荐）
 
@@ -117,21 +119,21 @@
 安装脚本在本地根据源码构建镜像，不提供预构建镜像，也不从公开镜像仓库拉取业务镜像。
 
 ```bash
-# 1. 从 GitHub Releases 下载版本化源码包（以 0.4.4 为例）
-curl -fLO https://github.com/tswawa/xianyu-saas/releases/download/v0.4.4/xianyu-saas-0.4.4-source.zip
+# 1. 从 GitHub Releases 下载版本化源码包（请将 <version> 替换为实际发布的版本号）
+curl -fLO https://github.com/tswawa/xianyu-saas/releases/download/v<version>/xianyu-saas-<version>-source.zip
 
 # 2. 解压并进入解压目录
-unzip -q xianyu-saas-0.4.4-source.zip
-cd xianyu-saas-0.4.4
+unzip -q xianyu-saas-<version>-source.zip
+cd xianyu-saas-<version>
 
 # 3. 执行安装脚本
 sudo bash deploy/docker-install.sh
 ```
 
 - **访问地址**：`http://127.0.0.1:4173/xianyu-saas/`
-- **数据目录**：SQLite 数据库与各店铺配置文件保存在项目根目录下的 `./data` 目录中。
+- **数据目录**：SQLite 数据库、店铺配置与主密钥保存在 `./data` 目录；内置更新器的代码存储在 `./data/app-code`，基础运行环境与可信公钥固定在容器镜像内。
 - **环境要求**：必须在本地 Linux 或 WSL2 Linux 文件系统中执行，不支持在 Windows PowerShell 或 Git Bash 中直接运行。在 Windows 上使用时，请安装 Windows 版 Docker Desktop 并启用 Linux 容器模式，在 WSL2 的 Linux 文件系统路径中下载解压并运行。Worker 及控制面依赖 Linux 内核接口（如 `fcntl`、`/proc`、`RLIMIT_AS`、`setsid` 等），不支持 Windows 原生直接运行全部服务。
-- **重复执行**：脚本具备幂等性。检测到已登记的受管安装后，仅校验并启动既有容器（`docker start`），不会重建镜像或覆盖现有业务数据；修改环境变量或 Compose 配置后，`docker start` 不会加载新配置，需由维护者按实际运行镜像、挂载和更新器登记关系人工维护，不能直接拿旧源码重新构建覆盖升级后的镜像。
+- **重复执行**：脚本具备幂等性。检测到已运行的容器后，仅校验并启动既有容器（`docker start` 保留原镜像与配置），不会重新构建镜像，也不会替换或自动迁移旧镜像；修改环境变量或 Compose 配置后，`docker start` 不会加载新配置，需由维护者人工重建容器；旧版未接入内置启动器的 Docker 容器无法通过重新运行脚本自动迁移。
 
 查看应用日志、暂停应用与恢复：
 ```bash
@@ -140,7 +142,7 @@ sudo docker stop xianyu-saas
 sudo bash deploy/docker-install.sh
 ```
 
-- **版本更新说明**：通过上述安装脚本完成更新器登记后，管理员可在工作台内受控升级。升级只切换镜像，保留业务数据；失败自动回滚代码。Docker 升级时不自动备份数据库，维护前请自行备份 `./data` 目录。升级与回滚边界详见 [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md)。
+- **网页更新说明**：系统默认内置文件更新器与监督启动器，无需手动组装或登记独立更新容器。管理员在网页端检查到新版本后，输入密码确认即可下载官方 Releases 签名源码包、校验签名并自动切换代码重启服务；普通代码更新保存在 `./data/app-code` 中，不重新构建 Docker 镜像，保留数据库、店铺配置与主密钥；若新版本启动失败自动回滚代码（回滚仅针对应用代码，不恢复或备份业务数据，维护前请自行对 `./data` 目录进行冷备份）。若遇到依赖或运行环境变动，需重新运行官方安装脚本。详见 [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md)。
 
 ### 方式二：Ubuntu 原生安装（x86_64 / ARM64）
 
@@ -150,28 +152,26 @@ sudo bash deploy/docker-install.sh
 
 ```bash
 # x86_64 架构：
-curl -fLO https://github.com/tswawa/xianyu-saas/releases/download/v0.4.4/xianyu-saas-0.4.4-linux-x86_64
-chmod +x xianyu-saas-0.4.4-linux-x86_64
-sudo ./xianyu-saas-0.4.4-linux-x86_64 install --version 0.4.4
-```
+curl -fLO https://github.com/tswawa/xianyu-saas/releases/download/v<version>/xianyu-saas-<version>-linux-x86_64
+chmod +x xianyu-saas-<version>-linux-x86_64
+sudo ./xianyu-saas-<version>-linux-x86_64 install --version <version>
 
-```bash
 # ARM64 架构：
-curl -fLO https://github.com/tswawa/xianyu-saas/releases/download/v0.4.4/xianyu-saas-0.4.4-linux-aarch64
-chmod +x xianyu-saas-0.4.4-linux-aarch64
-sudo ./xianyu-saas-0.4.4-linux-aarch64 install --version 0.4.4
+curl -fLO https://github.com/tswawa/xianyu-saas/releases/download/v<version>/xianyu-saas-<version>-linux-aarch64
+chmod +x xianyu-saas-<version>-linux-aarch64
+sudo ./xianyu-saas-<version>-linux-aarch64 install --version <version>
 ```
 
 - **访问地址**：`http://127.0.0.1:8096/xianyu-saas/`
-- **数据与配置**：数据保存在 `/var/lib/xianyu-saas`，配置文件位于 `/etc/xianyu-saas.env`。
-- **系统服务**：安装后由 systemd 管理 `xianyu-saas.service`、`xianyu-saas-consumer.service`、`xianyu-saas-updater.service` 与 `xianyu-saas-updater.path`。
+- **数据与配置**：数据保存在 `/var/lib/xianyu-saas`，配置文件位于 `/etc/xianyu-saas.env`，更新代码保存在 `/var/lib/xianyu-saas/app-code`。
+- **系统服务与更新**：安装后由 systemd 管理服务，并由监督启动器运行；同样支持在网页端直接执行签名源码包下载、代码切换与自动重启，无需手动组装独立更新器。
 - **日常维护**：安装完成后直接使用系统已注册的管理器命令进行维护：
   ```bash
   sudo xianyu-saas status
   sudo xianyu-saas restart
   sudo xianyu-saas doctor
   ```
-- **说明**：管理器文件本身是独立的引导安装程序，不是包含全量依赖的离线大包；执行时会拉取并校验签名运行包。升级时原生更新器包含数据库备份步骤。
+- **说明**：管理器是引导安装程序，执行时下载并校验签名运行包。原生安装事务会备份数据库；网页文件更新仅保留现有数据，不另做数据库备份。
 
 ### 源码开发指南（仅限开发者）
 

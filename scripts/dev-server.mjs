@@ -3,7 +3,9 @@ import http from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const root = process.env.SAAS_DEV_WEB_ROOT
+  ? path.resolve(process.env.SAAS_DEV_WEB_ROOT)
+  : path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const frontend = path.join(root, "frontend");
 const assets = path.join(frontend, "assets");
 const port = Number.parseInt(process.env.SAAS_DEV_WEB_PORT || "4173", 10);

@@ -10,14 +10,16 @@
 - 系统需具备 `curl`、`unzip`，以及支持 Engine API v1.47 的 Linux Docker Engine 与 Compose 插件（不支持远程 Docker 上下文）。
 
 ### 2. 获取 Release 安装包
-从 GitHub Releases 下载固定版本的源码安装包（以 0.4.4 为例）：
+从 GitHub Releases 下载固定版本的源码安装包（请将 `<version>` 替换为实际发布的版本号）：
 ```bash
-curl -fLO https://github.com/tswawa/xianyu-saas/releases/download/v0.4.4/xianyu-saas-0.4.4-source.zip
-unzip -q xianyu-saas-0.4.4-source.zip
-cd xianyu-saas-0.4.4
+curl -fLO https://github.com/tswawa/xianyu-saas/releases/download/v<version>/xianyu-saas-<version>-source.zip
+unzip -q xianyu-saas-<version>-source.zip
+cd xianyu-saas-<version>
 ```
 
-> 提示：推荐下载项目发布的 `xianyu-saas-0.4.4-source.zip`。它包含构建元数据并与签名清单绑定；GitHub 自动打包的 Source code 不包含发布构建信息。
+> 提示：推荐下载项目发布的 `xianyu-saas-<version>-source.zip`。它包含构建元数据并与签名清单绑定；GitHub 自动打包的 Source code 不包含发布构建信息。
+>
+> **说明**：本次重构的默认内置文件更新与监督启动器机制**尚未正式对外发布**（已有公开的 0.4.4 与 0.4.5-update-test.1 发布包不包含此内置机制）。内部测试中，真实的 Docker 容器内网页升级与数据保留已验收通过，待后续正式版本发布后即可直接使用。
 
 ### 3. 一键安装并验收（推荐）
 ```bash
@@ -26,17 +28,18 @@ sudo bash deploy/docker-install.sh
 
 脚本在全新安装时按固定顺序完成：
 1. 缺失时从示例创建 `config/saas.env`（权限 0600，同时作为 Compose 的 env_file）；
-2. 渲染 `docker-compose.yml` 与 `docker-compose.updates.yml` 并在本地构建镜像（不拉取远程预构建镜像）；
+2. 渲染 `docker-compose.yml` 并在本地构建镜像（不拉取远程预构建镜像）；
 3. 把仓库内置的 `deploy/update-signing.pub` 复制为容器内 root 拥有的本地副本（权限 0644）；
-4. 仅为全新 `./data` 目录设置容器用户属主（非递归，不改动已有数据）；
-5. 启动应用容器与独立更新器容器；
+4. 准备 `./data` 目录及可写代码存储 `./data/app-code`（非递归设置属主，不改动已有业务数据）；
+5. 启动应用容器（内置 `docker/launcher.sh` 启动器统一监督 API、任务消费者及静态前端）；
 6. 等待容器运行与 `/health` 健康；
-7. 执行一次性更新器登记（`initialize`）；
-8. 调用应用侧 `platform_update.update_capabilities()` 验收真实的更新就绪能力。
+7. 验收内置文件更新就绪能力。
 
-- **信任来源**：只信任源码包内置的公钥（`deploy/update-signing.pub`）；脚本绝不从外部自动下载替换公钥。首次下载脚本本身不验证整个 ZIP 的外置签名，后续网页升级时由更新器自动核验签名。
-- **受管安装幂等性**：检测到已登记的受管安装后，脚本不会重新构建镜像，不会覆盖更新器私有状态，也不会覆盖或降级已由网页更新过的受管镜像。受管重跑只校验并启动既有容器（`docker start` 保留原镜像与配置）。
-- **重跑不加载新配置**：已登记的受管实例，重复运行安装脚本或执行 `docker start` 均不会把当前目录或 `config/saas.env` 的新配置应用到容器。修改环境变量、端口映射或数据挂载后，`docker start` 或 `docker compose restart` 都不会加载新容器配置。更改配置需在维护窗口由维护者按实际运行镜像、挂载和更新器登记关系人工重建容器；不能直接拿旧源码目录重新构建（`up --build`）覆盖网页升级后的镜像。
+- **默认内置更新机制**：系统默认采用内置启动器与文件更新机制（`docker/launcher.sh` + `backend/file_update.py`），日常代码升级直接在 `./data/app-code` 中切换并重启进程，无需特权 sidecar 容器或独立更新器登记。
+- **历史独立更新器兼容**：早期设计的独立特权更新器（`docker-compose.updates.yml`）及更新器登记逻辑在系统中保留向后兼容，但不作为默认推荐路径。
+- **信任来源**：只信任源码包内置的公钥（`deploy/update-signing.pub`）；脚本绝不从外部自动下载替换公钥。首次下载源码包本身不验证外置签名，后续网页升级时由内置更新器自动核验签名。
+- **脚本重跑与升级边界**：检测到既有受管安装后，脚本只校验并启动既有容器（`docker start` 保留原镜像与配置），不会重新构建镜像，也不会替换或升级已有镜像。因此，**旧版未接入内置启动器的 Docker 容器无法通过重新运行脚本自动迁移**。若需升级基础镜像或切换至新机制，需由维护者在维护窗口停止旧容器后重新构建启动。
+- **重跑不加载新配置**：已安装实例，重复运行安装脚本或执行 `docker start` 均不会把当前目录或 `config/saas.env` 的新配置应用到容器。修改环境变量、端口映射或数据挂载后，`docker start` 或 `docker compose restart` 都不会加载新容器配置。更改配置需由维护者在维护窗口按实际运行镜像、挂载关系人工重建容器。
 - **运行环境限制**：安装脚本只支持 Linux Bash 与本地 Linux Docker 引擎；不支持远程 Docker 上下文，请在真实 Linux 文件系统路径中执行（Windows 请用 WSL2 的 Linux 环境）。
 - **超时与诊断**：容器启动与更新就绪验收默认超时为 300 秒（可用 `--timeout` 参数调整）；排查可查看 `docker compose logs`。
 
@@ -63,13 +66,13 @@ sudo docker stop xianyu-saas
 sudo bash deploy/docker-install.sh
 ```
 
-### 5. 纯手动源码启动（无网页更新能力）
-若仅作本地源码开发且不使用独立更新器，可通过标准 Compose 命令启动（此路径不具备网页自动升级能力）：
+### 5. 手动 Compose 启动（自定义编排）
+若不通过安装脚本，也可以直接使用标准 Docker Compose 命令启动：
 ```bash
 cp config/saas.env.docker.example config/saas.env
 docker compose up -d --build
 ```
-- 业务数据统一持久化在宿主机 `./data` 目录中。
+- 默认 Dockerfile 构建的镜像同样内置监督启动器与文件更新机制；业务数据及可写代码存储保存在宿主机 `./data` 目录（容器内映射 `/data`）。
 
 ---
 
@@ -86,18 +89,18 @@ docker compose up -d --build
 
 ### 2. 首次安装
 
-从官方 GitHub Releases 下载对应架构的管理器可执行文件（无后缀），执行 `install` 命令（指定 `--version 0.4.4` 锁定安装版本）：
+从官方 GitHub Releases 下载对应架构的管理器可执行文件（无后缀），执行 `install` 命令（指定 `--version <version>` 锁定安装版本）：
 
 ```bash
 # x86_64 架构：
-curl -fLO https://github.com/tswawa/xianyu-saas/releases/download/v0.4.4/xianyu-saas-0.4.4-linux-x86_64
-chmod +x xianyu-saas-0.4.4-linux-x86_64
-sudo ./xianyu-saas-0.4.4-linux-x86_64 install --version 0.4.4
+curl -fLO https://github.com/tswawa/xianyu-saas/releases/download/v<version>/xianyu-saas-<version>-linux-x86_64
+chmod +x xianyu-saas-<version>-linux-x86_64
+sudo ./xianyu-saas-<version>-linux-x86_64 install --version <version>
 
 # ARM64 架构：
-curl -fLO https://github.com/tswawa/xianyu-saas/releases/download/v0.4.4/xianyu-saas-0.4.4-linux-aarch64
-chmod +x xianyu-saas-0.4.4-linux-aarch64
-sudo ./xianyu-saas-0.4.4-linux-aarch64 install --version 0.4.4
+curl -fLO https://github.com/tswawa/xianyu-saas/releases/download/v<version>/xianyu-saas-<version>-linux-aarch64
+chmod +x xianyu-saas-<version>-linux-aarch64
+sudo ./xianyu-saas-<version>-linux-aarch64 install --version <version>
 ```
 
 也可以通过仓库内的在线安装脚本自动识别架构并安装：
@@ -106,8 +109,8 @@ sudo bash deploy/install.sh
 ```
 
 - **访问地址**：`http://127.0.0.1:8096/xianyu-saas/`
-- **数据与配置路径**：业务数据保存在 `/var/lib/xianyu-saas`，环境配置文件位于 `/etc/xianyu-saas.env`。
-- **管理器机制说明**：管理器文件本身是引导管理程序，不是包含全量依赖的离线大包；执行 `install` 时会在本机自动下载、验证对应架构的签名运行时包（`.tar.gz`、`.manifest.json`、`.manifest.sig`），并自动部署配置 systemd 服务单元（`xianyu-saas.service`、`xianyu-saas-consumer.service`、`xianyu-saas-updater.service` 与 `xianyu-saas-updater.path`）。
+- **数据与配置路径**：业务数据保存在 `/var/lib/xianyu-saas`，环境配置文件位于 `/etc/xianyu-saas.env`，可写代码存储位于 `/var/lib/xianyu-saas/app-code`。
+- **管理器机制说明**：管理器文件本身是引导管理程序，不是包含全量依赖的离线大包；执行 `install` 时会在本机自动下载、验证对应架构的签名运行时包（`.tar.gz`、`.manifest.json`、`.manifest.sig`），并自动部署配置由监督启动器运行的 systemd 服务（`xianyu-saas.service`）。
 
 ### 3. 日常维护与服务控制
 
@@ -149,169 +152,53 @@ sudo xianyu-saas doctor
 ### 版本识别与发布更新机制
 控制台界面显示当前运行进程加载的代码版本、构建元数据以及从服务端缓存获取的最新发布信息。系统在服务端默认每 6 小时（21600 秒，可通过 `SAAS_UPDATE_CHECK_INTERVAL_SECONDS` 调整）异步探测一次发布版本，全站共享数据库缓存与租约，不重复请求 GitHub；浏览器在页面可见时每 5 分钟读取本地缓存，发现新版本后在版本徽标变黄提示。自动探测仅作发现，绝不触发静默安装。
 
-- **首次安装与受管更新分工**：首次安装请使用官方 Release 发布的安装包（Docker 为 `xianyu-saas-<version>-source.zip`，Ubuntu 原生为对应架构的管理器无后缀可执行文件）；已登记实例后续直接在网页控制台进行受控升级。
-- **重复运行安装脚本**：已完成受管登记的实例，重复执行 `deploy/docker-install.sh` 仅校验并启动既有容器，不会作为升级手段，也不会自动应用本地新的环境变量或 Compose 变更。
-- **业务数据保护边界**：升级与回滚只操作应用运行镜像或服务版本，保留业务数据。Docker 部署中挂载的 `./data` 业务数据（SQLite 数据库、店铺配置、卡密库存等）始终保留，Docker 升级时不自动备份数据库，维护前请自行对 `./data` 目录进行冷备份；Ubuntu 原生部署的数据位于 `/var/lib/xianyu-saas`，原生更新器升级时包含数据库备份步骤，配置位于 `/etc/xianyu-saas.env`。两边均建议维护者做好日常备份。
+- **首次安装与受管更新分工**：首次安装请使用官方 Release 发布的安装包（Docker 为 `xianyu-saas-<version>-source.zip`，Ubuntu 原生为对应架构的管理器无后缀可执行文件）；已安装实例后续直接在网页控制台进行受控升级。
+- **重复运行安装脚本**：已安装实例，重复执行 `deploy/docker-install.sh` 仅校验并启动既有容器（`docker start` 保留原镜像与配置），不会替换镜像，也不会作为升级手段或自动应用本地新的环境变量与 Compose 变更。
+- **业务数据保护边界**：网页文件更新和失败回退只切换代码，保留现有数据库、店铺数据与配置，不另做数据库备份。Docker 数据位于 `./data`；Ubuntu 默认数据位于 `/var/lib/xianyu-saas`，配置位于 `/etc/xianyu-saas.env`。通过原生安装器升级完整运行环境时，安装事务另有数据库备份。两种部署都需要日常备份。
 
-### Docker 容器升级方式
+### 默认内置文件更新机制（推荐）
 
-#### 1. 未登记历史实例的人工维护边界
-若未启用独立更新器组件，Web 控制台无权操纵宿主机 Docker 守护进程，无法直接在网页中执行受控升级。
-- **配置与数据风险提示**：对于未登记更新器的旧版 Docker 部署，不能简单下载新版本解压到新目录直接执行 `docker compose up -d --build`，否则 Compose 会在新的相对路径下创建空的 `./data`，导致无法加载原有业务数据；
-- **人工维护原则**：未登记的历史实例若需升级或维护，维护者必须自行保证原有数据挂载路径（`/data`）不变，并在操作前完整冷备数据；也可以参考方式一的安装脚本重新规范化接入。系统不为未登记的旧版源码或历史容器提供自动网页升级通道。
+系统新增 `backend/file_update.py` 与 `docker/launcher.sh` 监督启动器，默认内置在 Docker 容器与 Ubuntu 官方部署中，无需用户手动组装独立更新器容器或编写 systemd 维护单元。
 
-#### 2. 独立 Docker 更新器组件
-为支持网页管理员受控升级与可信校验，项目通过独立更新器覆盖配置 `docker-compose.updates.yml` 提供受控升级。推荐安装路径是 `deploy/docker-install.sh`：它统一完成镜像构建、公钥预装、一次性登记与就绪验收，重复执行不会重建或降级受管镜像。
+#### 1. 代码目录与运行隔离
+- **Docker 部署**：可写代码存储目录为 `/data/app-code`（映射在宿主机 `./data/app-code`）；基础运行环境（Python 虚拟环境、系统库）与受信任公钥（`/app/update-signing.pub`，由 root 只读拥有）固定在容器镜像内部；
+- **Ubuntu 原生部署**：可写代码存储目录为 `/var/lib/xianyu-saas/app-code`；运行环境与可信公钥（`/etc/xianyu-saas/update-signing.pub`）固定在代码存储目录之外；
+- **数据与凭据保护**：业务数据库（`saas.db`）、租户与店铺数据（`tenants/`）、主密钥（`ai-master-key`）及配置文件（`config/saas.env` 或 `/etc/xianyu-saas.env`）均位于代码存储目录之外，更新过程始终保留，不会被修改或覆盖。
 
-**已有最终验收状态**：
-- 实际 SaaS Docker 构建安装、就绪验收、静态资源服务、运行中重跑及停止恢复已通过；
-- 签名测试应用升级与启动失败回退（保留既有配置与新增业务数据）已通过；
-- 未验收：真实线上闲鱼店铺与订单、旧版直装迁移、线上正式 Release 浏览器端到端点击更新。新发布流程的最终全链路检查尚未开始。
+#### 2. 网页受控更新流程
+1. **检查与确认**：管理员登录 Web 控制台，在版本更新页面查看新版本说明，点击升级并输入当前登录密码进行身份核验；
+2. **下载与验签**：后台直接从 GitHub Releases 下载目标版本的官方签名源码包（`xianyu-saas-<version>-source.zip` 及其签名清单），使用本地预置的受信公钥核验 Ed25519 签名与 SHA-256 校验和；
+3. **停服前兼容性检查**：系统比对目标版本与当前版本的 `UPDATE_DATA_VERSION` 以及 Python 依赖要求（`requirements.txt`）；若存在不兼容声明，在停止服务前直接拒绝升级并给出明确提示；
+4. **解压与原子切换**：校验通过后，代码解压至代码存储的 `releases/<version>` 目录；由监督启动器停止当前服务，将 `current` 软链接原子切换至新版本目录并启动服务；
+5. **健康检查与自动回滚**：新版本启动后，启动器等待 `/health` 接口就绪并核对版本；若新版本在超时时间内未通过健康检查，启动器自动将 `current` 软链接回滚至上一版本并重启恢复；
+6. **边界说明**：自动回滚仅针对应用代码目录的软链接切换，系统不自动备份或回滚业务数据库；日常运维建议在升级前自行对数据目录（`./data` 或 `/var/lib/xianyu-saas`）进行冷备份；
+7. **镜像免重构**：普通代码更新直接在可写代码存储中切换，**无需重新构建 Docker 镜像**；
+8. **发布状态说明**：基于真实 Docker 容器的网页升级与数据保留已在测试中验收通过，但**尚未正式对外发布**，已有的 0.4.4 与 0.4.5-update-test.1 公开包不包含此内置机制。
 
-未登记独立更新器的旧版 Docker 部署、直接使用源码运行或旧版 systemd 安装，不在本版本的网页自动升级通道内；需要维护者参考部署文档进行规范化配置或人工更新。
+### 依赖或底层运行环境变动时的升级
 
-- **架构、工具链与权限隔离**：
-  - **工具链版本规范**：更新器容器内 Docker CLI 保持 28.3.3，Buildx 保持 0.26.1（CLI 与 Buildx 均未升级）；仅通过单独官方固定的 `docker:29.8.0-cli` 构建阶段引入官方 Compose 5.5.1，并在镜像构建时严格校验插件版本；
-  - **官方 Compose 执行层分工**：由官方 Compose 负责候选镜像构建、目标单应用服务（`--no-deps`）的停止、重建与失败时切回旧镜像；更新器保留签名校验、维护排空、执行状态及健康检查，不再复制全量业务数据或运行数据迁移预演。配置检查复用同一份运行配置摘要，不另存容器快照指纹；
-  - **覆盖配置顺序规则**：`docker-compose.updates.yml` 必须置于所有用户本地覆盖文件之后最后叠加（`docker compose -f docker-compose.yml -f <用户覆盖配置> -f docker-compose.updates.yml ...`）。该文件仅补充受控更新所需字段，不强制 `container_name`，保留用户原有端口、数据卷、资源配额与 `extra_hosts`；文件内 `volumes: !override` 会替换前面的挂载列表，最终配置必须同时保有应用数据挂载（`/data`）、更新 IPC 卷与受信公钥，严禁将包含 `!override` 的自定义配置置于 `docker-compose.updates.yml` 之后；
-  - **公钥安全配置**：必须配置 `SAAS_UPDATE_PUBLIC_KEY_HOST_FILE` 指向宿主机预先可信安装的公钥文件，且该文件在容器内必须是 root 拥有、非符号链接且不可被 group/other 改写；系统仅信任本地预装公钥，绝不自动信任远端随行下载的公钥。`deploy/docker-install.sh` 默认把仓库内置的 `deploy/update-signing.pub` 复制成受管副本再挂载，因此操作者无需手工准备；手工接入时请自行保证上述属主与权限要求；
-  - **Socket 挂载与权限事实**：Web 应用容器绝不挂载 Docker socket。仅独立更新器辅助容器（`xianyu-updater`）挂载宿主机 `/var/run/docker.sock`；挂载声明中的 `read_only: true` 属于文件系统挂载属性，更新器仍可通过 UNIX socket 通信调用 Docker 守护进程的高权限管理 API，更新器属于受信任的高权限核心组件；
-  - **网络与权限收敛**：更新器容器不向外暴露任何网络端口与管理 API，使用 `network_mode: bridge` 保障 Buildx 客户端出站访问公开镜像仓库鉴权，丢弃多余 Linux 权限，Web 应用仅向受限的共享 IPC 卷提交请求。
+当发布的版本包含底层 Python 依赖增减、C 动态库更新或 `UPDATE_DATA_VERSION` 变更时，内置文件更新器会在停服前拒绝升级。此时需要维护者重新执行官方安装入口完成环境级升级：
 
-- **受控初始化与配置登记（Docker 子命令 `initialize`）**：
-  - **安装脚本已内置**：`deploy/docker-install.sh` 会使用同一组 `-p`、`--project-directory`、`--env-file` 与配置文件顺序自动执行下述登记，并在登记后等待真实更新就绪；下列手工命令用于自定义布局或人工排查，必须与安装脚本保持相同的参数与文件顺序；
-  - **登记原理与凭据保护**：更新器依赖宿主机当前生效的完整 Compose 项目配置开展受控编排。解析后的配置 JSON 可能包含数据库密码或业务凭据，**严禁将其打印到终端、提交至代码仓库或记录到公开日志**。登记过程通过标准输入将原始字节流直接传递至更新器私有卷中安全保存，宿主机无需常驻额外守护进程、镜像仓库或管理面板；
-  - **参数一致性要求**：调用端必须提供完整且两侧完全一致的 `-p <项目名>`、工作目录、`--env-file` 及所有配置文件列表（`updates` 覆盖文件位于最后），不得猜测项目名称或数据卷名称。输入配置与当前运行容器不匹配时（首次登记时同样执行严格比对），命令将直接报错中止。环境变量插值仅读取命令当前运行环境及 CLI `--env-file`，单纯服务内部的 `env_file` 指令不作为 `${...}` 的插值来源；
-  - **标准登记执行命令**：
-    Dockerfile 默认工作目录已固定为更新器脚本所在目录，健康检查统一使用镜像自带 Python 解释器。执行初始化登记时，必须使用统一的 Bash 参数数组复用到 `config` 与 `exec` 两端。原项目名不能推测，必须通过占位变量显式提供；若有外部环境文件或本地覆盖配置，必须按原顺序完整加入，且 `docker-compose.updates.yml` 必须置于最后。执行时直接在镜像默认工作目录调用 `python docker_updater.py initialize`（注意：这是 Docker 专用的 `initialize` 子命令，与 systemd 的 `--initialize` 区分；**不得覆盖该默认工作目录**，不发明新脚本或额外参数，命令不打印配置 JSON 避免凭据外泄）：
-    ```bash
-    # 原部署项目名不能猜，必须由操作者显式提供：
-    : "${COMPOSE_PROJECT_NAME:?请先设置原部署项目名}"
+- **Docker 部署**：
+  从 GitHub Releases 下载新版本源码包并解压，重新运行官方安装脚本：
+  ```bash
+  sudo bash deploy/docker-install.sh
+  ```
+  此命令只适用于全新安装。对既有容器，脚本重跑只会启动原容器；运行环境升级仍需维护者保留数据、按新版本配置重建容器，不能把脚本重跑当作已完成升级。
+- **Ubuntu 原生部署**：
+  下载新版本管理器或通过在线安装脚本重新执行安装：
+  ```bash
+  sudo ./xianyu-saas install --version <新版本号>
+  # 或使用在线脚本：
+  sudo bash deploy/install.sh --version <新版本号>
+  ```
+  管理器将下载新版独立运行时包并刷新 systemd 服务。
 
-    COMPOSE_ARGS=(
-      -p "$COMPOSE_PROJECT_NAME"
-      # 若存在外部环境变量文件，按原配置显式加入：
-      # --env-file .env
-      -f docker-compose.yml
-      # 若存在本地覆盖配置，必须按原顺序逐个加入：
-      # -f .local/docker-compose.local.yml
-      -f docker-compose.updates.yml  # updates 覆盖配置必须置于最后
-    )
+### 历史实例修复与向后兼容
 
-    docker compose "${COMPOSE_ARGS[@]}" config --format json | \
-      docker compose "${COMPOSE_ARGS[@]}" exec -T xianyu-updater python docker_updater.py initialize
-    ```
-  - **非 Linux 宿主的输入约束**：Windows 等非 Linux 宿主必须通过 WSL2 的 Linux 环境与真实 Linux 路径执行，不要依赖 PowerShell/Windows 文本管道转换（避免文本转码与回车换行损坏）；`deploy/docker-install.sh` 已在 Linux 内完成登记管道，手工命令仅在自定义布局时使用，同样应在 Linux 环境中执行；若宿主机缺少 Docker Compose 插件，应按照官方文档安装，不可使用无法提供 compose 子命令的伪装配置；
-  - **首次接入与配置漂移边界**：`initialize` 属于一次性受控登记命令，若更新器私有卷中已存在任何登记记录、操作日志（journal）或更新历史，命令均直接返回冲突并拒绝执行；系统未提供 `refresh` 或 `reconfigure` 命令。一旦部署配置、数据卷、网络或挂载身份发生未登记的配置漂移，系统将暂停网页升级并转交维护者排查重新接入；处理过程中**必须完整保留原私有状态、历史记录与备份，严禁删除私有卷强行绕过**；
-
-- **单应用依赖边界与操作限制**：
-  - **依赖支持边界**：依赖限制代码已完成严格收敛。升级操作只更新目标服务（`--no-deps`），为避免静默忽略依赖条件，仅允许应用服务对当前更新器声明 `xianyu-updater: condition: service_started, required: true, restart: false` 依赖；其他任意依赖策略、额外迁移任务、其他联动容器的健康/完成条件在登记前均会被明确拒绝；系统整体升级安全依靠持久化状态与失败恢复，不宣称 Compose 具备原子事务能力；不支持 Swarm、Kubernetes、自定义 hooks 或复杂容器拓扑；
-  - **运维操作红线**：严禁在更新期间执行 `down -v`、`renew-anon-volumes`、`remove-orphans`、`prune` 或并行的外部 Compose/tag/update 变更。若检测到外部配置漂移，或在恢复阶段遇到数据结构不兼容，系统主动保持维护状态并完整保留现场错误日志转人工排查，绝不静默覆盖运维人员提交的新配置。
-
-- **升级执行流程与数据回滚红线**：
-  1. 管理员在工作台发起升级，系统下载目标版本源码包与签名清单，核验 Ed25519 签名与 SHA-256 散列；
-  2. 管理员输入当前登录密码完成身份再次确认，并勾选停机维护风险后提交升级（HTTP 202 仅代表受理）；
-  3. 更新器核验登记配置一致性，基于完整源码包执行本地构建，旧容器在构建完成前保持对外服务；
-  4. 比较当前与目标镜像的 `UPDATE_DATA_VERSION`，仅相同的正整数允许自动更新和回退；标记缺失或不同会在停服前拒绝操作，需维护者按发布说明人工升级。这是发布者对数据库、配置及凭据格式的兼容性声明，不代替迁移审查；
-  5. 进入维护状态排空流量，停止旧容器，官方 Compose 使用原配置和同一 `/data` 挂载重建目标应用并检查就绪；不再执行全量冷备或数据预演，日常备份由部署者负责；
-  6. **回滚与容器重建事实**：升级失败时使用旧镜像**重新创建旧版本容器**（容器 ID 可以改变，原配置与数据卷保持）；**不恢复或覆盖业务数据**，宿主机源码目录亦不自动覆盖。
-
-### systemd 独立更新器升级
-若采用 systemd 原生部署，系统升级由运行在活动代码软链接（`current`）之外的独立更新服务承载（由 root 运行，避免与日常应用共享运行权限）。未登记独立更新器的旧版本安装不会因新版本发布自动具备网页升级能力，必须由系统管理员在宿主机完成一次性受控基线接入与初始化。
-
-#### 1. 首次受控接入标准操作时序
-
-操作必须由管理员以 root 身份在宿主机按以下四个严格先后的步骤执行，要求在同一受控 shell 中按顺序执行。为保证更新器各阶段配置一致并满足布局校验（`validate_layout`），先定义统一工作目录与账户变量，并通过 shell 参数扩展强制设置版本变量（以 `/srv` 规范为例）：
-
-```bash
-set -euo pipefail
-APP_ROOT=/srv/xianyu-saas
-BUNDLE_ROOT=$APP_ROOT/updater
-STATE_ROOT=/srv/xianyu-saas-data
-UPDATE_ROOT=/srv/xianyu-saas-updates
-UPDATER_STATE_ROOT=/srv/xianyu-saas-updater
-APP_UID=$(id -u xianyu-saas)
-[ -n "$APP_UID" ] && [ "$APP_UID" -gt 0 ] || { echo "无法解析 xianyu-saas 账户 UID"; exit 1; }
-: "${VERSION:?请先设置已获批准且支持维护协议的真实已签名版本}"
-```
-
-1. **安装独立更新器组件（Bundle）**：
-   - 从经审批的可信本地安装介质，将更新脚本及配套受信任模块安装至活动软链接之外的独立维护目录（例如 `$BUNDLE_ROOT`，即 `/srv/xianyu-saas/updater/`，也就是 `SAAS_UPDATER_BUNDLE_ROOT`），属主设为 root:root；
-   - 组件固定包含 8 个核心代码文件：`deploy/updater/updater.py` 与 `backend/{account_storage.py, db.py, docker_update_protocol.py, platform_update.py, runtime_settings.py, update_maintenance.py, version.py}`，以及本地预装公钥副本 `deploy/update-signing.pub`；
-   - 严禁从未经校验的网络源直接下载或提取上述核心代码；更新器统一使用生产运行虚拟环境的 Python 解释器（例如 `$APP_ROOT/runtime/backend-venv/bin/python`）。所有运行模式均必须由 root 执行（已通过便携合约与 AST 静态校验，真实 Linux 运行端验收仍在等待隔离环境）。
-
-2. **离线导入受信基线版本（`--import-trusted-baseline`）**：
-   - 准备管理员选定的真实已签名兼容版本（`VERSION`）的三个离线发布资产文件：归档包、清单与数字签名。注意：未包含签名维护协议 `MAINTENANCE_PROTOCOL=1` 的旧版本无法通过新基线导入；本命令示例供已签名的受支持版本正式发布或获得经批准的签名介质后使用；
-   - 资产文件必须放置于受 root 保护的本地目录，属主为 root，文件权限设为 `0600`，文件基名须严格符合命名规范：`xianyu-saas-$VERSION.tar.gz`、`xianyu-saas-$VERSION.manifest.json`、`xianyu-saas-$VERSION.manifest.sig`；
-   - 命令行必须显式传入刚好三个绝对路径参数（`--import-trusted-baseline ARCHIVE MANIFEST SIGNATURE`）。更新器启动时会立即解析完整配置（`Config.from_env()`）并执行目录布局校验（`validate_layout()`）；若仅传入发布目录与公钥，其余路径将回退至内置默认值导致 `releases.parent` 与 `current.parent` 不一致而报错中止。因此离线导入必须通过 `sudo env -i` 提供与后续初始化完全一致的完整路径配置：
-     ```bash
-     sudo env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
-       SAAS_UPDATE_APP_UID="$APP_UID" \
-       SAAS_UPDATER_BUNDLE_ROOT="$BUNDLE_ROOT" \
-       SAAS_CURRENT_ROOT="$APP_ROOT/current" \
-       SAAS_CURRENT_LINK="$APP_ROOT/current" \
-       SAAS_RELEASES_DIR="$APP_ROOT/releases" \
-       SAAS_STATE_DIR="$STATE_ROOT" \
-       SAAS_UPDATE_STAGING_DIR="$UPDATE_ROOT/staging" \
-       SAAS_UPDATE_INTENT_FILE="$UPDATE_ROOT/intent.json" \
-       SAAS_UPDATER_STATE_DIR="$UPDATER_STATE_ROOT" \
-       SAAS_UPDATE_PUBLIC_KEY_FILE="$BUNDLE_ROOT/deploy/update-signing.pub" \
-       "$APP_ROOT/runtime/backend-venv/bin/python" "$BUNDLE_ROOT/deploy/updater/updater.py" \
-       --import-trusted-baseline \
-       "$APP_ROOT/import/xianyu-saas-$VERSION.tar.gz" \
-       "$APP_ROOT/import/xianyu-saas-$VERSION.manifest.json" \
-       "$APP_ROOT/import/xianyu-saas-$VERSION.manifest.sig"
-     ```
-   - **导入语义与安全性**：更新器严格使用预先安装的本地公钥（系统绝不使用随资产附带的公钥）核验 Ed25519 签名与 SHA-256 文件散列，并以纯 AST 静态语法解析确认候选版本维护协议声明为 `MAINTENANCE_PROTOCOL=1`（绝不执行候选代码）。校验通过后原子解包至 `$APP_ROOT/releases/$VERSION/` 目录。该操作具备等幂性，**绝不自动切换 `current` 软链接、不重启服务、不初始化业务数据库，亦不触碰任何业务数据**。若已存在不同内容的同版本目录，命令安全失败并报错中止，切勿强行绕过。
-
-3. **人工维护切换现役软链接**：
-   - 管理员协调业务停机维护窗口，停止运行中的旧版服务；
-   - 严禁使用非原子的 `ln -sfn`（目标已存在或为目录时存在嵌套软链接及非原子覆盖风险）。
-   - 若尚未创建现役软链接（全新部署）：
-     ```bash
-     ln -s "$APP_ROOT/releases/$VERSION" "$APP_ROOT/current"
-     ```
-   - 若已存在现役软链接：
-     1. 核验 `$APP_ROOT/current` 确为符号链接；若为实体目录或普通文件则立即中止，人工排查并禁止强制覆盖：
-        ```bash
-        [ -L "$APP_ROOT/current" ] || { echo "$APP_ROOT/current 未检测为符号链接，拒绝操作"; exit 1; }
-        ```
-     2. 记录旧目标路径以便需要时人工回退恢复：
-        ```bash
-        OLD_TARGET=$(readlink "$APP_ROOT/current")
-        echo "当前版本软链接指向: $OLD_TARGET"
-        ```
-     3. 在同一父目录下创建临时软链接，并通过 `mv -T --` 原子重命名替换现役软链接（使用 `&&` 串联执行，若临时链接已存在导致 `ln` 失败，绝不将遗留临时路径覆盖至 `current`）：
-        ```bash
-        ln -s "$APP_ROOT/releases/$VERSION" "$APP_ROOT/.current.tmp" && mv -T -- "$APP_ROOT/.current.tmp" "$APP_ROOT/current"
-        ```
-   - 确保此时 `current` 软链接所指版本已具备维护协议能力并与导入基线一致。
-
-4. **执行一次性更新器初始化（`--initialize`）**：
-   - 现役版本对齐后，以 root 身份执行初始化。必须通过 `sudo env -i` 显式提供与步骤 2 导入及服务 `EnvironmentFile` 完全一致的可信路径及参数（避免 `sudo` 默认清理环境变量导致系统回退至非预期的默认路径）：
-     ```bash
-     sudo env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
-       SAAS_UPDATE_APP_UID="$APP_UID" \
-       SAAS_UPDATER_BUNDLE_ROOT="$BUNDLE_ROOT" \
-       SAAS_CURRENT_ROOT="$APP_ROOT/current" \
-       SAAS_CURRENT_LINK="$APP_ROOT/current" \
-       SAAS_RELEASES_DIR="$APP_ROOT/releases" \
-       SAAS_STATE_DIR="$STATE_ROOT" \
-       SAAS_UPDATE_STAGING_DIR="$UPDATE_ROOT/staging" \
-       SAAS_UPDATE_INTENT_FILE="$UPDATE_ROOT/intent.json" \
-       SAAS_UPDATER_STATE_DIR="$UPDATER_STATE_ROOT" \
-       SAAS_UPDATE_PUBLIC_KEY_FILE="$BUNDLE_ROOT/deploy/update-signing.pub" \
-       "$APP_ROOT/runtime/backend-venv/bin/python" "$BUNDLE_ROOT/deploy/updater/updater.py" \
-       --initialize
-     ```
-   - **初始化门禁与可信记录**：`--initialize` 将核验 `current` 指向版本的签名清单与 `MAINTENANCE_PROTOCOL=1` 协议支持，配置意图目录属主为 root、权限设为 sticky `01770`（所属组赋给应用 UID 对应 GID），创建公开状态目录（权限 `0755`）并原子写入受信接入记录（`status/initialization.json`）。该记录严格包含六个字段（`schema`、`protocol`、`public_key_sha256`、`bundle_sha256`、`entrypoint_sha256`、`initialized_at`），无周期心跳或过期失效；控制面要求其必须与 API 信任公钥、独立 bundle 固定 8 文件规范哈希及实际 entrypoint 完全匹配。**只有初始化成功生成可信接入记录后，系统控制面与前端工作台才放行后续的版本升级操作**（门禁代码已完成落地生效，本机仅通过静态与便携测试，真实 Linux root 运行动态验收仍待验证）；初始化过程绝不修改业务数据的所属权限。
-   - 启动更新监听单元（`xianyu-saas-updater.path`）与业务服务。
-
-#### 2. 专用路径、服务模板与环境一致性规范
-- **公钥与 Bundle 路径一致性**：更新器使用的 `SAAS_UPDATE_PUBLIC_KEY_FILE` 必须与控制面 API 绑定的公钥完全一致（二进制内容与公钥指纹匹配）。systemd 部署中公钥与 unit 默认配置一致，指向独立 bundle 内预装的 `deploy/update-signing.pub`（例如 `/srv/xianyu-saas/updater/deploy/update-signing.pub`），新增环境变量 `SAAS_UPDATER_BUNDLE_ROOT` 明确指定独立 bundle 根目录；Docker 部署模式下宿主机公钥文件路径可独立配置（例如 `/etc/xianyu-saas/update-signing.pub`），两者互不混淆；
-- **服务模板同步修改**：`deploy/systemd/` 目录下的服务模板（`xianyu-saas.service`、`xianyu-saas-updater.service`、`xianyu-saas-updater.path`）中的 `WorkingDirectory`、`ExecStart`、`RequiresMountsFor`、`ReadWritePaths` 以及配置文件中的目录变量（含 `SAAS_UPDATER_BUNDLE_ROOT`、`SAAS_UPDATE_PUBLIC_KEY_FILE` 等），必须与实际安装目录严格对应同步修改，严禁仅修改命令行示例而保留不匹配的服务单元配置；
-- **静态维护协议核验**：更新器在后续处理升级意图时，继续在验签与散列校验通过后，通过纯 AST 静态语法解析读取候选版本的 `MAINTENANCE_PROTOCOL=1` 常量，绝不为协议检查而预先执行未受信任的候选代码；
-- **回滚与迁移策略**：当前 systemd 更新器采用严格保守策略，一旦涉及未经验证的数据库结构或破坏性数据变化，立即中断并交由人工处理；自动回滚仅回退代码软链接与运行环境，绝不覆盖业务数据。升级请求必须经系统管理员在网页中输入当前登录密码完成身份再次确认，并勾选确认停机维护风险后方可提交；系统不包含第二认证因素，密码与临时确认令牌不存入浏览器持久存储。注意：真实 Linux/systemd 生产环境升级与回滚端到端验收目前仍在等待隔离验证环境，不可提前标记为已通过。
+- **旧版 Docker 实例升级**：既有旧版 Docker 安装未接入内置启动器时，**重新运行安装脚本不会自动迁移或替换已有容器镜像**（脚本重跑仅执行 `docker start` 启动既有容器）。如需切换到内置文件更新机制，需在维护窗口停止并清理旧容器后，使用包含新机制的源码重新构建启动应用容器；
+- **Ubuntu 旧版实例修复**：使用包含新机制的官方安装器，指定包含启动器的新版本执行安装。安装器核验旧安装的签名与服务模板后，保留数据并切换到新运行时包；同版本旧包缺少启动器时不能靠重装模板补齐。未知或修改过的历史布局仍会拒绝自动接入。
+- **旧版独立特权更新器兼容**：早期设计的独立更新器组件（`docker-compose.updates.yml` 与 systemd 独立更新服务）代码在系统中继续保留向后兼容，但已不再作为推荐路径。
 
 ---
 

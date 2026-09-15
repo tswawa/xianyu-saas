@@ -148,7 +148,8 @@ class UpdateAPI:
             if mode == "docker":
                 staged = self.backend.stage_docker_release(release, self.channel, current, operation_id)
             else:
-                staged = self.backend.stage_release(release, self.channel, current, require_maintenance=True)
+                staged = self.backend.stage_release(release, self.channel, current, require_maintenance=True,
+                                                    operation_id=operation_id)
         ensure_owned()
         if self.is_paused():
             raise protocol.PlatformUpdateError("update_maintenance_active")

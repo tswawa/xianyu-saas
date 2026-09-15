@@ -96,7 +96,7 @@ SEMVER_RE = re.compile(
 )
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 ALLOWED_TOP_LEVEL_DIRS = frozenset(
-    {"backend", "frontend", "worker", "scripts", "deploy", "config", "docs", "tests", "runtime", "manager"}
+    {"backend", "frontend", "worker", "scripts", "deploy", "config", "docs", "tests", "runtime", "manager", "docker"}
 )
 ALLOWED_ROOT_FILES = frozenset(
     {
@@ -687,15 +687,27 @@ def inspect_public_releases(current_version: str, session=None) -> dict:
                    published_at=str(winner.get("published_at") or "")[:80],
                    release_notes=str(winner.get("body") or "")[:MAX_RELEASE_NOTES_CHARS])
     payload["installer_assets"] = {}
+    try:
+        import file_update
+        file_mode = file_update.configured() or file_update.launcher_fresh()
+    except Exception:
+        file_mode = False
     for deployment in ("docker", "systemd"):
+        # A built-in launcher install consumes the signed Docker source ZIP for
+        # both docker and systemd deployments, including standalone installs.
+        parse_deployment = "docker" if deployment == "systemd" and file_mode else deployment
         try:
-            payload["installer_assets"][deployment] = _parse_release(winner, RELEASE_CHANNEL, deployment=deployment) is not None
+            payload["installer_assets"][deployment] = _parse_release(winner, RELEASE_CHANNEL, deployment=parse_deployment) is not None
         except PlatformUpdateError:
             payload["installer_assets"][deployment] = False
     return payload
 
 
 def fetch_release(channel: str, current_version: str, session=None, *, deployment: str = "systemd") -> ReleaseInfo | None:
+    if deployment == "systemd" and _file_update_backend() is not None:
+        # A launcher-managed systemd install (source or standalone runtime)
+        # consumes the signed Docker source descriptor, not the retired source OTA.
+        deployment = "docker"
     payload, release = inspect_releases(channel, current_version, session=session, deployment=deployment)
     if payload["status"] == "incomplete":
         raise PlatformUpdateError(payload["error_code"])
@@ -1083,6 +1095,14 @@ def read_docker_capabilities() -> dict:
 
 def read_operation_status(operation: dict) -> dict | None:
     """Merge only executor-owned, identity-matched, safe progress fields."""
+    updater = _file_update_backend()
+    if updater is not None:
+        try:
+            file_status = updater.read_status(operation)
+        except updater.FileUpdateError:
+            file_status = None
+        if file_status is not None:
+            return file_status
     operation_id = str(operation.get("operation_id") or "")
     if not OPERATION_ID_RE.fullmatch(operation_id):
         raise PlatformUpdateError("update_operation_invalid")
@@ -1116,8 +1136,37 @@ def read_operation_status(operation: dict) -> dict | None:
             "error_code": _safe_error_code(payload.get("error_code"), "")}
 
 
+def _file_update_backend():
+    """Return the bundled file updater only while its supervisor launcher is live."""
+    try:
+        import file_update
+    except ImportError:
+        return None
+    try:
+        return file_update if file_update.launcher_fresh() else None
+    except Exception:
+        return None
+
+
 def update_capabilities() -> dict:
     mode = deployment_kind()
+    if mode in {"docker", "systemd"}:
+        updater = _file_update_backend()
+        if updater is not None:
+            try:
+                capability = updater.capability_or_reason()
+            except Exception:
+                capability = None
+            if capability is not None:
+                return capability
+        else:
+            try:
+                import file_update
+                explicit = file_update.capability_or_reason()
+            except Exception:
+                explicit = None
+            if explicit is not None:
+                return explicit
     instructions = {
         "docker": "Docker 网页更新需显式接入独立更新器、可信签名公钥和本项目共享目录；普通容器不会获得宿主控制权限。升级仅回退代码或镜像，不恢复旧业务数据。",
         "source": "这是源码部署。请维护者备份数据、取得目标源码并按原部署方式更新和重启；当前未配置网页安装服务。",
@@ -1488,7 +1537,14 @@ def stage_release(
     *,
     session=None,
     require_maintenance=False,
+    operation_id: str | None = None,
 ) -> dict:
+    updater = _file_update_backend()
+    if updater is not None and operation_id:
+        try:
+            return updater.stage(release, channel, current_version, str(operation_id))
+        except updater.FileUpdateError as error:
+            raise PlatformUpdateError(error.code) from error
     if channel not in VALID_CHANNELS:
         raise PlatformUpdateError("update_channel_invalid")
     if SemVer.parse(release.version).compare(SemVer.parse(current_version)) <= 0:
@@ -1614,6 +1670,12 @@ def _docker_manifest(raw: bytes, signature: bytes, version: str):
 
 def stage_docker_release(release: ReleaseInfo, channel: str, current_version: str,
                          operation_id: str, *, session=None) -> dict:
+    updater = _file_update_backend()
+    if updater is not None:
+        try:
+            return updater.stage(release, channel, current_version, operation_id)
+        except updater.FileUpdateError as error:
+            raise PlatformUpdateError(error.code) from error
     from docker_update_protocol import DockerUpdateError, extract_verified_source
     import shutil
     if channel not in VALID_CHANNELS:
@@ -1661,6 +1723,13 @@ def stage_docker_release(release: ReleaseInfo, channel: str, current_version: st
 
 
 def validate_docker_candidate(operation_id: str, version: str, manifest_sha256: str) -> None:
+    updater = _file_update_backend()
+    if updater is not None:
+        try:
+            updater.validate_operation(version, manifest_sha256)
+            return
+        except updater.FileUpdateError as error:
+            raise PlatformUpdateError(error.code) from error
     from docker_update_protocol import DockerUpdateError, extract_verified_source
     import shutil
 
@@ -1690,6 +1759,12 @@ def validate_docker_candidate(operation_id: str, version: str, manifest_sha256: 
 
 
 def write_docker_update_request(operation: dict) -> dict:
+    updater = _file_update_backend()
+    if updater is not None:
+        try:
+            return updater.publish(operation)
+        except updater.FileUpdateError as error:
+            raise PlatformUpdateError(error.code) from error
     operation_id = str(operation.get("operation_id") or "")
     if not OPERATION_ID_RE.fullmatch(operation_id):
         raise PlatformUpdateError("update_operation_invalid")
@@ -1957,6 +2032,13 @@ def load_verified_candidate(
 
 
 def validate_candidate(candidate_path: str, version: str, manifest_sha256: str = "", *, require_maintenance=False) -> dict:
+    updater = _file_update_backend()
+    if updater is not None and manifest_sha256:
+        try:
+            updater.validate_operation(version, manifest_sha256)
+            return {"schema": 1, "version": version, "kind": "file", "manifest_sha256": manifest_sha256}
+        except updater.FileUpdateError as error:
+            raise PlatformUpdateError(error.code) from error
     marker, files = load_verified_candidate(candidate_path, version, manifest_sha256)
     if require_maintenance:
         _require_maintenance_protocol(_candidate_root(candidate_path), files)
@@ -1964,6 +2046,12 @@ def validate_candidate(candidate_path: str, version: str, manifest_sha256: str =
 
 
 def available_rollback_versions(current_version: str) -> list[dict]:
+    updater = _file_update_backend()
+    if updater is not None:
+        try:
+            return updater.available_rollback_versions(current_version)
+        except Exception:
+            return []
     if deployment_kind() == "docker":
         try:
             return read_docker_capabilities()["rollback_versions"]
@@ -2118,6 +2206,16 @@ def write_update_intent(
     requested_at: float | None = None,
 ) -> dict:
     """Write one private updater intent while keeping filesystem errors stable."""
+    updater = _file_update_backend()
+    if updater is not None:
+        try:
+            return updater.publish({
+                "operation_id": operation_id, "action": action, "version": version,
+                "expected_current_version": expected_current_version, "manifest_sha256": manifest_sha256,
+                "requested_at": requested_at, "requested_by": requested_by, "candidate_path": candidate_path,
+            })
+        except updater.FileUpdateError as error:
+            raise PlatformUpdateError(error.code) from error
     try:
         return _write_update_intent_unwrapped(
             action,

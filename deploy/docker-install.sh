@@ -96,7 +96,7 @@ docker compose version >/dev/null 2>&1 || fail "需要 Docker Compose v2（docke
 engine_os="$(docker info --format '{{.OSType}}' 2>/dev/null || true)"
 [[ "$engine_os" == "linux" ]] || fail "Docker 引擎不可用或不是本地 Linux 容器模式"
 
-for required in docker-compose.yml docker-compose.updates.yml Dockerfile config/saas.env.docker.example; do
+for required in docker-compose.yml Dockerfile config/saas.env.docker.example; do
     [[ -f "$root/$required" && ! -L "$root/$required" ]] || fail "缺少 $required；请在完整源码检出的项目根目录运行"
 done
 
@@ -174,14 +174,30 @@ elif (( ${#existing_projects[@]} == 1 )) && [[ "${existing_projects[0]}" != "$pr
 fi
 [[ "$project" =~ ^[a-z0-9][a-z0-9_-]{0,62}$ ]] || fail "项目名不合法: $project（请用 --project-name 指定）"
 
+# 默认安装使用随镜像分发的内置文件更新器，不再要求 sidecar 登记；
+# 仅当检测到既有 sidecar 受管安装时才保留旧的覆盖配置流程。
+builtin=true
+if [[ -n "$(docker ps --all --filter "label=io.xianyu.updates.role=updater" --filter "label=com.docker.compose.project=$project" --format '{{.ID}}' 2>/dev/null || true)" ]]; then
+    builtin=false
+fi
+if docker volume inspect "${project}_updater-private" >/dev/null 2>&1; then
+    builtin=false
+fi
+if [[ "$builtin" == false ]]; then
+    [[ -f "$root/docker-compose.updates.yml" && ! -L "$root/docker-compose.updates.yml" ]] \
+        || fail "检测到既有 sidecar 受管安装，但缺少 docker-compose.updates.yml；请恢复完整源码后再运行"
+fi
+
 compose=(
     docker compose
     --project-directory "$root"
     -p "$project"
     --env-file "$env_file"
     -f "$root/docker-compose.yml"
-    -f "$root/docker-compose.updates.yml"
 )
+if [[ "$builtin" == false ]]; then
+    compose+=(-f "$root/docker-compose.updates.yml")
+fi
 export COMPOSE_PROJECT_NAME="$project"
 export SAAS_ENV_FILE="$env_file"
 
@@ -211,7 +227,11 @@ while IFS=$'\x1f' read -r container_id container_service container_role containe
     fi
     case "$container_service" in
         "$APP_SERVICE")
-            [[ "$container_role" == "app" ]] || fail "检测到未接入独立更新器的应用容器；本入口只支持全新的推荐安装或本脚本的受管重跑，不会替换、迁移或调整既有容器"
+            if [[ "$builtin" == true ]]; then
+                [[ -z "$container_role" || "$container_role" == "app" ]] || fail "检测到未接入内置文件更新器的应用容器；请先人工核对"
+            else
+                [[ "$container_role" == "app" ]] || fail "检测到未接入独立更新器的应用容器；本入口只支持全新的推荐安装或本脚本的受管重跑，不会替换、迁移或调整既有容器"
+            fi
             [[ "$has_app" == false ]] || fail "检测到多个应用容器；拒绝在重复状态上操作，请维护者人工处理"
             app_container="$container_id"; has_app=true ;;
         "$UPDATER_SERVICE")
@@ -224,14 +244,20 @@ while IFS=$'\x1f' read -r container_id container_service container_role containe
 done <<< "$project_rows"
 
 managed=false
-if [[ "$has_app" == true || "$has_updater" == true ]]; then
-    managed=true
-fi
-if [[ "$managed" == false ]] && docker image inspect "${project}-${APP_SERVICE}:managed" >/dev/null 2>&1; then
-    managed=true
-fi
-if [[ "$managed" == false ]] && docker volume inspect "${project}_updater-private" >/dev/null 2>&1; then
-    managed=true
+if [[ "$builtin" == true ]]; then
+    if [[ "$has_app" == true ]]; then
+        managed=true
+    fi
+else
+    if [[ "$has_app" == true || "$has_updater" == true ]]; then
+        managed=true
+    fi
+    if [[ "$managed" == false ]] && docker image inspect "${project}-${APP_SERVICE}:managed" >/dev/null 2>&1; then
+        managed=true
+    fi
+    if [[ "$managed" == false ]] && docker volume inspect "${project}_updater-private" >/dev/null 2>&1; then
+        managed=true
+    fi
 fi
 
 if [[ "$has_app" == true ]]; then
@@ -266,14 +292,19 @@ require_existing_data() {
 }
 
 if [[ "$managed" == true ]]; then
-    printf 'docker-install: 检测到已登记的受管安装：只校验并启动既有容器；当前 compose/env 变更不会被自动应用\n'
+    printf 'docker-install: 检测到受管安装：只校验并启动既有容器；当前 compose/env 变更不会被自动应用\n'
     [[ "$env_file_missing" == false ]] || fail "受管安装缺少环境文件 $env_file；拒绝用示例覆盖既有部署"
     [[ "$has_app" == true ]] || fail "受管安装缺少应用容器；拒绝在既有状态上重建或替换，请维护者人工处理"
-    [[ "$has_updater" == true ]] || fail "受管安装缺少更新器容器；拒绝在既有状态上重建或替换，请维护者人工处理"
-    for image_name in "${project}-${APP_SERVICE}:managed" "${project}-${UPDATER_SERVICE}:local"; do
-        docker image inspect "$image_name" >/dev/null 2>&1 || fail "受管安装缺少镜像 $image_name；拒绝自动重建，请维护者人工处理"
-    done
-    [[ "$need_stage" == false ]] || fail "受管安装缺少本地公钥副本 $key_path；拒绝静默重新生成，请人工核对"
+    if [[ "$builtin" == true ]]; then
+        docker image inspect "xianyu-saas:local" >/dev/null 2>&1 \
+            || fail "受管安装缺少内置应用镜像 xianyu-saas:local；拒绝自动重建，请维护者人工处理"
+    else
+        [[ "$has_updater" == true ]] || fail "受管安装缺少更新器容器；拒绝在既有状态上重建或替换，请维护者人工处理"
+        for image_name in "${project}-${APP_SERVICE}:managed" "${project}-${UPDATER_SERVICE}:local"; do
+            docker image inspect "$image_name" >/dev/null 2>&1 || fail "受管安装缺少镜像 $image_name；拒绝自动重建，请维护者人工处理"
+        done
+        [[ "$need_stage" == false ]] || fail "受管安装缺少本地公钥副本 $key_path；拒绝静默重新生成，请人工核对"
+    fi
     require_existing_data
     "${compose[@]}" config >/dev/null || fail "compose 配置渲染失败（请检查 $env_file；受管重跑只用于解析既有项目，不会应用变更）"
 else
@@ -323,15 +354,19 @@ else
         need_root_prep=true
     fi
     if [[ "$need_root_prep" == true ]]; then
-        staging_image="${project}-${APP_SERVICE}:managed"
-        if ! docker image inspect "$staging_image" >/dev/null 2>&1; then
-            staging_image="${project}-${UPDATER_SERVICE}:local"
+        if [[ "$builtin" == true ]]; then
+            staging_image="xianyu-saas:local"
+        else
+            staging_image="${project}-${APP_SERVICE}:managed"
+            if ! docker image inspect "$staging_image" >/dev/null 2>&1; then
+                staging_image="${project}-${UPDATER_SERVICE}:local"
+            fi
         fi
         docker image inspect "$staging_image" >/dev/null 2>&1 \
-            || fail "缺少已构建镜像，无法准备 root 拥有的公钥副本与全新数据目录"
+            || fail "缺少已构建镜像，无法准备全新数据目录"
     fi
 
-    if [[ "$need_stage" == true ]]; then
+    if [[ "$builtin" == false && "$need_stage" == true ]]; then
         printf 'docker-install: 预装受信任公钥（容器内 root 拥有）...\n'
         mkdir -p -- "$(dirname -- "$key_path")"
         docker run --rm --user 0:0 --entrypoint /bin/sh \
@@ -366,7 +401,11 @@ find_container() {
 }
 
 if [[ "$managed" == true ]]; then
-    for pair in "$app_container:$APP_SERVICE" "$updater_container:$UPDATER_SERVICE"; do
+    container_pairs=("$app_container:$APP_SERVICE")
+    if [[ "$builtin" == false ]]; then
+        container_pairs+=("$updater_container:$UPDATER_SERVICE")
+    fi
+    for pair in "${container_pairs[@]}"; do
         container_id="${pair%%:*}"
         container_service="${pair##*:}"
         if [[ "$(docker inspect --format '{{.State.Running}}' "$container_id" 2>/dev/null || true)" != "true" ]]; then
@@ -376,8 +415,11 @@ if [[ "$managed" == true ]]; then
     done
 else
     app_container="$(find_container "$APP_SERVICE")"
-    updater_container="$(find_container "$UPDATER_SERVICE")"
-    [[ -n "$app_container" && -n "$updater_container" ]] || fail "容器启动后未找到应用或更新器容器"
+    [[ -n "$app_container" ]] || fail "容器启动后未找到应用容器"
+    if [[ "$builtin" == false ]]; then
+        updater_container="$(find_container "$UPDATER_SERVICE")"
+        [[ -n "$updater_container" ]] || fail "容器启动后未找到更新器容器"
+    fi
 fi
 
 wait_running_id() {
@@ -403,10 +445,13 @@ wait_healthy_id() {
     return 1
 }
 
-wait_running_id "$updater_container" || fail "更新器容器未在 ${timeout}s 内运行；请查看 ${UPDATER_SERVICE} 日志"
+if [[ "$builtin" == false ]]; then
+    wait_running_id "$updater_container" || fail "更新器容器未在 ${timeout}s 内运行；请查看 ${UPDATER_SERVICE} 日志"
+fi
 wait_running_id "$app_container" || fail "应用容器未在 ${timeout}s 内运行；请查看 ${APP_SERVICE} 日志"
 wait_healthy_id "$app_container" || fail "应用容器未在 ${timeout}s 内健康；请查看 ${APP_SERVICE} 日志"
 
+if [[ "$builtin" == false ]]; then
 printf 'docker-install: 检查更新器登记状态...\n'
 registration="$("${compose[@]}" exec -T "$UPDATER_SERVICE" python -c 'from pathlib import Path; print("registered" if (Path("/var/lib/xianyu-updater") / "docker-deployment.json").is_file() else "unregistered")' 2>/dev/null || true)"
 if [[ "$registration" == "unregistered" ]]; then
@@ -437,6 +482,7 @@ if [[ "$registration" == "unregistered" ]]; then
 elif [[ "$registration" != "registered" ]]; then
     fail "无法确认更新器登记状态（容器未就绪）"
 fi
+fi
 
 printf 'docker-install: 等待实际更新就绪能力...\n'
 deadline=$((SECONDS + timeout))
@@ -463,6 +509,8 @@ if [[ "$ready" != true ]]; then
             fail "网页升级未就绪（$reason）：更新器或共享 IPC 目录不可用" ;;
         update_maintenance_protocol_unavailable|update_health_invalid)
             fail "网页升级未就绪（$reason）：应用未提供独立更新器所需的本机协议" ;;
+        update_launcher_stale|update_launcher_conflict|update_launcher_unhealthy)
+            fail "网页升级未就绪（$reason）：内置文件更新监督启动器未就绪或与旧服务冲突；请检查应用容器日志" ;;
         *)
             fail "等待网页升级就绪超时（最后原因: $reason）；请查看 ${UPDATER_SERVICE} 日志" ;;
     esac

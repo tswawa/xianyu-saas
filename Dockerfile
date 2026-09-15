@@ -87,8 +87,11 @@ COPY worker/ /app/worker/
 COPY frontend/ /app/frontend/
 COPY scripts/dev-server.mjs /app/scripts/dev-server.mjs
 COPY docker/entrypoint.sh /app/docker/entrypoint.sh
+COPY docker/launcher.sh /app/docker/launcher.sh
 # GPL 要求随二进制分发许可与来源署名。
 COPY LICENSE LICENSING.md CHANGELOG.md package.json /app/
+# 不可变的受信任公钥（root 所有、只读）供内置文件更新器校验签名。
+COPY deploy/update-signing.pub /app/update-signing.pub
 
 ARG SAAS_BUILD_COMMIT=""
 ARG SAAS_BUILD_DIRTY="unknown"
@@ -96,7 +99,7 @@ RUN SAAS_BUILD_COMMIT="$SAAS_BUILD_COMMIT" SAAS_BUILD_DIRTY="$SAAS_BUILD_DIRTY" 
     python backend/version.py --write-build-info
 
 # 代码保持 root 拥有且不可写；仅 /data 与运行期目录对服务账号开放。
-RUN chmod +x /app/docker/entrypoint.sh \
+RUN chmod +x /app/docker/entrypoint.sh /app/docker/launcher.sh \
     && find /app -name '__pycache__' -type d -prune -exec rm -rf {} + \
     && chmod -R a+rX,go-w /app \
     && install -d -o xianyu -g xianyu -m 0700 /data /app/.local

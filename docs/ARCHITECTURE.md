@@ -81,13 +81,13 @@ flowchart LR
 
 ### 6. 版本探测与平台更新架构
 - **低频版本探测协调**：由服务端 `update_probe.py` 协调，默认每 6 小时（`SAAS_UPDATE_CHECK_INTERVAL_SECONDS=21600`）异步查询一次发布源。采用全站共享数据库缓存与租约机制，防止多标签页与多用户重复发起外部请求；网页前端仅在可见时每 5 分钟读取本地版本缓存并驱动徽标提示，探测过程不执行静默下载或安装；
-- **Docker Compose 更新架构**：
-  - 更新器固定使用 Docker Engine API v1.47；Web 应用容器绝不挂载宿主机 Docker socket；仅独立更新器容器（`xianyu-updater`）挂载宿主机 `/var/run/docker.sock`（作为受信任的高权限编排组件）；
-  - 安装入口 `deploy/docker-install.sh` 统一负责本地源码构建、内置受信公钥副本预装（容器内 root 拥有，0644）、全新 `./data` 目录容器属主准备、一次性更新器登记（`initialize`）与真实更新就绪能力验收；
-  - 网页升级由更新器核验签名清单与源码包后，在本地构建新镜像，使用原 Compose 配置和同一数据卷挂载（`/data`）重新创建应用容器；失败时自动切回旧镜像重建容器，绝不恢复或覆盖业务数据；修改环境或 Compose 配置后 `docker start` 不加载新配置，需由维护者按实际运行关系人工重建；
-- **Ubuntu 原生 systemd 更新架构**：
-  - 提供无后缀的 bootstrap 管理器（`xianyu-saas-<version>-linux-x86_64` 与 `xianyu-saas-<version>-linux-aarch64`），由管理员执行 `install --version <version>`；
-  - 管理器自动下载并校验对应架构的签名运行时压缩包，建立独立更新器服务（`xianyu-saas-updater.service` 与 `xianyu-saas-updater.path`）、专用 sticky `01770` IPC 目录及受信接入记录（`status/initialization.json`）；原生升级包含数据库备份步骤（数据保存在 `/var/lib/xianyu-saas`，配置位于 `/etc/xianyu-saas.env`）；
+- **默认内置文件更新架构（推荐）**：
+  - 核心模块由 `backend/file_update.py` 与监督启动器 `docker/launcher.sh` 构成，默认随 Docker 容器及 Ubuntu 原生部署启动，无需手动组装或登记独立更新器；
+  - **存储隔离边界**：可写代码存储与业务数据、基础环境隔离：Docker 代码存储在 `/data/app-code`（映射宿主机 `./data/app-code`），Ubuntu 代码存储在 `/var/lib/xianyu-saas/app-code`；数据库、租户配置、主密钥以及底层 Python 运行环境与公钥固定在可写代码存储之外；
+  - **网页更新与进程切换**：管理员在网页确认升级后，后台下载 GitHub Releases 官方签名源码包，使用只读的受信公钥核验数字签名，检查 `UPDATE_DATA_VERSION` 与依赖兼容性（不兼容在停服前拒绝）；启动器停止原进程、原子切换 `current` 软链接至新版本并重启服务，核验 `/health`；普通代码更新不重新构建 Docker 镜像；
+  - **健康检查与回滚机制**：新版本启动失败或健康检查超时，启动器自动回滚软链接至上一版本并重启恢复；回滚仅针对应用代码软链接，不触碰亦不回滚业务数据库；
+  - **运行环境变更升级**：当遇到依赖或底层环境变动时，内置更新器在停服前拒绝升级，由维护者重新运行官方安装入口（`docker-install.sh` 或管理器 `install`）完成镜像重建或独立运行时刷新；
+- **历史独立更新器兼容**：早期版本的独立更新器组件（`docker-compose.updates.yml` 与 systemd 独立更新服务）代码保持向后兼容，但不作为新手默认路径；
 - **当前验收状态与边界**：
-  - 已完成验证：实际 SaaS Docker 构建安装、就绪验收、静态资源服务、运行中脚本重跑、停止后恢复，以及签名测试应用的网页升级与启动失败回退（保留既有配置与新增业务数据）；
-  - 未经验证：真实线上闲鱼店铺与订单、旧版直装实例的数据迁移，以及线上正式 Release 在浏览器中的端到端点击升级。新发布流程的最终全链路检查尚未开始。
+  - 已完成验证：实际 SaaS Docker 构建安装、就绪验收、静态资源服务、运行中脚本重跑、停止后恢复，以及基于签名源码包的真实 Docker 容器网页升级与数据保留（保留既有配置与业务数据），启动失败自动回退；
+  - 发布状态：上述默认内置文件更新与启动器机制**尚未正式对外发布**（已有公开包 0.4.4 与 0.4.5-update-test.1 不包含此机制）；真实线上闲鱼店铺与订单、旧版直装实例的数据迁移，以及线上正式 Release 在浏览器中的端到端点击升级仍待随正式版发布验收。

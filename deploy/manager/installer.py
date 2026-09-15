@@ -86,6 +86,13 @@ LEGACY_COMMIT = "779ed3432cf288b7e3fb8697c584f388cf3d79f0"
 APPLICATION_UNITS = (API_SERVICE, CONSUMER_SERVICE)
 UNITS = (API_SERVICE, CONSUMER_SERVICE, UPDATER_SERVICE, UPDATER_PATH_UNIT)
 START_UNITS = (API_SERVICE, CONSUMER_SERVICE, UPDATER_PATH_UNIT)
+# Exact signatures of the previously published (pre-launcher) unit templates.
+# A managed installation carrying these is repaired by a precise template
+# identity match; unknown or edited templates still fail closed.
+LEGACY_TEMPLATE_SHA256 = {
+    API_SERVICE: frozenset({"5a994a50af5d36bbb4f528b071947f5c19f9a1481ff1e70bfba9f93c7108bfdf"}),
+    CONSUMER_SERVICE: frozenset({"a0ecaccd5cbe3d38b87e16fb161ca80628f21d7e5750914341590a0efba80617"}),
+}
 MARKER_FILE = ".xianyu-release.json"
 CACHED_MANIFEST_FILE = ".xianyu-manifest.json"
 CACHED_SIGNATURE_FILE = ".xianyu-manifest.sig"
@@ -680,6 +687,7 @@ class Installer:
         executable: Path | None = None,
         public_key: bytes | None = None,
         updater_initializer: Callable[[dict[str, str]], object] | None = None,
+        update_capability_probe: Callable[[AccountIdentity, Path], bool] | None = None,
         clock=time.time,
     ):
         self.fs = filesystem or Filesystem()
@@ -692,6 +700,9 @@ class Installer:
         self.updater_initializer = updater_initializer or (
             lambda environment: invoke_updater("initialize", environment_overrides=environment)
         )
+        # Production uses the real service-user capability probe; test harnesses
+        # may inject a probe because they never run a real systemd/runtime.
+        self.update_capability_probe = update_capability_probe or self._verify_update_capability
         self.clock = clock
         self._managed_data_roots: tuple[Path, ...] = ()
         self._managed_tenants_path = Path("/var/lib/xianyu-saas/tenants")
@@ -710,30 +721,80 @@ class Installer:
                 self._recover_interrupted_install(architecture)
             existing = self._existing_installation(architecture)
             if existing is not None:
-                if version is not None and existing["version"] != version:
+                upgrade = version is not None and existing["version"] != version
+                if upgrade and self._semver_key(version) <= self._semver_key(existing["version"]):
                     raise ManagerError("manager_install_version_conflict")
+                if existing.get("templates_outdated") or upgrade:
+                    # The installed release identity was verified above and its
+                    # unit templates matched the signed legacy generation exactly;
+                    # update the templates and restart through the normal transaction.
+                    repair_version, release_root = self._current_release_path()
+                    if repair_version != existing["version"]:
+                        raise ManagerError("manager_install_identity_invalid")
+                    self._preflight(fresh=False)
+                    manager = self._download_manager(architecture)
+                    metadata = self._verify_cached_release(
+                        release_root, repair_version, architecture, "manager_signed_adoption_invalid"
+                    )
+                    self._repair_runtime_executables(release_root, metadata)
+                    extracted = None
+                    if upgrade:
+                        release = self._download_and_verify(architecture, version)
+                        extracted, target_metadata = self._prepare_release(release)
+                        if target_metadata.update_data_version != metadata.update_data_version:
+                            raise ManagerError("manager_install_version_conflict")
+                    elif not self.fs.is_file(release_root / "docker/launcher.sh"):
+                        # An old signed runtime cannot gain new application code
+                        # from a template-only repair. Select a newer signed release.
+                        raise ManagerError("manager_install_version_conflict")
+                    state = InstallationState("signed_unmanaged", repair_version, release_root)
+                    account = self._prepare_account()
+                    environment_raw, data_environment = self._admit_environment(state, account)
+                    self._admit_destinations(state, manager, release, environment_raw)
+                    snapshot = self._snapshot_transaction(state)
+                    return self._commit(
+                        state=state, manager=manager, release=release, extracted=extracted,
+                        environment_raw=environment_raw, data_environment=data_environment,
+                        account=account, snapshot=snapshot,
+                    )
+                if self._launcher_templates():
+                    self.commands.run((SYSTEMD_BIN, "start", API_SERVICE))
+                    account = self.commands.account(PRODUCT)
+                    active = self._file_update_pointer_state()
+                    code_root = (self._file_update_store_link().parent / active).resolve() if active else self.paths.current_link
+                    if account is None or not self.update_capability_probe(account, code_root):
+                        raise ManagerError("manager_update_ready_failed")
                 self.fs.remove(self.paths.diagnostic_file)
                 return {**existing, "ok": True, "status": "already_installed"}
 
             state = self._classify_state(architecture)
-            if state.kind in {"legacy", "signed_unmanaged"} and version not in {None, LEGACY_VERSION}:
-                raise ManagerError("manager_install_version_conflict")
+            if state.kind in {"legacy", "signed_unmanaged"} and version is not None:
+                baseline_version = LEGACY_VERSION if state.kind == "legacy" else state.version
+                if self._semver_key(version) < self._semver_key(baseline_version):
+                    raise ManagerError("manager_install_version_conflict")
             self._preflight(fresh=state.kind == "fresh")
 
             manager = manager or self._download_manager(architecture)
             metadata = None
             extracted = None
             if state.kind in {"fresh", "legacy"}:
-                target_version = LEGACY_VERSION if state.kind == "legacy" else version
+                target_version = (version or LEGACY_VERSION) if state.kind == "legacy" else version
                 release = self._download_and_verify(architecture, target_version)
                 extracted, metadata = self._prepare_release(release)
             elif state.kind == "signed_unmanaged":
                 if state.release_root is None:
                     raise ManagerError("manager_signed_adoption_invalid")
                 metadata = self._verify_cached_release(
-                    state.release_root, LEGACY_VERSION, architecture, "manager_signed_adoption_invalid"
+                    state.release_root, state.version, architecture, "manager_signed_adoption_invalid"
                 )
                 self._repair_runtime_executables(state.release_root, metadata)
+                if version is not None and version != state.version:
+                    release = self._download_and_verify(architecture, version)
+                    extracted, target_metadata = self._prepare_release(release)
+                    if target_metadata.update_data_version != metadata.update_data_version:
+                        raise ManagerError("manager_install_version_conflict")
+                elif self._launcher_templates() and not self.fs.is_file(state.release_root / "docker/launcher.sh"):
+                    raise ManagerError("manager_install_version_conflict")
             else:
                 raise ManagerError("manager_install_state_unsafe")
 
@@ -780,8 +841,6 @@ class Installer:
                 raise ManagerError("manager_install_state_unsafe") from None
             marker_paths = tuple(release_root / name for name in INTERNAL_RELEASE_FILES)
             if any(self.fs.exists(path) for path in marker_paths):
-                if version != LEGACY_VERSION:
-                    raise ManagerError("manager_signed_adoption_invalid")
                 self._verify_cached_release(
                     release_root, version, architecture, "manager_signed_adoption_invalid"
                 )
@@ -850,6 +909,7 @@ class Installer:
         if account is None or account.home != "/var/lib/xianyu-saas" or account.shell != "/usr/sbin/nologin" or account.group != PRODUCT:
             raise ManagerError("manager_install_identity_invalid")
         self._admit_environment(InstallationState("signed_unmanaged", version, release_root), account)
+        templates_outdated = False
         for unit in UNITS:
             source = self._template(f"deploy/systemd/{unit}")
             destination = self.paths.systemd_dir / unit
@@ -857,12 +917,17 @@ class Installer:
                 self.fs.validate_root_file(destination, MAX_MANIFEST_BYTES)
             except ManagerError as exc:
                 raise ManagerError("manager_install_identity_invalid") from exc
-            if self.fs.read_bytes(destination, MAX_MANIFEST_BYTES) != self._template_payload(source, destination):
+            raw = self.fs.read_bytes(destination, MAX_MANIFEST_BYTES)
+            if raw == self._template_payload(source, destination):
+                continue
+            if hashlib.sha256(raw).hexdigest() not in LEGACY_TEMPLATE_SHA256.get(unit, frozenset()):
                 raise ManagerError("manager_install_identity_invalid")
+            templates_outdated = True
         return {
             "version": version,
             "manager_version": payload["manager_version"],
             "architecture": architecture,
+            "templates_outdated": templates_outdated,
         }
 
     def _preflight(self, *, fresh: bool) -> None:
@@ -1670,6 +1735,8 @@ class Installer:
         old_links: dict[Path, str | None],
         snapshot: UnitSnapshot,
         database_path: Path,
+        store_previous: str,
+        launcher_mode: bool,
     ) -> dict:
         return {
             "schema": 1,
@@ -1688,6 +1755,9 @@ class Installer:
             "database_backup": None,
             "stopped": False,
             "changed_units": False,
+            "store_previous": store_previous,
+            "store_pointer_changed": False,
+            "launcher_mode": launcher_mode,
         }
 
     def _update_install_journal(self, journal: dict, phase: str, **changes) -> None:
@@ -1708,6 +1778,7 @@ class Installer:
             "schema", "operation_id", "phase", "state_kind", "target_version", "manager_version",
             "old_links", "snapshot", "created_release", "created_manager", "created_environment",
             "created_key", "database_path", "database_backup", "stopped", "changed_units",
+            "store_previous", "store_pointer_changed", "launcher_mode",
         }
         if set(payload) != required or payload.get("schema") != 1:
             raise ManagerError("manager_install_recovery_failed")
@@ -1726,6 +1797,14 @@ class Installer:
             or type(payload.get("created_key")) is not bool
             or type(payload.get("stopped")) is not bool
             or type(payload.get("changed_units")) is not bool
+        ):
+            raise ManagerError("manager_install_recovery_failed")
+        store_previous = payload.get("store_previous")
+        if (
+            not isinstance(store_previous, str) or len(store_previous) > 4096 or "\x00" in store_previous
+            or (store_previous and (not store_previous.startswith("/") or ".." in Path(store_previous).parts))
+            or type(payload.get("store_pointer_changed")) is not bool
+            or type(payload.get("launcher_mode")) is not bool
         ):
             raise ManagerError("manager_install_recovery_failed")
         allowed_links = {
@@ -1807,6 +1886,12 @@ class Installer:
         lock_descriptor = self._acquire_update_lock()
         try:
             self._assert_no_pending_update()
+            if journal["store_pointer_changed"]:
+                store_link = self._file_update_store_link()
+                if journal["store_previous"]:
+                    self.fs.replace_symlink(store_link, journal["store_previous"])
+                else:
+                    self.fs.remove(store_link)
             self._rollback(
                 snapshot=snapshot,
                 old_links={Path(path): target for path, target in journal["old_links"].items()},
@@ -1845,6 +1930,9 @@ class Installer:
         old_links = {path: self._link_snapshot(path) for path in link_paths}
         created_release = created_manager = created_environment = created_key = False
         stopped = changed_units = False
+        store_link = self._file_update_store_link()
+        store_previous = self._file_update_pointer_state()
+        store_pointer_changed = False
         database_path = Path(data_environment["SAAS_DB"])
         database_backup: DatabaseBackup | None = None
         operation_id = secrets.token_hex(16)
@@ -1863,6 +1951,8 @@ class Installer:
                 old_links=old_links,
                 snapshot=snapshot,
                 database_path=database_path,
+                store_previous=store_previous or "",
+                launcher_mode=self._launcher_templates(),
             )
             self._save_install_journal(journal)
             self._update_install_journal(journal, "maintenance")
@@ -1919,7 +2009,16 @@ class Installer:
                     raise ManagerError("manager_install_failed")
                 created_release = self._publish_release(release, extracted)
             changed_units = True
-            self._update_install_journal(journal, "switched", changed_units=True)
+            store_version = self._semver_key(Path(store_previous).name) if store_previous else None
+            base_version = self._semver_key(release.version) if release is not None else self._semver_key(target_version)
+            if store_previous is not None and store_version is not None and base_version is not None and base_version > store_version:
+                # A full-runtime upgrade to a newer base deactivates stale web code;
+                # same/older base keeps web-updated code (repair never downgrades).
+                store_pointer_changed = True
+            self._update_install_journal(journal, "switched", changed_units=True,
+                                         store_pointer_changed=store_pointer_changed)
+            if store_pointer_changed:
+                self.fs.remove(store_link)
             if release is not None:
                 self.fs.replace_symlink(self.paths.current_link, f"releases/{release.version}")
             self.fs.replace_symlink(self.paths.manager_current_link, f"releases/{manager.version}")
@@ -1939,14 +2038,33 @@ class Installer:
             self._assert_no_pending_update()
             self._write_initialization(manager)
             self._update_install_journal(journal, "initialized")
-            self.commands.run((SYSTEMD_BIN, "enable", *START_UNITS))
+            launcher_mode = bool(journal.get("launcher_mode"))
+            if launcher_mode:
+                # The API unit runs the built-in launcher, which owns the consumer.
+                self.commands.run((SYSTEMD_BIN, "enable", API_SERVICE))
+                self.commands.run((SYSTEMD_BIN, "disable", CONSUMER_SERVICE, UPDATER_PATH_UNIT))
+            else:
+                self.commands.run((SYSTEMD_BIN, "enable", *START_UNITS))
             self.commands.run((SYSTEMD_BIN, "start", API_SERVICE))
             self._update_install_journal(journal, "api_started")
-            if not self.network.health(target_version):
+            effective_version = target_version
+            effective_root = self.paths.current_link
+            if store_previous is not None and not store_pointer_changed:
+                store_version = self._semver_key(Path(store_previous).name)
+                base_version = self._semver_key(target_version)
+                if store_version is not None and base_version is not None and store_version >= base_version:
+                    effective_version = Path(store_previous).name
+                    effective_root = self._file_update_store_link()
+            if not self.network.health(effective_version):
                 raise ManagerError("manager_install_health_failed")
             self._update_install_journal(journal, "healthy")
-            self.commands.run((SYSTEMD_BIN, "start", CONSUMER_SERVICE, UPDATER_PATH_UNIT))
+            if not launcher_mode:
+                self.commands.run((SYSTEMD_BIN, "start", CONSUMER_SERVICE, UPDATER_PATH_UNIT))
             self._update_install_journal(journal, "services_started")
+            # Installation/repair succeeds only when the service user's real
+            # update_capabilities reports apply for the effective code root.
+            if launcher_mode and not self.update_capability_probe(account, effective_root):
+                raise ManagerError("manager_update_ready_failed")
             traffic_open = True
             self._write_maintenance(operation_id, False, "succeeded")
             self._update_install_journal(journal, "completed")
@@ -1962,6 +2080,14 @@ class Installer:
         except Exception as exc:
             if traffic_open:
                 raise ManagerError("manager_install_recovery_failed") from exc
+            if store_pointer_changed:
+                try:
+                    if store_previous is not None:
+                        self.fs.replace_symlink(store_link, store_previous)
+                    else:
+                        self.fs.remove(store_link)
+                except Exception as restore:
+                    raise ManagerError("manager_install_recovery_failed") from restore
             try:
                 self._rollback(
                     snapshot=snapshot,
@@ -1983,6 +2109,88 @@ class Installer:
         finally:
             if lock_descriptor >= 0:
                 os.close(lock_descriptor)
+
+    def _file_update_store_link(self) -> Path:
+        return self.paths.state_dir / "app-code/current"
+
+    @classmethod
+    def _semver_key(cls, value: str):
+        text = str(value or "")
+        if not VERSION_RE.fullmatch(text):
+            return None
+        core = text.split("+", 1)[0]
+        numeric, _, pre = core.partition("-")
+        try:
+            parts = tuple(int(part) for part in numeric.split("."))
+        except ValueError:
+            return None
+        pre_key = tuple(
+            (0, int(part)) if part.isdigit() else (1, part) for part in pre.split(".")
+        ) if pre else ()
+        return (*parts, (1, ()) if not pre else (0, pre_key))
+
+    def _file_update_pointer_state(self) -> str | None:
+        link = self._file_update_store_link()
+        try:
+            if not link.is_symlink():
+                return None
+            target = link.resolve(strict=True)
+        except OSError:
+            return None
+        name = target.name
+        releases = link.parent / "releases"
+        if (target.parent != releases.resolve() or self._semver_key(name) is None
+                or not (target / "backend/app.py").is_file()):
+            raise ManagerError("manager_install_path_unsafe")
+        return str(target)
+
+    def _launcher_templates(self) -> bool:
+        """True when the shipped API unit runs the built-in file-update launcher."""
+        try:
+            source = self._template(f"deploy/systemd/{API_SERVICE}")
+            payload = self._template_payload(source, self.paths.systemd_dir / API_SERVICE)
+            return "docker/launcher.sh" in payload.decode("utf-8", "replace")
+        except (ManagerError, UnicodeError):
+            return False
+
+    @staticmethod
+    def _account_name(account: AccountIdentity) -> str:
+        try:
+            import pwd
+
+            return pwd.getpwuid(account.uid).pw_name
+        except (KeyError, OSError, ImportError):
+            return ""
+
+    def _verify_update_capability(self, account: AccountIdentity, code_root: Path) -> bool:
+        """Run the service user's real update_capabilities and require apply=True."""
+        name = self._account_name(account)
+        python = self.paths.current_link / "runtime/python/bin/python3"
+        site = self.paths.current_link / "runtime/site/backend"
+        store_root = self._file_update_store_link().parent
+        if not name or not self.fs.is_file(python):
+            return False
+        command = (
+            "/usr/sbin/runuser", "-u", name, "--", "/usr/bin/env",
+            f"PYTHONPATH={code_root / 'backend'}:{site}",
+            "SAAS_DEPLOYMENT_MODE=systemd", "SAAS_RELEASE_KIND=standalone",
+            f"SAAS_CURRENT_ROOT={code_root}", f"SAAS_APP_CODE_DIR={store_root}",
+            "SAAS_UPDATE_PUBLIC_KEY_FILE=/etc/xianyu-saas/update-signing.pub",
+            str(python), "-c",
+            "import json, platform_update; print(json.dumps(platform_update.update_capabilities()))",
+        )
+        for _ in range(60):
+            result = self.commands.run(command, check=False)
+            if result.returncode == 0:
+                try:
+                    payload = json.loads(result.stdout or "")
+                except (ValueError, TypeError):
+                    payload = {}
+                if (isinstance(payload, dict) and payload.get("apply") is True
+                        and payload.get("deployment") == "systemd"):
+                    return True
+            time.sleep(1)
+        return False
 
     def _create_directories(self, uid: int, gid: int) -> None:
         entries = (

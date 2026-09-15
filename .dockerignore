@@ -16,7 +16,9 @@ coverage
 docs
 handoff
 tests
-deploy
+deploy/*
+# 受信任公钥随不可变镜像分发，供内置文件更新器校验签名。
+!deploy/update-signing.pub
 蒸馏
 # 文档不进镜像，但保留许可与署名文件以满足 GPL 分发要求。
 *.md

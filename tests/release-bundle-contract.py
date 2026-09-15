@@ -234,12 +234,13 @@ class Repository:
                 "runtime/sbom.cdx.json": BUILDER.json_bytes({"bomFormat": "CycloneDX", "specVersion": "1.5"}),
                 "runtime/third-party.json": BUILDER.json_bytes({"schema": 1, "packages": []}),
                 "manager/xianyu-saas": manager,
+                "docker/launcher.sh": b"#!/bin/sh\n# synthetic launcher\nexit 0\n",
             }
             for name, payload in payloads.items():
                 path = bundle / name
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_bytes(payload)
-                if name == "manager/xianyu-saas":
+                if name in {"manager/xianyu-saas", "docker/launcher.sh"}:
                     path.chmod(0o755)
             bootstrap = directory / "manager"
             bootstrap.write_bytes(manager)
@@ -512,6 +513,7 @@ def verify_bundle(repo: Repository, output: Path, *, notes_path=None, epoch=EPOC
         by_path = {item["path"]: item for item in standalone_manifest["files"]}
         assert by_path["runtime/python/bin/python3"]["executable"] is True
         assert by_path["manager/xianyu-saas"]["executable"] is True
+        assert by_path["docker/launcher.sh"]["executable"] is True
         with tarfile.open(output / archive_name, "r:gz") as archive:
             assert stat.S_IMODE(archive.getmember("runtime/python/bin/python3").mode) == 0o755
     with tempfile.TemporaryDirectory(prefix="release-contract-public-") as temporary:

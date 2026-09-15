@@ -704,6 +704,13 @@ def build(args) -> Path:
             if worker_env_example.is_symlink() or not worker_env_example.is_file():
                 raise StandaloneError("standalone_source_layout_invalid")
             worker_env_example.unlink()
+        launcher_source = source_root / "docker" / "launcher.sh"
+        if launcher_source.is_symlink() or not launcher_source.is_file():
+            raise StandaloneError("standalone_source_layout_invalid")
+        launcher_directory = bundle / "docker"
+        launcher_directory.mkdir()
+        shutil.copyfile(launcher_source, launcher_directory / "launcher.sh")
+        (launcher_directory / "launcher.sh").chmod(0o755)
         shutil.copyfile(source_root / "package.json", bundle / "package.json")
         runtime = bundle / "runtime"
         runtime.mkdir()

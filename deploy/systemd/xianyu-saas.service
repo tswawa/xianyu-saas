@@ -1,7 +1,10 @@
 [Unit]
-Description=Xianyu SaaS API and managed bot supervisor
+Description=Xianyu SaaS application supervisor and built-in file updater
 After=network-online.target
 Wants=network-online.target
+# The built-in launcher owns the consumer; stop the legacy consumer unit to
+# avoid running two consumers for the same database.
+Conflicts=xianyu-saas-consumer.service
 
 [Service]
 Type=simple
@@ -20,7 +23,18 @@ Environment=SAAS_BOT_PYTHONPATH=/opt/xianyu-saas/current/runtime/site/worker
 Environment=SAAS_UPDATE_PUBLIC_KEY_FILE=/etc/xianyu-saas/update-signing.pub
 Environment=SAAS_UPDATE_INTENT_FILE=/var/lib/xianyu-saas-updates/intent.json
 Environment=SAAS_UPDATE_STATUS_DIR=/var/lib/xianyu-saas-updates/status
-ExecStart=/opt/xianyu-saas/current/runtime/python/bin/python3 -m uvicorn app:app --host 0.0.0.0 --port 8096 --proxy-headers --forwarded-allow-ips=127.0.0.1 --limit-concurrency 100 --backlog 128
+# Immutable runtime/python and runtime/site packages stay outside the writable
+# code store; updated application code is launched from the store.
+Environment=SAAS_APP_CODE_DIR=/var/lib/xianyu-saas/app-code
+Environment=SAAS_LAUNCH_BASE_ROOT=/opt/xianyu-saas/current
+Environment=SAAS_LAUNCH_PYTHON=/opt/xianyu-saas/current/runtime/python/bin/python3
+Environment=SAAS_LAUNCH_PYTHONPATH_EXTRA=/opt/xianyu-saas/current/runtime/site/backend
+Environment=SAAS_LAUNCH_WORKER_PYTHON=/opt/xianyu-saas/current/runtime/python/bin/python3
+Environment=SAAS_LAUNCH_WORKER_PYTHONPATH_EXTRA=/opt/xianyu-saas/current/runtime/site/worker
+Environment=SAAS_LAUNCH_WEB=0
+Environment=SAAS_LAUNCH_CONSUMER=1
+Environment=SAAS_LAUNCH_CONFLICT_UNITS=xianyu-saas-consumer.service xianyu-saas-updater.service
+ExecStart=/opt/xianyu-saas/current/docker/launcher.sh
 
 Restart=on-failure
 RestartSec=10

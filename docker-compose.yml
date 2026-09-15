@@ -20,6 +20,8 @@ services:
       SAAS_DB: /data/saas.db
       SAAS_TENANTS_DIR: /data/tenants
       SAAS_BOT_ROOT: /app/worker
+      # 可写的内置文件更新代码存储；业务数据仍由 ./data 挂载持久化。
+      SAAS_APP_CODE_DIR: /data/app-code
     volumes:
       - ./data:/data
     # 控制面派生 Worker 时用 RLIMIT_AS 限制内存，需要允许进程自设资源上限。

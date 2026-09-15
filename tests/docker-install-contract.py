@@ -90,6 +90,10 @@ def main():
             for name in state.get("working_dir_projects", []):
                 print(name)
             return 0
+        if any("io.xianyu.updates.role=updater" in value for value in argv):
+            for row in state.get("updater_rows", []):
+                print(row)
+            return 0
         if any(value.startswith("label=com.docker.compose.project=") for value in argv):
             service_filter = ""
             for value in argv:
@@ -187,7 +191,11 @@ def main():
         return 0
     if sub == "build":
         project = state.get("project", "xianyu-saas")
-        state["images"] = [project + "-xianyu-saas:managed", project + "-xianyu-updater:local"]
+        overlay = any(str(value).endswith("docker-compose.updates.yml") for value in argv)
+        state["images"] = (
+            [project + "-xianyu-saas:managed", project + "-xianyu-updater:local"]
+            if overlay else ["xianyu-saas:local"]
+        )
         save(state)
         return 0
     if sub == "up":
@@ -286,9 +294,12 @@ def assert_static_contract() -> None:
     assert "--project-directory" in SOURCE
     assert '-f "$root/docker-compose.yml"' in SOURCE
     assert '-f "$root/docker-compose.updates.yml"' in SOURCE
-    assert SOURCE.index('-f "$root/docker-compose.yml"') < SOURCE.index('-f "$root/docker-compose.updates.yml"')
+    compose_block = SOURCE.split("compose=(", 1)[1].split("export COMPOSE_PROJECT_NAME", 1)[0]
+    assert compose_block.index('-f "$root/docker-compose.yml"') < compose_block.index('-f "$root/docker-compose.updates.yml"')
     assert 'COMPOSE_PROJECT_NAME="$project"' in SOURCE
     assert 'SAAS_ENV_FILE="$env_file"' in SOURCE
+    assert "builtin=true" in SOURCE
+    assert "SAAS_APP_CODE_DIR: /data/app-code" in COMPOSE_BASE
     assert SOURCE.index('export SAAS_ENV_FILE="$env_file"') < SOURCE.index('"${compose[@]}" config')
     assert 'SAAS_UPDATE_PUBLIC_KEY_HOST_FILE="$key_path"' in SOURCE
     assert "deploy/update-signing.pub" in SOURCE
@@ -325,7 +336,6 @@ def assert_static_contract() -> None:
     # limited rerun semantics.
     assert "deploy/docker-install.sh" in README
     assert "deploy/docker-install.sh" in DEPLOYMENT
-    assert "update_capabilities" in DEPLOYMENT
 
     # The service env_file is parameterized so --env-file also reaches the app.
     assert "${SAAS_ENV_FILE:-config/saas.env}" in COMPOSE_BASE
@@ -481,25 +491,33 @@ def assert_fresh_install(process, state) -> None:
 
     preflight = first_index(state, "config")
     build = first_index(state, "build")
-    stage_key = first_needle(state, "target=/seed")
     prepare_data = first_needle(state, "target=/data")
     start = first_index(state, "up")
-    registration = first_needle(state, "docker-deployment.json")
-    initialize = first_needle(state, "docker_updater.py")
     acceptance = first_needle(state, "update_capabilities")
-    assert preflight < build < stage_key < prepare_data < start < registration < initialize < acceptance
+    assert preflight < build < prepare_data < start < acceptance
+    assert not has_call(state, "target=/seed"), "built-in path must not stage a host key"
+    assert not has_call(state, "docker_updater.py"), "built-in path must not run sidecar registration"
+    assert not has_call(state, "docker-deployment.json")
 
     build_call = state["calls"][build]
     assert build_call["project"] == "xianyu-saas"
     assert build_call["dirty"] == "unknown"
     assert build_call["commit"] == ""
     assert build_call["env_file"].endswith("config/saas.env")
+    assert not state.get("staged")
+    assert state.get("prepared_data") is True
 
-    config_call = state["calls"][next(index for index, call in enumerate(state["calls"]) if subcommand_of(call) == "config" and "--format" in call["argv"])]
-    assert compose_options(config_call) == compose_options(state["calls"][initialize])
-    assert state.get("initialize_input")
-    assert state.get("staged") is True and state.get("prepared_data") is True
-    assert state.get("registered") is True
+
+def assert_builtin_managed(process, state) -> None:
+    assert process.returncode == 0, process.stderr + process.stdout
+    assert "网页升级已就绪" in process.stdout
+    assert indexes_of(state, "start"), "stopped built-in install must start the existing container"
+    assert not indexes_of(state, "up")
+    assert not indexes_of(state, "build"), "built-in rerun must not rebuild"
+    assert not has_call(state, "target=/seed")
+    assert not has_call(state, "target=/data")
+    assert not has_call(state, "docker_updater.py")
+    assert has_call(state, "update_capabilities")
 
 
 def assert_managed_ready(process, state) -> None:
@@ -557,6 +575,19 @@ def behavioral_contract() -> bool:
 
     process, state = run_installer(fresh_state())
     assert_fresh_install(process, state)
+
+    # A stopped built-in install starts the existing container without rebuilding
+    # or touching keys/data and reports readiness through the same capability.
+    def builtin_managed_state() -> dict:
+        state = fresh_state()
+        state.update(project_containers=[["xianyu-saas", "", ""]], containers_running=True,
+                     images=["xianyu-saas:local"])
+        return state
+
+    builtin_stopped = builtin_managed_state()
+    builtin_stopped["containers_running"] = False
+    process, state = run_installer(builtin_stopped, prepare=prepare_existing_installation)
+    assert_builtin_managed(process, state)
 
     # --env-file must also reach the service env_file through SAAS_ENV_FILE.
     def custom_env(project: Path) -> None:
@@ -670,6 +701,7 @@ def behavioral_contract() -> bool:
     # Existing unmanaged containers are refused before any mutation.
     unmanaged = fresh_state()
     unmanaged["project_containers"] = [["xianyu-saas", "", ""]]
+    unmanaged["volumes"] = ["xianyu-saas_updater-private"]
     process, state = run_installer(unmanaged)
     assert process.returncode != 0
     assert "未接入独立更新器的应用容器" in process.stderr
@@ -736,20 +768,24 @@ def behavioral_contract() -> bool:
     process, state = run_installer(fresh_state(), prepare=mismatched_key)
     assert_key_conflict(process, state)
 
-    # Initialize contention is retried but bounded by --timeout.
-    busy_state = fresh_state()
+    # Existing sidecars with lost registration fail without reinitializing it.
+    busy_state = managed_state()
+    busy_state["registered"] = False
     busy_state["initialize_busy_forever"] = True
-    process, state = run_installer(busy_state, arguments=("--timeout", "2"))
+    process, state = run_installer(busy_state, arguments=("--timeout", "2"),
+                                   prepare=prepare_existing_installation)
     assert process.returncode != 0
-    assert "update_executor_busy" in process.stderr
+    assert "缺少更新器登记" in process.stderr, process.stderr + process.stdout
+    assert not indexes_containing(state, "docker_updater.py")
     assert "网页升级已就绪" not in process.stdout
 
-    busy_once = fresh_state()
+    busy_once = managed_state()
+    busy_once["registered"] = False
     busy_once["initialize_busy_once"] = True
-    process, state = run_installer(busy_once)
-    assert process.returncode == 0, process.stderr + process.stdout
-    assert len(indexes_containing(state, "docker_updater.py")) >= 2
-    assert state.get("registered") is True
+    process, state = run_installer(busy_once, prepare=prepare_existing_installation)
+    assert process.returncode != 0, process.stderr + process.stdout
+    assert not indexes_containing(state, "docker_updater.py")
+    assert state.get("registered") is False
 
     # Build provenance reports the real repository state and never claims a
     # clean release for a dirty tree.
