@@ -13,15 +13,16 @@ concurrency:
 
 jobs:
   validate:
-    # One version-only update probe reuses v0.4.4's successful full CI.
-    if: github.ref_name != 'v0.4.5-update-test.1'
+    # Version-only probes: test.1 reuses v0.4.4 CI; test.3 reuses test.2
+    # successful full CI (run 34933220732). Packaging and signing still run.
+    if: github.ref_name != 'v0.4.5-update-test.1' && github.ref_name != 'v0.4.5-update-test.3'
     uses: ./.github/workflows/ci.yml
     permissions:
       contents: read
 
   standalone:
     needs: validate
-    if: always() && (needs.validate.result == 'success' || (needs.validate.result == 'skipped' && github.ref_name == 'v0.4.5-update-test.1'))
+    if: always() && (needs.validate.result == 'success' || (needs.validate.result == 'skipped' && (github.ref_name == 'v0.4.5-update-test.1' || github.ref_name == 'v0.4.5-update-test.3')))
     strategy:
       fail-fast: false
       matrix:
@@ -179,7 +180,7 @@ jobs:
 
   publish:
     needs: [validate, standalone]
-    if: always() && needs.standalone.result == 'success' && (needs.validate.result == 'success' || (needs.validate.result == 'skipped' && github.ref_name == 'v0.4.5-update-test.1'))
+    if: always() && needs.standalone.result == 'success' && (needs.validate.result == 'success' || (needs.validate.result == 'skipped' && (github.ref_name == 'v0.4.5-update-test.1' || github.ref_name == 'v0.4.5-update-test.3')))
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     permissions:
