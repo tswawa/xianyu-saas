@@ -261,9 +261,12 @@ def static_bundle_contracts():
     installer = (ROOT / "deploy/manager/installer.py").read_text(encoding="utf-8")
     assert "nginx" not in installer.lower()
     service = (ROOT / "deploy/systemd/xianyu-saas.service").read_text(encoding="utf-8")
-    assert "--host 0.0.0.0 --port 8096" in service
-    assert "--limit-concurrency 100" in service and "--backlog 128" in service
-    assert "--host 127.0.0.1" not in service
+    assert "ExecStart=/opt/xianyu-saas/current/docker/launcher.sh" in service
+    launcher = (ROOT / "docker/launcher.sh").read_text(encoding="utf-8")
+    assert 'api_port="${SAAS_LAUNCH_API_PORT:-8096}"' in launcher
+    assert '--host 0.0.0.0 --port "$api_port"' in launcher
+    assert "--limit-concurrency 100" in launcher and "--backlog 128" in launcher
+    assert "--host 127.0.0.1" not in launcher
     for relative in (
         "deploy/update-signing.pub", "deploy/updater/updater.py", "backend/platform_update.py",
         "backend/standalone_runtime.py", "backend/update_maintenance.py", "backend/version.py",
