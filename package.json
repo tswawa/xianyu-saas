@@ -1,6 +1,6 @@
 {
   "name": "xianyu-saas",
-  "version": "0.4.5-update-test.4",
+  "version": "0.4.5-update-test.5",
   "private": true,
   "description": "按店铺账号隔离的闲鱼客服工作台、服务端与自动客服 worker",
   "license": "GPL-3.0-only",

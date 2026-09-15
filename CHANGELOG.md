@@ -2,7 +2,12 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号按 [Semantic Versioning](https://semver.org/lang/zh-CN/) 管理。
 
-> 说明：当前工程代码版本为 `0.4.5-update-test.4`。文中的历史记录反映内部开发基线与功能演进。
+> 说明：当前工程代码版本为 `0.4.5-update-test.5`。文中的历史记录反映内部开发基线与功能演进。
+
+## [0.4.5-update-test.5] - 2026-09-15
+
+- 与 0.4.5-update-test.4 配套的网页更新目标，仅递增版本号，不改动业务代码、运行依赖或数据格式。
+- 测试时先安装 0.4.5-update-test.4，再在网页检查更新并升级到本版；完成后应显示 0.4.5-update-test.5，保留账号、配置和业务数据。
 
 ## [0.4.5-update-test.4] - 2026-09-15
 
