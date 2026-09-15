@@ -261,7 +261,7 @@ def static_bundle_contracts():
     installer = (ROOT / "deploy/manager/installer.py").read_text(encoding="utf-8")
     assert "nginx" not in installer.lower()
     service = (ROOT / "deploy/systemd/xianyu-saas.service").read_text(encoding="utf-8")
-    assert "ExecStart=/opt/xianyu-saas/current/docker/launcher.sh" in service
+    assert f"ExecStart={CURRENT_LINK.as_posix()}/docker/launcher.sh" in service
     launcher = (ROOT / "docker/launcher.sh").read_text(encoding="utf-8")
     assert 'api_port="${SAAS_LAUNCH_API_PORT:-8096}"' in launcher
     assert '--host 0.0.0.0 --port "$api_port"' in launcher
