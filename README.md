@@ -6,7 +6,7 @@
 
 [![License: GPL-3.0-only](https://img.shields.io/badge/license-GPL--3.0--only-blue.svg)](LICENSE)
 
-[功能介绍](#功能介绍) · [下载安装](#安装) · [首次使用](#首次使用) · [网页更新](#网页更新) · [更多截图](#更多截图) · [开发与文档](#开发与文档)
+[功能介绍](#功能介绍) · [下载安装](#安装) · [首次使用](#首次使用) · [网页更新](#网页更新) · [更多截图](#更多截图) · [开发与文档](#开发与文档) · [交流与建议](#交流与建议)
 
 ![工作台概览](docs/assets/readme/overview.png)
 
@@ -290,6 +290,12 @@ docs/       部署、使用与架构文档
 | 进程、数据流与 Worker | [系统架构](docs/ARCHITECTURE.md) · [Worker 说明](worker/README.md) |
 | 版本变化与发布维护 | [更新记录](CHANGELOG.md) · [发布指南](docs/RELEASING.md) |
 | 漏洞报告与社区协作 | [安全政策](SECURITY.md) · [行为准则](CODE_OF_CONDUCT.md) |
+
+## 交流与建议
+
+对项目有改进建议，或想交流使用经验，欢迎加入 QQ 交流群：**1106909549**。
+
+<img src="docs/assets/community/qq-group.jpg" alt="xianyu-saas 交流群二维码，QQ群号 1106909549" width="360">
 
 ## 许可证
 
