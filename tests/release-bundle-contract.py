@@ -357,22 +357,18 @@ def assert_generated_notes(repo: Repository, notes_path: Path) -> None:
     notes = notes_path.read_text(encoding="utf-8")
     base = f"xianyu-saas-{repo.version}"
     download = f"https://github.com/{UPDATER.RELEASE_OWNER}/{UPDATER.RELEASE_REPOSITORY}/releases/download/v{repo.version}"
-    assert notes.startswith(f"# xianyu-saas {repo.version} 发布说明")
-    install_section = notes.index("## 首次安装")
-    native_section = notes.index("### 2. Ubuntu 原生安装")
-    update_section = notes.index("## 已有用户更新")
+    assert notes.startswith("## 本次版本变更\n\n")
     changes_section = notes.index("## 本次版本变更")
-    attachments_section = notes.index("## 附件说明")
-    assert install_section < native_section < update_section < attachments_section < changes_section
-    assert notes.count("## 附件说明") == 1
+    download_section = notes.index("## 下载")
+    assert changes_section < download_section
+    assert notes.count("## 下载") == 1
     for name in (f"{base}-source.zip", f"{base}-linux-x86_64", f"{base}-linux-aarch64"):
         assert f"{download}/{name}" in notes, name
-    assert "sudo bash deploy/docker-install.sh" in notes
-    assert f"sudo ./{base}-linux-x86_64 install" in notes
-    assert f"`{base}-linux-aarch64`" in notes
-    assert f"install --version {repo.version}" in notes
+    assert f"https://github.com/tswawa/xianyu-saas/blob/v{repo.version}/README.md" in notes
+    assert "```" not in notes, "installation commands belong in the linked guide"
     assert "### Added\n\n- Release fixture only." in notes
     assert "Source code" in notes
+    assert len(notes) < 1500, "a short changelog must produce a compact release entry"
     assert len(notes) <= UPDATER.MAX_RELEASE_NOTES_CHARS
 
 
@@ -1000,7 +996,7 @@ def main():
     folded = b"## [1.2.0]\n\nCurrent changes.\n\n<details>\n<summary>Test history</summary>\n\n## [1.1.0-test.2]\n\nSecond test.\n\n## [1.1.0-test.1]\n\nFirst test.\n\n</details>\n\n## [1.0.0]\n\nOld changes.\n"
     for version, expected in (("1.2.0", "Current changes."), ("1.1.0-test.2", "Second test."), ("1.1.0-test.1", "First test.")):
         notes = BUILDER.release_notes({"CHANGELOG.md": (folded, False)}, version, UPDATER).decode("utf-8")
-        assert notes.split("## 本次版本变更\n\n", 1)[1].strip() == expected
+        assert notes.split("## 本次版本变更\n\n", 1)[1].split("## 下载", 1)[0].strip() == expected
     with tempfile.TemporaryDirectory(prefix="xianyu-release-contract-") as temporary:
         run = Path(temporary)
         with patch.object(socket.socket, "connect", side_effect=AssertionError("network forbidden")), patch.object(socket, "create_connection", side_effect=AssertionError("network forbidden")):

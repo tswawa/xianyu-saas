@@ -291,82 +291,19 @@ def release_version(files: dict, protocol) -> str:
         raise BundleError("release_version_invalid") from None
 
 
-RELEASE_GUIDE_TEMPLATE = """# xianyu-saas {version} 发布说明
+RELEASE_GUIDE_TEMPLATE = """## 下载
 
-官方仓库：https://github.com/tswawa/xianyu-saas
+- [Docker 源码安装包（source.zip）](https://github.com/tswawa/xianyu-saas/releases/download/v{version}/xianyu-saas-{version}-source.zip)
+- [Ubuntu x86_64 引导管理器](https://github.com/tswawa/xianyu-saas/releases/download/v{version}/xianyu-saas-{version}-linux-x86_64)
+- [Ubuntu ARM64 引导管理器](https://github.com/tswawa/xianyu-saas/releases/download/v{version}/xianyu-saas-{version}-linux-aarch64)
 
-本版本提供 Docker（推荐）与 Ubuntu 原生安装两种方式。普通用户通过下方下载入口安装即可；其余附件由安装器和更新器自动调用，无需手动下载。
+详细安装说明与部署要求请查看 [README.md](https://github.com/tswawa/xianyu-saas/blob/v{version}/README.md)。
 
-## 用户下载入口
-
-| 部署方式 | 适用环境 | 下载文件 |
-| --- | --- | --- |
-| Docker 部署（推荐） | Linux 服务器、Docker Desktop + WSL2 | [`xianyu-saas-{version}-source.zip`](https://github.com/tswawa/xianyu-saas/releases/download/v{version}/xianyu-saas-{version}-source.zip) |
-| Ubuntu 原生安装（x86_64） | Ubuntu 22.04 / 24.04、Debian 12（x86_64） | [`xianyu-saas-{version}-linux-x86_64`](https://github.com/tswawa/xianyu-saas/releases/download/v{version}/xianyu-saas-{version}-linux-x86_64) |
-| Ubuntu 原生安装（ARM64） | Ubuntu 22.04 / 24.04、Debian 12（ARM64） | [`xianyu-saas-{version}-linux-aarch64`](https://github.com/tswawa/xianyu-saas/releases/download/v{version}/xianyu-saas-{version}-linux-aarch64) |
-
-> 提示：推荐下载项目发布的 `xianyu-saas-{version}-source.zip`。它包含构建元数据并与签名清单绑定；GitHub 自动打包的 Source code 不包含发布构建信息。
-
----
-
-## 首次安装
-
-### 1. Docker 部署（推荐）
-
-系统需具备 `curl`、`unzip`，以及支持 Engine API v1.47 的 Linux Docker Engine 与 Compose 插件。在本地 Linux 终端或 WSL2 Linux 文件系统中执行：
-
-```bash
-curl -fLO https://github.com/tswawa/xianyu-saas/releases/download/v{version}/xianyu-saas-{version}-source.zip
-unzip -q xianyu-saas-{version}-source.zip
-cd xianyu-saas-{version}
-sudo bash deploy/docker-install.sh
-```
-
-- **访问地址**：`http://127.0.0.1:4173/xianyu-saas/`
-- **数据路径**：业务数据保存在项目目录下的 `./data`
-
----
-
-### 2. Ubuntu 原生安装（x86_64 与 ARM64 择一执行）
-
-支持 Ubuntu 22.04、24.04 及 Debian 12。系统需具备 `systemd`、`systemd-analyze`、`useradd` 和 `curl`。根据机器架构选择对应的安装命令执行：
-
-**x86_64 架构：**
-```bash
-curl -fLO https://github.com/tswawa/xianyu-saas/releases/download/v{version}/xianyu-saas-{version}-linux-x86_64
-chmod +x xianyu-saas-{version}-linux-x86_64
-sudo ./xianyu-saas-{version}-linux-x86_64 install --version {version}
-```
-
-**ARM64 架构：**
-```bash
-curl -fLO https://github.com/tswawa/xianyu-saas/releases/download/v{version}/xianyu-saas-{version}-linux-aarch64
-chmod +x xianyu-saas-{version}-linux-aarch64
-sudo ./xianyu-saas-{version}-linux-aarch64 install --version {version}
-```
-
-- **访问地址**：`http://127.0.0.1:8096/xianyu-saas/`
-- **数据路径**：数据保存在 `/var/lib/xianyu-saas`，配置文件位于 `/etc/xianyu-saas.env`
-- **日常维护**：安装后使用统一的 `sudo xianyu-saas status`、`start`、`stop`、`restart`、`doctor` 管理服务
-
----
-
-## 已有用户更新
-
-- **网页更新**：本版新安装内置文件更新启动器，在网页版本更新页面下载签名包、确认更新后，程序切换代码并自动重启，保留业务数据；启动失败时尝试恢复上一版本。普通代码更新无需重建 Docker 镜像，依赖或数据格式不兼容时会拒绝更新。
-- **Docker 重复运行**：对已登记的 Docker 实例，重复执行 `deploy/docker-install.sh` 只会检查并启动现有容器，不会重建镜像、不加载本地新配置，也不会覆盖业务数据。常规暂停只需 `docker stop xianyu-saas`，恢复直接重新运行安装脚本。Docker 升级时不自动备份数据库，维护前请自行备份 `./data` 目录。
-- **Ubuntu 备份与恢复**：配置位于 `/etc/xianyu-saas.env`。内置文件更新不自动备份数据库，操作前请备份 `/var/lib/xianyu-saas` 和配置；旧原生更新器执行运行环境升级时仍包含数据库备份步骤。
-- **历史未登记实例**：未经安装器初始化的旧版容器或早期源码运行实例不在网页自动升级支持范围内，需由维护者参考文档手动迁移。
-
----
-
-## 附件说明
-
-本版本发布附件共 14 项（包括 Docker 源码包与清单、Ubuntu 双架构管理器与运行时包、发布索引及签名）。其余清单与签名附件供安装器和更新器自动校验使用，完整说明见维护文档 `docs/RELEASING.md`。"""
+> 其他清单与签名附件由安装程序和更新器自动调用校验，无需手动下载；GitHub 自动生成的 Source code 归档不含构建元数据，不是推荐的安装包。"""
 
 
 def release_guide(version: str, protocol) -> str:
-    """Render the reviewed installation guide with the release version."""
+    """Render compact download links with a version-pinned installation guide."""
     return RELEASE_GUIDE_TEMPLATE.replace("{version}", version).strip()
 
 
@@ -386,7 +323,7 @@ def release_notes(files: dict, version: str, protocol) -> bytes:
     body = section[:end.start() if end else len(section)].strip()
     if not body:
         raise BundleError("release_notes_invalid")
-    notes = release_guide(version, protocol) + "\n\n## 本次版本变更\n\n" + body + "\n"
+    notes = "## 本次版本变更\n\n" + body + "\n\n" + release_guide(version, protocol) + "\n"
     notes = notes.replace("\r\n", "\n").rstrip("\n") + "\n"
     if len(notes) > protocol.MAX_RELEASE_NOTES_CHARS:
         raise BundleError("release_notes_invalid")
