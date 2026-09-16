@@ -270,6 +270,7 @@ def static_bundle_contracts():
     for relative in (
         "deploy/update-signing.pub", "deploy/updater/updater.py", "backend/platform_update.py",
         "backend/standalone_runtime.py", "backend/update_maintenance.py", "backend/version.py",
+        "backend/update_progress.py",
     ):
         assert relative in spec
 

@@ -300,6 +300,7 @@ def stage(release, channel: str, current_version: str, operation_id: str) -> dic
     import platform_update as protocol
     import requests
     from docker_update_protocol import DockerUpdateError, extract_verified_source, verify_docker_manifest
+    from update_progress import report_phase
 
     if not launcher_fresh():
         raise FileUpdateError("update_installation_unavailable")
@@ -317,8 +318,10 @@ def stage(release, channel: str, current_version: str, operation_id: str) -> dic
     staging.mkdir(mode=0o700, parents=True)
     session = requests.Session()
     try:
+        report_phase("checking")
         manifest_raw = _fetch(session, release.manifest.api_url, protocol.MAX_MANIFEST_BYTES)
         signature_raw = _fetch(session, release.signature.api_url, protocol.MAX_SIGNATURE_BYTES)
+        report_phase("verifying")
         parsed = verify_docker_manifest(manifest_raw, signature_raw, _key_raw(), expected_version=release.version)
         if parsed.source_name != release.artifact.name or parsed.source_size != release.artifact.size:
             raise FileUpdateError("update_manifest_invalid")
@@ -327,10 +330,10 @@ def stage(release, channel: str, current_version: str, operation_id: str) -> dic
         runtime_raw = _fetch(session, release.runtime_manifest.api_url, protocol.MAX_MANIFEST_BYTES)
         _runtime_manifest(runtime_raw, release, parsed)
         source_path = staging / "source.zip"
-        raw = protocol._request_bytes(session, release.artifact.api_url, max_bytes=parsed.source_size, asset=True)
-        if len(raw) != parsed.source_size:
+        digest = protocol._download_asset_to_file(session, release.artifact, source_path,
+                                                 max_bytes=parsed.source_size)
+        if not secrets.compare_digest(digest, parsed.source_sha256):
             raise FileUpdateError("update_artifact_hash_mismatch")
-        source_path.write_bytes(raw)
         candidate = extract_verified_source(source_path, staging / "extract", parsed)
         _verify_candidate_tree(candidate)
         _verify_compatibility(candidate)

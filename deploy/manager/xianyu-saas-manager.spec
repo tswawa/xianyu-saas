@@ -30,6 +30,7 @@ BUNDLE_FILES = (
     "backend/runtime_settings.py",
     "backend/standalone_runtime.py",
     "backend/update_maintenance.py",
+    "backend/update_progress.py",
     "backend/version.py",
     "deploy/updater/updater.py",
     "deploy/update-signing.pub",

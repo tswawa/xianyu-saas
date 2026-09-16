@@ -44,6 +44,7 @@ from cryptography.hazmat.primitives import serialization  # noqa: E402
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey  # noqa: E402
 
 from db import DB  # noqa: E402
+from update_progress import observe_preparation  # noqa: E402
 import platform_update as PLATFORM_UPDATE  # noqa: E402
 from platform_update import (  # noqa: E402
     CACHED_MANIFEST_FILE,
@@ -621,7 +622,13 @@ def main() -> None:
         lambda: fetch_release("stable", "0.1.0", session=redirect),
     )
 
-    staged = stage_release(stable, "stable", "0.1.0", session=FakeSession(stable_assets))
+    progress = []
+    with observe_preparation(progress.append):
+        staged = stage_release(stable, "stable", "0.1.0", session=FakeSession(stable_assets))
+    assert progress[-2:] == [
+        {"phase": "downloading", "downloaded_bytes": stable.artifact.size,
+         "total_bytes": stable.artifact.size}, {"phase": "verifying"},
+    ]
     candidate = Path(staged["candidate_path"])
     assert candidate.is_dir()
     marker, expected_files = load_verified_candidate(

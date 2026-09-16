@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 import secrets
 import sqlite3
 import threading
@@ -9,6 +10,7 @@ import time
 
 import platform_update as protocol
 from update_maintenance import maintenance_active
+from update_progress import observe_preparation
 
 
 TERMINAL_STATUSES = frozenset({"succeeded", "rolled_back", "failed", "recovery_failed"})
@@ -31,6 +33,31 @@ class UpdateAPI:
         self._thread = None
         self._lifecycle_lock = threading.Lock()
         self._publish_lock = threading.Lock()
+        self._preparation_lock = threading.Lock()
+        self._preparation = None
+
+    def preparation(self):
+        """Return a detached, public snapshot; no session or filesystem details."""
+        with self._preparation_lock:
+            return dict(self._preparation) if self._preparation is not None else None
+
+    def _preparation_progress(self, operation_id, progress):
+        with self._preparation_lock:
+            if (self._preparation is not None and self._preparation["active"]
+                    and self._preparation["operation_id"] == operation_id):
+                self._preparation.update(progress)
+
+    @staticmethod
+    def _preparation_error(error):
+        if isinstance(error, protocol.PlatformUpdateError):
+            code = error.code
+            if isinstance(code, str) and re.fullmatch(r"[a-z][a-z0-9_]{0,95}", code):
+                return code
+        if isinstance(error, sqlite3.Error):
+            return "update_database_unavailable"
+        if isinstance(error, ValueError):
+            return "update_busy" if str(error) == "update_busy" else "update_operation_invalid"
+        return "update_staging_failed"
 
     def current_version(self):
         return str(self._version() if callable(self._version) else self._version)
@@ -124,12 +151,35 @@ class UpdateAPI:
         if action not in {"apply", "rollback"}:
             raise protocol.PlatformUpdateError("update_operation_invalid")
         protocol.SemVer.parse(version)
+        operation_id = secrets.token_hex(16)
+        with self._preparation_lock:
+            if self._preparation is not None and self._preparation["active"]:
+                raise protocol.PlatformUpdateError("update_busy")
+            self._preparation = {
+                "active": True, "operation_id": operation_id, "version": version,
+                "action": action, "phase": "checking", "downloaded_bytes": 0,
+                "total_bytes": None, "error_code": "",
+            }
+        try:
+            with observe_preparation(lambda progress: self._preparation_progress(operation_id, progress)):
+                result = self._prepare(version, action, user_id, session_digest, operation_id,
+                                       ensure_owned=ensure_owned)
+            self._preparation_progress(operation_id, {
+                "active": False, "phase": "ready", "operation_id": result["operation_id"],
+            })
+            return result
+        except BaseException as error:
+            self._preparation_progress(operation_id, {
+                "active": False, "phase": "failed", "error_code": self._preparation_error(error),
+            })
+            raise
+
+    def _prepare(self, version, action, user_id, session_digest, operation_id, *, ensure_owned):
         capability = self._require_available("download" if action == "apply" else "rollback")
         current = self.current_version()
         mode = capability["deployment"]
         if mode not in {"docker", "systemd"}:
             raise protocol.PlatformUpdateError("update_installation_unsupported")
-        operation_id = secrets.token_hex(16)
         if action == "rollback":
             target = next((x for x in self.backend.available_rollback_versions(current)
                            if x["version"] == version), None)

@@ -6353,6 +6353,7 @@ def _admin_update_status_payload() -> dict:
             "latest_update": _platform_update_payload(active or db.latest_platform_update(channel)),
             "update_check": {key: value for key, value in check.items() if key != "update_probe"},
             "update_probe": check["update_probe"], "operation": operation,
+            "preparation": update_api.preparation(),
             "capabilities": capabilities,
             "rollback_versions": available_rollback_versions(current["version"]) if capabilities["rollback"] else [],
         }

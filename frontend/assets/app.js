@@ -4,7 +4,7 @@
 
   const API_PREFIX = "/xianyu-saas";
   const QR_LOGIN_POLL_MS = 1500;
-  const ASSET_VERSION = "20260914-02";
+  const ASSET_VERSION = "20260916-01";
   const AI_TEXT_PLACEHOLDERS = new Set(["无", "暂无", "没有", "未填写", "待填写", "待补充", "占位", "n/a", "na", "none", "null", "todo", "tbd"]);
   const ICONS = API_PREFIX + "/assets/icons.svg?v=" + ASSET_VERSION + "#";
   // 旧版视图 key → 新版视图 key（历史会话/书签兜底）。
@@ -6782,8 +6782,22 @@
       const result = await api("/api/admin/updates/check", { method: "POST", suppressSessionReset: true });
       if (!platformUpdateSessionMatches(session) || generation !== session.generation) return;
       session.probeError = "";
-      applyVersionSnapshot(session, state.version, { ...state.versionUpdate, update_check: result, update_probe: result.update_probe || state.versionUpdate?.update_probe });
-      session.cacheAt = Date.now();
+      // The manual check returns release discovery data only: it carries no
+      // deployment capabilities. Re-read the authoritative status so the panel
+      // never keeps a discovery-only snapshot, which would render an unknown
+      // deployment and a generic "reason not identified" message even when the
+      // installation is actually update-ready.
+      const { version, update, error } = await readUpdateStatus();
+      if (!platformUpdateSessionMatches(session) || generation !== session.generation) return;
+      // Only this read's own results decide success; a historical cache may be
+      // kept for display but must not masquerade as a fresh authoritative read.
+      const currentCaps = updateSnapshotCapabilities(version, update);
+      session.probeError = currentCaps ? "" : updateErrorMessage(error, "probe_failed");
+      const snapshot = update ? { ...update } : (state.versionUpdate ? { ...state.versionUpdate } : {});
+      // A stale object must not outrank this read's /api/version capabilities.
+      if (!update) delete snapshot.capabilities;
+      applyVersionSnapshot(session, version, { ...snapshot, update_check: result, update_probe: result.update_probe || snapshot.update_probe });
+      if (currentCaps) session.cacheAt = Date.now();
     } catch (error) {
       if (!platformUpdateSessionMatches(session) || generation !== session.generation) return;
       session.probeError = updateErrorMessage(error, "probe_failed");
@@ -6867,10 +6881,10 @@
       loading: "正在获取版本与更新状态...", unchecked: "尚未检查更新", no_update: "当前已是最新版本，无需更新",
       updater_missing: "未检测到独立更新器，请参考文档为当前环境安装并启动更新组件", source_manual: "源码部署不支持网页自动升级，请拉取最新代码手动构建",
       readiness_unknown: "当前环境暂不具备网页更新条件，具体原因未识别，请参考部署文档或联系维护者",
-      preparing: "正在下载并校验升级制品，请稍候...", confirm_password: "升级需要验证管理员身份，请输入当前管理员密码", risk_required: "请勾选确认已知晓升级风险",
-      reconnecting: "服务正在重启与健康检查，正在尝试重新连接...", completed: "系统升级已完成，请重新加载界面以应用最新资源", restored: "升级未完成，系统已安全回退至上一稳定版本",
+      preparing: "正在连接更新源…", confirm_password: "更新包已准备好，请输入管理员密码", risk_required: "请确认已了解更新时会短暂重启",
+      reconnecting: "正在重启，等待服务恢复…", completed: "更新完成，刷新页面即可使用", restored: "更新未完成，已恢复上一版本",
       failed: "升级失败，请查看下方具体原因或服务端日志", probe_failed: "版本检查失败，无法连接到更新源", probe_cooldown: "检查过于频繁，请稍后再试",
-      confirm_expired: "身份确认已过期，请重新输入密码确认", download_failed: "升级制品下载失败，请检查网络连接后重试", signature_failed: "升级包签名校验失败，制品已被拒绝",
+      confirm_expired: "身份确认已过期，请重新输入密码", download_failed: "更新包下载失败，请稍后重试", signature_failed: "更新包校验失败，请重新下载",
       recovery_failed: "自动恢复失败，系统处于维护状态，请查看服务端日志进行人工处理", unknown_error: "发生未知错误，请稍后重试或查看服务端日志",
     },
     errors: {
@@ -6888,6 +6902,11 @@
       update_download_size_mismatch: "下载文件大小与清单声明不符", update_staging_failed: "升级制品暂存写入失败", release_assets_invalid: "发布制品结构或文件格式不合法",
       release_assets_missing: "发布版本缺少必要的升级制品", update_channel_invalid: "更新渠道无效", update_public_key_missing: "服务端未配置更新签名公钥",
       update_public_key_invalid: "更新签名公钥格式无效", update_service_unavailable: "更新服务暂不可用", update_installation_unavailable: "当前环境不具备自动升级条件",
+      update_launcher_stale: "内置文件更新启动器心跳已过期，请检查 xianyu-saas 服务是否运行。",
+      update_launcher_unhealthy: "内置文件更新启动器当前未就绪，请查看 xianyu-saas 服务日志后重试。",
+      update_launcher_conflict: "检测到旧的独立更新服务仍在运行，请先停止它再重试。",
+      update_switching: "内置文件更新正在切换版本，请稍候刷新。",
+      update_store_unwritable: "可写代码存储目录不可写，请检查 app-code 目录的权限与属主。",
       update_operation_invalid: "更新操作标识或参数无效", update_not_staged: "目标版本的升级包尚未下载就绪", update_probe_failed: "版本检查失败，无法连接到更新源",
       update_probe_cooldown: "版本检查过于频繁，请稍后再试", update_interrupted: "更新执行被意外中断", update_executor_error: "更新执行器内部错误",
       update_executor_busy: "更新执行器繁忙，已有其他任务占用", update_request_expired: "更新请求已过期", update_invalid_admin: "操作发起人管理员身份无效",
@@ -6942,6 +6961,12 @@
       window.clearTimeout(previous.pollTimer);
     }
     state.platformUpdate = null;
+    // Never let a previous identity's capability snapshot enable buttons after
+    // logout or an account switch.
+    state.versionUpdate = null;
+    state.docs.version = null;
+    state.docs.update = null;
+    state.docs.badgeLoaded = false;
     $("#updatePasswordForm")?.reset();
     closeDialog("platformUpdateDialog");
     setBusy($("#versionBadgeRefresh"), false);
@@ -6959,7 +6984,7 @@
     const session = state.platformUpdate = {
       identity: updateIdentity(), docs: state.docs, generation: 0, cacheAt: 0, cacheAttemptAt: 0, cacheTimer: 0, loading: false, manual: false,
       confirmedCheck: null, error: "", probeError: "", stage: null, operation: null, operationRevision: 0, pollTimer: 0, pollLoading: false,
-      dialogEpoch: 0, busy: "", submitted: false, reconnecting: false,
+      dialogEpoch: 0, busy: "", submitted: false, reconnecting: false, preparation: null,
     };
     scheduleVersionCacheRefresh(session);
     renderVersionBadge();
@@ -6992,15 +7017,104 @@
     return Boolean(session?.submitted || (session?.operation && !UPDATE_TERMINAL_PHASES.has(updatePhase(session.operation))));
   }
 
+  function acceptUpdatePreparation(session, update) {
+    if (!platformUpdateSessionMatches(session) || !Object.hasOwn(update || {}, "preparation")) return;
+    const preparation = update.preparation;
+    session.preparation = preparation && typeof preparation === "object" ? { ...preparation } : null;
+    if (session.preparation && !session.preparation.active && update?.operation?.operation_id === session.preparation.operation_id
+      && UPDATE_TERMINAL_PHASES.has(updatePhase(update.operation))) session.preparation = null;
+    // A staged record can belong to another login. The download endpoint must
+    // still bind it to this session before we show the password form.
+    if (session.preparation?.active) scheduleUpdateOperationPoll(session);
+  }
+
+  function formatUpdateBytes(value) {
+    const bytes = Math.max(0, Number(value) || 0);
+    if (bytes >= 1e9) return (bytes / 1e9).toFixed(1) + " GB";
+    if (bytes >= 1e6) return (bytes / 1e6).toFixed(1) + " MB";
+    if (bytes >= 1e3) return (bytes / 1e3).toFixed(0) + " KB";
+    return Math.floor(bytes) + " B";
+  }
+
+  function renderUpdateDownload(session) {
+    const preparation = session.preparation;
+    const show = !session.stage && !updateOperationActive(session)
+      && (session.busy === "prepare" || Boolean(preparation && (preparation.active || preparation.phase === "ready" || preparation.phase === "failed")));
+    const section = $("#updateDownloadProgress");
+    if (section) section.hidden = !show;
+    if (!show) return;
+    const phase = preparation?.phase || "checking";
+    const received = Number(preparation?.downloaded_bytes);
+    const total = Number(preparation?.total_bytes);
+    const hasTotal = phase === "downloading" && Number.isFinite(total) && total > 0 && Number.isFinite(received) && received >= 0;
+    const percent = hasTotal ? Math.min(100, Math.floor(received / total * 100)) : null;
+    const labels = { checking: "正在连接更新源…", downloading: "正在下载更新包", verifying: "正在检查更新包…", ready: "更新包已准备好", failed: "下载未完成" };
+    text("#updateDownloadLabel", labels[phase] || labels.checking);
+    text("#updateDownloadPercent", percent === null ? "" : percent + "%");
+    const meter = $("#updateDownloadMeter");
+    if (meter) {
+      meter.hidden = phase === "failed";
+      if (percent !== null) meter.value = percent;
+      else if (phase === "ready") meter.value = 100;
+      else meter.removeAttribute("value");
+    }
+    text("#updateDownloadAmount", phase === "failed" ? updateErrorMessage(preparation, "download_failed")
+      : phase === "ready" ? "点击更新继续，无需重复下载"
+        : phase === "downloading" ? formatUpdateBytes(received) + (hasTotal ? " / " + formatUpdateBytes(total) : " 已下载")
+          : phase === "verifying" ? "检查通过后即可确认更新" : "可以关闭窗口，稍后回来查看进度");
+  }
+
+  function updateReleaseSummary(notes) {
+    const value = String(notes || "");
+    const heading = /^##\s+(?:本次版本变更|更新内容|变更记录)[^\n]*\n/m.exec(value);
+    return heading ? value.slice(heading.index + heading[0].length).split(/\n##\s/)[0].trim() : value;
+  }
+
+  function updateSnapshotCapabilities(version, update) {
+    const caps = update?.capabilities || version?.capabilities;
+    return caps && typeof caps === "object" && typeof caps.deployment === "string" ? caps : null;
+  }
+
+  async function readUpdateStatus() {
+    // Read both status endpoints independently: one failure must not discard the
+    // other's valid result, and the real read error must stay available.
+    const results = await Promise.allSettled([
+      api("/api/version", { suppressSessionReset: true, timeoutMs: UPDATE_READ_TIMEOUT_MS }),
+      isPlatformAdmin() ? api("/api/admin/updates", { suppressSessionReset: true, timeoutMs: UPDATE_READ_TIMEOUT_MS }) : Promise.resolve(null),
+    ]);
+    const version = results[0].status === "fulfilled" ? results[0].value : null;
+    const update = results[1].status === "fulfilled" ? results[1].value : null;
+    const failed = results.find((entry) => entry.status === "rejected");
+    return { version, update, error: failed ? failed.reason : null };
+  }
+
   function applyVersionSnapshot(session, version, update) {
     const current = version || state.version || {};
+    const previous = state.versionUpdate;
     let check = update?.update_check || current.update_check || {};
     const failed = check.status === "error" || check.error_code || check.error;
     if (failed && isConfirmedHigherRelease(session.confirmedCheck, current.version)) check = session.confirmedCheck;
     else session.confirmedCheck = isConfirmedHigherRelease(check, current.version) ? check : null;
+    // Capabilities from THIS read are authoritative and must win over any
+    // historical cache, so an old update object can never mask a fresh result.
+    const currentCaps = updateSnapshotCapabilities(version, update);
+    const next = update ? { ...update } : (previous ? { ...previous } : null);
+    if (next) {
+      if (currentCaps) next.capabilities = currentCaps;
+      else {
+        // Keep a previously loaded full state for display instead of
+        // downgrading to an unknown deployment.
+        const previousCaps = updateSnapshotCapabilities(null, previous);
+        if (previousCaps) next.capabilities = previousCaps;
+      }
+      next.update_check = check;
+    }
     session.docs.version = state.version = { ...current, update_check: check };
-    session.docs.update = state.versionUpdate = update ? { ...update, update_check: check } : null;
-    session.docs.badgeLoaded = true;
+    session.docs.update = state.versionUpdate = next;
+    if (session.busy !== "prepare") acceptUpdatePreparation(session, update);
+    // Only a snapshot with real deployment capabilities counts as a fully
+    // loaded status; a discovery-only result must not block later full reads.
+    if (updateSnapshotCapabilities(state.version, next)) session.docs.badgeLoaded = true;
     renderVersionBadge();
     renderPlatformUpdate();
   }
@@ -7014,15 +7128,21 @@
     session.loading = generation;
     session.cacheAttemptAt = Date.now();
     try {
-      const [version, update] = await Promise.all([
-        api("/api/version", { suppressSessionReset: true, timeoutMs: UPDATE_READ_TIMEOUT_MS }),
-        isPlatformAdmin() ? api("/api/admin/updates", { suppressSessionReset: true, timeoutMs: UPDATE_READ_TIMEOUT_MS }) : Promise.resolve(null),
-      ]);
+      const { version, update, error } = await readUpdateStatus();
       if (!platformUpdateSessionMatches(session) || generation !== session.generation) return;
-      session.cacheAt = Date.now();
-      session.probeError = "";
-      applyVersionSnapshot(session, version, update);
-      if (operationRevision === session.operationRevision) acceptUpdateOperation(session, update?.operation);
+      // Only this read's own results decide success; a historical cache may be
+      // kept for display but must not masquerade as a fresh authoritative read.
+      if (updateSnapshotCapabilities(version, update)) {
+        session.cacheAt = Date.now();
+        session.probeError = "";
+        applyVersionSnapshot(session, version, update);
+        if (operationRevision === session.operationRevision) acceptUpdateOperation(session, update?.operation);
+      } else {
+        // No authoritative capabilities this time: keep any previously loaded
+        // state for display, surface the real read error and stay retryable.
+        session.probeError = updateErrorMessage(error, "probe_failed");
+        applyVersionSnapshot(session, version, update);
+      }
     } catch (error) {
       if (platformUpdateSessionMatches(session) && generation === session.generation) {
         session.probeError = updateErrorMessage(error, "probe_failed");
@@ -7059,21 +7179,24 @@
     const operation = session.operation;
     const phase = updatePhase(operation);
     const active = updateOperationActive(session);
-    const target = session.stage?.version || operation?.version || (isConfirmedHigherRelease(check, state.version?.version) ? check.version : "");
+    const target = session.stage?.version || (session.preparation?.active ? session.preparation.version : "") || (active ? operation?.version : "") || (isConfirmedHigherRelease(check, state.version?.version) ? check.version : "");
     text("#updateCurrentVersion", state.version?.version || "--");
     text("#updateTargetVersion", target || "--");
     text("#updateDeployment", UPDATE_UI_COPY.deployments[caps.deployment === "docker" ? "docker_compose" : caps.deployment] || UPDATE_UI_COPY.deployments.unknown);
-    text("#updateReleaseNotes", session.stage?.release_notes || check.release_notes || state.version?.release_notes || "");
+    text("#updateReleaseNotes", updateReleaseSummary(session.stage?.release_notes || check.release_notes || state.version?.release_notes));
     let readiness = !session.docs.badgeLoaded ? UPDATE_UI_COPY.messages.loading : !updateActionAllowed("apply")
       ? (caps.deployment === "source" ? UPDATE_UI_COPY.messages.source_manual : updateErrorMessage({ code: caps.reason || caps.error_code }, "readiness_unknown"))
       : target ? "" : check.status === "current" ? UPDATE_UI_COPY.messages.no_update : UPDATE_UI_COPY.messages.unchecked;
     const probe = state.versionUpdate?.update_probe || state.version?.update_probe;
     if (probe?.state === "error") readiness = updateErrorMessage(probe, "probe_failed");
     if (session.stage) readiness = UPDATE_UI_COPY.messages.confirm_password;
-    if (session.busy === "prepare") readiness = UPDATE_UI_COPY.messages.preparing;
-    text("#updateReadinessMessage", session.error || readiness || session.probeError);
+    if (session.busy === "prepare" || session.preparation?.active) readiness = "";
+    // A real read/probe error must stay visible; a placeholder "loading"
+    // readiness must not mask it.
+    text("#updateReadinessMessage", session.error || session.probeError || readiness);
     const download = $("#updateDownloadButton");
-    if (download) { download.hidden = !isPlatformAdmin() || Boolean(session.stage) || active; download.disabled = Boolean(session.busy) || !target || !updateActionAllowed("apply"); }
+    if (download) { download.hidden = !isPlatformAdmin() || Boolean(session.stage) || active; download.disabled = Boolean(session.busy) || Boolean(session.preparation?.active) || !target || !updateActionAllowed("apply"); }
+    renderUpdateDownload(session);
     const form = $("#updatePasswordForm");
     if (form) form.hidden = !session.stage || active || !isPlatformAdmin();
     const confirm = $("#updateConfirmButton");
@@ -7094,7 +7217,7 @@
     if (rollback) {
       const selected = rollback.value;
       const candidates = updateRollbackCandidates();
-      const show = isPlatformAdmin() && candidates.length > 0 && !active && !session.stage;
+      const show = isPlatformAdmin() && candidates.length > 0 && !active && !session.stage && !session.preparation?.active;
       rollback.closest(".update-rollback-card").hidden = !show;
       rollback.hidden = !show;
       rollback.innerHTML = candidates.map((item) => '<option value="' + esc(item.version) + '">' + esc(item.version) + '</option>').join("");
@@ -7128,7 +7251,8 @@
     $("#updatePasswordForm")?.reset();
     if (!session) return;
     session.dialogEpoch += 1;
-    if (!session.submitted) { session.stage = null; session.busy = ""; }
+    // Closing the window does not cancel a download or discard its result.
+    if (!session.submitted && session.busy !== "prepare") session.busy = "";
     session.error = "";
     if (event?.type === "close") $("#versionBadgeButton")?.focus({ preventScroll: true });
   }
@@ -7146,33 +7270,44 @@
 
   async function preparePlatformUpdate(action = "apply") {
     const session = ensurePlatformUpdateSession();
-    if (!session || session.busy || session.stage || updateOperationActive(session) || !updateActionAllowed(action) || !$("#platformUpdateDialog")?.open) return;
+    if (!session || session.busy || session.stage || session.preparation?.active || updateOperationActive(session) || !updateActionAllowed(action) || !$("#platformUpdateDialog")?.open) return;
     const candidate = action === "rollback" ? updateRollbackCandidates().find((item) => item.version === $("#updateRollbackSelect")?.value) : null;
     const check = state.versionUpdate?.update_check || state.version?.update_check;
     const version = action === "rollback" ? candidate?.version : isConfirmedHigherRelease(check, state.version?.version) ? check.version : "";
     if (!version) return;
-    const epoch = session.dialogEpoch;
-    const valid = () => platformUpdateSessionMatches(session) && session.dialogEpoch === epoch && $("#platformUpdateDialog")?.open && isPlatformAdmin();
+    const valid = () => platformUpdateSessionMatches(session) && isPlatformAdmin();
     session.busy = "prepare";
+    session.preparation = { active: true, version, action, phase: "checking", downloaded_bytes: 0, total_bytes: null };
+    session.operation = null;
     session.error = "";
     session.reconnecting = false;
     session.operationRevision += 1;
     renderPlatformUpdate();
+    scheduleUpdateOperationPoll(session);
     try {
       const result = await api("/api/admin/updates/download", { method: "POST", body: JSON.stringify({ version, action }), suppressSessionReset: true });
       if (!valid()) return;
       if (result.status !== "staged" || result.version !== version || !/^[a-f0-9]{32}$/.test(result.operation_id) || !/^[a-f0-9]{64}$/.test(result.manifest_sha256)
         || (candidate && candidate.manifest_sha256 !== result.manifest_sha256)) throw new ApiError(UPDATE_UI_COPY.messages.unknown_error, 502, "manifest_invalid");
       session.stage = { ...result, action };
+      session.preparation = null;
       session.operation = null;
       $("#updatePasswordForm")?.reset();
     } catch (error) {
-      if (valid()) session.error = updateErrorMessage(error, "download_failed");
+      if (valid()) {
+        session.error = updateErrorMessage(error, "download_failed");
+        // A rejected request never started our download. Keep server-reported
+        // progress intact, but do not leave the optimistic state running forever.
+        if (error.status >= 400 && error.status < 500 && error.status !== 408 && !session.preparation?.operation_id) {
+          session.preparation = { ...session.preparation, active: false, phase: "failed", error_code: error.code || "" };
+        }
+      }
     } finally {
       if (valid()) {
         session.busy = "";
         renderPlatformUpdate();
-        if (session.stage) $("#updateAdminPassword")?.focus({ preventScroll: true });
+        if (session.stage && $("#platformUpdateDialog")?.open) $("#updateAdminPassword")?.focus({ preventScroll: true });
+        scheduleUpdateOperationPoll(session);
       }
     }
   }
@@ -7266,9 +7401,11 @@
   }
 
   function scheduleUpdateOperationPoll(session) {
-    if (!platformUpdateSessionMatches(session) || !isPlatformAdmin() || !updateOperationActive(session)) return;
+    if (!platformUpdateSessionMatches(session) || !isPlatformAdmin()) return;
     window.clearTimeout(session.pollTimer);
-    session.pollTimer = window.setTimeout(() => void pollUpdateOperation(session), UPDATE_OPERATION_POLL_MS);
+    const preparing = session.busy === "prepare" || session.preparation?.active;
+    if (!preparing && !updateOperationActive(session)) return;
+    session.pollTimer = window.setTimeout(() => void pollUpdateOperation(session), preparing ? 1000 : UPDATE_OPERATION_POLL_MS);
   }
 
   async function pollUpdateOperation(session) {
@@ -7278,10 +7415,17 @@
     try {
       const update = await api("/api/admin/updates", { suppressSessionReset: true, timeoutMs: UPDATE_READ_TIMEOUT_MS });
       if (!platformUpdateSessionMatches(session) || revision !== session.operationRevision) return;
+      session.probeError = "";
+      acceptUpdatePreparation(session, update);
       acceptUpdateOperation(session, update?.operation);
-      if (!updateOperationActive(session)) void loadVersionInfo({ force: true });
+      renderPlatformUpdate();
+      if (!updateOperationActive(session) && session.busy !== "prepare" && !session.preparation?.active) void loadVersionInfo({ force: true });
     } catch (_) {
-      if (platformUpdateSessionMatches(session)) { session.reconnecting = true; renderPlatformUpdate(); }
+      if (platformUpdateSessionMatches(session)) {
+        if (updateOperationActive(session)) session.reconnecting = true;
+        else session.probeError = "暂时无法读取下载进度，正在重试…";
+        renderPlatformUpdate();
+      }
     } finally {
       if (platformUpdateSessionMatches(session)) { session.pollLoading = false; scheduleUpdateOperationPoll(session); }
     }
@@ -7491,7 +7635,7 @@
     if (updateBtn) {
       updateBtn.hidden = !canUpgrade;
       if (canUpgrade && check.version) {
-        text("#versionBadgeUpdateText", "立即升级到 v" + check.version);
+        text("#versionBadgeUpdateText", "更新");
       }
     }
     if (updateActions) {

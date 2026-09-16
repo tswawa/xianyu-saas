@@ -4463,7 +4463,7 @@ async function checkUpdates(browser, baseUrl) {
     const unknownDownload = holdUpdateResponse("POST", updatesPath + "/download", { status: 422,
       body: { detail: { code: "future_backend_update_error", message: "internal updater path disclosure" } } });
     await page.click("#updateDownloadButton"); await unknownDownload.started(); unknownDownload.release();
-    await page.waitForFunction(() => document.querySelector("#updateReadinessMessage")?.textContent === "升级制品下载失败，请检查网络连接后重试");
+    await page.waitForFunction(() => document.querySelector("#updateReadinessMessage")?.textContent === "更新包下载失败，请稍后重试");
     assert.doesNotMatch(await page.locator("#updateReadinessMessage").textContent(), /future_backend_update_error|internal updater path disclosure/, "unknown backend update errors must stay safely generalized");
 
     const signature = failGate("POST", updatesPath + "/download", "signature_verification_failed", 422);
@@ -4472,11 +4472,22 @@ async function checkUpdates(browser, baseUrl) {
     assert.equal(await page.locator("#updatePasswordForm").isVisible(), false);
     assert.equal(installs(), 0);
     const prepareClosed = holdUpdateResponse("POST", updatesPath + "/download");
+    const downloadsBeforeClose = count(updatesPath + "/download", "POST");
     await page.click("#updateDownloadButton"); await prepareClosed.started();
+    fixtures.updateStatus.preparation = { active: true, operation_id: "c".repeat(32), version: "0.2.0", action: "apply", phase: "downloading", downloaded_bytes: 250000, total_bytes: 1000000 };
+    const downloadProgress = page.waitForResponse((response) => new URL(response.url()).pathname.endsWith(updatesPath) && response.request().method() === "GET");
+    await page.clock.fastForward(1001); await downloadProgress;
+    await page.waitForFunction(() => document.querySelector("#updateDownloadPercent")?.textContent === "25%");
+    assert.equal(await page.locator("#updateDownloadMeter").evaluate((meter) => meter.value), 25);
+    assert.equal(await page.locator("#updateDownloadAmount").textContent(), "250 KB / 1.0 MB");
+    assert.equal(await page.locator(".update-notes-container").evaluate((notes) => notes.open), false, "release notes start collapsed");
+    await assertNoOverflow(page, "download progress");
+    fixtures.updateStatus.preparation = null;
     await close(); prepareClosed.release(); await page.waitForLoadState("networkidle");
     await open();
-    assert.equal(await page.locator("#updatePasswordForm").isVisible(), false, "closed preparation cannot revive the confirmation form");
-    await prepare();
+    assert.equal(await page.locator("#updatePasswordForm").isVisible(), true, "reopening must reuse the completed download");
+    assert.equal(count(updatesPath + "/download", "POST"), downloadsBeforeClose + 1, "reopening must not repeat the download");
+    assert.equal(installs(), 0, "download completion after close must never submit an update");
     const preparedVersion = await page.locator("#updateTargetVersion").textContent();
     await page.fill("#updateAdminPassword", "Mock-Update-Password-123!");
     setCheck(check("0.4.0"));
@@ -4486,7 +4497,7 @@ async function checkUpdates(browser, baseUrl) {
     const confirmationsBeforeRisk = fixtures.adminConfirmRequests.length;
     await page.click("#updateConfirmButton");
     assert.equal(fixtures.adminConfirmRequests.length, confirmationsBeforeRisk, "risk checkbox is required before password confirmation");
-    assert.match(await page.locator("#updateReadinessMessage").textContent(), /勾选/);
+    assert.match(await page.locator("#updateReadinessMessage").textContent(), /请确认已了解/);
     await fillConfirmation("wrong-mock-password");
     evidence.allowedFailures.push({ path: "/api/admin/confirm", status: 401 });
     await desktopApiClick(page, "#updateConfirmButton", "/api/admin/confirm", "POST", 401);
@@ -4499,7 +4510,9 @@ async function checkUpdates(browser, baseUrl) {
     await page.click("#updateConfirmButton"); await closedConfirmation.started();
     await close(); closedConfirmation.release(); await page.waitForLoadState("networkidle");
     assert.equal(installs(), 0, "closing before confirmation resolves must prevent apply");
-    await open(); await prepare(); await fillConfirmation();
+    await open();
+    assert.equal(await page.locator("#updatePasswordForm").isVisible(), true, "closing confirmation must preserve the prepared package");
+    await fillConfirmation();
     const roleConfirmation = holdUpdateResponse("POST", "/api/admin/confirm");
     await page.click("#updateConfirmButton"); await roleConfirmation.started();
     fixtures.me = { ...admin, role: "owner", is_admin: false };
@@ -4547,7 +4560,7 @@ async function checkUpdates(browser, baseUrl) {
     assert.equal(await page.inputValue("#updateAdminPassword"), "");
     const maintenance = failGate("GET", updatesPath, "update_maintenance_active", 503);
     await page.clock.fastForward(4001); await maintenance.started(); maintenance.release();
-    await page.waitForFunction(() => document.querySelector("#updateOperationMessage")?.textContent.includes("重新连接"));
+    await page.waitForFunction(() => document.querySelector("#updateOperationMessage")?.textContent.includes("等待服务恢复"));
     await close();
     const preInstallVersion = holdUpdateResponse("GET", "/api/version");
     const preInstallStatus = holdUpdateResponse("GET", updatesPath);

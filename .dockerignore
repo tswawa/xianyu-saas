@@ -10,6 +10,7 @@ worker/runtime-data
 .local
 data
 test-results
+.playwright-mcp
 coverage
 .pytest_cache
 .narrafork

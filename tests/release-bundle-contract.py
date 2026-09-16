@@ -155,6 +155,7 @@ class Repository:
             "deploy/docker-install.sh": b"#!/bin/sh\n# fixture docker installer\nexit 0\n",
             "config/saas.env.docker.example": b"SAAS_ENV=production\n",
             "docker/entrypoint.sh": b"#!/bin/sh\nexit 0\n",
+            "docker/launcher.sh": b"#!/bin/sh\n# synthetic launcher\nexit 0\n",
             "docs/DEPLOYMENT.md": b"Docker and manual deployment fixture.\n",
             "docs/assets/readme/orders.png": b"public documentation screenshot fixture\n",
             "docs/说明.md": "说明样例\n".encode(),
@@ -167,7 +168,7 @@ class Repository:
         }
         for name, payload in self.files.items():
             self.write(name, payload)
-        executables = ("scripts/check.sh", "docker/entrypoint.sh")
+        executables = ("scripts/check.sh", "docker/entrypoint.sh", "docker/launcher.sh")
         # --chmod changes only the index. POSIX worktree modes must match it;
         # Windows still needs the explicit index flag to preserve executable bits.
         for name in executables:
@@ -473,7 +474,7 @@ def verify_bundle(repo: Repository, output: Path, *, notes_path=None, epoch=EPOC
         for entry in archive.infolist():
             assert entry.filename.startswith(prefix) and stat.S_ISREG(entry.external_attr >> 16)
             relative = entry.filename.removeprefix(prefix)
-            executable = relative in {"scripts/check.sh", "docker/entrypoint.sh"}
+            executable = relative in {"scripts/check.sh", "docker/entrypoint.sh", "docker/launcher.sh"}
             assert stat.S_IMODE(entry.external_attr >> 16) == (0o755 if executable else 0o644)
             payload = archive.read(entry)
             source_payloads[relative] = payload
@@ -562,9 +563,13 @@ def workflow_contract(repo: Repository, output: Path):
     assert '--notes-file "$dir/release-notes.md"' not in publish_section
     assert publish_section.count("scripts/verify-public-release.py") == 2
     assert publish_section.index('gh release download "$RELEASE_TAG"') < publish_section.index('--draft=false')
-    assert "python -B tests/docker-update-protocol-contract.py" in publish_section
-    assert "python -B tests/standalone-build-contract.py" in publish_section
-    assert "python -B tests/release-bundle-contract.py" in publish_section
+    assert "needs: validate" in standalone_section
+    assert "uses: ./.github/workflows/ci.yml" in workflow
+    assert "update-test." not in workflow, "test tags must follow the normal validation pipeline"
+    validation = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+    assert "run: npm test" in validation
+    for contract in ("docker-update-protocol-contract.py", "standalone-build-contract.py", "release-bundle-contract.py"):
+        assert "python -B tests/" + contract in publish_section, contract
     assert {path.name for path in output.iterdir()} == set(VERIFIER.expected_content(repo.version)) | {
         "artifacts.json", "artifacts.json.sig"
     }
@@ -992,6 +997,10 @@ def notes_and_metadata_contract(run: Path):
 
 
 def main():
+    folded = b"## [1.2.0]\n\nCurrent changes.\n\n<details>\n<summary>Test history</summary>\n\n## [1.1.0-test.2]\n\nSecond test.\n\n## [1.1.0-test.1]\n\nFirst test.\n\n</details>\n\n## [1.0.0]\n\nOld changes.\n"
+    for version, expected in (("1.2.0", "Current changes."), ("1.1.0-test.2", "Second test."), ("1.1.0-test.1", "First test.")):
+        notes = BUILDER.release_notes({"CHANGELOG.md": (folded, False)}, version, UPDATER).decode("utf-8")
+        assert notes.split("## 本次版本变更\n\n", 1)[1].strip() == expected
     with tempfile.TemporaryDirectory(prefix="xianyu-release-contract-") as temporary:
         run = Path(temporary)
         with patch.object(socket.socket, "connect", side_effect=AssertionError("network forbidden")), patch.object(socket, "create_connection", side_effect=AssertionError("network forbidden")):

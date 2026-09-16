@@ -14,7 +14,7 @@
 - [ ] 文档包含免责声明，明确提示使用者遵守平台规则与法律法规。
 
 ## 3. 版本号一致性
-- [ ] `package.json`、`package-lock.json` 与 `backend/version.py` 版本号一致（当前为 `0.4.4`）；
+- [ ] `package.json`、`package-lock.json` 与 `backend/version.py` 版本号一致；
 - [ ] `backend/version.py`、`frontend/assets/app.js` 与 `frontend/index.html` 静态资产版本标识一致；
 - [ ] `backend/version.py` 的 `UPDATE_DATA_VERSION` 声明与当前业务数据读写兼容性一致。
 

@@ -13,18 +13,12 @@ concurrency:
 
 jobs:
   validate:
-    # test.1 reuses v0.4.4 CI; test.3 reuses test.2 full CI (34933220732).
-    # test.4 changes only installer prerelease routing, covered by the Linux
-    # installer/manager suites and rerun below before signing; test.5 only bumps
-    # the version. Both reuse test.2 full CI. Other releases run complete CI.
-    if: github.ref_name != 'v0.4.5-update-test.1' && github.ref_name != 'v0.4.5-update-test.3' && github.ref_name != 'v0.4.5-update-test.4' && github.ref_name != 'v0.4.5-update-test.5'
     uses: ./.github/workflows/ci.yml
     permissions:
       contents: read
 
   standalone:
     needs: validate
-    if: always() && (needs.validate.result == 'success' || (needs.validate.result == 'skipped' && (github.ref_name == 'v0.4.5-update-test.1' || github.ref_name == 'v0.4.5-update-test.3' || github.ref_name == 'v0.4.5-update-test.4' || github.ref_name == 'v0.4.5-update-test.5')))
     strategy:
       fail-fast: false
       matrix:
@@ -182,7 +176,6 @@ jobs:
 
   publish:
     needs: [validate, standalone]
-    if: always() && needs.standalone.result == 'success' && (needs.validate.result == 'success' || (needs.validate.result == 'skipped' && (github.ref_name == 'v0.4.5-update-test.1' || github.ref_name == 'v0.4.5-update-test.3' || github.ref_name == 'v0.4.5-update-test.4' || github.ref_name == 'v0.4.5-update-test.5')))
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     permissions:
@@ -234,16 +227,10 @@ jobs:
             tar -xf ".local/downloads/$target/standalone-$target.tar" -C ".local/standalone-inputs/$target"
           done
       - name: Verify release contracts
-        env:
-          RELEASE_TAG: ${{ github.ref_name }}
         run: |
           python -B tests/docker-update-protocol-contract.py
           python -B tests/standalone-build-contract.py
           python -B tests/release-bundle-contract.py
-          if [[ "$RELEASE_TAG" == "v0.4.5-update-test.4" || "$RELEASE_TAG" == "v0.4.5-update-test.5" ]]; then
-            python -B tests/systemd-installer-contract.py
-            python -B tests/systemd-manager-contract.py
-          fi
       - name: Build and sign complete release
         env:
           RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}

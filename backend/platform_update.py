@@ -33,6 +33,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 from version import VERSION, RELEASE_CHANNEL, deployment_kind
+from update_progress import report_download, report_phase
 from update_maintenance import (
     read_trusted_json,
     status_directory,
@@ -424,6 +425,7 @@ def _download_asset_to_file(
     _validate_fixed_api_url(asset.api_url, asset=True)
     if asset.size <= 0 or asset.size > max_bytes:
         raise PlatformUpdateError("update_download_too_large")
+    report_download(0, asset.size)
     response = _open_release_response(session, asset.api_url, asset=True, timeout=(5, 120))
     status_code = int(getattr(response, "status_code", 0) or 0)
     try:
@@ -458,6 +460,7 @@ def _download_asset_to_file(
                         raise PlatformUpdateError("update_download_too_large")
                     digest.update(chunk)
                     output.write(chunk)
+                    report_download(total, asset.size)
                 output.flush()
                 os.fsync(output.fileno())
         finally:
@@ -465,6 +468,7 @@ def _download_asset_to_file(
                 os.close(descriptor)
         if total != asset.size:
             raise PlatformUpdateError("update_download_size_mismatch")
+        report_phase("verifying")
         return digest.hexdigest()
     except requests.RequestException as exc:
         try:
@@ -1551,6 +1555,7 @@ def stage_release(
         raise PlatformUpdateError("update_downgrade_rejected")
     session = session or requests.Session()
     standalone = release.kind == STANDALONE_RELEASE_KIND
+    report_phase("checking")
     manifest_limit = MAX_STANDALONE_MANIFEST_BYTES if standalone else MAX_MANIFEST_BYTES
     archive_limit = MAX_STANDALONE_ARCHIVE_BYTES if standalone else MAX_ARCHIVE_BYTES
     manifest_raw = _request_bytes(
@@ -1559,6 +1564,7 @@ def stage_release(
     signature_raw = _request_bytes(
         session, release.signature.api_url, max_bytes=MAX_SIGNATURE_BYTES, asset=True
     )
+    report_phase("verifying")
     verify_manifest_signature(manifest_raw, signature_raw)
     manifest, expected_files = parse_manifest(manifest_raw, release)
     manifest_sha256 = hashlib.sha256(manifest_raw).hexdigest()
@@ -1683,8 +1689,10 @@ def stage_docker_release(release: ReleaseInfo, channel: str, current_version: st
     if SemVer.parse(release.version).compare(SemVer.parse(current_version)) <= 0:
         raise PlatformUpdateError("update_downgrade_rejected")
     session = session or requests.Session()
+    report_phase("checking")
     raw = _request_bytes(session, release.manifest.api_url, max_bytes=MAX_MANIFEST_BYTES, asset=True)
     signature = _request_bytes(session, release.signature.api_url, max_bytes=MAX_SIGNATURE_BYTES, asset=True)
+    report_phase("verifying")
     manifest = _docker_manifest(raw, signature, release.version)
     if release.artifact.name != manifest.source_name or release.artifact.size != manifest.source_size:
         raise PlatformUpdateError("update_manifest_invalid")

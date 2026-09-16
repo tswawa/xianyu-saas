@@ -375,6 +375,9 @@ def release_notes(files: dict, version: str, protocol) -> bytes:
         document = files["CHANGELOG.md"][0].decode("utf-8")
     except (KeyError, UnicodeError):
         raise BundleError("release_notes_missing") from None
+    # Changelog history may be folded for readers. Its HTML wrapper must not
+    # leak into a standalone release's notes, including the last folded entry.
+    document = re.sub(r"^[ \t]*(?:</?details>|<summary>[^\n]*</summary>)[ \t]*$", "", document, flags=re.MULTILINE)
     headings = list(re.finditer(r"^##\s+\[?" + re.escape(version) + r"\]?(?=\s|$)[^\n]*\n", document, re.MULTILINE))
     if len(headings) != 1:
         raise BundleError("release_notes_missing")

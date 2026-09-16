@@ -15,7 +15,7 @@
 - 表示各版本能否双向兼容读写同一份业务数据（SQLite 数据库与存储目录）；
 - 数据库结构或存储格式不兼容时必须递增，并于发布说明写明人工迁移指引；
 - 相同版本号允许自动更新和回退；数值不匹配或缺失时，更新器拒绝自动更新并保持停机前状态；
-- Docker 升级不自动备份数据库，维护前需自行备份 `./data` 目录；Ubuntu 原生升级包含数据库备份步骤（数据保存在 `/var/lib/xianyu-saas`）。建议维护者日常做好冷备份。
+- 内置文件更新不自动备份数据库，维护前建议做好冷备份（Docker 业务数据在 `./data`，Ubuntu 在 `/var/lib/xianyu-saas`）；仅在使用旧原生更新器执行完整运行环境升级时包含数据库备份步骤。
 
 ---
 
@@ -75,13 +75,13 @@ export RELEASE_SIGNING_KEY="..."
 python scripts/build-release.py \
   --ref HEAD \
   --standalone-input-root .local/standalone-inputs \
-  --output ".local/releases/0.4.4" \
-  --notes-output ".local/releases/0.4.4-release-notes.md"
+  --output ".local/releases/<version>" \
+  --notes-output ".local/releases/<version>-release-notes.md"
 
 # 验证发布资产完整性与数字签名
 python scripts/verify-public-release.py \
-  --directory ".local/releases/0.4.4" \
-  --version "0.4.4" \
+  --directory ".local/releases/<version>" \
+  --version "<version>" \
   --commit "$(git rev-parse HEAD)" \
   --public-key deploy/update-signing.pub
 ```
@@ -115,7 +115,7 @@ python scripts/verify-public-release.py \
 
 ## 6. 运行端与维护者边界说明
 
-- **安装入口与更新入口分离**：普通用户首次安装使用上述 3 个入口文件；已登记实例后续直接通过 Web 控制台执行网页更新；
-- **重复执行安装脚本**：`deploy/docker-install.sh` 具备幂等性，对已登记容器仅做校验和启动，不覆盖升级镜像，也不应用新环境变量；
-- **回滚与数据持久化**：升级失败时切回旧镜像重建容器，绝不覆盖业务数据；
-- **未覆盖场景说明**：目前已通过真实 Docker 安装、就绪验收、重跑与停止恢复，以及测试应用升级与回滚的验证；真实闲鱼店铺业务、旧版本直装迁移及正式 Release 浏览器点击升级仍待后续实际运行检验。
+- **安装入口与更新入口分离**：普通用户首次安装使用上述 3 个入口文件；已安装实例后续直接通过 Web 控制台执行网页更新；
+- **重复执行安装脚本**：`deploy/docker-install.sh` 具备幂等性，对已存在容器仅做校验和启动，不覆盖镜像，也不自动应用新的环境变量；
+- **回滚与数据持久化**：内置更新器启动失败时自动回滚至上一版本代码软链接并重启，不触碰亦不回滚业务数据库；
+- **验证边界说明**：已完成 Docker 容器内更新回滚与数据保留验证；2026-09-16 用户已确认其实际 Ubuntu/systemd 实例完成网页更新。真实闲鱼店铺业务、旧版本直装迁移及正式 Release 浏览器端到端更新仍待正式发布时最终检验。

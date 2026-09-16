@@ -32,6 +32,7 @@ import platform_update as protocol
 from update_api import UpdateAPI
 from version import VERSION
 from update_maintenance import UpdateStateError
+from update_progress import observe_preparation, report_download, report_phase
 
 
 class Backend:
@@ -117,11 +118,91 @@ class OperationsContract(unittest.TestCase):
             self.assertNotIn(forbidden, row)
         self.assertNotIn("/must/not/leak", json.dumps(row))
 
+    def test_preparation_is_visible_during_download_and_isolated_between_requests(self):
+        self.assertIsNone(self.service.preparation())
+        entered, resume = threading.Event(), threading.Event()
+        result, errors = [], []
+        original_stage = self.backend.stage_docker_release
+
+        def stage(*args):
+            report_download(3, 10)
+            entered.set()
+            if not resume.wait(5):
+                raise RuntimeError("synthetic test timeout")
+            report_download(10, 10)
+            report_phase("verifying")
+            return original_stage(*args)
+
+        def run():
+            try:
+                result.append(self.prepare())
+            except BaseException as error:
+                errors.append(error)
+
+        self.backend.stage_docker_release = stage
+        worker = threading.Thread(target=run)
+        worker.start()
+        try:
+            self.assertTrue(entered.wait(5))
+            snapshot = self.service.preparation()
+            self.assertTrue(snapshot["active"])
+            self.assertEqual((snapshot["phase"], snapshot["downloaded_bytes"], snapshot["total_bytes"]),
+                             ("downloading", 3, 10))
+            self.assertEqual((snapshot["version"], snapshot["action"]), ("1.1.0", "apply"))
+            self.assertIsNone(self.db.latest_update_operation())
+            self.assertCode("update_busy", self.prepare)
+            report_download(999, 1000)  # This thread has no preparation observer.
+            self.assertEqual(self.service.preparation(), snapshot)
+            snapshot["phase"] = "tampered"
+            self.assertEqual(self.service.preparation()["phase"], "downloading")
+        finally:
+            resume.set()
+            worker.join(5)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+        ready = self.service.preparation()
+        self.assertFalse(ready["active"])
+        self.assertEqual(ready["phase"], "ready")
+        self.assertEqual(ready["operation_id"], result[0]["operation_id"])
+        self.assertEqual((ready["downloaded_bytes"], ready["total_bytes"]), (10, 10))
+        self.assertEqual(self.db.get_update_operation(ready["operation_id"])["status"], "staged")
+
+    def test_preparation_starts_before_network_and_failures_clear_activity(self):
+        snapshots = []
+
+        def unavailable(*_args, **_kwargs):
+            snapshots.append(self.service.preparation())
+            raise protocol.PlatformUpdateError("update_source_failed")
+
+        self.backend.fetch_release = unavailable
+        self.assertCode("update_source_failed", self.prepare)
+        self.assertTrue(snapshots[0]["active"])
+        self.assertEqual(snapshots[0]["phase"], "checking")
+        self.assertIsNone(snapshots[0]["total_bytes"])
+        failed = self.service.preparation()
+        self.assertFalse(failed["active"])
+        self.assertEqual((failed["phase"], failed["error_code"]), ("failed", "update_source_failed"))
+        self.assertIsNone(self.db.latest_update_operation())
+
+        self.backend.fetch_release = Mock(side_effect=OSError("/private/path?token=secret"))
+        with self.assertRaises(OSError):
+            self.prepare()
+        failed = self.service.preparation()
+        self.assertFalse(failed["active"])
+        self.assertEqual(failed["error_code"], "update_staging_failed")
+        self.assertNotIn("private", json.dumps(failed))
+        self.assertNotIn("secret", json.dumps(failed))
+        report_download(100, 100)
+        self.assertEqual(self.service.preparation(), failed)
+
     def test_repeated_preparation_reuses_verified_identity(self):
         first = self.prepare()
         second = self.prepare()
         self.assertEqual(first["operation_id"], second["operation_id"])
         self.assertEqual(len(self.db.list_update_operations()), 1)
+        self.assertEqual(self.service.preparation()["operation_id"], first["operation_id"])
+        self.assertEqual(self.service.preparation()["phase"], "ready")
+        self.assertIsNone(self.service.preparation()["total_bytes"])
         self.assertEqual(self.backend.requests, {})
         self.assertCode("confirmation_invalid", lambda: self.service._publish(dict(self.db.get_update_operation(first["operation_id"]))))
 
@@ -499,6 +580,37 @@ class TransportContract(unittest.TestCase):
         self.assertEqual(error.exception.code, "update_source_rate_limited")
         self.assertEqual(error.exception.retry_after, 600)
 
+    def test_streamed_download_reports_received_bytes_and_then_verification(self):
+        payload = b"x" * (256 * 1024 + 7)
+        asset = protocol.ReleaseAsset(123, "synthetic.zip", len(payload))
+        session, _ = self.session({self.API: (200, {}, payload)})
+        events = []
+        with tempfile.TemporaryDirectory(prefix="update-progress-") as temporary, \
+             observe_preparation(events.append):
+            path = Path(temporary) / "source.zip"
+            digest = protocol._download_asset_to_file(session, asset, path)
+            self.assertEqual(path.read_bytes(), payload)
+        self.assertEqual(digest, hashlib.sha256(payload).hexdigest())
+        self.assertEqual(events, [
+            {"phase": "downloading", "downloaded_bytes": 0, "total_bytes": len(payload)},
+            {"phase": "downloading", "downloaded_bytes": 256 * 1024, "total_bytes": len(payload)},
+            {"phase": "downloading", "downloaded_bytes": len(payload), "total_bytes": len(payload)},
+            {"phase": "verifying"},
+        ])
+
+    def test_short_download_never_reports_verified_or_invented_received_bytes(self):
+        asset = protocol.ReleaseAsset(123, "synthetic.zip", 10)
+        session, _ = self.session({self.API: (200, {}, b"abc")})
+        events = []
+        with tempfile.TemporaryDirectory(prefix="update-progress-short-") as temporary, \
+             observe_preparation(events.append):
+            path = Path(temporary) / "source.zip"
+            with self.assertRaises(protocol.PlatformUpdateError) as error:
+                protocol._download_asset_to_file(session, asset, path)
+            self.assertEqual(error.exception.code, "update_download_size_mismatch")
+            self.assertFalse(path.exists())
+        self.assertEqual(events[-1], {"phase": "downloading", "downloaded_bytes": 3, "total_bytes": 10})
+
 
 class PublicKeyMountContract(unittest.TestCase):
     def test_windows_permission_bits_require_root_owned_readonly_docker_mount(self):
@@ -563,7 +675,13 @@ class DockerStagingContract(unittest.TestCase):
                  patch.object(protocol, "load_public_key", return_value=fixture.key.public_key()):
                 session = requests.Session()
                 session.mount("https://", RecordingAdapter(entries))
-                staged = protocol.stage_docker_release(release, "release", "0.1.0", operation_id, session=session)
+                progress = []
+                with observe_preparation(progress.append):
+                    staged = protocol.stage_docker_release(release, "release", "0.1.0", operation_id, session=session)
+                self.assertEqual(progress[-2:], [
+                    {"phase": "downloading", "downloaded_bytes": archive.stat().st_size,
+                     "total_bytes": archive.stat().st_size}, {"phase": "verifying"},
+                ])
                 self.assertEqual(staged["manifest_sha256"], hashlib.sha256(raw).hexdigest())
                 self.assertEqual({x.name for x in directory.iterdir()}, {"source.zip", "docker.manifest.json", "docker.manifest.sig"})
                 self.assertEqual(staged["candidate_path"], "")
@@ -646,6 +764,67 @@ class DockerStagingContract(unittest.TestCase):
                             )
                     self.assertEqual(error.exception.code, "update_maintenance_protocol_unsupported")
                     self.assertFalse(directory.exists(), "rejected source must not leave staged artifacts")
+
+    def test_builtin_source_stage_streams_signed_source_and_preserves_compatibility_checks(self):
+        import base64
+        import importlib.util
+        import file_update
+        import version
+
+        spec = importlib.util.spec_from_file_location("builtin_progress_fixture", ROOT / "tests/docker-update-protocol-contract.py")
+        fixture_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(fixture_module)
+        with tempfile.TemporaryDirectory(prefix="builtin-progress-") as temporary:
+            root = Path(temporary)
+            fixture = fixture_module.Fixture(root / "fixture")
+            for relative in file_update.REQUIRED_CANDIDATE_FILES:
+                fixture.files[relative] = b"# synthetic candidate\n"
+            fixture.files["backend/version.py"] = (
+                f'VERSION = "{fixture_module.VERSION}"\nUPDATE_DATA_VERSION = {version.UPDATE_DATA_VERSION}\n'
+            ).encode()
+            base = root / "base"
+            for relative in ("backend/requirements.txt", "worker/requirements.txt"):
+                fixture.files[relative] = b"synthetic-dependency==1\n"
+                path = base / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(fixture.files[relative])
+            archive = fixture.archive()
+            runtime = fixture_module.encoded({
+                "schema": 1, "version": fixture_module.VERSION,
+                "artifact": f"xianyu-saas-{fixture_module.VERSION}.tar.gz", "files": ["synthetic"],
+            })
+            descriptor = fixture.descriptor(archive)
+            descriptor["runtime_manifest_sha256"] = hashlib.sha256(runtime).hexdigest()
+            raw = fixture_module.encoded(descriptor)
+            signature = base64.b64encode(fixture.key.sign(raw))
+            names = fixture_module.PROTOCOL.docker_asset_names(fixture_module.VERSION)
+            release = protocol.ReleaseInfo(
+                "synthetic", fixture_module.VERSION, "v" + fixture_module.VERSION, "", "notes", True,
+                protocol.ReleaseAsset(1, names[0], archive.stat().st_size),
+                protocol.ReleaseAsset(2, names[1], len(raw)), protocol.ReleaseAsset(3, names[2], len(signature)),
+                protocol.ReleaseAsset(4, protocol._asset_names(fixture_module.VERSION)[1], len(runtime)),
+            )
+            entries = {release.artifact.api_url: (200, {}, archive.read_bytes()),
+                       release.manifest.api_url: (200, {}, raw), release.signature.api_url: (200, {}, signature),
+                       release.runtime_manifest.api_url: (200, {}, runtime)}
+            class FixtureSession(requests.Session):
+                def __init__(self):
+                    super().__init__()
+                    self.mount("https://", RecordingAdapter(entries))
+
+            progress = []
+            with patch.object(file_update, "code_root", return_value=root / "store"), \
+                 patch.object(file_update, "launcher_fresh", return_value=True), \
+                 patch.object(file_update, "active_root", return_value=base), \
+                 patch.object(file_update, "_key_raw", return_value=fixture.public), \
+                 patch.object(requests, "Session", FixtureSession), observe_preparation(progress.append):
+                staged = file_update.stage(release, "release", "0.1.0", "d" * 32)
+            self.assertEqual(staged["manifest_sha256"], hashlib.sha256(raw).hexdigest())
+            self.assertTrue((Path(staged["candidate_path"]) / "backend/app.py").is_file())
+            self.assertEqual(progress[-2:], [
+                {"phase": "downloading", "downloaded_bytes": archive.stat().st_size,
+                 "total_bytes": archive.stat().st_size}, {"phase": "verifying"},
+            ])
 
 
 class PublicStateLogicContract(unittest.TestCase):

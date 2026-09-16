@@ -53,6 +53,7 @@ xianyusaas迭代演示UI-1.html
 
 # Generated test output
 test-results/
+.playwright-mcp/
 coverage/
 .pytest_cache/
 node_modules/

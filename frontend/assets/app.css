@@ -148,7 +148,7 @@
 
 @font-face {
   font-family: "Whale UI";
-  src: url("/xianyu-saas/assets/ui-sans-generated.woff2?v=20260914-02") format("woff2");
+  src: url("/xianyu-saas/assets/ui-sans-generated.woff2?v=20260916-01") format("woff2");
   font-style: normal;
   font-weight: 100 900;
   font-display: swap;
@@ -2064,9 +2064,49 @@ input:focus, textarea:focus, select:focus { border-color: var(--brand-yellow-hov
   color: #065F46;
 }
 .update-notes-container {
+  display: block;
+}
+.update-notes-container > summary {
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--ink-soft);
+}
+.update-notes-container[open] > summary {
+  margin-bottom: 8px;
+}
+.update-download-progress {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 8px;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  background: var(--surface-soft);
+}
+.update-download-percent {
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+.update-download-progress progress {
+  width: 100%;
+  height: 8px;
+  border: 0;
+  border-radius: 999px;
+  overflow: hidden;
+  accent-color: var(--brand-yellow-hover);
+}
+.update-download-progress progress::-webkit-progress-bar {
+  background: var(--line);
+  border-radius: 999px;
+}
+.update-download-progress progress::-webkit-progress-value {
+  background: var(--brand-yellow-hover);
+  border-radius: 999px;
+}
+.update-download-progress progress::-moz-progress-bar {
+  background: var(--brand-yellow-hover);
+  border-radius: 999px;
 }
 .update-section-head {
   display: flex;
