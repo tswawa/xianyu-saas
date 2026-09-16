@@ -19,8 +19,9 @@ cd xianyu-saas
 
 # 运行全套本地测试（含浏览器端 UI 回归）需要安装 Chromium：
 npx playwright install --with-deps chromium
-# 注意：测试工具依赖仅用于本地开发与门禁校验，生产部署环境仅需 Python 3.10+ 与 Nginx，切勿混淆两类依赖。
 ```
+
+以上为开发与测试环境。实际部署请使用 Docker 或 Ubuntu 安装包，要求见[部署指南](docs/DEPLOYMENT.md)。
 
 ## 安全红线
 
@@ -59,25 +60,29 @@ git status --short
 文档中的界面截图（`docs/assets/readme/*.png`）支持通过自动化测试脚本全量离线重现生成：
 
 ```bash
-# 生成文档全套演示截图（覆盖桌面端与移动端共 12 张视图）
+# 生成文档全套演示截图（覆盖桌面端与移动端共 13 张视图）
 SAAS_UI_SCOPE=docs-capture node tests/ui-check.mjs
 ```
 
 - **执行要求**：需要安装 Node.js 与 Playwright Chromium 依赖（`npx playwright install --with-deps chromium`）；
-- **写入目标**：所有断言校验通过后自动更新 `docs/assets/readme/` 目录下的 12 张演示截图文件；
+- **写入目标**：所有断言校验通过后自动更新 `docs/assets/readme/` 目录下的 13 张演示截图文件；
 - **离线安全**：仅在显式指定 `SAAS_UI_SCOPE=docs-capture` 时触发截图生成与写入（日常 `npm test` 不会触发截图写入）；测试全程使用本地离线 Mock 数据与演示资产，不发起外部网络请求，不连接任何真实平台或外部模型服务。
 
 ## 版本发布与打包规范
 
 项目遵循语义化版本规范，新版本通过 GitHub Actions 自动化流水线签名并发布：
 
-- **版本号统一**：发布新版本前，须同步更新 `package.json`、`package-lock.json` 与 `backend/version.py` 中的版本号（例如 `0.2.2`），确保版本标识全局一致；
+- **版本号统一**：发布新版本前，须同步更新 `package.json`、`package-lock.json` 与 `backend/version.py` 中的版本号（例如 `0.4.5`），确保版本标识全局一致；
 - **本地打包验证**：可通过仓库内置脚本针对选定的 Git 提交进行离线打包演练（打包过程严格基于 Git 跟踪对象，不收录未跟踪的本地文件与私有配置）：
   ```bash
-  python3 scripts/build-release.py --ref HEAD --output .local/releases/test-build
+  python scripts/build-release.py \
+    --ref HEAD \
+    --standalone-input-root .local/standalone-inputs \
+    --output ".local/releases/<version>" \
+    --notes-output ".local/releases/<version>-release-notes.md"
   ```
-- **自动化发布工作流**：必须在 `main` 分支 CI 完整执行通过后，方可向仓库推送 `v*` 格式版本标签（例如 `v0.2.2`）；不能预先推签或提前假设通过。推送标签后触发 `.github/workflows/release.yml`，工作流复用 CI 门禁并调用打包脚本生成带数字签名的发布资产草稿（历史 v0.2.2 包含 8 项资产；后续 0.3.0+ 规划扩展为 10 项，包含 Docker 升级清单及签名），校验无误后正式发布；
-- **公钥与私钥分离**：签名公钥保存于 `deploy/update-signing.pub`，签名私钥仅由服务端 Actions Secret 托管，严禁将私钥以任何形式提交至代码仓库或打入分发包。
+- **自动化发布工作流**：推送 `v*` 格式版本标签（例如 `v0.4.5`）后触发 `.github/workflows/release.yml`，流水线分为 `validate`（自动化验证）、`standalone`（多架构原生运行时构建）与 `publish`（签名、验证与发布），生成 14 项带数字签名的发布资产，详细规范见 [`docs/RELEASING.md`](docs/RELEASING.md)；
+- **公钥与私钥分离**：签名公钥保存于 `deploy/update-signing.pub`，签名私钥仅由 GitHub Actions Secret 托管，严禁将私钥以任何形式提交至代码仓库或打入分发包。
 
 ## 提交信息与 PR 规范
 

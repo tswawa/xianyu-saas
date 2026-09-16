@@ -10,16 +10,17 @@
 - 系统需具备 `curl`、`unzip`，以及支持 Engine API v1.47 的 Linux Docker Engine 与 Compose 插件（不支持远程 Docker 上下文）。
 
 ### 2. 获取 Release 安装包
-从 GitHub Releases 下载固定版本的源码安装包（请将 `<version>` 替换为实际发布的版本号）：
+从 GitHub Releases 下载正式版源码安装包：
 ```bash
-curl -fLO https://github.com/tswawa/xianyu-saas/releases/download/v<version>/xianyu-saas-<version>-source.zip
-unzip -q xianyu-saas-<version>-source.zip
-cd xianyu-saas-<version>
+VERSION=0.4.5
+curl -fLO "https://github.com/tswawa/xianyu-saas/releases/download/v${VERSION}/xianyu-saas-${VERSION}-source.zip"
+unzip -q "xianyu-saas-${VERSION}-source.zip"
+cd "xianyu-saas-${VERSION}"
 ```
 
-> 提示：推荐下载项目发布的 `xianyu-saas-<version>-source.zip`。它包含构建元数据并与签名清单绑定；GitHub 自动打包的 Source code 不包含发布构建信息。
->
-> **说明**：默认内置文件更新与监督启动器机制已随测试包提供。Docker 容器内网页更新与数据保留已在测试中验证通过；2026-09-16 用户已确认其真实 Ubuntu/systemd 实例网页更新成功。
+请使用项目发布的 `xianyu-saas-<version>-source.zip`。GitHub 自动生成的 “Source code” 归档缺少发布构建信息，不是这里的安装包。
+
+> **说明**：默认内置文件更新与监督启动器机制已在 0.4.5 正式版中内置。Docker 与 Ubuntu 原生部署均默认具备网页更新能力。
 
 ### 3. 一键安装并验收（推荐）
 ```bash
@@ -89,18 +90,14 @@ docker compose up -d --build
 
 ### 2. 首次安装
 
-从官方 GitHub Releases 下载对应架构的管理器可执行文件（无后缀），执行 `install` 命令（指定 `--version <version>` 锁定安装版本）：
+从官方 GitHub Releases 下载对应架构的安装器，执行 `install` 命令。以下命令安装 0.4.5，ARM64 机器请将 `ARCH` 改为 `aarch64`：
 
 ```bash
-# x86_64 架构：
-curl -fLO https://github.com/tswawa/xianyu-saas/releases/download/v<version>/xianyu-saas-<version>-linux-x86_64
-chmod +x xianyu-saas-<version>-linux-x86_64
-sudo ./xianyu-saas-<version>-linux-x86_64 install --version <version>
-
-# ARM64 架构：
-curl -fLO https://github.com/tswawa/xianyu-saas/releases/download/v<version>/xianyu-saas-<version>-linux-aarch64
-chmod +x xianyu-saas-<version>-linux-aarch64
-sudo ./xianyu-saas-<version>-linux-aarch64 install --version <version>
+VERSION=0.4.5
+ARCH=x86_64  # ARM64 改为 aarch64
+curl -fLO "https://github.com/tswawa/xianyu-saas/releases/download/v${VERSION}/xianyu-saas-${VERSION}-linux-${ARCH}"
+chmod +x "xianyu-saas-${VERSION}-linux-${ARCH}"
+sudo "./xianyu-saas-${VERSION}-linux-${ARCH}" install --version "$VERSION"
 ```
 
 也可以通过仓库内的在线安装脚本自动识别架构并安装：
@@ -163,28 +160,24 @@ sudo xianyu-saas doctor
 #### 1. 代码目录与运行隔离
 - **Docker 部署**：可写代码存储目录为 `/data/app-code`（映射在宿主机 `./data/app-code`）；基础运行环境（Python 虚拟环境、系统库）与受信任公钥（`/app/update-signing.pub`，由 root 只读拥有）固定在容器镜像内部；
 - **Ubuntu 原生部署**：可写代码存储目录为 `/var/lib/xianyu-saas/app-code`；运行环境与可信公钥（`/etc/xianyu-saas/update-signing.pub`）固定在代码存储目录之外；
-- **数据与凭据保护**：业务数据库（`saas.db`）、租户与店铺数据（`tenants/`）、主密钥（`ai-master-key`）及配置文件（`config/saas.env` 或 `/etc/xianyu-saas.env`）均位于代码存储目录之外，更新过程始终保留，不会被修改或覆盖。
+- **数据与凭据保护**：业务数据库（`saas.db`）、租户与店铺数据（`tenants/`）、主密钥（`ai-master-key`）及配置文件（`config/saas.env` 或 `/etc/xianyu-saas.env`）均位于代码存储目录之外，切换代码时保留；新版本继续使用这些数据与配置。
 
 #### 2. 网页受控更新流程
 1. **检查与下载**：管理员登录 Web 控制台，打开「系统更新」窗口查看版本信息，点击「更新」开始下载目标版本的官方签名源码包（`xianyu-saas-<version>-source.zip` 及其签名清单）；
 2. **下载进度与验签**：窗口按实际进度显示连接更新源、已下载/总大小及百分比（未知大小不虚构百分比）；下载途中关闭窗口不会重复发起任务，再次打开可读取当前进度；后台使用本地受信公钥核验 Ed25519 签名，并校验下载包的 SHA-256；
 3. **停服前兼容性检查**：系统比对目标版本与当前版本的 `UPDATE_DATA_VERSION` 以及 Python 依赖要求（`requirements.txt`）；若存在不兼容声明，在停止服务前直接拒绝更新并给出明确提示；
-4. **密码确认与切换重启**：更新包校验就绪后，由管理员输入当前登录密码进行身份核验并确认；由监督启动器停止当前服务，将 `current` 软链接原子切换至新版本目录并启动服务；
-5. **健康检查与自动回滚**：新版本启动后，启动器等待 `/health` 接口就绪并核对版本；若新版本在超时时间内未通过健康检查，启动器自动将 `current` 软链接回滚至上一版本并重启恢复；
+4. **密码确认与切换重启**：更新包校验就绪后，由管理员输入当前登录密码进行身份核验并确认；由监督启动器停止当前服务，将 `current` 软链接切换至新版本目录并启动服务；
+5. **健康检查与自动回滚**：新版本启动后，启动器等待 `/health` 接口就绪并核对版本；若新版本在超时时间内未通过健康检查，启动器尝试将 `current` 软链接切回上一版本并重启；
 6. **边界说明**：自动回滚仅针对应用代码目录的软链接切换，系统不自动备份或回滚业务数据库；
 7. **镜像免重构**：Docker 部署中的普通代码更新直接在可写代码存储中切换，**无需重新构建 Docker 镜像**；
-8. **验证状态说明**：Docker 容器内的网页更新与数据保留已在测试中验证通过；2026-09-16 用户已确认其真实 Ubuntu/systemd 实例网页更新成功。
+8. **运行状态说明**：切换版本会短暂中断服务；重启后使用现有数据库与店铺配置，重新建立运行连接。
 
 ### 依赖或底层运行环境变动时的升级
 
-当发布的版本包含底层 Python 依赖增减、C 动态库更新或 `UPDATE_DATA_VERSION` 变更时，内置文件更新器会在停服前拒绝升级。此时需要维护者重新执行官方安装入口完成环境级升级：
+文件更新检测到运行依赖或 `UPDATE_DATA_VERSION` 不兼容时，会在停服前拒绝升级。需要更换底层环境的版本，应按其发布说明维护运行环境；仅重装运行环境不能代替不兼容数据的迁移。
 
 - **Docker 部署**：
-  从 GitHub Releases 下载新版本源码包并解压，重新运行官方安装脚本：
-  ```bash
-  sudo bash deploy/docker-install.sh
-  ```
-  此命令只适用于全新安装。对既有容器，脚本重跑只会启动原容器；运行环境升级仍需维护者保留数据、按新版本配置重建容器，不能把脚本重跑当作已完成升级。
+  从 GitHub Releases 下载新版本源码包。维护者应记录现有挂载与环境配置，在维护窗口使用新版本重建镜像和容器，并继续挂载原业务数据。重跑 `deploy/docker-install.sh` 只会检查并启动已有容器，不会完成运行环境升级。具体迁移步骤以目标版本发布说明为准。
 - **Ubuntu 原生部署**：
   下载新版本管理器或通过在线安装脚本重新执行安装：
   ```bash
@@ -215,8 +208,8 @@ sudo xianyu-saas doctor
 1. **默认无令牌注册（`SAAS_BOOTSTRAP_ENABLED=0`）**：
    - 首次启动且数据库为空时，在前端登录界面直接点击「创建首个管理员账号」；
    - 该操作不受 `SAAS_ALLOW_REGISTRATION=0` 限制，无需命令行介入；
-   - 系统原子创建首个 `admin` 账号及默认店铺基础配置目录；
-   - 首次管理员注册与后续用户注册支持补齐空目录与纯默认配置残留，严格拒绝业务数据、未知/损坏/非默认配置及符号链接；两入口接入并发回滚保护（仅清理本次新建且未被认领的目录；SQLite 写事务串行化，已有事务或数据库异常时保守保留存储目录）；
+   - 系统创建首个 `admin` 账号及默认店铺基础配置目录；
+   - 首次管理员注册与后续用户注册支持安全处理空目录与默认配置残留，拒绝未知或损坏配置，发生异常时自动清理未认领目录并保留既有数据；
    - **安全提示**：空数据库部署完成后，任何可访问者都能注册首个管理员。请务必在完成部署后立即完成初始化注册，再将端口或反代向外部开放。
 2. **后续注册开关**：
    - 首个管理员注册完毕后，后续注册用户仅具备普通店主（`owner`）角色；

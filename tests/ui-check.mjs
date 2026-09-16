@@ -4129,7 +4129,7 @@ async function captureDocs(browser, baseUrl) {
     await openView(page, view);
     await page.evaluate(() => window.scrollTo(0, 0));
   };
-  const capture = async (name, requiredInFrame = []) => {
+  const capture = async (name, requiredInFrame = [], { dialog = null } = {}) => {
     await page.waitForLoadState("networkidle");
     await page.evaluate(async () => {
       await document.fonts.ready;
@@ -4145,7 +4145,9 @@ async function captureDocs(browser, baseUrl) {
       assert.ok(bounds && bounds.x >= 0 && bounds.y >= 0 && bounds.x + bounds.width <= viewport.width + 1 && bounds.y + bounds.height <= viewport.height + 1,
         `${name}: ${selector} must fit in the image: ${JSON.stringify({ bounds, viewport })}`);
     }
-    assert.equal(await page.locator('dialog[open], [aria-busy="true"]:visible, .spin:visible').count(), 0, `${name}: no dialog or busy indicator`);
+    assert.equal(await page.locator('dialog[open]').count(), dialog ? 1 : 0, `${name}: only the intended dialog may be open`);
+    if (dialog) assert.equal(await page.locator(dialog).isVisible(), true, `${name}: intended dialog must be visible`);
+    assert.equal(await page.locator('[aria-busy="true"]:visible, .spin:visible').count(), 0, `${name}: no transient busy indicator`);
     assert.doesNotMatch(await page.locator('[data-panel]:not([hidden])').innerText(), /正在加载|正在读取|加载中|mock-user-verification|bootstrap-ui-contract|sk-[A-Za-z0-9]/);
     assert.equal(await page.locator('input[type="password"]:visible').evaluateAll((inputs) => inputs.every((input) => input.value === "")), true, `${name}: sensitive fields must be empty`);
     assertDesktopEvidence(evidence);
@@ -4246,8 +4248,33 @@ async function captureDocs(browser, baseUrl) {
     assert.equal(await page.inputValue("#resourceMaxWorkers"), "3");
     await capture("resources.png", ["#settingsResourcesPanel"]);
 
-    assert.equal(captures.length, 12);
-    assert.equal(new Set(captures.map((item) => item.name)).size, 12);
+    // These bytes and versions are offline demonstration data. The current
+    // frontend renders the normal status endpoint; no update is submitted.
+    const releaseVersion = JSON.parse(fs.readFileSync(path.join(repoRoot, "package.json"), "utf8")).version;
+    const currentVersion = "0.4.4";
+    const updateCapabilities = { deployment: "docker", check: true, download: true, apply: true, rollback: true, ready: true, reason: "" };
+    const updateCheck = { status: "available", available: true, version: releaseVersion, current_version: currentVersion,
+      release_notes: "## 更新内容\n- 简化更新操作。\n- 显示更新包下载进度。\n\n离线演示数据。" };
+    fixtures.version = { ...fixtures.version, version: currentVersion, capabilities: updateCapabilities, update_check: updateCheck };
+    fixtures.updateStatus = { ...fixtures.updateStatus, current: { ...fixtures.updateStatus.current, version: currentVersion },
+      capabilities: updateCapabilities, update_check: updateCheck, rollback_versions: [], operation: null,
+      preparation: { active: true, operation_id: "d".repeat(32), version: releaseVersion, action: "apply", phase: "downloading",
+        downloaded_bytes: 32800000, total_bytes: 52400000, error_code: "" } };
+    await page.reload({ waitUntil: "networkidle" });
+    await visit("home", { width: 1440, height: 900 });
+    await readyHome();
+    await page.click("#versionBadgeButton");
+    await page.click("#versionBadgeUpdate");
+    await page.waitForSelector("#platformUpdateDialog[open]");
+    await page.waitForFunction((version) => document.querySelector("#updateDownloadPercent")?.textContent === "62%"
+      && document.querySelector("#updateTargetVersion")?.textContent === version, releaseVersion);
+    assert.equal((await page.locator("#updateDownloadButton").innerText()).trim(), "更新");
+    assert.equal(await page.locator("#updateDownloadAmount").innerText(), "32.8 MB / 52.4 MB");
+    assert.doesNotMatch(await page.locator("#platformUpdateDialog").innerText(), /update-test|ui-contract|合成/);
+    await capture("update.png", ["#platformUpdateDialog", "#updateDownloadProgress", "#updateDownloadButton"], { dialog: "#platformUpdateDialog" });
+
+    assert.equal(captures.length, 13);
+    assert.equal(new Set(captures.map((item) => item.name)).size, 13);
     const origin = new URL(baseUrl).origin;
     assert.equal(fixtures.docsCaptureRequests.every((request) => new URL(request.url).origin === origin), true, "every captured HTTP request must use the loopback mock server");
     assert.equal(fixtures.apiRequests.filter((request) => request.method !== "GET").every((request) => ["/api/auth/login", "/api/auth/logout", "/api/bot/conversations/chat-1/read", "/api/bot/conversations/chat-2/read", "/api/bot/conversations/chat-1/takeover"].includes(request.path)), true, "capture must not invoke model tests, platform probes or configuration writes");

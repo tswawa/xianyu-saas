@@ -30,6 +30,6 @@
 - [ ] 流水线中 `scripts/verify-public-release.py` 在本地打包后及远端上传后二次下载核验均成功通过。
 
 ## 6. 发布页面与说明核对
-- [ ] GitHub Release 正文包含三个明确的用户下载入口（Docker `source.zip`、Ubuntu x86_64 管理器、Ubuntu ARM64 管理器）；
-- [ ] 包含 Docker 首次安装步骤、Ubuntu 安装步骤、已有用户网页更新说明与备份提醒；
+- [ ] GitHub Release 正文按「变更在前、三个下载入口与文档链接在后」排布，包含版本核心变更说明；
+- [ ] 包含三个明确的用户下载入口（Docker `source.zip`、Ubuntu x86_64 管理器、Ubuntu ARM64 管理器）及 `README.md` 文档链接，不重复冗长命令；
 - [ ] 确认 Release 状态已由 Draft 转为正式发布（`draft=false`）。
