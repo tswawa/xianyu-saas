@@ -1601,7 +1601,11 @@ def main():
     assert reply_status.status_code == 200
     assert reply_status.json()["reply"]["status"] == "queued"
     assert "content" not in reply_status.text and "我来帮你处理" not in reply_status.text
-    assert client.post("/api/bot/messages/reply", json={"content": "错误会话", "chat_id": "missing"}).status_code == 409
+    missing_conversation = client.post(
+        "/api/bot/messages/reply", json={"content": "错误会话", "chat_id": "missing"},
+    )
+    assert missing_conversation.status_code == 404, missing_conversation.text
+    assert missing_conversation.json()["detail"]["code"] == "conversation_not_found"
 
     # The internal token is accepted only while present. The proxy resolves the
     # exact shop's saved provider connection and keeps the worker-facing protocol

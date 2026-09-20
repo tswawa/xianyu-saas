@@ -4,7 +4,7 @@
 
   const API_PREFIX = "/xianyu-saas";
   const QR_LOGIN_POLL_MS = 1500;
-  const ASSET_VERSION = "20260920-06";
+  const ASSET_VERSION = "20260920-07";
   const AI_TEXT_PLACEHOLDERS = new Set(["无", "暂无", "没有", "未填写", "待填写", "待补充", "占位", "n/a", "na", "none", "null", "todo", "tbd"]);
   const ICONS = API_PREFIX + "/assets/icons.svg?v=" + ASSET_VERSION + "#";
   // 旧版视图 key → 新版视图 key（历史会话/书签兜底）。
@@ -3965,9 +3965,18 @@
     const generation = ++state.templateEditorOpenGeneration;
     try {
       await Promise.all([loadCards(), loadProducts()]);
+      if (!accountContextMatches(context) || generation !== state.templateEditorOpenGeneration || state.view !== "templates") return;
+      if (state.productsTruncatedAccountKey !== context.accountKey) {
+        // Passive product refreshes do not establish catalog completeness.
+        // Pair fresh status with fresh products before reconciling bindings.
+        const bot = await accountScopedApi(context, "/api/bot/status");
+        if (!accountContextMatches(context) || generation !== state.templateEditorOpenGeneration || state.view !== "templates") return;
+        const catalogStatus = registerCatalogStatus(bot);
+        await loadProducts({ force: true, catalogStatus });
+      }
     } catch (error) {
       if (accountContextMatches(context) && generation === state.templateEditorOpenGeneration) {
-        showToast(error.message || "卡密池加载失败，请稍后重试", "error");
+        showToast(error.message || "模板数据加载失败，请稍后重试", "error");
       }
       return;
     }

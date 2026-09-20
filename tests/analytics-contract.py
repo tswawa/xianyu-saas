@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import sqlite3
 import sys
@@ -85,11 +87,11 @@ def seed_account(root: Path, today: datetime) -> None:
                    user_id, item_id, role, content, timestamp, chat_id, source_id
                ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
             [
-                ("buyer-a", "item-a", "user", "private buyer text", f"{day} 10:00:00", "chat-a", "in-1"),
-                ("seller", "item-a", "assistant", "private reply text", f"{day} 10:01:00", "chat-a", "auto-1"),
-                ("buyer-b", "item-b", "user", "old message", f"{old_day} 10:00:00", "chat-b", "old-1"),
-                ("buyer-c", "item-c", "user", "newest private message", f"{day} 15:00:00", "chat-c", "in-2"),
-                ("seller", "item-c", "assistant", "manual seller reply", f"{day} 15:00:00", "chat-c", "manual_reply:42"),
+                ("buyer-a", "100001", "user", "private buyer text", f"{day} 10:00:00", "chat-a", "in-1"),
+                ("seller", "100001", "assistant", "private reply text", f"{day} 10:01:00", "chat-a", "auto-1"),
+                ("buyer-b", "100002", "user", "old message", f"{old_day} 10:00:00", "chat-b", "old-1"),
+                ("buyer-c", "100003", "user", "newest private message", f"{day} 15:00:00", "chat-c", "in-2"),
+                ("seller", "100003", "assistant", "manual seller reply", f"{day} 15:00:00", "chat-c", "manual_reply:42"),
             ],
         )
         con.executemany(
@@ -104,7 +106,7 @@ def seed_account(root: Path, today: datetime) -> None:
             """INSERT INTO assistant_outcomes(
                    source_id, chat_id, user_id, item_id, role, content, created_at, updated_at
                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            ("auto-pruned", "chat-c", "seller", "item-c", "assistant", "private outcome", f"{day}T11:00:00", f"{day}T11:00:00"),
+            ("auto-pruned", "chat-c", "seller", "100003", "assistant", "private outcome", f"{day}T11:00:00", f"{day}T11:00:00"),
         )
         con.execute(
             """INSERT INTO conversation_controls(
@@ -181,6 +183,13 @@ def main() -> None:
     assert created.status_code == 200, created.text
     second_root = storage.ensure_account_dir(user_id, "second")
     seed_account(default_root, today)
+    account_ref = hashlib.sha256(b"123456").hexdigest()[:16]
+    app.write_secret(user_id, "cookies.txt", "unb=123456; _m_h5_tk=analytics_abc; sid=contract")
+    app.write_secret(user_id, "shop_snapshot.json", json.dumps({
+        "version": 1, "account_ref": account_ref, "nickname": "offline-analytics-shop",
+        "products": [{"id": item_id, "title": "本店商品"} for item_id in ("100001", "100002", "100003")],
+        "product_count": 3, "synced_at": "offline", "truncated": False,
+    }))
     # Empty database files model a worker initialization interrupted before
     # schema creation.  Statistics must treat them as empty, not return 500.
     for name in ("chat_history.db", "delivery_state.db"):
@@ -249,6 +258,28 @@ def main() -> None:
     free_analytics = client.get("/api/bot/analytics")
     assert free_analytics.status_code == 200
     assert isinstance(free_analytics.json()["totals"], dict)
+
+    # A conversation where this account is the buyer remains in history but
+    # cannot increase the customer-service unread counts.
+    with sqlite3.connect(default_root / "chat_history.db") as con:
+        con.execute("""CREATE TABLE customer_conversation_scope (
+            chat_id TEXT PRIMARY KEY, item_id TEXT NOT NULL, account_ref TEXT NOT NULL,
+            scope TEXT NOT NULL, checked_at REAL NOT NULL)""")
+        con.execute("""INSERT INTO messages(user_id, item_id, role, content, timestamp, chat_id, source_id)
+            VALUES (?, ?, 'user', ?, ?, ?, ?)""", (
+                "other-seller", "900001", "non-customer private text",
+                today.strftime("%Y-%m-%d 16:00:00"), "buyer-side-chat", "foreign-in-1",
+            ))
+        con.execute("INSERT INTO customer_conversation_scope VALUES (?, ?, ?, 'foreign', ?)",
+                    ("buyer-side-chat", "900001", account_ref, time.time()))
+        assert con.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 6
+    filtered = client.get("/api/bot/analytics?period=1")
+    assert filtered.status_code == 200, filtered.text
+    assert filtered.json()["totals"]["unread_conversations_total"] == 3
+    assert filtered.json()["totals"]["unread_messages_total"] == 3
+    assert "non-customer private text" not in filtered.text
+    visible = client.get("/api/bot/conversations").json()["conversations"]
+    assert {row["chat_id"] for row in visible} == {"chat-a", "chat-b", "chat-c"}
     print("analytics contract: scoped redacted aggregates, buckets, permissions and compatibility passed")
 
 
