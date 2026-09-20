@@ -1020,6 +1020,21 @@ def _state_rows(con):
         return {}
 
 
+def _needs_human_rows(con):
+    """Chats the worker flagged as pending human handling (AI handoff)."""
+    if not _table_exists(con, "conversation_flags"):
+        return set()
+    try:
+        return {
+            str(row["chat_id"])
+            for row in con.execute(
+                "SELECT chat_id FROM conversation_flags WHERE needs_human = 1"
+            ).fetchall()
+        }
+    except sqlite3.Error:
+        return set()
+
+
 def _manual_mode_rows(user_id: int, account_key: str):
     """Read worker takeover state when the delivery database exists."""
     con = _connect(user_id, "delivery_state.db", account_key)
@@ -1071,9 +1086,60 @@ def _message_time_value(value) -> float:
         return 0.0
 
 
-def _buyer_label(value) -> str:
+def _buyer_label(value, nickname="") -> str:
+    if isinstance(nickname, str):
+        name = " ".join(re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", nickname).split())[:80]
+        if name:
+            return f"买家 · {name}"
     text = "".join(character for character in str(value or "") if character.isalnum())
     return f"买家 · {text[-6:]}" if text else "买家咨询"
+
+
+def _customer_conversation_filter(con, user_id, account_key):
+    """Show only conversations confirmed to concern this shop's own listings."""
+    try:
+        cookie = AccountStorage(TENANTS_ROOT).read_text(user_id, account_key, "cookies.txt")
+        if len(cookie) > 65536:
+            return "0", ()
+        identities = [value.strip() for part in cookie.split(";")
+                      for name, separator, value in [part.strip().partition("=")]
+                      if separator and name == "unb"]
+        if len(identities) != 1 or not identities[0].isascii() or not identities[0].isdigit():
+            return "0", ()
+        account_ref = hashlib.sha256(identities[0].encode("utf-8")).hexdigest()[:16]
+    except (OSError, UnicodeError, ValueError, AccountStorageError):
+        return "0", ()
+    current_item = """(
+        SELECT current_item.item_id FROM messages current_item
+        WHERE current_item.chat_id = messages.chat_id
+          AND COALESCE(current_item.item_id, '') != ''
+        ORDER BY current_item.id DESC LIMIT 1
+    )"""
+    conditions, values = [], []
+    foreign, foreign_values = "0", ()
+    if _table_exists(con, "customer_conversation_scope"):
+        matched_scope = f"""SELECT 1 FROM customer_conversation_scope scope
+            WHERE scope.chat_id = messages.chat_id AND scope.scope = ?
+              AND scope.account_ref = ? AND scope.item_id != ''
+              AND scope.item_id = {current_item}"""
+        foreign = f"EXISTS ({matched_scope})"
+        foreign_values = ("foreign", account_ref)
+        conditions.append(f"EXISTS ({matched_scope})")
+        values.extend(("owned", account_ref))
+    snapshot = load_verified_snapshot(user_id, account_key)
+    if snapshot and snapshot.get("account_ref") == account_ref:
+        # Snapshot membership is positive proof even for historical chats that
+        # predate role recording. A missing listing is not proof of ownership.
+        owned_items = sorted({str(item.get("id") or "") for item in snapshot["products"]
+                              if isinstance(item, dict) and str(item.get("id") or "").isascii()
+                              and str(item.get("id") or "").isdigit()})[:1000]
+        if owned_items:
+            placeholders = ",".join("?" for _ in owned_items)
+            conditions.append(f"{current_item} IN ({placeholders})")
+            values.extend(owned_items)
+    if not conditions:
+        return "0", ()
+    return f"NOT ({foreign}) AND ({' OR '.join(conditions)})", (*foreign_values, *values)
 
 
 def conversations(
@@ -1083,6 +1149,7 @@ def conversations(
     *,
     search: str = "",
     unread_only: bool = False,
+    needs_human_only: bool = False,
 ):
     """Return account-scoped conversation summaries for the workbench.
 
@@ -1103,16 +1170,19 @@ def conversations(
         # the endpoint predictable while still allowing a match outside the
         # first page of a busy inbox.
         query_limit = min(1000 if (needle or unread_only) else maximum, 1000)
+        visible, visibility_values = _customer_conversation_filter(con, user_id, account_key)
         groups = con.execute(
-            """SELECT chat_id, MAX(id) AS last_id, COUNT(*) AS message_count,
+            f"""SELECT chat_id, MAX(id) AS last_id, COUNT(*) AS message_count,
                       MAX(CASE WHEN role = 'user' THEN id ELSE 0 END) AS last_inbound_id
                FROM messages
-               WHERE COALESCE(chat_id, '') != ''
+                WHERE COALESCE(chat_id, '') != '' AND {visible}
                GROUP BY chat_id ORDER BY last_id DESC LIMIT ?""",
-            (query_limit,),
+            (*visibility_values, query_limit),
         ).fetchall()
         states = _state_rows(con)
         manual_modes = _manual_mode_rows(user_id, account_key)
+        pending_human = _needs_human_rows(con)
+        has_peer_names = _table_exists(con, "conversation_peer_names")
         out = []
         for group in groups:
             chat_id = str(group["chat_id"] or "")
@@ -1150,7 +1220,15 @@ def conversations(
                    ORDER BY id DESC LIMIT 1""",
                 (chat_id,),
             ).fetchone()
-            buyer_label = _buyer_label(buyer["user_id"] if buyer else latest["user_id"])
+            buyer_nickname = ""
+            if buyer and has_peer_names:
+                peer_name = con.execute(
+                    """SELECT nickname FROM conversation_peer_names
+                       WHERE chat_id = ? AND peer_id = ?""",
+                    (chat_id, str(buyer["user_id"] or "")),
+                ).fetchone()
+                buyer_nickname = str(peer_name["nickname"] or "") if peer_name else ""
+            buyer_label = _buyer_label(buyer["user_id"] if buyer else latest["user_id"], buyer_nickname)
             if needle:
                 haystack = " ".join(
                     (chat_id, str(latest["item_id"] or ""), buyer_label, preview)
@@ -1165,9 +1243,20 @@ def conversations(
                     ).fetchone()
                     if history_match is None:
                         continue
+            needs_human = chat_id in pending_human
             if unread_only and unread_count <= 0:
                 continue
-            status = "manual" if takeover else "needs_reply" if unread_count else "handled"
+            if needs_human_only and not needs_human:
+                continue
+            status = (
+                "manual"
+                if takeover
+                else "needs_human"
+                if needs_human
+                else "needs_reply"
+                if unread_count
+                else "handled"
+            )
             out.append(
                 {
                     "chat_id": chat_id,
@@ -1182,6 +1271,7 @@ def conversations(
                     "unread": unread_count > 0,
                     "unread_count": unread_count,
                     "status": status,
+                    "needs_human": needs_human,
                     "takeover": takeover,
                     "takeover_expires_at": takeover_expires_at,
                     "search_match": bool(needle),
@@ -1207,6 +1297,7 @@ def conversation_unread_totals(
     return {
         "conversations": sum(1 for row in rows if row.get("unread")),
         "messages": sum(int(row.get("unread_count", 0) or 0) for row in rows),
+        "needs_human": sum(1 for row in rows if row.get("needs_human")),
     }
 
 
@@ -1228,12 +1319,17 @@ def messages(
         maximum = min(max(limit, 1), 200)
         selected = str(chat_id or "").strip()
         needle = str(search or "").strip().casefold()[:120]
+        visible, visibility_values = _customer_conversation_filter(con, user_id, account_key)
         if not selected:
             latest = con.execute(
-                """SELECT chat_id FROM messages
-                   WHERE COALESCE(chat_id, '') != '' ORDER BY id DESC LIMIT 1"""
+                f"""SELECT chat_id FROM messages
+                    WHERE COALESCE(chat_id, '') != '' AND {visible} ORDER BY id DESC LIMIT 1""",
+                visibility_values,
             ).fetchone()
             selected = str(latest["chat_id"] or "") if latest else ""
+        if selected and not _conversation_exists(con, selected, user_id, account_key):
+            con.rollback()
+            return []
 
         message_columns = {
             str(row[1]) for row in con.execute("PRAGMA table_info(messages)").fetchall()
@@ -1263,8 +1359,8 @@ def messages(
             rows = con.execute(
                 f"""SELECT id, role, content, timestamp, chat_id, item_id,
                            {source_select}, {type_select}, {media_select}
-                    FROM messages ORDER BY id DESC LIMIT ?""",
-                (maximum,),
+                    FROM messages WHERE {visible} ORDER BY id DESC LIMIT ?""",
+                (*visibility_values, maximum),
             ).fetchall()
         out = []
         manual_parts_seen = set()
@@ -1326,10 +1422,13 @@ def messages(
                 ).fetchall()
         else:
             drafts = con.execute(
-                """SELECT id, request_id, content, created_at, chat_id, item_id,
-                          status, attempts, updated_at, media_json
-                   FROM manual_reply_drafts ORDER BY id DESC LIMIT ?""",
-                (maximum,),
+                f"""SELECT id, request_id, content, created_at, chat_id, item_id,
+                           status, attempts, updated_at, media_json
+                    FROM manual_reply_drafts WHERE EXISTS (
+                        SELECT 1 FROM messages WHERE messages.chat_id = manual_reply_drafts.chat_id
+                          AND ({visible})
+                    ) ORDER BY id DESC LIMIT ?""",
+                (*visibility_values, maximum),
             ).fetchall()
         for draft in drafts:
             outbox_id = int(draft["id"])
@@ -1415,6 +1514,9 @@ def message_match_count(
     try:
         con.execute("BEGIN IMMEDIATE")
         _ensure_manual_reply_outbox(con)
+        if not _conversation_exists(con, selected, user_id, account_key):
+            con.rollback()
+            return 0
         message_row = con.execute(
             """SELECT COUNT(*) AS total FROM messages
                WHERE chat_id = ?
@@ -1497,7 +1599,7 @@ def append_manual_draft(
     try:
         _ensure_manual_reply_outbox(con)
         selected = str(chat_id or "").strip()
-        if not selected:
+        if not selected or not _conversation_exists(con, selected, user_id, account_key):
             return None
         target = con.execute(
             """SELECT chat_id, item_id FROM messages
@@ -1561,6 +1663,8 @@ def enqueue_manual_reply(
     try:
         con.execute("BEGIN IMMEDIATE")
         _ensure_manual_reply_outbox(con)
+        if not _conversation_exists(con, selected, user_id, account_key):
+            raise ManualReplyQueueError("conversation_not_found", "当前还没有可回复的对话")
         existing = con.execute(
             """SELECT id, request_id, payload_digest, chat_id, item_id, content, media_json, created_at,
                       status, attempts, updated_at
@@ -1681,7 +1785,7 @@ def manual_reply_status(
                FROM manual_reply_drafts WHERE request_id = ?""",
             (str(request_id or "").strip(),),
         ).fetchone()
-        if row is None:
+        if row is None or not _conversation_exists(con, str(row["chat_id"] or ""), user_id, account_key):
             con.commit()
             return None
         try:
@@ -1756,10 +1860,12 @@ def manual_reply_attention(
         con.close()
 
 
-def _conversation_exists(con, chat_id: str) -> bool:
+def _conversation_exists(con, chat_id: str, user_id, account_key=DEFAULT_ACCOUNT_ID) -> bool:
     try:
+        visible, visibility_values = _customer_conversation_filter(con, user_id, account_key)
         return con.execute(
-            "SELECT 1 FROM messages WHERE chat_id = ? LIMIT 1", (chat_id,)
+            f"SELECT 1 FROM messages WHERE chat_id = ? AND {visible} LIMIT 1",
+            (chat_id, *visibility_values),
         ).fetchone() is not None
     except sqlite3.Error:
         return False
@@ -1770,7 +1876,7 @@ def conversation_exists(user_id: int, chat_id: str, account_key: str = DEFAULT_A
     if con is None:
         return False
     try:
-        return _conversation_exists(con, str(chat_id or "").strip())
+        return _conversation_exists(con, str(chat_id or "").strip(), user_id, account_key)
     finally:
         con.close()
 
@@ -1790,7 +1896,7 @@ def mark_conversation_read(
         return None
     try:
         con.execute("BEGIN IMMEDIATE")
-        if not _conversation_exists(con, selected):
+        if not _conversation_exists(con, selected, user_id, account_key):
             con.rollback()
             return None
         latest = con.execute(
@@ -1917,7 +2023,7 @@ def set_conversation_takeover(
     expires_at = worker_state["expires_at"]
     try:
         con.execute("BEGIN IMMEDIATE")
-        if not _conversation_exists(con, selected):
+        if not _conversation_exists(con, selected, user_id, account_key):
             con.rollback()
             return None
         _ensure_conversation_state(con)

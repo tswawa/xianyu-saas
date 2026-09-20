@@ -11,7 +11,7 @@
 ## 2. 开源合规与许可证
 - [ ] 根目录 `LICENSE`（GPL-3.0-only）完整；
 - [ ] `LICENSING.md`、`worker/NOTICE.md` 与字体开源许可证（`frontend/assets/OFL-NotoSansSC.txt`）齐全规范；
-- [ ] 文档包含免责声明，明确提示使用者遵守平台规则与法律法规。
+- [ ] 上游署名与第三方许可说明准确，未混入未经授权的代码或素材。
 
 ## 3. 版本号一致性
 - [ ] `package.json`、`package-lock.json` 与 `backend/version.py` 版本号一致；

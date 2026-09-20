@@ -227,6 +227,7 @@ class DB:
                     heartbeat_at REAL,
                     exit_code INTEGER,
                     last_error TEXT NOT NULL DEFAULT '',
+                    auto_resume INTEGER NOT NULL DEFAULT 1,
                     updated_at REAL NOT NULL,
                     PRIMARY KEY(user_id, account_id)
                 );
@@ -387,6 +388,7 @@ class DB:
                         if "duplicate column name" not in str(error).lower():
                             raise
             self._migrate_shop_accounts_locked()
+            self._migrate_worker_runtimes_locked()
             # Existing installations have users but no account rows.  The
             # default account is intentionally metadata-only and keeps all
             # legacy tenant files usable until their callers opt into
@@ -624,6 +626,23 @@ class DB:
             """,
             (now, now),
         )
+
+    def _migrate_worker_runtimes_locked(self):
+        """Add auto-resume without restarting explicitly stopped legacy workers."""
+        columns = {
+            str(row["name"])
+            for row in self.con.execute("PRAGMA table_info(worker_runtimes)").fetchall()
+        }
+        if "auto_resume" not in columns:
+            self.con.execute(
+                "ALTER TABLE worker_runtimes ADD COLUMN auto_resume INTEGER NOT NULL DEFAULT 1"
+            )
+            self.con.execute(
+                """
+                UPDATE worker_runtimes SET auto_resume = 0
+                WHERE desired_state = 'stopped' AND state = 'stopped' AND pid IS NULL
+                """
+            )
 
     def _backfill_worker_runtimes_locked(self):
         """Give every enabled shop a durable default running intent."""
@@ -1016,7 +1035,7 @@ class DB:
 
     def reserve_shop_connection(
         self, resource_key, owner, sync_key, lease_seconds=180,
-        risk_until=0, now=None,
+        risk_until=0, now=None, *, ignore_sync_cooldown=False,
     ):
         """Atomically preflight local protection and reserve one shop, without I/O.
 
@@ -1043,7 +1062,9 @@ class DB:
                     if row:
                         if row["lease_until"] > now:
                             blockers.append((row["lease_until"], "sync_busy"))
-                        if row["cooldown_until"] > now:
+                        if row["cooldown_until"] > now and not (
+                            ignore_sync_cooldown and key == sync_key
+                        ):
                             blockers.append((row["cooldown_until"], "sync_cooldown"))
                 if blockers:
                     deadline, code = max(blockers, key=lambda item: item[0])
@@ -1091,6 +1112,24 @@ class DB:
             )
             self.con.commit()
             return cur.rowcount == 1
+
+    def arm_control_lease_cooldown(self, resource_key, seconds, now=None):
+        """Set a cooldown on a resource without requiring an owned lease."""
+        now = time.time() if now is None else float(now)
+        cooldown_until = now + min(max(float(seconds), 0.0), 86400.0)
+        with self._lock:
+            self.con.execute(
+                """
+                INSERT INTO control_leases(resource_key, owner, lease_until, cooldown_until, updated_at)
+                VALUES (?, '', 0, ?, ?)
+                ON CONFLICT(resource_key) DO UPDATE SET
+                    cooldown_until = excluded.cooldown_until,
+                    updated_at = excluded.updated_at
+                """,
+                (str(resource_key), cooldown_until, now),
+            )
+            self.con.commit()
+            return True
 
     def get_control_lease(self, resource_key):
         with self._lock:
@@ -1337,6 +1376,19 @@ class DB:
                 "SELECT * FROM worker_runtimes WHERE desired_state = ? ORDER BY user_id, account_id",
                 (str(desired_state),),
             ).fetchall()
+
+    def set_worker_auto_resume(self, user_id, account_id, auto_resume):
+        """Mark whether a stop is explicit (0) or the runtime may auto-resume (1)."""
+        with self._lock:
+            cur = self.con.execute(
+                """
+                UPDATE worker_runtimes SET auto_resume = ?
+                WHERE user_id = ? AND account_id = ?
+                """,
+                (1 if auto_resume else 0, int(user_id), int(account_id)),
+            )
+            self.con.commit()
+            return cur.rowcount == 1
 
     def persist_worker_runtime(
         self,

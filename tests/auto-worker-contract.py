@@ -32,6 +32,7 @@ sys.path.insert(0, str(ROOT / "backend"))
 from fastapi.testclient import TestClient  # noqa: E402
 
 import app  # noqa: E402
+import bot_manager  # noqa: E402
 import shop_sync  # noqa: E402
 
 
@@ -409,6 +410,95 @@ def main() -> None:
         synced = client.post("/api/bot/shop/sync", headers=sync_headers)
         assert synced.status_code == 200, synced.text
         assert starts["sync-shop"] == 1
+
+        # Paid-order delivery is independent of the automatic reply switch.
+        # Exercise public control routes and durable recovery for every type.
+        create_account(client, "delivery-shop")
+        delivery_headers = {"X-Shop-Account": "delivery-shop"}
+        delivery_cookie = "unb=610009; _m_h5_tk=delivery-token_tail; sid=delivery"
+        delivery_login = client.put(
+            "/api/bot/cookies", headers=delivery_headers, json={"cookies": delivery_cookie}
+        )
+        assert delivery_login.status_code == 200, delivery_login.text
+        delivery_snapshot = fake_shop_sync(delivery_cookie)
+        delivery_snapshot.update(products=[{"id": "100009", "title": "发货商品"}], product_count=1)
+        shop_sync.save_snapshot(user_id, delivery_snapshot, "delivery-shop")
+        delivery_account = app.db.get_shop_account(user_id, account_key="delivery-shop")
+        delivery_configs = [
+            {"delivery": "material", "payload": "测试订单资料"},
+            {"delivery": "pan", "resource_match": ["测试资源"]},
+            {"delivery": "redeem"},
+        ]
+        for config in delivery_configs:
+            app.write_secret(user_id, "products_config.json", json.dumps({
+                "version": 1, "types": [{**config, "item_ids": ["100009"], "enabled": True}],
+            }), "delivery-shop")
+            assert client.put("/api/automation", headers=delivery_headers, json={"enabled": True}).status_code == 200
+            started = client.post("/api/bot/start", headers=delivery_headers, json={"mode": "rules"})
+            assert started.status_code == 200, started.text
+            delivery_pid = running["delivery-shop"]
+            disabled_replies = client.put("/api/automation", headers=delivery_headers, json={"enabled": False})
+            assert disabled_replies.status_code == 200, disabled_replies.text
+            assert disabled_replies.json()["automation"]["enabled"] is False
+            assert running["delivery-shop"] == delivery_pid
+            delivery_runtime = app.db.get_worker_runtime(user_id, delivery_account["id"])
+            assert delivery_runtime["desired_state"] == "running"
+            assert delivery_runtime["mode"] == "rules"
+            assert bot_manager._worker_automation_enabled(user_id, "delivery-shop") is True
+
+            # A dead listener must recover with replies still off, using the
+            # existing desired state and account-scoped rules mode.
+            running.pop("delivery-shop")
+            previous_starts = starts["delivery-shop"]
+            with (
+                patch.dict(os.environ, {"SAAS_RESTORE_WORKERS": "1"}),
+                patch.object(app.db, "list_worker_runtimes", return_value=[delivery_runtime]),
+                patch.object(app, "bot_adopt", return_value=(False, "pid_dead")),
+            ):
+                app.restore_desired_workers()
+            assert starts["delivery-shop"] == previous_starts + 1
+            recovered = app.db.get_worker_runtime(user_id, delivery_account["id"])
+            assert recovered["state"] == "running" and recovered["mode"] == "rules"
+            assert app._read_automation_settings(user_id, "delivery-shop")["enabled"] is False
+
+            # Explicit stop fences recovery even though the delivery remains
+            # enabled. Only a new explicit start reopens the listener.
+            stopped_delivery = client.post("/api/bot/stop", headers=delivery_headers)
+            assert stopped_delivery.status_code == 200, stopped_delivery.text
+            stopped_runtime = app.db.get_worker_runtime(user_id, delivery_account["id"])
+            with (
+                patch.dict(os.environ, {"SAAS_RESTORE_WORKERS": "1"}),
+                patch.object(app.db, "list_worker_runtimes", return_value=[stopped_runtime]),
+            ):
+                app.restore_desired_workers()
+            assert "delivery-shop" not in running
+            assert starts["delivery-shop"] == previous_starts + 1
+            restarted = client.post("/api/bot/start", headers=delivery_headers, json={"mode": "rules"})
+            assert restarted.status_code == 200, restarted.text
+            assert app._read_automation_settings(user_id, "delivery-shop")["enabled"] is False
+            assert client.post("/api/bot/stop", headers=delivery_headers).status_code == 200
+
+        # Disabled, incomplete and foreign-shop bindings cannot authorize a
+        # delivery-only start. Strict document errors still fail closed.
+        for invalid_config in (
+            {"delivery": "material", "item_ids": ["100009"], "payload": "资料", "enabled": False},
+            {"delivery": "material", "item_ids": ["100009"], "payload": "   "},
+            {"delivery": "material", "item_ids": ["999999"], "payload": "其他店铺资料"},
+            {"delivery": "pan", "item_ids": ["100009"], "resource_match": []},
+            {"delivery": "redeem", "item_ids": []},
+        ):
+            app.write_secret(user_id, "products_config.json", json.dumps({
+                "version": 1, "types": [invalid_config],
+            }), "delivery-shop")
+            denied_delivery = client.post("/api/bot/start", headers=delivery_headers, json={"mode": "rules"})
+            assert denied_delivery.status_code == 409, denied_delivery.text
+            assert denied_delivery.json()["detail"]["code"] == "automation_disabled"
+            assert "delivery-shop" not in running
+            assert bot_manager._worker_automation_enabled(user_id, "delivery-shop") is False
+        app.write_secret(user_id, "products_config.json", "{broken", "delivery-shop")
+        corrupt_delivery = client.post("/api/bot/start", headers=delivery_headers, json={"mode": "rules"})
+        assert corrupt_delivery.status_code == 503, corrupt_delivery.text
+        app.write_secret(user_id, "products_config.json", '{"version":1,"types":[]}', "delivery-shop")
 
         # Verified login must not bypass fail-closed account controls. Missing
         # rules and corrupt settings preserve durable intent but never spawn.

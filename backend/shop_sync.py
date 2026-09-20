@@ -346,6 +346,17 @@ def reserve_sync(user_id: int, account_key: str = DEFAULT_ACCOUNT_ID) -> None:
         _last_sync_by_tenant[scope] = now
 
 
+def note_sync(user_id: int, account_key: str = DEFAULT_ACCOUNT_ID) -> None:
+    """Record a completed explicit sync without enforcing the cooldown.
+
+    The user-initiated login replace must never be blocked by the anti-abuse
+    cooldown, but later background syncs should still be cooled down.
+    """
+    now = time.monotonic()
+    with _sync_lock:
+        _last_sync_by_tenant[(int(user_id), normalize_account_key(account_key))] = now
+
+
 def _safe_text(value, limit: int) -> str:
     if not isinstance(value, str):
         return ""
@@ -593,6 +604,23 @@ def load_verified_snapshot(user_id: int, account_key: str = DEFAULT_ACCOUNT_ID) 
     if not isinstance(snapshot.get("nickname"), str) or not isinstance(snapshot.get("products"), list):
         return None
     return snapshot
+
+
+def clear_connection(user_id: int, account_key: str = DEFAULT_ACCOUNT_ID) -> None:
+    """Drop the verified snapshot and sync state for one account.
+
+    Used by the explicit "disconnect" action so a stopped shop no longer looks
+    verified. Cookies are cleared separately by the caller.
+    """
+    try:
+        root = _account_root(user_id, account_key)
+    except OSError:
+        return
+    for name in (SNAPSHOT_NAME, SYNC_STATE_NAME):
+        try:
+            os.remove(os.path.join(root, name))
+        except OSError:
+            pass
 
 
 def _circuit_until() -> float:

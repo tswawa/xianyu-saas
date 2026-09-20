@@ -50,6 +50,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 import app  # noqa: E402
 import bot_manager  # noqa: E402
 import shop_sync  # noqa: E402
+from ai_customer_service import PERSONA_PRESET_INSTRUCTIONS  # noqa: E402
 from platform_ai import identify_scope, issue_token, revoke_token  # noqa: E402
 from version import ASSET_VERSION, VERSION  # noqa: E402
 
@@ -69,7 +70,10 @@ class UpstreamHandler(BaseHTTPRequestHandler):
             "payload": json.loads(body),
         }
         upstream_payload = UpstreamHandler.seen["payload"]
-        is_reply_decision = "reply|handoff|no_reply" in json.dumps(upstream_payload, ensure_ascii=False)
+        is_reply_decision = any(
+            marker in json.dumps(upstream_payload, ensure_ascii=False)
+            for marker in ("reply|handoff|no_reply", "禁止转人工")
+        )
         text = (
             json.dumps({"decision": "reply", "reply": "收到", "reason_code": "answered"}, ensure_ascii=False)
             if is_reply_decision
@@ -111,7 +115,10 @@ def mock_upstream_request(url, api_key, payload, headers):
         "payload": payload,
     }
     upstream_payload = payload if isinstance(payload, dict) else {}
-    is_reply_decision = "reply|handoff|no_reply" in json.dumps(upstream_payload, ensure_ascii=False)
+    is_reply_decision = any(
+        marker in json.dumps(upstream_payload, ensure_ascii=False)
+        for marker in ("reply|handoff|no_reply", "禁止转人工")
+    )
     text = (
         json.dumps({"decision": "reply", "reply": "收到", "reason_code": "answered"}, ensure_ascii=False)
         if is_reply_decision
@@ -351,7 +358,10 @@ def assert_bot_manager_access_contract():
             assert rules_env["AUTOMATION_MODE"] == "rules"
             assert rules_env["REPLY_RULES_FILE"].endswith(f"/{rules_user}/reply_rules.json")
             assert rules_env["AUTOMATION_SETTINGS_FILE"].endswith(f"/{rules_user}/automation_settings.json")
-            assert rules_env["SIMULATE_HUMAN_TYPING"] == "False"
+            # Reply pacing comes only from the account settings document; the
+            # legacy environment-based typing delay must not be injected.
+            assert "SIMULATE_HUMAN_TYPING" not in rules_env
+            assert "MAX_REPLY_DELAY" not in rules_env
             assert all(key not in rules_env for key in ("API_KEY", "MODEL_BASE_URL", "MODEL_NAME"))
             assert issued_tokens == []
             rules_status = bot_manager.status(rules_user)
@@ -772,6 +782,21 @@ def main():
     assert partial_payload["business_start"] == "09:00"
     assert partial_payload["business_end"] == "23:30"
 
+    # Each engine switch is a complete partial update by itself. It must not
+    # overwrite the other engine or either page's saved settings.
+    for field, value in (("rules_enabled", False), ("ai_enabled", False),
+                         ("rules_enabled", True), ("ai_enabled", True)):
+        before_settings = json.loads(settings_path.read_text())
+        toggled = client.put("/api/automation", json={field: value})
+        assert toggled.status_code == 200, toggled.text
+        after_settings = json.loads(settings_path.read_text())
+        assert toggled.json()["automation"][field] is value
+        expected_settings = {**before_settings, field: value}
+        expected_settings["enabled"] = (
+            expected_settings["rules_enabled"] or expected_settings["ai_enabled"]
+        )
+        assert after_settings == expected_settings
+
     automation_user = app.db.get_user("free-user")
     automation_account = app.db.get_shop_account(automation_user["id"], account_key="default")
     first_read_entered = threading.Event()
@@ -879,8 +904,8 @@ def main():
     assert stopped_runtime["state"] == "stopped"
     assert stopped_runtime["pid"] is None
 
-    # Explicit automation disable must also stop a durable worker owned by a
-    # different API process, not just consult this process's in-memory map.
+    # Reply disable preserves a durable delivery worker, including one owned
+    # by a different API process. Explicit stop above remains a full stop.
     disable_generation = int(stopped_runtime["generation"] or 0)
     app.db.persist_worker_runtime(
         free_user_row["id"],
@@ -898,13 +923,31 @@ def main():
         patch.object(app, "bot_stop", return_value=(False, "not_running")),
         patch.object(app, "bot_terminate_pid", return_value=(True, "stopped")) as disable_remote_stop,
     ):
+        delivery_only = client.put("/api/automation", json={"enabled": False})
+    assert delivery_only.status_code == 200, delivery_only.text
+    assert delivery_only.json()["automation"]["enabled"] is False
+    disable_remote_stop.assert_not_called()
+    delivery_runtime = app.db.get_worker_runtime(free_user_row["id"], free_account["id"])
+    assert delivery_runtime["desired_state"] == "running"
+    assert delivery_runtime["pid"] == 42002
+
+    # The shop runtime is default-on: disabling replies never retires the
+    # durable worker, even when no delivery is enabled. Only an explicit stop
+    # (covered above) may do that.
+    disabled_deliveries = [dict(row, enabled=False) for row in basic_automation["deliveries"]]
+    assert client.put("/api/automation", json={"deliveries": disabled_deliveries}).status_code == 200
+    with (
+        patch.object(app, "bot_process_id", return_value=None),
+        patch.object(app, "bot_stop", return_value=(False, "not_running")),
+        patch.object(app, "bot_terminate_pid", return_value=(True, "stopped")) as disable_remote_stop,
+    ):
         disabled_automation = client.put("/api/automation", json={"enabled": False})
     assert disabled_automation.status_code == 200, disabled_automation.text
-    disable_remote_stop.assert_called_once_with(free_user_row["id"], 42002, "default")
+    disable_remote_stop.assert_not_called()
     disabled_runtime = app.db.get_worker_runtime(free_user_row["id"], free_account["id"])
-    assert disabled_runtime["desired_state"] == "stopped"
-    assert disabled_runtime["pid"] is None
-    assert client.put("/api/automation", json={"enabled": True}).status_code == 200
+    assert disabled_runtime["desired_state"] == "running"
+    assert disabled_runtime["pid"] == 42002
+    assert client.put("/api/automation", json={"enabled": True, "deliveries": basic_automation["deliveries"]}).status_code == 200
 
     # Desired intent and observed runtime are one CAS-protected transaction.
     # The watchdog callback uses the same worker-control lease and publishes the
@@ -1694,5 +1737,67 @@ def main():
     print("api-contract: self-use permissions, product-card, worker and AI proxy contracts passed")
 
 
+def assert_ai_persona_save():
+    """Exercise the browser's flat save payload through real HTTP validation/storage."""
+    user_id = app.db.create_user("persona-contract", "persona-contract-password")
+    app.db.ensure_default_shop_account(user_id)
+    bot_manager.ensure_dir(user_id, initialize=True)
+    client = TestClient(app.app)
+    login = client.post("/api/auth/login", json={
+        "username": "persona-contract", "password": "persona-contract-password",
+    })
+    assert login.status_code == 200, login.text
+    client.cookies.set("xianyu_saas_session", login.cookies.get("xianyu_saas_session"), path="/")
+    revision = client.get("/api/bot/ai/config").json()["config"]["revision"]
+    for preset, name, instruction in (
+        ("mint", "薄荷客服", "1"),
+        ("mint", "薄荷客服", ""),
+        ("catgirl", "小喵客服", "先准确回答当前问题。"),
+        ("custom", "店铺客服", "使用店主填写的人设说明。"),
+    ):
+        payload = {
+            "store_content": "本店提供软件使用指导，价格和库存以商品页面为准。",
+            "persona_preset": preset,
+            "persona_name": name,
+            "persona_instruction": instruction,
+            "tone": "friendly",
+            "buyer_address": "亲",
+            "reply_length": "short",
+            "emoji_level": "medium",
+            "forbidden_claims": "不承诺永久稳定",
+            "handoff_rules": "退款争议由店主处理",
+            "expected_revision": revision,
+        }
+        saved = client.put("/api/bot/ai/config", json=payload)
+        assert saved.status_code == 200, saved.text
+        config = saved.json()["config"]
+        assert config["status"] == "saved" and config["enabled"] is True, config
+        assert config["revision"] == revision + 1, config
+        for key, value in payload.items():
+            if key in {"tone", "buyer_address", "reply_length", "emoji_level"}:
+                assert key not in config, (key, config)
+            elif key != "expected_revision":
+                expected = PERSONA_PRESET_INSTRUCTIONS[preset] if key == "persona_instruction" and not value else value
+                assert config[key] == expected, (key, config[key], expected)
+        loaded = client.get("/api/bot/ai/config")
+        assert loaded.status_code == 200, loaded.text
+        assert loaded.json()["config"] == config
+        stale = client.put("/api/bot/ai/config", json=payload)
+        assert stale.status_code == 409, stale.text
+        revision = config["revision"]
+        print(f"persona-api: {preset}, instruction_length={len(instruction)}, PUT/GET preserved fields and applied preset defaults")
+    # Adding this supported field must not turn off strict payload validation.
+    invalid = client.put("/api/bot/ai/config", json={
+        **payload, "expected_revision": revision, "unknown_field": "invalid",
+    })
+    assert invalid.status_code == 422, invalid.text
+    assert client.get("/api/bot/ai/config").json()["config"] == config
+    print("persona-api: revision conflicts and unknown-field rejection preserved")
+
+
 if __name__ == "__main__":
-    main()
+    if "--ai-persona-only" in sys.argv:
+        assert_ai_persona_save()
+    else:
+        main()
+        assert_ai_persona_save()

@@ -41,12 +41,21 @@ def normalise_strategy(value) -> str:
 def normalise_settings(value) -> dict:
     """Return a bounded account-scoped automation settings document."""
     if value is None:
-        return {"version": 1, "strategy": "standard", "enabled": True}
+        return {"version": 1, "strategy": "standard", "enabled": True,
+                "rules_enabled": True, "ai_enabled": True}
     if not isinstance(value, dict):
         raise AutomationValidationError("自动策略格式无效")
     enabled = value.get("enabled", True)
     if not isinstance(enabled, bool):
         raise AutomationValidationError("自动化开关格式无效")
+    # Per-engine switches control the rule engine and the AI engine
+    # independently; legacy documents that only have ``enabled`` inherit it.
+    rules_enabled = value.get("rules_enabled", enabled)
+    ai_enabled = value.get("ai_enabled", enabled)
+    if not isinstance(rules_enabled, bool):
+        raise AutomationValidationError("规则客服开关格式无效")
+    if not isinstance(ai_enabled, bool):
+        raise AutomationValidationError("智能客服开关格式无效")
 
     def _optional_text(key: str, limit: int) -> str:
         raw = value.get(key)
@@ -82,6 +91,8 @@ def normalise_settings(value) -> dict:
         "version": 1,
         "strategy": normalise_strategy(value.get("strategy", "standard")),
         "enabled": enabled,
+        "rules_enabled": rules_enabled,
+        "ai_enabled": ai_enabled,
         "first_reply": _optional_text("first_reply", 1000),
         "fallback_reply": _optional_text("fallback_reply", 1000),
         "delay_min_seconds": _bounded_int("delay_min_seconds", 0, 0, 60),

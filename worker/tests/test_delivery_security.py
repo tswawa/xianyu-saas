@@ -61,6 +61,9 @@ class FakeApi:
         self.detail_error = None
         self.consign_calls = 0
         self.consign_error = None
+        self.sold_calls = 0
+        self.sold_error = None
+        self.sold_items = []
 
     def update_cookies(self, cookies):
         self.session.cookies.update(cookies)
@@ -81,6 +84,16 @@ class FakeApi:
         if self.consign_error is not None:
             raise self.consign_error
         return {"ret": ["SUCCESS::调用成功"]}
+
+    def get_sold_orders(self, page_number=1, rows_per_page=20, query_code="NOT_SHIP", order_ids=""):
+        self.sold_calls += 1
+        if self.sold_error is not None:
+            raise self.sold_error
+        return {
+            "items": list(self.sold_items),
+            "next_page": False,
+            "total_count": len(self.sold_items),
+        }
 
     def get_item_info(self, item_id):
         self.item_calls += 1
@@ -743,9 +756,11 @@ class AgentTestCase(unittest.IsolatedAsyncioTestCase):
                 (event.key,),
             ).fetchone()
         self.assertEqual(row, ("ignored", "expired_message", "{}"))
-        self.assertEqual(
-            self.agent.context_manager.get_context_by_chat("chat-stale"), []
-        )
+        # 过期买家消息现在只入库供人工查看，不自动回复（事件仍记为 ignored）。
+        stored = self.agent.context_manager.get_context_by_chat("chat-stale")
+        self.assertEqual(len(stored), 1)
+        self.assertEqual(stored[0]["role"], "user")
+        self.assertEqual(stored[0]["content"], "hello")
 
     async def test_distinct_persisted_events_without_platform_id_do_not_collide(self):
         first = chat_message(
@@ -937,6 +952,71 @@ class AgentTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             self.agent.delivery_store.get_order(order_key).status, "delivered"
         )
+
+    async def test_cancelled_scanned_delivery_retries_same_reservation_and_message(self):
+        self.bind()
+        pending_order = {
+            "order_id": ORDER_ID,
+            "item_id": API_ITEM_ID,
+            "buyer_id": BUYER_ID,
+            "quantity": 1,
+            "paid_amount": self.api.paid_amount,
+            "in_refund": False,
+        }
+        order_key = self.agent._canonical_order_key(ORDER_ID)
+        send_started = asyncio.Event()
+
+        async def wait_for_disconnect(*_args, **kwargs):
+            await kwargs["before_attempt"]()
+            send_started.set()
+            await asyncio.Event().wait()
+
+        self.agent.send_text_reliably = AsyncMock(side_effect=wait_for_disconnect)
+        scan = asyncio.create_task(self.agent._reconcile_pending_order(pending_order))
+        try:
+            await asyncio.wait_for(send_started.wait(), timeout=2)
+            first = self.agent.delivery_store.get_order(order_key)
+            self.assertEqual(first.status, "sending")
+            self.assertEqual(len(first.resources), 1)
+            first_send = self.agent.send_text_reliably.await_args
+            scan.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await scan
+        finally:
+            if not scan.done():
+                scan.cancel()
+            await asyncio.gather(scan, return_exceptions=True)
+
+        interrupted = self.agent.delivery_store.get_order(order_key)
+        self.assertEqual(interrupted.status, "retry")
+        self.assertEqual(interrupted.reason, "worker_cancelled")
+        self.assertEqual(interrupted.resources, first.resources)
+        self.assertEqual(
+            [order.key for order in self.agent.delivery_store.retryable_orders()],
+            [order_key],
+        )
+        counts = self.agent.delivery_store.inventory_counts()["redeem"]
+        self.assertEqual((counts["available"], counts["reserved"]), (2, 1))
+
+        async def acknowledge_send(*_args, **kwargs):
+            await kwargs["before_attempt"]()
+
+        self.agent.send_text_reliably = AsyncMock(side_effect=acknowledge_send)
+        await self.agent._reconcile_pending_order(pending_order)
+        self.agent.send_text_reliably.assert_awaited_once()
+        second_send = self.agent.send_text_reliably.await_args
+        self.assertEqual(second_send.args, first_send.args)
+        self.assertEqual(second_send.kwargs["message_key"], first_send.kwargs["message_key"])
+        self.assertEqual(second_send.kwargs["message_key"], f"order:{order_key}")
+        delivered = self.agent.delivery_store.get_order(order_key)
+        self.assertEqual(delivered.status, "delivered")
+        self.assertEqual(delivered.resources, first.resources)
+        counts = self.agent.delivery_store.inventory_counts()["redeem"]
+        self.assertEqual((counts["available"], counts["delivered"]), (2, 1))
+        self.assertEqual(self.api.consign_calls, 1)
+        await self.agent._reconcile_pending_order(pending_order)
+        self.agent.send_text_reliably.assert_awaited_once()
+        self.assertEqual(self.api.consign_calls, 1)
 
     async def test_verified_order_auto_delivers_even_in_manual_mode(self):
         self.bind()

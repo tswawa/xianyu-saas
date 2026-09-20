@@ -75,6 +75,8 @@ def load_automation_settings(path=None):
         "version": 1,
         "strategy": "standard",
         "enabled": True,
+        "rules_enabled": True,
+        "ai_enabled": True,
         "first_reply": "",
         "fallback_reply": "",
         "delay_min_seconds": 0,
@@ -101,6 +103,11 @@ def load_automation_settings(path=None):
     enabled = payload.get("enabled", True)
     if not isinstance(enabled, bool):
         raise RuntimeError("自动化开关无效")
+    for key in ("rules_enabled", "ai_enabled"):
+        value = payload.get(key, enabled)
+        if not isinstance(value, bool):
+            raise RuntimeError(f"自动化设置 {key} 无效")
+        defaults[key] = value
 
     control_re = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
     for key in ("first_reply", "fallback_reply"):
@@ -260,6 +267,36 @@ def _ai_product_facts(item_id, item_info):
         "status": _ai_fact_text(item_info.get("status") or item_info.get("itemStatus"), 80),
         "skus": clean_skus,
     }
+
+
+REPLY_BUBBLE_MAX_CHARS = 90
+REPLY_BUBBLE_MAX_COUNT = 3
+REPLY_BUBBLE_DELAY_SECONDS = 0.8
+
+
+def _split_reply_bubbles(text, max_chars=None, max_count=None):
+    """把较长的 AI 回复拆成几条更像真人的短消息，不改变原意。"""
+    text = str(text or "").strip()
+    if not text:
+        return []
+    max_chars = max_chars or REPLY_BUBBLE_MAX_CHARS
+    max_count = max_count or REPLY_BUBBLE_MAX_COUNT
+    if len(text) <= max_chars or "http" in text.lower():
+        return [text]
+    parts = [part.strip() for part in re.split(r"(?<=[。！？!?；;\n])", text) if part.strip()]
+    bubbles = []
+    current = ""
+    for part in parts:
+        if current and len(current) + len(part) > max_chars:
+            bubbles.append(current)
+            current = part
+        else:
+            current += part
+    if current:
+        bubbles.append(current)
+    if len(bubbles) > max_count:
+        bubbles = bubbles[: max_count - 1] + ["".join(bubbles[max_count - 1 :])]
+    return [bubble for bubble in bubbles if bubble]
 
 
 def _normalized_ai_reply(value):
@@ -460,7 +497,7 @@ def read_number_env(name, default, minimum, maximum, *, integer=False):
 
 
 from utils.xianyu_utils import generate_mid, generate_uuid, trans_cookies, generate_device_id, decrypt
-from XianyuAgent import XianyuReplyBot
+from XianyuAgent import LLMConfigurationError, LLMServiceError, XianyuReplyBot
 from context_manager import ChatContextManager, normalize_manual_reply_media, normalize_media
 from delivery_store import DeliveryStore, DeliveryStoreError
 
@@ -666,10 +703,27 @@ class XianyuLive:
         self.item_cache_ttl = read_number_env(
             "ITEM_CACHE_TTL", 300, 30, 3600
         )
+        # Avoid hammering the platform for the same item after a soft failure.
+        self.item_info_failure_ttl = read_number_env(
+            "ITEM_INFO_FAILURE_TTL", 900, 60, 3600
+        )
+        self._item_info_failure_until = {}
         self.delivery_retry_interval = read_number_env(
             "DELIVERY_RETRY_INTERVAL", 600, 60, 86_400, integer=True
         )
         self.last_delivery_retry_at = 0.0
+        # 对平台保持低频：默认 5 分钟一次、仅 1 页，避免因高频拉单触发风控。
+        self.pending_order_scan_interval = read_number_env(
+            "PENDING_ORDER_SCAN_INTERVAL", 300, 60, 3600
+        )
+        self.pending_order_scan_pages = read_number_env(
+            "PENDING_ORDER_SCAN_PAGES", 1, 1, 20, integer=True
+        )
+        self.pending_order_scan_rows = read_number_env(
+            "PENDING_ORDER_SCAN_ROWS", 30, 1, 50, integer=True
+        )
+        self.pending_order_scan_task = None
+        self._pending_order_scan_running = False
         self.manual_review_alert_interval = read_number_env(
             "MANUAL_REVIEW_ALERT_INTERVAL", 300, 60, 86_400
         )
@@ -695,6 +749,11 @@ class XianyuLive:
         self.connection_ready = asyncio.Event()
         self.pending_send_acks = {}
         self.heartbeat_mids = set()
+        # 无历史会话补发：按请求 mid 关联 SingleChatConversation/create 响应。
+        self.pending_conversation_requests = {}
+        self.conversation_create_timeout = read_number_env(
+            "CONVERSATION_CREATE_TIMEOUT", 8, 1, 60
+        )
 
         # Token刷新相关配置。托管环境注入的错峰值必须严格位于计划边界内。
         self.token_refresh_interval = read_number_env(
@@ -746,17 +805,23 @@ class XianyuLive:
         ):
             raise RuntimeError("TOGGLE_KEYWORDS 必须包含 1 到 10 个短关键词")
 
-        # 模拟人工输入配置
-        human_typing_value = os.getenv("SIMULATE_HUMAN_TYPING", "False").strip().lower()
-        if human_typing_value not in {"true", "false"}:
-            raise RuntimeError("SIMULATE_HUMAN_TYPING 必须是 True 或 False")
-        self.simulate_human_typing = human_typing_value == "true"
-        self.max_reply_delay = read_number_env("MAX_REPLY_DELAY", 25, 1, 60)
         self.llm_timeout = read_number_env("LLM_TIMEOUT", 50, 5, 180)
+        self.llm_retry_attempts = read_number_env(
+            "LLM_RETRY_ATTEMPTS", 3, 1, 6, integer=True
+        )
+        self.llm_retry_delay = read_number_env("LLM_RETRY_DELAY", 0.8, 0, 30)
         self.ai_readiness_lock_timeout = 5.0
         self.ai_readiness_timeout = 8.0
         self.llm_lock = asyncio.Lock()
         self.llm_tasks = set()
+        # 全局限速：任意两条对外消息之间至少间隔这么久（含随机抖动），
+        # 避免多买家同时咨询时瞬间连发触发风控。
+        self.outbound_min_interval = read_number_env(
+            "OUTBOUND_MIN_INTERVAL", 0.0, 0.0, 120.0
+        )
+        self.outbound_jitter = read_number_env("OUTBOUND_JITTER", 0.0, 0.0, 60.0)
+        self.outbound_send_lock = asyncio.Lock()
+        self._next_outbound_at = 0.0
         self.message_semaphore = asyncio.Semaphore(
             read_number_env("MESSAGE_WORKERS", 6, 1, 32, integer=True)
         )
@@ -1089,6 +1154,8 @@ class XianyuLive:
         if signature is None:
             settings = load_automation_settings("")
             settings["enabled"] = False
+            settings["rules_enabled"] = False
+            settings["ai_enabled"] = False
             self.automation_settings_available = False
             logger.error("自动化设置文件缺失，已暂停自动回复")
         else:
@@ -1098,6 +1165,8 @@ class XianyuLive:
             except RuntimeError as exc:
                 settings = load_automation_settings("")
                 settings["enabled"] = False
+                settings["rules_enabled"] = False
+                settings["ai_enabled"] = False
                 self.automation_settings_available = False
                 logger.error("自动化设置无效，已暂停自动回复 error={}", type(exc).__name__)
         self.automation_settings = settings
@@ -1788,6 +1857,216 @@ class XianyuLive:
                     type(exc).__name__,
                 )
 
+    @staticmethod
+    def _parse_sold_order(item):
+        """Extract verified facts from one merchant.sold.get order item."""
+        if not isinstance(item, dict):
+            raise RuntimeError("sold_order_invalid")
+        common = item.get("commonData")
+        buyer = item.get("buyerInfoVO")
+        price = item.get("priceVO")
+        if not isinstance(common, dict) or not isinstance(buyer, dict):
+            raise RuntimeError("sold_order_invalid")
+        if not isinstance(price, dict):
+            price = {}
+        order_id = str(common.get("orderId") or "")
+        item_id = str(common.get("itemId") or "")
+        buyer_id = str(buyer.get("buyerId") or "")
+        if not order_id.isdigit() or not item_id.isdigit() or not buyer_id.isdigit():
+            raise RuntimeError("sold_order_invalid")
+        buy_num = price.get("buyNum", 1)
+        if buy_num is None or buy_num == "":
+            buy_num = 1
+        if type(buy_num) is not int or not 1 <= buy_num <= 50:
+            raise RuntimeError("sold_order_invalid")
+        return {
+            "order_id": order_id,
+            "item_id": item_id,
+            "buyer_id": buyer_id,
+            "quantity": buy_num,
+            "paid_amount": str(price.get("totalPrice") or ""),
+            "in_refund": bool(common.get("inRefund")),
+        }
+
+    async def _reconcile_pending_order(self, order):
+        """Fulfil one discovered pending-shipment order, or record why not.
+
+        Reuses the canonical order key, the verified-payment store, inventory
+        reservations, per-order locking and the reverify-before-send path. It
+        never sends into a conversation it cannot resolve from verified facts.
+        """
+        item_config = self.classify_item(order["item_id"])
+        if item_config is None:
+            return
+        if order["in_refund"]:
+            return
+        order_key = self._canonical_order_key(order["order_id"])
+        existing = self.delivery_store.get_order(order_key)
+        if existing is not None and existing.status in {
+            "delivered",
+            "manual_review",
+            "cancelled",
+            "expired",
+        }:
+            return
+        chat_id = self.delivery_store.find_chat_binding(order["buyer_id"], order["item_id"])
+        # 无可信绑定时，稍后（订单身份核验通过后）用真实平台会话 ID 补一次，
+        # 不再用 buyer_id 猜测会话。
+        needs_conversation = not chat_id
+        try:
+            detail_response = await self._call_xianyu_api(
+                self.xianyu.get_order_detail, order["order_id"], fatal_auth=False
+            )
+            detail = self._parse_order_detail(detail_response)
+        except AuthenticationUnavailableError:
+            # Protected auth failures carry worker-wide meaning; let the scan
+            # loop stop instead of masking them as one order's local error.
+            raise
+        except (XianyuApiError, OSError, RuntimeError) as exc:
+            logger.warning(
+                "待发货订单详情读取或解析失败 order_id={} error={}",
+                order["order_id"],
+                type(exc).__name__,
+            )
+            return
+        if (
+            detail["order_id"] != order["order_id"]
+            or detail["item_id"] != order["item_id"]
+            or detail["buyer_id"] != order["buyer_id"]
+            or detail["status"] != 2
+            or not detail["seller"]
+        ):
+            logger.warning("待发货订单身份或状态核验不通过，跳过 order_id={}", order["order_id"])
+            return
+        if needs_conversation:
+            resolved_chat_id = await self._create_order_conversation(
+                order["buyer_id"], order["item_id"]
+            )
+            if not resolved_chat_id:
+                logger.warning(
+                    "待发货订单无历史会话且会话创建未成功，保留待下次扫描 order_id={}",
+                    order["order_id"],
+                )
+                return
+            chat_id = resolved_chat_id
+            if not self.delivery_store.record_chat_binding(
+                chat_id, order["buyer_id"], order["item_id"], observed_at=time.time()
+            ):
+                logger.warning("待发货订单会话绑定冲突 chat={}", stable_ref(chat_id))
+        try:
+            self.delivery_store.record_verified_payment_event(
+                order_key,
+                chat_id,
+                time.time(),
+                self.payment_notice_retention,
+                platform_order_id=order["order_id"],
+                platform_status="2",
+                paid_amount=detail["paid_amount"] or order["paid_amount"],
+                quantity=detail["quantity"],
+            )
+        except DeliveryStoreError as exc:
+            logger.warning("待发货订单付款记录写入跳过 order_id={} error={}", order["order_id"], exc)
+            return
+        await self._fulfill_order(
+            order_key,
+            item_config,
+            buyer_id=order["buyer_id"],
+            item_id=order["item_id"],
+        )
+
+    async def scan_pending_orders(self):
+        """One bounded single-flight sweep of seller orders awaiting shipment."""
+        if self._pending_order_scan_running:
+            return
+        # No enabled mapped delivery product authorizes nothing, and an open
+        # auth circuit would only fail every request. Skip without touching the
+        # platform instead of letting a stale listing drive delivery.
+        if self.authentication_failure_code or self.token_circuit_open:
+            return
+        self._pending_order_scan_running = True
+        try:
+            self._refresh_runtime_config()
+            if not self.products:
+                return
+            pages = int(self.pending_order_scan_pages)
+            rows = int(self.pending_order_scan_rows)
+            seen_order_ids = set()
+            complete = False
+            for page in range(1, pages + 1):
+                batch = await self._call_xianyu_api(
+                    self.xianyu.get_sold_orders, page, rows, "NOT_SHIP", fatal_auth=False
+                )
+                if not isinstance(batch, dict):
+                    break
+                for raw in batch.get("items") or []:
+                    try:
+                        order = self._parse_sold_order(raw)
+                    except RuntimeError:
+                        continue
+                    if order["order_id"] in seen_order_ids:
+                        continue
+                    seen_order_ids.add(order["order_id"])
+                    await self._reconcile_pending_order(order)
+                if not batch.get("next_page"):
+                    complete = True
+                    break
+            if not complete:
+                logger.warning(
+                    "待发货订单扫描达到分页上限 pages={}，本轮可能未覆盖全部订单",
+                    pages,
+                )
+        finally:
+            self._pending_order_scan_running = False
+
+    async def _pending_order_scan_loop(self):
+        consecutive_failures = 0
+        while True:
+            try:
+                await self.scan_pending_orders()
+            except asyncio.CancelledError:
+                raise
+            except AuthenticationUnavailableError as exc:
+                # The platform closed authentication; the connection loop owns
+                # the stop/reconnect decision, so end this scanner quietly.
+                logger.warning("认证不可用，暂停待发货订单扫描 code={}", exc.code)
+                return
+            except (XianyuApiError, DeliveryStoreError, OSError, sqlite3.Error, RuntimeError) as exc:
+                consecutive_failures += 1
+                risk_code = (
+                    getattr(exc, "code", "") if isinstance(exc, XianyuApiError) else ""
+                )
+                if risk_code in {
+                    "risk_control",
+                    "verification_required",
+                    "account_restricted",
+                    "session_expired",
+                }:
+                    # 风控/鉴权问题绝不紧着重试，长时间退避，避免加重封禁。
+                    retry_delay = 1800.0
+                    logger.warning(
+                        "待发货订单扫描遇到风控/鉴权，长时间退避 code={} delay={:.0f}",
+                        risk_code,
+                        retry_delay,
+                    )
+                else:
+                    retry_delay = min(
+                        max(float(self.pending_order_scan_interval), 1.0)
+                        * (2 ** min(consecutive_failures - 1, 4)),
+                        1800.0,
+                    )
+                    logger.warning(
+                        "待发货订单扫描临时失败，将继续重试 error={} delay={:.1f}",
+                        type(exc).__name__,
+                        retry_delay,
+                    )
+                await asyncio.sleep(retry_delay)
+                continue
+            consecutive_failures = 0
+            await asyncio.sleep(
+                max(float(self.pending_order_scan_interval), 5.0)
+                + random.uniform(0.0, 5.0)
+            )
+
     async def _reverify_order(self, reservation):
         response = await self._call_xianyu_api(
             self.xianyu.get_order_detail, reservation.platform_order_id
@@ -1835,7 +2114,7 @@ class XianyuLive:
             return f"付款已经核验，这是你购买的资源：\n{reservation.payload}"
         raise RuntimeError("delivery payload is unavailable")
 
-    async def _fulfill_order(self, order_key, item_config):
+    async def _fulfill_order(self, order_key, item_config, *, buyer_id=None, item_id=None):
         async with self._keyed_lock(
             self.order_locks, self.order_lock_users, order_key
         ):
@@ -1848,12 +2127,17 @@ class XianyuLive:
             self._refresh_redeem_inventory()
             binding = None
             if not current.buyer_id or not current.item_id:
-                binding = self.delivery_store.get_chat_binding(current.chat_id)
-                if binding is None:
-                    self.delivery_store.mark_order_manual_review(
-                        order_key, "chat_binding_unavailable"
-                    )
-                    return "manual_review"
+                if buyer_id and item_id:
+                    # Order-scanned fulfillment carries buyer/item facts from
+                    # the platform order listing and detail verification.
+                    binding = {"buyer_id": str(buyer_id), "item_id": str(item_id)}
+                else:
+                    binding = self.delivery_store.get_chat_binding(current.chat_id)
+                    if binding is None:
+                        self.delivery_store.mark_order_manual_review(
+                            order_key, "chat_binding_unavailable"
+                        )
+                        return "manual_review"
             if self.classify_item(current.item_id or binding["item_id"]) != item_config:
                 self.delivery_store.mark_order_manual_review(order_key, "unsupported_item")
                 return "manual_review"
@@ -1964,6 +2248,11 @@ class XianyuLive:
                     order_key, "manual_takeover_before_send"
                 )
                 return "manual_review"
+            except asyncio.CancelledError:
+                # Reconnect cancels the pending-order scanner while it may own
+                # a send. Keep its reservation retryable with the same UUID.
+                self.delivery_store.mark_order_retry(order_key, "worker_cancelled")
+                raise
             except Exception as exc:
                 self.delivery_store.mark_order_retry(order_key, type(exc).__name__)
                 raise
@@ -1993,30 +2282,29 @@ class XianyuLive:
 
 
     async def human_reply_delay(self, user_msg, bot_reply, chat_id):
-        """Return the account-configured base delay plus bounded random jitter."""
-        settings = getattr(self, "automation_settings", {})
+        """Return the account-configured base delay plus bounded random jitter.
+
+        This is a single account-level automation setting shared by the rule
+        engine and the AI engine. It has no environment-variable fallback, so
+        the observable pacing always matches the saved control document
+        (defaults to zero when nothing is configured).
+        """
+        settings = getattr(self, "automation_settings", {}) or {}
         base_delay = int(settings.get("delay_min_seconds") or 0)
         random_delay = int(settings.get("delay_max_seconds") or 0)
-        if self._automation_settings_signature is not None:
-            return min(float(base_delay) + random.uniform(0, float(random_delay)), 120.0)
-        if not self.simulate_human_typing:
-            return 0.0
-        maximum = self.max_reply_delay
-        hour = time.localtime().tm_hour
-        night = hour >= 23 or hour < 8
-        if night:
-            return min(random.uniform(10, 25), maximum)
-        think = random.uniform(2, 5) + min(len(user_msg) / 20, 4)
-        typing = min(len(bot_reply) * random.uniform(0.04, 0.1), 8)
-        return min(max(think + typing, 2.0), maximum)
+        return min(float(base_delay) + random.uniform(0, float(random_delay)), 120.0)
 
-    async def _call_xianyu_api(self, operation, *args):
+    async def _call_xianyu_api(self, operation, *args, fatal_auth=True):
         try:
             return await asyncio.to_thread(operation, *args)
         except XianyuAuthenticationError as exc:
             if exc.code in XianyuAuthenticationError.ALLOWED_CODES:
-                await self._stop_for_auth_failure(exc.code)
-                raise AuthenticationUnavailableError(exc.code) from None
+                if fatal_auth:
+                    await self._stop_for_auth_failure(exc.code)
+                    raise AuthenticationUnavailableError(exc.code) from None
+                # A soft, best-effort request (e.g. product facts) must not open
+                # the account auth circuit and stop the whole worker.
+                raise XianyuApiError(exc.code) from None
             raise
 
     def _token_failure_delay(self):
@@ -2335,6 +2623,33 @@ class XianyuLive:
             self.pending_send_acks.pop(message_mid, None)
         return sent_media
 
+    async def _send_with_pacing(self, operation):
+        """Run one real send attempt while holding the outbound slot.
+
+        The connection wait, the pre-send verification and the actual platform
+        send all execute under one slot, so a reconnect storm, a slow
+        verification or a retry cannot release several sends at once.  The next
+        slot is scheduled from the completion time (send -> wait -> next); the
+        slot is released on success, failure and cancellation alike, and the
+        schedule still advances so a retry waits the configured interval.
+        """
+        interval = float(getattr(self, "outbound_min_interval", 0.0) or 0.0)
+        jitter = float(getattr(self, "outbound_jitter", 0.0) or 0.0)
+        lock = getattr(self, "outbound_send_lock", None)
+        if lock is None or (interval <= 0.0 and jitter <= 0.0):
+            return await operation()
+        async with lock:
+            next_at = getattr(self, "_next_outbound_at", 0.0)
+            now = time.monotonic()
+            if next_at > now:
+                await asyncio.sleep(next_at - now)
+            try:
+                return await operation()
+            finally:
+                self._next_outbound_at = (
+                    time.monotonic() + interval + random.uniform(0.0, jitter)
+                )
+
     async def send_text_reliably(
         self, cid, toid, text, message_key=None, before_attempt=None,
         allow_manual=False, media=None,
@@ -2352,13 +2667,17 @@ class XianyuLive:
         for attempt in range(2):
             if not allow_manual and self.is_manual_mode(cid):
                 raise ManualTakeoverError("chat entered manual mode")
-            try:
+            attempt_ws = None
+
+            async def attempt_send():
+                nonlocal attempt_ws
                 await asyncio.wait_for(self.connection_ready.wait(), timeout=45)
                 if not allow_manual and self.is_manual_mode(cid):
                     raise ManualTakeoverError("chat entered manual mode")
                 ws = self.ws
                 if ws is None:
                     raise ConnectionError("websocket is unavailable")
+                attempt_ws = ws
                 # Reverify only after the connection is usable, immediately
                 # before the send, so a reconnect wait cannot stale the proof.
                 if before_attempt is not None:
@@ -2367,21 +2686,134 @@ class XianyuLive:
                 if media:
                     send_kwargs["media"] = media
                 return await self.send_msg(ws, cid, toid, text, **send_kwargs)
+
+            try:
+                return await self._send_with_pacing(attempt_send)
             except Exception as exc:
                 last_error = exc
                 if isinstance(exc, (ManualTakeoverError, AutomationReplySuppressed)):
                     raise
+                # Only tear down the exact connection this attempt used. If the
+                # connection was already replaced, clearing it or closing the
+                # newer socket would loop reconnects, so leave it untouched.
                 current_ws = self.ws
-                self.connection_ready.clear()
-                if current_ws is not None:
-                    try:
-                        await asyncio.wait_for(current_ws.close(), timeout=5)
-                    except Exception:
-                        pass
+                if current_ws is None or current_ws is attempt_ws:
+                    self.connection_ready.clear()
+                    if current_ws is not None:
+                        try:
+                            await asyncio.wait_for(current_ws.close(), timeout=5)
+                        except Exception:
+                            pass
                 if attempt == 0:
                     logger.warning("消息发送失败，等待连接恢复后重试 error={}", type(exc).__name__)
                     await asyncio.sleep(0)
         raise last_error or ConnectionError("message delivery failed")
+
+    @staticmethod
+    def _conversation_response_cid(message_data):
+        """Extract ``body.singleChatConversation.cid`` from a create response."""
+        body = message_data.get("body") if isinstance(message_data, dict) else None
+        if not isinstance(body, dict):
+            return None
+        conversation = body.get("singleChatConversation")
+        if not isinstance(conversation, dict):
+            return None
+        cid = conversation.get("cid")
+        if not isinstance(cid, str) or not cid.strip():
+            return None
+        return cid.strip()
+
+    def _resolve_conversation_response(self, message_data):
+        """Complete a pending conversation future by matching the response mid.
+
+        Runs inline in the receive loop (no second recv, no blocking) and never
+        stores the protocol response as a buyer message.
+        """
+        if not isinstance(message_data, dict):
+            return False
+        headers = message_data.get("headers")
+        if not isinstance(headers, dict):
+            return False
+        mid = headers.get("mid")
+        if not isinstance(mid, str):
+            return False
+        future = self.pending_conversation_requests.get(mid)
+        if future is None or future.done():
+            return False
+        code = message_data.get("code")
+        if code is not None and code != 200:
+            future.set_exception(PlatformMessageRejected("conversation create rejected"))
+            return True
+        cid = self._conversation_response_cid(message_data)
+        if not cid:
+            future.set_exception(RuntimeError("conversation cid missing"))
+            return True
+        future.set_result(cid)
+        return True
+
+    def _fail_pending_conversation_requests(self, reason: str):
+        code = reason or "conversation_unavailable"
+        for future in tuple(self.pending_conversation_requests.values()):
+            if not future.done():
+                future.set_exception(ConnectionError(code))
+
+    async def _create_order_conversation(self, buyer_id, item_id):
+        """Resolve the real 1:1 conversation id for a verified order.
+
+        Uses one bounded ``SingleChatConversation/create`` request on the shared
+        websocket, correlating the response by request mid. Returns the bare cid
+        or ``None``; on any failure the caller stays recoverable through the next
+        low-frequency scan (no content sent, no shipment marked, no permanent
+        terminal state). Never blocks the receive loop and never retries here.
+        """
+        ws = self.ws
+        if ws is None or not self.connection_ready.is_set():
+            logger.warning("待发货订单缺少会话但当前未连接，跳过会话创建")
+            return None
+        future = asyncio.get_running_loop().create_future()
+        mid = generate_mid()
+        self.pending_conversation_requests[mid] = future
+        msg = {
+            "lwp": "/r/SingleChatConversation/create",
+            "headers": {"mid": mid},
+            "body": [
+                {
+                    "pairFirst": f"{buyer_id}@goofish",
+                    "pairSecond": f"{self.myid}@goofish",
+                    "bizType": "1",
+                    "extension": {"itemId": str(item_id)},
+                    "ctx": {"appVersion": "1.0", "platform": "web"},
+                }
+            ],
+        }
+        async def send_and_wait():
+            await ws.send(json.dumps(msg))
+            return await future
+
+        try:
+            raw_cid = await asyncio.wait_for(
+                send_and_wait(), timeout=self.conversation_create_timeout
+            )
+        except asyncio.TimeoutError:
+            logger.warning("待发货订单会话创建超时，保留待下次扫描")
+            return None
+        except Exception as exc:  # noqa: BLE001 - stay recoverable, no retry here
+            logger.warning("待发货订单会话创建失败 error={}", type(exc).__name__)
+            return None
+        finally:
+            self.pending_conversation_requests.pop(mid, None)
+            if not future.done():
+                future.cancel()
+            elif not future.cancelled():
+                # A disconnect may fail the response while send is still blocked.
+                future.exception()
+        cid = str(raw_cid or "").strip()
+        if cid.endswith("@goofish"):
+            cid = cid[: -len("@goofish")]
+        if not cid or len(cid) > 256:
+            logger.warning("待发货订单会话创建返回无效 cid")
+            return None
+        return cid
 
     @staticmethod
     def _manual_reply_error_code(error):
@@ -2606,6 +3038,10 @@ class XianyuLive:
                     raise ManualReplyLeaseLost("manual reply lease lost")
                 if final_result.get("complete"):
                     self._cleanup_manual_media(media)
+                    try:
+                        self.context_manager.set_conversation_needs_human(chat_id, False)
+                    except Exception:
+                        logger.warning("清除待人工失败 chat={}", stable_ref(chat_id))
                 elif kind == "image":
                     self._cleanup_manual_media([media[int(part["media_index"])]])
             return final_result
@@ -3096,7 +3532,13 @@ class XianyuLive:
         if not getattr(self, "reply_rules_available", True):
             return "reply_rules_invalid"
         settings = getattr(self, "automation_settings", {})
-        if settings.get("enabled") is False:
+        legacy_enabled = settings.get("enabled", True)
+        if (
+            settings.get("rules_enabled", legacy_enabled) is False
+            and settings.get("ai_enabled", legacy_enabled) is False
+        ):
+            # Only both engines disabled suppresses globally; a single engine
+            # being enabled must not be blocked by the legacy master switch.
             return "automation_disabled"
         if not within_business_hours(settings):
             return "business_hours"
@@ -3217,6 +3659,67 @@ class XianyuLive:
             return 0
         return int(number) if number.is_integer() else round(number, 2)
 
+    def _remember_item_info_failure(self, item_id):
+        now = time.time()
+        self._item_info_failure_until[item_id] = now + self.item_info_failure_ttl
+        if len(self._item_info_failure_until) > 500:
+            for key in [
+                key
+                for key, until in self._item_info_failure_until.items()
+                if until <= now
+            ][:200]:
+                self._item_info_failure_until.pop(key, None)
+
+    async def _customer_conversation_scope(self, chat_id, item_id):
+        """Authorize customer service from account-owned listings or platform role."""
+        if not item_id:
+            return "unknown"
+        account_ref = hashlib.sha256(str(self.myid).encode("utf-8")).hexdigest()[:16]
+        now = time.time()
+        scope = "unknown"
+        try:
+            snapshot = load_private_json_file(
+                os.path.join(self.state_dir, "shop_snapshot.json"), dict,
+                maximum_bytes=5 * 1024 * 1024,
+            )
+        except RuntimeError:
+            snapshot = {}
+        products = snapshot.get("products")
+        if (
+            snapshot.get("version") == 1
+            and snapshot.get("account_ref") == account_ref
+            and isinstance(products, list)
+            and any(isinstance(product, dict) and str(product.get("id") or "") == item_id
+                    for product in products)
+        ):
+            scope = "owned"
+        else:
+            cached = self.context_manager.get_customer_conversation_scope(
+                chat_id, item_id, account_ref,
+            )
+            if cached:
+                ttl = 30 if cached["scope"] == "unknown" else 300
+                if 0 <= now - cached["checked_at"] < ttl:
+                    return cached["scope"]
+            try:
+                response = await self._call_xianyu_api(
+                    self.xianyu.get_message_head_info, chat_id, item_id, fatal_auth=False,
+                )
+                response = self._json_object(response)
+                data = self._json_object(response.get("data")) if response else None
+                common = self._json_object(data.get("commonData")) if data else None
+                if common and self._numeric_identifier(common.get("itemId")) == item_id:
+                    # Unlike order verification, pre-sale chats need no orderId.
+                    seller = self._platform_boolean(common.get("seller"))
+                    if seller is not None:
+                        scope = "owned" if seller else "foreign"
+            except Exception as exc:
+                logger.warning("会话身份暂未确认 chat={} error={}", stable_ref(chat_id), type(exc).__name__)
+        self.context_manager.set_customer_conversation_scope(
+            chat_id, item_id, account_ref, scope, checked_at=now,
+        )
+        return scope
+
     async def _get_fresh_item_info(self, item_id):
         cached = self.context_manager.get_item_info(
             item_id, max_age=self.item_cache_ttl
@@ -3231,13 +3734,18 @@ class XianyuLive:
             )
             if isinstance(cached, dict):
                 return cached
+            if self._item_info_failure_until.get(item_id, 0.0) > time.time():
+                # A recent soft failure; do not retry the platform yet.
+                return None
             try:
                 api_result = await self._call_xianyu_api(
-                    self.xianyu.get_item_info, item_id
+                    self.xianyu.get_item_info, item_id, fatal_auth=False
                 )
             except Exception as exc:
-                logger.error(
-                    "商品信息请求失败 item={} error={}",
+                self._remember_item_info_failure(item_id)
+                logger.warning(
+                    "商品信息请求失败（降级为无实时商品信息，{}s 内不再重试） item={} error={}",
+                    int(self.item_info_failure_ttl),
                     stable_ref(item_id),
                     type(exc).__name__,
                 )
@@ -3245,9 +3753,11 @@ class XianyuLive:
             if not isinstance(api_result, dict) or not isinstance(
                 api_result.get("data"), dict
             ):
+                self._remember_item_info_failure(item_id)
                 return None
             item_info = api_result["data"].get("itemDO")
             if not isinstance(item_info, dict):
+                self._remember_item_info_failure(item_id)
                 return None
             self.context_manager.save_item_info(item_id, item_info)
             return item_info
@@ -3759,6 +4269,23 @@ class XianyuLive:
             or len(sender_id) > 256
         ):
             return
+        if (
+            sender_id != self.myid
+            and create_time <= time.time() * 1000 + 60_000
+            and not self.is_system_message(message)
+            and not self.is_bracket_system_message(content)
+        ):
+            try:
+                nickname = details.get("senderNick")
+                if not isinstance(nickname, str) or not nickname.strip():
+                    nickname = details.get("reminderTitle")
+                # Sender names come from the platform envelope, never message text.
+                self.context_manager.set_conversation_peer_name(
+                    chat_id, sender_id, nickname,
+                    observed_at=create_time / 1000,
+                )
+            except Exception as exc:
+                logger.warning("会话昵称保存失败 chat={} error={}", stable_ref(chat_id), type(exc).__name__)
         original_content = content
         source_content = original_content
         if media:
@@ -3788,9 +4315,42 @@ class XianyuLive:
                 item_id,
                 source_nonce=source_nonce,
             )
+        scope = await self._customer_conversation_scope(chat_id, item_id)
+        if scope == "foreign":
+            # Keep the current item context even for shopping conversations.
+            # Later platform messages may omit itemId; they must not fall back
+            # to an older listing that happened to belong to this shop.
+            self.context_manager.add_message_by_chat(
+                chat_id, sender_id, item_id,
+                "assistant" if sender_id == self.myid else "user", content,
+                source_id=source_id, content_type=content_type, media=media,
+            )
+            logger.info("本账号为买方，跳过客服会话 chat={}", stable_ref(chat_id))
+            return
         age_ms = time.time() * 1000 - create_time
         if age_ms > self.message_expire_time or age_ms < -60_000:
-            logger.info("忽略过期消息 chat={}", stable_ref(chat_id))
+            if age_ms > self.message_expire_time and sender_id != self.myid:
+                # 停机/风控期间错过的买家消息：只入库供人工查看，不自动回复。
+                try:
+                    self.context_manager.add_message_by_chat(
+                        chat_id,
+                        sender_id,
+                        item_id,
+                        "user",
+                        content,
+                        source_id=source_id,
+                        content_type=content_type,
+                        media=media,
+                    )
+                    logger.info(
+                        "过期买家消息仅入库不回复 chat={} age_s={}",
+                        stable_ref(chat_id),
+                        int(age_ms / 1000),
+                    )
+                except Exception:
+                    logger.warning("过期消息入库失败 chat={}", stable_ref(chat_id))
+            else:
+                logger.info("忽略过期消息 chat={}", stable_ref(chat_id))
             return "ignored_expired_message"
 
         if sender_id == self.myid:
@@ -3846,7 +4406,7 @@ class XianyuLive:
             logger.info("记录卖家人工回复 chat={} chars={}", stable_ref(chat_id), len(content))
             return
 
-        if item_id and not self.delivery_store.record_chat_binding(
+        if scope == "owned" and item_id and not self.delivery_store.record_chat_binding(
             chat_id, sender_id, item_id, observed_at=create_time / 1000
         ):
             logger.warning("聊天身份绑定发生冲突 chat={}", stable_ref(chat_id))
@@ -3869,6 +4429,13 @@ class XianyuLive:
     ):
         self._refresh_runtime_config()
         assistant_source = f"assistant:{source_id}"
+        scope = await self._customer_conversation_scope(chat_id, item_id)
+        if scope == "foreign":
+            pending = self.context_manager.get_source_message(assistant_source)
+            if pending and pending.get("role") == "assistant_pending":
+                self.context_manager.cancel_assistant_reply(assistant_source)
+                self._delete_assistant_draft_provenance(assistant_source)
+            return
         inserted = self.context_manager.add_message_by_chat(
             chat_id,
             sender_id,
@@ -3900,8 +4467,12 @@ class XianyuLive:
                 len(content),
             )
 
-        if not item_id:
-            logger.info("消息已保存但未关联商品，跳过自动回复 chat={}", stable_ref(chat_id))
+        if scope != "owned":
+            pending = self.context_manager.get_source_message(assistant_source)
+            if pending and pending.get("role") == "assistant_pending":
+                self.context_manager.cancel_assistant_reply(assistant_source)
+                self._delete_assistant_draft_provenance(assistant_source)
+            logger.info("尚未确认本店卖家身份，跳过自动回复 chat={}", stable_ref(chat_id))
             return
 
         draft = self.context_manager.get_source_message(assistant_source)
@@ -3950,6 +4521,19 @@ class XianyuLive:
                 reason,
             )
 
+        def mark_needs_human():
+            """AI 判定转人工时，标记该会话提醒人工处理。"""
+            try:
+                self.context_manager.set_conversation_needs_human(chat_id, True)
+            except Exception:
+                logger.warning("标记待人工失败 chat={}", stable_ref(chat_id))
+
+        def clear_needs_human():
+            try:
+                self.context_manager.set_conversation_needs_human(chat_id, False)
+            except Exception:
+                logger.warning("清除待人工失败 chat={}", stable_ref(chat_id))
+
         def suppress_reply(reason):
             if draft is not None:
                 self.context_manager.cancel_assistant_reply(assistant_source)
@@ -3980,6 +4564,9 @@ class XianyuLive:
             suppress_reply(suppression_reason)
             return
         settings = getattr(self, "automation_settings", {})
+        legacy_enabled = settings.get("enabled", True) is not False
+        rules_enabled = settings.get("rules_enabled", legacy_enabled) is not False
+        ai_enabled = settings.get("ai_enabled", legacy_enabled) is not False
 
         if replaying_draft:
             bot_reply = draft["content"]
@@ -4007,7 +4594,7 @@ class XianyuLive:
                 suppress_reply("automation_revision_invalid")
                 return
 
-        if not replaying_draft and (
+        if not replaying_draft and rules_enabled and (
             rule_reply := self._match_reply_rule(content, item_id, refresh=False)
         ) is not None:
             # Deterministic rules are literal, always precede item lookup and AI,
@@ -4026,6 +4613,9 @@ class XianyuLive:
             first_reply = str(settings.get("first_reply") or "").strip()
             fallback_reply = str(settings.get("fallback_reply") or "").strip()
             if getattr(self, "automation_mode", "rules_ai") == "rules":
+                if not rules_enabled:
+                    record_no_reply("rules_disabled")
+                    return
                 if first_reply and not any(
                     isinstance(message, dict) and message.get("role") == "user"
                     for message in prior_context
@@ -4039,6 +4629,9 @@ class XianyuLive:
                     record_no_reply("no_rule_match")
                     return
             else:
+                if not ai_enabled:
+                    record_no_reply("ai_disabled")
+                    return
                 if self.bot is None:
                     record_no_reply("ai_configuration_invalid")
                     return
@@ -4074,14 +4667,44 @@ class XianyuLive:
                         recent_replies,
                     )
 
+                async def call_ai_with_retry(recent_replies):
+                    """对瞬时故障（服务不可用/超时/限流）做有界重试，配置错误不重试。"""
+                    attempts = self.llm_retry_attempts
+                    for attempt in range(attempts):
+                        try:
+                            return await call_ai(recent_replies)
+                        except asyncio.TimeoutError:
+                            if attempt + 1 >= attempts:
+                                raise
+                            logger.warning(
+                                "LLM 回复超时，重试 chat={} attempt={}",
+                                stable_ref(chat_id),
+                                attempt + 1,
+                            )
+                        except LLMConfigurationError:
+                            raise
+                        except LLMServiceError:
+                            if attempt + 1 >= attempts:
+                                raise
+                            logger.warning(
+                                "LLM 回复失败，重试 chat={} attempt={}",
+                                stable_ref(chat_id),
+                                attempt + 1,
+                            )
+                        except Exception:
+                            raise
+                        await asyncio.sleep(self.llm_retry_delay * (2 ** attempt))
+
                 try:
                     (
                         bot_reply,
                         detected_intent,
                         reason_code,
                         config_revision,
-                    ) = await call_ai(recent_assistant_replies)
+                    ) = await call_ai_with_retry(recent_assistant_replies)
                     if detected_intent != "reply":
+                        if detected_intent == "handoff":
+                            mark_needs_human()
                         record_no_reply(reason_code or f"ai_{detected_intent}")
                         return
                     if _unsafe_ai_reply(bot_reply):
@@ -4107,8 +4730,10 @@ class XianyuLive:
                             detected_intent,
                             reason_code,
                             config_revision,
-                        ) = await call_ai(retry_recent)
+                        ) = await call_ai_with_retry(retry_recent)
                         if detected_intent != "reply":
+                            if detected_intent == "handoff":
+                                mark_needs_human()
                             record_no_reply(reason_code or f"ai_{detected_intent}")
                             return
                         if _unsafe_ai_reply(bot_reply):
@@ -4165,6 +4790,8 @@ class XianyuLive:
             return
 
         async def verify_automatic_reply_before_attempt():
+            if await self._customer_conversation_scope(chat_id, item_id) != "owned":
+                raise AutomationReplySuppressed("not_verified_seller")
             reason = self.automatic_reply_suppression_reason(chat_id)
             if reason:
                 raise AutomationReplySuppressed(reason)
@@ -4188,14 +4815,18 @@ class XianyuLive:
         )
         bot_reply = draft["content"]
 
+        bubbles = _split_reply_bubbles(bot_reply) if reply_from_ai else [bot_reply]
         try:
-            await self.send_text_reliably(
-                chat_id,
-                sender_id,
-                bot_reply,
-                message_key=f"reply:{source_id}",
-                before_attempt=verify_automatic_reply_before_attempt,
-            )
+            for index, bubble in enumerate(bubbles):
+                await self.send_text_reliably(
+                    chat_id,
+                    sender_id,
+                    bubble,
+                    message_key=f"reply:{source_id}" if index == 0 else f"reply:{source_id}:{index}",
+                    before_attempt=verify_automatic_reply_before_attempt,
+                )
+                if index < len(bubbles) - 1:
+                    await asyncio.sleep(REPLY_BUBBLE_DELAY_SECONDS)
         except (ManualTakeoverError, AutomationReplySuppressed) as exc:
             reason = exc.reason if isinstance(exc, AutomationReplySuppressed) else "manual_mode"
             self.context_manager.cancel_assistant_reply(assistant_source)
@@ -4209,6 +4840,7 @@ class XianyuLive:
         self.context_manager.complete_assistant_reply(assistant_source, bot_reply)
         self._delete_assistant_draft_provenance(assistant_source)
         self.delivery_store.mark_automation_reply_sent(chat_id)
+        clear_needs_human()
         logger.info("机器人回复已发送 chat={} chars={}", stable_ref(chat_id), len(bot_reply))
 
     async def send_heartbeat(self, ws):
@@ -4510,6 +5142,9 @@ class XianyuLive:
                     self.inbound_recovery_task = asyncio.create_task(
                         self._inbound_recovery_loop()
                     )
+                    self.pending_order_scan_task = asyncio.create_task(
+                        self._pending_order_scan_loop()
+                    )
                     self.last_delivery_retry_at = time.time()
                     self._schedule_delivery_task(self.retry_pending_deliveries())
 
@@ -4524,6 +5159,10 @@ class XianyuLive:
 
                             # 处理心跳响应
                             if await self.handle_heartbeat_response(message_data):
+                                continue
+
+                            # 会话创建响应：按 mid 完成 Future，不当作买家消息入库。
+                            if self._resolve_conversation_response(message_data):
                                 continue
 
                             if self.is_sync_package(message_data):
@@ -4580,6 +5219,7 @@ class XianyuLive:
                 for future in tuple(self.pending_send_acks.values()):
                     if not future.done():
                         future.set_exception(ConnectionError("websocket disconnected"))
+                self._fail_pending_conversation_requests("websocket disconnected")
                 if self.ws is not None:
                     self.ws = None
                 # 清理任务
@@ -4605,6 +5245,13 @@ class XianyuLive:
                     except asyncio.CancelledError:
                         pass
                     self.inbound_recovery_task = None
+                if self.pending_order_scan_task:
+                    self.pending_order_scan_task.cancel()
+                    try:
+                        await self.pending_order_scan_task
+                    except asyncio.CancelledError:
+                        pass
+                    self.pending_order_scan_task = None
 
                 auth_error_code = (
                     fatal_auth_error.code

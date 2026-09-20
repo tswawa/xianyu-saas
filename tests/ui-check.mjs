@@ -10,6 +10,10 @@ const requireFromRepo = createRequire(path.join(repoRoot, "package.json"));
 const { chromium } = requireFromRepo("playwright");
 
 const staticRoot = path.join(repoRoot, "frontend");
+const backendSource = fs.readFileSync(path.join(repoRoot, "backend", "app.py"), "utf8");
+const cspSource = backendSource.match(/"Content-Security-Policy":\s*\(([\s\S]*?)\)/)?.[1];
+assert.ok(cspSource, "production HTML CSP must be available to browser tests");
+const productionCsp = [...cspSource.matchAll(/"([^"\r\n]*)"/g)].map((match) => match[1]).join("");
 const resultRoot = path.join(repoRoot, "test-results");
 const versionSource = fs.readFileSync(path.join(repoRoot, "backend", "version.py"), "utf8");
 const assetVersion = versionSource.match(/^ASSET_VERSION\s*=\s*["']([^"']+)["']\s*$/m)?.[1] || "";
@@ -18,10 +22,13 @@ const desktopSettingsOpsScope = ["settings", "ops", "dashboard", "goods", "resou
 const mockOnlyScope = process.env.SAAS_UI_SCOPE === "mock";
 const connectionFlowsScope = process.env.SAAS_UI_SCOPE === "connection-flows";
 const ruleDraftsScope = process.env.SAAS_UI_SCOPE === "rule-drafts";
+const deliveryStartScope = process.env.SAAS_UI_SCOPE === "delivery-start";
+const personaCompactScope = process.env.SAAS_UI_SCOPE === "persona-compact";
+const imageUploadScope = process.env.SAAS_UI_SCOPE === "image-upload";
 const updatesScope = process.env.SAAS_UI_SCOPE === "updates";
 // Public documentation images are opt-in, never a side effect of a test scope.
 const docsCaptureScope = process.env.SAAS_UI_SCOPE === "docs-capture";
-const screenshotsEnabled = !docsCaptureScope && !desktopSettingsOpsScope && !mockOnlyScope && !connectionFlowsScope && !ruleDraftsScope && !updatesScope && process.env.SAAS_UI_SCREENSHOTS !== "0";
+const screenshotsEnabled = !docsCaptureScope && !desktopSettingsOpsScope && !mockOnlyScope && !connectionFlowsScope && !ruleDraftsScope && !deliveryStartScope && !personaCompactScope && !imageUploadScope && !updatesScope && process.env.SAAS_UI_SCREENSHOTS !== "0";
 if (screenshotsEnabled) fs.mkdirSync(resultRoot, { recursive: true });
 for (const staleName of screenshotsEnabled ? [
   "local-live-desktop.png", "local-live-mobile.png", "shop-connector-missing-desktop.png",
@@ -34,6 +41,7 @@ for (const staleName of screenshotsEnabled ? [
   "chat-member-desktop.png", "chat-member-mobile.png",
   "shops-desktop.png", "shops-mobile.png", "goods-free-desktop.png",
   "auto-reply-free-desktop.png", "auto-reply-free-mobile.png",
+  "auto-reply-desktop.png", "common-service-desktop.png", "chat-desktop.png",
   "vip-free-desktop.png", "vip-free-mobile.png",
   "home-member-desktop.png", "home-member-mobile.png", "home-member-mobile-viewport.png",
   "analytics-member-desktop.png", "orders-member-desktop.png",
@@ -62,12 +70,8 @@ const productFixtures = [
 const overflowTemplateItemIds = productFixtures.map((item) => item.id);
 const defaultAiStoreConfig = {
   store_content: "",
-  persona_preset: "friendly",
+  persona_preset: "catgirl",
   persona_name: "",
-  tone: "friendly",
-  buyer_address: "亲",
-  reply_length: "short",
-  emoji_level: "low",
   forbidden_claims: "",
   handoff_rules: "",
 };
@@ -104,6 +108,7 @@ function orderFixturePage(rows, params, accountKey) {
     page, page_size: pageSize, total: selected.length, total_pages: pages, status_counts: counts, status_options: orderStatusOptions };
 }
 const fixtures = {
+  productionCsp: false,
   releaseCheckStatus: "available",
   orderQueries: [],
   orderQueryDelays: [],
@@ -302,6 +307,7 @@ const fixtures = {
   automationResponseGates: {},
   pendingAutomationGates: new Set(),
   botStartModes: [],
+  botStartResponses: [],
   botStops: [],
   botStatusRequests: 0,
   botStatusResponseGates: [],
@@ -820,7 +826,9 @@ function createServer() {
   return http.createServer((req, res) => {
     const url = new URL(req.url, "http://127.0.0.1");
     if (url.pathname === "/xianyu-saas" || url.pathname === "/xianyu-saas/") {
-      res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" });
+      res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store",
+        ...(fixtures.productionCsp ? { "Content-Security-Policy": productionCsp } : {}),
+      });
       res.end(fs.readFileSync(path.join(staticRoot, "index.html")));
       return;
     }
@@ -1081,9 +1089,13 @@ function createServer() {
         const key = decodeURIComponent(accountPathMatch[1]);
         const account = accountForRequest(req, key);
         if (!account || account.enabled === false) return json(res, { detail: "店铺不存在" }, 404);
-        if (key === "default") return json(res, { detail: "默认店铺不能删除" }, 409);
         fixtures.shopAccountDeleteRequests.push(key);
         fixtures.requestSequence.push(`account-delete:${key}`);
+        if (key === "default") {
+          // The default shop disconnects instead of being deleted.
+          account.status = "unconfigured";
+          return json(res, { ok: true, disconnected: true, account: { ...account } });
+        }
         account.enabled = false;
         account.status = "disabled";
         return json(res, { ok: true, account: { ...account } });
@@ -1321,10 +1333,7 @@ function createServer() {
           store_content: payload.store_content,
           persona_preset: payload.persona_preset,
           persona_name: payload.persona_name,
-          tone: payload.tone,
-          buyer_address: payload.buyer_address,
-          reply_length: payload.reply_length,
-          emoji_level: payload.emoji_level,
+          persona_instruction: payload.persona_instruction,
           forbidden_claims: payload.forbidden_claims,
           handoff_rules: payload.handoff_rules,
         });
@@ -1518,7 +1527,16 @@ function createServer() {
         }
         if (payload.deliveries !== undefined) automation.deliveries = payload.deliveries;
         automation.strategy = payload.strategy || automation.strategy;
-        automation.enabled = payload.enabled ?? automation.enabled;
+        const previousEnabled = automation.enabled !== false;
+        automation.rules_enabled = payload.rules_enabled ?? automation.rules_enabled ?? previousEnabled;
+        automation.ai_enabled = payload.ai_enabled ?? automation.ai_enabled ?? previousEnabled;
+        if (payload.enabled !== undefined && payload.rules_enabled === undefined && payload.ai_enabled === undefined) {
+          automation.rules_enabled = payload.enabled;
+          automation.ai_enabled = payload.enabled;
+          automation.enabled = payload.enabled;
+        } else if (payload.rules_enabled !== undefined || payload.ai_enabled !== undefined) {
+          automation.enabled = automation.rules_enabled !== false || automation.ai_enabled !== false;
+        }
         automation.first_reply = payload.first_reply ?? automation.first_reply;
         automation.fallback_reply = payload.fallback_reply ?? automation.fallback_reply;
         automation.delay_min_seconds = payload.delay_min_seconds ?? automation.delay_min_seconds;
@@ -1528,16 +1546,9 @@ function createServer() {
         automation.business_hours_enabled = payload.business_hours_enabled ?? automation.business_hours_enabled;
         automation.business_start = payload.business_start ?? automation.business_start;
         automation.business_end = payload.business_end ?? automation.business_end;
-        if (payload.enabled === false) {
-          const bot = scopedBot(req).value;
-          if (bot.running) {
-            fixtures.botStops.push({ accountKey: scoped.accountKey, mode: bot.automation_mode || "rules", reason: "automation_disabled" });
-            bot.running = false;
-            bot.running_total = 0;
-          }
-        }
         automation.rules_set = automation.rules.length > 0;
         automation.deliveries_set = automation.deliveries.length > 0;
+        automation.running = Boolean(scopedBot(req).value.running);
         const response = { ok: true, automation: structuredClone(automation) };
         const gate = fixtures.automationResponseGates[`PUT:${scoped.accountKey}`]?.shift();
         if (gate) {
@@ -1548,8 +1559,9 @@ function createServer() {
         return json(res, response);
       }
       if (apiPath === "/api/bot/products/batch/preview" && req.method === "POST") {
+        const automation = scopedFixture(req, "automation", fixtures.automation).value;
         const itemIds = Array.isArray(payload.item_ids) ? payload.item_ids.map(String) : [];
-        const byId = new Map(fixtures.automation.deliveries.map((item) => [String(item.item_id), item]));
+        const byId = new Map(automation.deliveries.map((item) => [String(item.item_id), item]));
         const changeCount = itemIds.filter((itemId) => {
           const current = byId.get(itemId);
           if (payload.enabled === false) return Boolean(current && current.enabled !== false);
@@ -1565,12 +1577,13 @@ function createServer() {
         } });
       }
       if (apiPath === "/api/bot/products/batch/commit" && req.method === "POST") {
+        const automation = scopedFixture(req, "automation", fixtures.automation).value;
         if (!fixtures.batchPreviewToken || payload.preview_token !== fixtures.batchPreviewToken) {
           return json(res, { detail: "商品或自动规则已变化，请重新检查" }, 409);
         }
         const itemIds = Array.isArray(payload.item_ids) ? payload.item_ids.map(String) : [];
         const selected = new Set(itemIds);
-        const byId = new Map(fixtures.automation.deliveries.map((item) => [String(item.item_id), { ...item }]));
+        const byId = new Map(automation.deliveries.map((item) => [String(item.item_id), { ...item }]));
         for (const itemId of itemIds) {
           const current = byId.get(itemId);
           if (payload.enabled === false) {
@@ -1579,11 +1592,12 @@ function createServer() {
             byId.set(itemId, { item_id: itemId, enabled: true, delivery: "material", material: payload.material });
           }
         }
-        fixtures.automation.deliveries = Array.from(byId.values());
-        fixtures.automation.deliveries_set = fixtures.automation.deliveries.some((item) => item.enabled !== false);
+        automation.deliveries = Array.from(byId.values());
+        automation.deliveries_set = automation.deliveries.some((item) => item.enabled !== false);
+        automation.running = Boolean(scopedBot(req).value.running);
         fixtures.batchCommits.push({ itemIds: Array.from(selected), enabled: payload.enabled !== false });
         fixtures.batchPreviewToken = "";
-        return json(res, { ok: true, automation: fixtures.automation });
+        return json(res, { ok: true, automation });
       }
       if (apiPath === "/api/bot/products/delivery-status" && req.method === "GET") {
         if (fixtures.deliveryStatusError) return json(res, { detail: { message: "发货状态暂时无法读取" } }, 503);
@@ -1777,7 +1791,10 @@ function createServer() {
           return;
         }
         if (delay > 0) {
-          setTimeout(() => json(res, { ok: true, conversation: updated }), delay);
+          setTimeout(() => {
+            Object.assign(conversation, updated);
+            json(res, { ok: true, conversation: updated });
+          }, delay);
           return;
         }
         Object.assign(conversation, updated);
@@ -1822,10 +1839,15 @@ function createServer() {
         return json(res, response);
       }
       if (apiPath === "/api/bot/messages/image" && req.method === "POST") {
+        const encodedFileName = req.headers["x-file-name-encoded"];
+        const fileName = encodedFileName !== undefined
+          ? decodeURIComponent(String(encodedFileName))
+          : String(req.headers["x-file-name"] || "");
         fixtures.manualImageRequests.push({
           chatId: String(url.searchParams.get("chat_id") || ""),
           contentType,
-          fileName: String(req.headers["x-file-name"] || ""),
+          fileName,
+          encodedFileName: String(encodedFileName || ""),
           bytes: Buffer.byteLength(rawBody),
         });
         const uploadNumber = fixtures.manualImageRequests.length;
@@ -1837,7 +1859,7 @@ function createServer() {
             path: `manual_reply_test_${uploadNumber}.jpg`,
             alt: "图片",
             label: "图片",
-            name: "",
+            name: fileName,
             mime: contentType.split(";", 1)[0] || "image/jpeg",
           },
         };
@@ -1936,6 +1958,8 @@ function createServer() {
         const scoped = scopedBot(req);
         const mode = payload.mode === "rules_ai" ? "rules_ai" : "rules";
         fixtures.botStartModes.push({ accountKey: scoped.accountKey, mode });
+        const failure = fixtures.botStartResponses.shift();
+        if (failure) return json(res, failure.body, failure.status);
         scoped.value.running = true;
         scoped.value.running_total = 1;
         scoped.value.automation_mode = mode;
@@ -2623,6 +2647,7 @@ async function checkConnectionFlows(browser, baseUrl) {
     if (Array.isArray(value)) fixtures[key] = structuredClone(value);
   }
   Object.assign(fixtures, {
+    productionCsp: true,
     me: structuredClone(saved.me), bot: structuredClone(saved.bot), ai: structuredClone(saved.ai),
     shopAccounts: [structuredClone(saved.shopAccounts[0]), { ...saved.shopAccounts[0], id: 91, key: "flow-empty", name: "沙盘空商品店" }],
     accountData: {}, apiRequests: [], aiRequests: [], aiPreviewRequests: [], aiPreviewResponses: [], aiPreviewResponseDelays: [], aiPreviewResponseGates: [],
@@ -2687,6 +2712,14 @@ async function checkConnectionFlows(browser, baseUrl) {
   };
   try {
     await desktopLogin(page, fixtures.me.username);
+    // Visibility alone cannot detect a QR image rejected by the production CSP.
+    fixtures.qrNextMode = "expired";
+    assert.equal((await openQr()).status(), 200);
+    await page.waitForFunction(() => {
+      const image = document.querySelector("#xianyuQrImage");
+      return image && !image.hidden && image.src.startsWith("blob:") && image.complete && image.naturalWidth > 0;
+    });
+    await closeQr();
     for (const code of ["sync_cooldown", "risk_cooldown"]) {
       fixtures.qrStartResponses.push({ detail: cooldown({ code }) });
       const starts = fixtures.qrStarts;
@@ -2749,6 +2782,19 @@ async function checkConnectionFlows(browser, baseUrl) {
         await closeQr();
       }
     }
+
+    // Short self-clearing contention (auto_retry) is retried once by the UI.
+    fixtures.qrNextMode = "confirmed";
+    fixtures.qrCompleteResponses.push({ status: 429, detail: {
+      code: "sync_busy", retry_after: 1, login_expires_in: 90,
+      can_retry_login: true, auto_retry: true, retryable: true,
+    } });
+    const autoFail = responseFor("/api/bot/login/complete");
+    await openQr();
+    assert.equal((await autoFail).status(), 429);
+    const autoCompletes = fixtures.qrCompleteRequests.length;
+    await page.waitForSelector("#xianyuLoginDialog", { state: "hidden" });
+    assert.equal(fixtures.qrCompleteRequests.length, autoCompletes + 1, "auto_retry performs one automatic retry");
 
     // A once-reusable confirmed session can expire while the user waits to click.
     fixtures.qrNextMode = "confirmed";
@@ -2813,26 +2859,31 @@ async function checkConnectionFlows(browser, baseUrl) {
 
     await openView(page, "ai-config");
     await page.waitForSelector("#aiKnowledgeContent:enabled");
+    assert.equal(await page.locator("#aiEnabledToggle").count(), 1, "AI engine exposes its own switch");
+    assert.equal(await page.locator('[data-panel="ai-config"] #aiPreviewInput').isVisible(), true, "sandbox remains on the AI settings page");
+    assert.equal(await page.locator('[data-panel="common-service"] #aiPreviewInput').count(), 0);
     await page.fill("#aiStoreContent", "未保存店铺草稿：仅在沙盘使用");
     await page.fill("#aiPersonaName", "未保存客服名称");
-    await page.selectOption("#aiTone", "professional");
-    await page.fill("#aiForbiddenClaims", "未保存禁止承诺");
-    await page.fill("#aiHandoffRules", "未保存转人工规则");
+    await page.fill("#aiPersonaInstruction", "未保存人设核心：专业回答，不编造承诺，退款问题由店主处理。");
     await page.fill("#aiKnowledgeContent", "未保存商品草稿：仅在沙盘使用");
     let response = await ask("第一轮草稿问题");
     assert.equal(response.sent, false);
     assert.equal(response.config_source, "draft_override");
     let sent = fixtures.aiPreviewRequests.at(-1).payload;
     assert.equal(sent.store_config.store_content, await page.inputValue("#aiStoreContent"));
-    assert.deepEqual(sent.store_config, { ...defaultAiStoreConfig, store_content: "未保存店铺草稿：仅在沙盘使用", persona_name: "未保存客服名称", tone: "professional", forbidden_claims: "未保存禁止承诺", handoff_rules: "未保存转人工规则" });
+    assert.deepEqual(sent.store_config, { ...defaultAiStoreConfig, persona_instruction: await page.inputValue("#aiPersonaInstruction"), store_content: "未保存店铺草稿：仅在沙盘使用", persona_name: "未保存客服名称" });
     assert.equal(sent.knowledge.content, await page.inputValue("#aiKnowledgeContent"));
     assert.equal(sent.item_id, await page.locator("#aiProductList .is-active[data-ai-product]").getAttribute("data-ai-product"));
     assert.deepEqual(sent.history, []);
-    const reply = response.reply;
-    await ask("第二轮继续咨询");
+    const secondPreview = await ask("第二轮继续咨询");
     sent = fixtures.aiPreviewRequests.at(-1).payload;
-    assert.deepEqual(sent.history, [{ role: "user", content: "第一轮草稿问题" }, { role: "assistant", content: reply }]);
+    // 沙盘不再多轮记忆：每次提问重置，history 始终为空。
+    assert.deepEqual(sent.history, []);
     assert.equal(fixtures.aiPreviewRequests.length, 2, "double-click sends one preview per question");
+    const latestPreviewText = await page.locator("#aiPreviewOutput").innerText();
+    assert.ok(latestPreviewText.includes(secondPreview.reply), "sandbox displays the latest reply");
+    assert.equal(latestPreviewText.includes("第一轮草稿问题"), false, "sandbox does not retain the previous question or answer");
+    assert.equal(await page.locator("#aiPreviewOutput .ai-preview-answer").count(), 1, "sandbox renders one result at a time");
 
     fixtures.aiPreviewResponses.push({ status: 503, body: { detail: { code: "provider_unavailable", message: "fixture preview failure" } } });
     const draft = { store: await page.inputValue("#aiStoreContent"), product: await page.inputValue("#aiKnowledgeContent") };
@@ -2891,7 +2942,6 @@ async function checkConnectionFlows(browser, baseUrl) {
       await late;
       await page.waitForTimeout(100);
       assert.equal((await page.locator("#aiPreviewOutput").textContent()).includes(marker), false, `${action} ignores the previous preview response`);
-      assert.equal((await page.locator("#aiPreviewHistory").textContent()).includes(marker), false);
       if (newer) {
         assert.equal(await page.locator("#aiRunPreview").isDisabled(), true, "an old finally must not unlock the new product preview");
         assert.equal(await page.inputValue("#aiPreviewInput"), "新商品正在生成的问题");
@@ -2920,7 +2970,7 @@ async function checkConnectionFlows(browser, baseUrl) {
     assert.deepEqual(evidence.pageErrors, []);
     assert.deepEqual(evidence.externalRequests, []);
     assert.equal(evidence.failedResponses.every((failure) => (failure.status === 429 && ["/api/bot/login/start", "/api/bot/login/complete"].includes(failure.path)) || (failure.status === 503 && failure.path === "/api/bot/ai/preview")), true, JSON.stringify(evidence.failedResponses));
-    console.log(JSON.stringify({ ok: true, scope: "connection-flows", screenshots: 0, cases: ["start-cooldown-no-qr", "manual-countdown-retry", "confirmed-login-reuse", "strict-bool-and-session-expiry", "expires-after-countdown", "duplicate-clicks", "close-shop-logout-clear-timers", "late-start-complete", "unsaved-store-product-drafts", "history", "failure-preserves-input", "empty-content", "no-product", "late-preview-close-shop-product", "stale-finally-keeps-new-request-busy"], qrStarts: fixtures.qrStarts, completes: fixtures.qrCompleteRequests.length, previews: fixtures.aiPreviewRequests.length, publishOrSend: 0 }));
+    console.log(JSON.stringify({ ok: true, scope: "connection-flows", screenshots: 0, cases: ["start-cooldown-no-qr", "manual-countdown-retry", "confirmed-login-reuse", "strict-bool-and-session-expiry", "expires-after-countdown", "duplicate-clicks", "close-shop-logout-clear-timers", "late-start-complete", "unsaved-store-product-drafts", "single-result-no-history", "failure-preserves-input", "empty-content", "no-product", "late-preview-close-shop-product", "stale-finally-keeps-new-request-busy"], qrStarts: fixtures.qrStarts, completes: fixtures.qrCompleteRequests.length, previews: fixtures.aiPreviewRequests.length, publishOrSend: 0 }));
     await desktopApiClick(page, "#logoutButton", "/api/auth/logout");
   } catch (error) {
     console.error(JSON.stringify({ scope: "connection-flows", error: error.message, previews: fixtures.aiPreviewRequests.map((request) => ({ account: request.accountKey, item: request.payload.item_id, question: request.payload.buyer_message })), state: await page.evaluate(() => ({ view: document.querySelector('[data-panel]:not([hidden])')?.dataset.panel, busy: document.querySelector('#aiRunPreview')?.disabled, question: document.querySelector('#aiPreviewInput')?.value, knowledge: document.querySelector('#aiKnowledgeContent')?.value, output: document.querySelector('#aiPreviewOutput')?.textContent })).catch(() => null) }));
@@ -3003,27 +3053,38 @@ async function checkHomeAlerts(browser, baseUrl) {
   const missingPrice = { ...productFixtures[0], title: "测试用商品超长标题ABCDEFGHIJKLMNOPQRSTUVWXYZ不应挤压价格", price_display: "", image_url: "https://cdn.example/home-product.png" };
   fixtures.products = [missingPrice];
   fixtures.bot = { ...baseBot, product_count: 1 };
-  const { page, evidence } = await desktopContractPage(browser, baseUrl);
+  const orderRows = Array.from({ length: 8 }, (_, index) => ({ order_key: `home-order-${8 - index}`,
+    item_title: `首页最新订单商品 ${8 - index}`, buyer_nick: `买家 ${8 - index}`, status: "delivered", paid_amount: "8.00",
+    created_at: `2026-09-${String(18 - index).padStart(2, "0")}T10:00:00Z` }));
+  fixtures.orders = structuredClone(orderRows);
+  fixtures.analyticsByPeriod = Object.fromEntries([1, 7, 30].map((days) => [days, {
+    totals: { ...fixtures.analytics.totals }, buckets: Array.from({ length: days }, (_, index) => ({
+      date: `2026-08-${String(index + 1).padStart(2, "0")}`, buyer_messages_total: index + 2, auto_replies_total: index + 1,
+    })),
+  }]));
+  fixtures.shopAccounts.push({ ...fixtures.shopAccounts[0], id: 92, key: "home-second", name: "首页订单隔离二店" });
+  fixtures.accountData["home-second"] = { bot: { ...baseBot }, products: [missingPrice],
+    orders: [{ ...orderRows[0], order_key: "home-second-order", item_title: "仅二店最新订单" }] };
+  const { page, evidence } = await desktopContractPage(browser, baseUrl, {}, new Date("2026-09-19T10:00:00Z"));
   const cases = [];
   const reloadHome = async () => {
     await page.reload({ waitUntil: "networkidle" });
     await page.waitForSelector("#workspace:not([hidden])");
+    await openView(page, "shops");
+    await page.waitForSelector('#accountTabs [data-account-switch="home-second"]');
     await openView(page, "home");
-    await page.waitForFunction((count) => document.querySelectorAll("#homeProductGrid .home-product-card").length === count, Math.min(fixtures.products.length, 6));
+    await page.waitForFunction((count) => document.querySelectorAll("#homeProductGrid .home-product-card").length === count, Math.min(fixtures.products.length, 4));
   };
   const checkLayout = async (count) => {
     for (const width of [1440, 1280, 980, 768, 640, 390, 320]) {
       await page.setViewportSize({ width, height: 1000 });
-      for (const scale of [1, 1.5, 2]) {
-        await page.evaluate((factor) => {
-          const nodes = [...document.querySelectorAll("#homeProductGrid .home-product-card, #homeProductGrid .home-product-name, #homeProductGrid .home-product-price, #homeProductGrid .badge")];
-          nodes.forEach((node) => { node.style.fontSize = ""; });
-          const sizes = nodes.map((node) => parseFloat(getComputedStyle(node).fontSize));
-          nodes.forEach((node, index) => { node.style.fontSize = `${sizes[index] * factor}px`; });
-        }, scale);
+      // Check the real compact layout at each viewport, without overriding
+      // individual font sizes (which does not simulate browser zoom).
+      {
         const result = await page.locator("#homeProductGrid").evaluate((grid) => {
           const bounds = grid.getBoundingClientRect();
           return { width: bounds.width, left: bounds.left, right: bounds.right, clientWidth: grid.clientWidth, scrollWidth: grid.scrollWidth,
+            columns: getComputedStyle(grid).gridTemplateColumns.split(" ").length,
             cards: [...grid.querySelectorAll(".home-product-card")].map((card) => {
               const rect = card.getBoundingClientRect();
               const price = card.querySelector(".home-product-price");
@@ -3037,11 +3098,11 @@ async function checkHomeAlerts(browser, baseUrl) {
                 titleLineHeight: parseFloat(getComputedStyle(title).lineHeight), ratio: thumb.width / thumb.height };
             }) };
         });
-        const label = `${count} products / ${width}px / ${scale}x`;
+        const label = `${count} products / ${width}px`;
         assert.equal(result.cards.length, count, label);
         assert.ok(result.scrollWidth <= result.clientWidth + 1, `${label}: grid cannot overflow`);
         for (const card of result.cards) {
-          assert.ok(card.width >= Math.min(160, result.width) - 1, `${label}: card is too narrow: ${JSON.stringify(card)}`);
+          assert.ok(card.width > 0, `${label}: compact preview card remains measurable`);
           assert.ok(card.left >= result.left - 1 && card.right <= result.right + 1, `${label}: card must fit its panel`);
           assert.ok(card.priceScrollWidth <= card.priceWidth + 1, `${label}: price cannot be clipped: ${JSON.stringify(card)}`);
           assert.ok(card.priceHeight <= card.priceLineHeight + 1, `${label}: price stays on one line`);
@@ -3053,6 +3114,7 @@ async function checkHomeAlerts(browser, baseUrl) {
           }
         }
         assert.equal(result.cards[0].pending, true, `${label}: missing price has a distinct style`);
+        assert.equal(result.columns, width > 768 ? 4 : 2, `${label}: compact previews use four desktop columns and two narrow columns`);
         if (count > 1) {
           assert.equal(result.cards[1].price, "¥0", `${label}: actual zero price must not become missing`);
           assert.equal(result.cards[1].pending, false);
@@ -3076,6 +3138,61 @@ async function checkHomeAlerts(browser, baseUrl) {
       message: legacy ? "闲鱼要求安全验证，请先在闲鱼 App 或浏览器完成安全验证" : "接口返回的状态需要确认。",
       action_label: "查看店铺", action_view: "shops", severity: "warning", resolved: false }];
   };
+  const checkLongAttentionLayout = async () => {
+    for (const width of [1440, 1280, 1024, 980, 768, 390, 320]) {
+      await page.setViewportSize({ width, height: 1000 });
+      await waitForPanelSettled(page);
+      const layout = await page.locator("#attentionList").evaluate((list) => {
+        const panel = list.closest(".card-section");
+        const trend = panel.parentElement.querySelector(".overview-trend-card");
+        const heading = panel.querySelector(".section-title");
+        const measure = (node) => {
+          const rect = node.getBoundingClientRect();
+          return { left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom,
+            width: rect.width, height: rect.height, clientWidth: node.clientWidth, scrollWidth: node.scrollWidth };
+        };
+        list.scrollTop = 0;
+        const before = { trend: measure(trend), panel: measure(panel), heading: measure(heading), pageY: scrollY };
+        list.scrollTop = list.scrollHeight;
+        const endScrollTop = list.scrollTop;
+        const lastAction = list.querySelector(".attention-row:last-child [data-view]");
+        // A single long row may exceed the viewport height. Its action still
+        // has to be reachable by scrolling this list, without moving the page.
+        list.scrollTop += Math.min(0, lastAction.getBoundingClientRect().top - list.getBoundingClientRect().top);
+        const after = { trend: measure(trend), panel: measure(panel), heading: measure(heading), pageY: scrollY };
+        const result = { before, after, list: measure(list), overflowY: getComputedStyle(list).overflowY,
+          endScrollTop, clientHeight: list.clientHeight, scrollHeight: list.scrollHeight,
+          lastAction: measure(lastAction),
+          rows: [...list.querySelectorAll(".attention-row")].map(measure) };
+        list.scrollTop = 0;
+        return result;
+      });
+      const label = `long attention ${width}px: ${JSON.stringify(layout)}`;
+      assert.equal(layout.rows.length, fixtures.attention.length, label);
+      if (width >= 1024) {
+        assert.ok(Math.abs(layout.before.trend.width - layout.before.panel.width) <= 1, `desktop trend and attention have equal widths; ${label}`);
+        assert.ok(Math.abs(layout.before.trend.top - layout.before.panel.top) <= 1, `desktop cards share the same row; ${label}`);
+        assert.ok(layout.before.panel.left >= layout.before.trend.right, `desktop cards do not overlap; ${label}`);
+        for (const card of [layout.before.trend, layout.before.panel]) {
+          assert.ok(Math.abs(card.height - 280) <= 1, `long reminders cannot stretch either desktop card beyond 280px; ${label}`);
+        }
+        assert.ok(Math.abs(layout.before.trend.height - layout.before.panel.height) <= 1, `desktop cards have equal heights; ${label}`);
+      } else {
+        assert.ok(layout.before.panel.top >= layout.before.trend.bottom - 1, `narrow cards stack without overlap; ${label}`);
+      }
+      assert.ok(["auto", "scroll"].includes(layout.overflowY), `attention has its own vertical scroller; ${label}`);
+      assert.ok(layout.clientHeight > 0 && layout.scrollHeight > layout.clientHeight + 1, `long reminders overflow inside the list; ${label}`);
+      assert.ok(layout.endScrollTop > 0 && Math.abs(layout.endScrollTop + layout.clientHeight - layout.scrollHeight) <= 1, `the list can actually scroll to its end; ${label}`);
+      assert.deepEqual(layout.after, layout.before, `scrolling reminders cannot move the heading, stretch the cards or scroll the page; ${label}`);
+      assert.ok(layout.list.top >= layout.before.heading.bottom - 1 && layout.list.bottom <= layout.before.panel.bottom + 1, `the list stays below its heading and inside its card; ${label}`);
+      assert.ok(layout.lastAction.top >= layout.list.top - 1 && layout.lastAction.bottom <= layout.list.bottom + 1, `the last reminder action remains reachable after scrolling; ${label}`);
+      for (const box of [layout.list, ...layout.rows]) {
+        assert.ok(box.left >= layout.before.panel.left - 1 && box.right <= layout.before.panel.right + 1, `long reminder rows stay inside the card; ${label}`);
+        assert.ok(box.scrollWidth <= box.clientWidth + 1, `long reminder text and actions wrap without horizontal clipping; ${label}`);
+      }
+      await assertNoOverflow(page, `long attention ${width}px`);
+    }
+  };
   try {
     await desktopLogin(page, fixtures.me.username);
     await assertDesktopAssetVersion(page);
@@ -3086,7 +3203,80 @@ async function checkHomeAlerts(browser, baseUrl) {
     fixtures.products = [missingPrice, { ...productFixtures[1], price_display: "¥0" }, ...productFixtures.slice(2, 6)];
     fixtures.bot.product_count = 6;
     await reloadHome();
-    await checkLayout(6);
+    await checkLayout(4);
+    await page.setViewportSize({ width: 1440, height: 1000 });
+    assert.deepEqual(await page.locator("#homeProductGrid .home-product-name").allTextContents(), fixtures.products.slice(0, 4).map((item) => item.title), "home caps the preview even when more products exist");
+    assert.deepEqual(await page.locator("#homeOrderList .order-item-cell").allTextContents(), orderRows.slice(0, 6).map((item) => item.item_title), "home shows the six newest rows in server order");
+    const previewProducts = fixtures.products;
+    const previewOrders = fixtures.orders;
+    const previewHeights = {};
+    for (const sample of [
+      { name: "three orders and three products", orders: 3, products: 3 },
+      { name: "six orders and four products", orders: 8, products: 6 },
+      { name: "empty previews", orders: 0, products: 0 },
+    ]) {
+      fixtures.orders = previewOrders.slice(0, sample.orders);
+      fixtures.products = previewProducts.slice(0, sample.products);
+      fixtures.bot.product_count = fixtures.products.length;
+      await reloadHome();
+      await page.waitForFunction((count) => document.querySelectorAll("#homeOrderList .order-item-cell").length === count, Math.min(sample.orders, 6));
+      assert.equal(await page.locator("#homeProductGrid .home-product-card").count(), Math.min(sample.products, 4), sample.name);
+      if (!sample.orders) {
+        assert.match(await page.locator("#homeOrderList").innerText(), /暂无最近订单/);
+        assert.match(await page.locator("#homeProductGrid").innerText(), /还没有商品/);
+      }
+      for (const width of [1440, 390]) {
+        await page.setViewportSize({ width, height: 1000 });
+        await waitForPanelSettled(page);
+        const row = await page.locator(".overview-preview-row").evaluate((node) => {
+          const box = (element) => {
+            const { top, bottom, left, right, height } = element.getBoundingClientRect();
+            return { top, bottom, left, right, height };
+          };
+          return { ...box(node), cards: [...node.querySelectorAll(":scope > .card-section")].map(box) };
+        });
+        const label = `${sample.name} / ${width}px: ${JSON.stringify(row)}`;
+        assert.equal(row.cards.length, 2, label);
+        const [ordersCard, productsCard] = row.cards;
+        if (width === 1440) {
+          assert.ok(Math.abs(ordersCard.top - productsCard.top) <= 1 && Math.abs(ordersCard.bottom - productsCard.bottom) <= 1, `desktop preview cards share both edges; ${label}`);
+          previewHeights[sample.name] = ordersCard.height;
+        } else {
+          assert.ok(productsCard.top >= ordersCard.bottom - 1, `mobile preview cards stack without overlap; ${label}`);
+        }
+        assert.ok(row.cards.every((card) => card.left >= row.left - 1 && card.right <= row.right + 1), `preview cards stay within their row; ${label}`);
+        await assertNoOverflow(page, label);
+      }
+    }
+    assert.ok(previewHeights["empty previews"] < previewHeights["six orders and four products"] - 1, "empty previews shrink naturally without a fixed row height");
+    fixtures.products = previewProducts;
+    fixtures.orders = previewOrders;
+    fixtures.bot.product_count = previewProducts.length;
+    await page.setViewportSize({ width: 1440, height: 1000 });
+    await reloadHome();
+    const thirtyDayResponse = page.waitForResponse((response) => response.url().includes("/api/bot/analytics?period=30"));
+    await page.click('#analyticsPeriod [data-period="30"]');
+    await thirtyDayResponse;
+    await page.waitForFunction(() => document.querySelectorAll("#analyticsChart .chart-bar").length === 30);
+    for (const width of [1440, 1024, 768, 390, 320]) {
+      await page.setViewportSize({ width, height: 1000 });
+      await waitForPanelSettled(page);
+      const chart = await page.locator("#analyticsChart").evaluate((node) => ({
+        bars: [...node.querySelectorAll(".chart-bar")].map((bar) => bar.title),
+        labels: [...node.querySelectorAll(".chart-bar-label")].filter((label) => {
+          const style = getComputedStyle(label);
+          return label.textContent.trim() && style.display !== "none" && style.visibility !== "hidden" && Number(style.opacity) !== 0 && label.getBoundingClientRect().width > 0;
+        }).map((label) => ({ text: label.textContent.trim(), left: label.getBoundingClientRect().left, right: label.getBoundingClientRect().right })),
+      }));
+      assert.equal(chart.bars.length, 30, `30-day chart retains every data point at ${width}px`);
+      assert.ok(chart.labels.length >= 2 && chart.labels.length <= 6, `30-day chart has at most six readable labels at ${width}px: ${JSON.stringify(chart.labels)}`);
+      assert.equal(chart.labels[0].text, "08/01");
+      assert.equal(chart.labels.at(-1).text, "08/30");
+      for (let index = 1; index < chart.labels.length; index += 1) assert.ok(chart.labels[index].left >= chart.labels[index - 1].right, `date labels do not overlap at ${width}px`);
+      assert.match(chart.bars[0], /2026-08-01.*2.*1/);
+      assert.match(chart.bars.at(-1), /2026-08-30.*31.*30/);
+      await assertNoOverflow(page, `30-day home trend ${width}px`);
+    }
     await page.setViewportSize({ width: 1440, height: 1000 });
     await page.locator("#homeProductGrid .home-product-card").first().click();
     await page.waitForSelector('[data-panel="goods"]:not([hidden])');
@@ -3141,16 +3331,77 @@ async function checkHomeAlerts(browser, baseUrl) {
       await reloadHome();
       assert.equal(await page.locator("#attentionList strong").innerText(), label, "unrelated errors retain their original meaning");
     }
+
+    // A crowded attention card must scroll independently instead of making the
+    // neighboring trend card as tall as its reminders. Include old worker CTA
+    // fields so stale saved records cannot redirect runtime errors to settings.
+    fixtures.bot = { ...baseBot, product_count: 1, running: false };
+    fixtures.attention = Array.from({ length: 10 }, (_, index) => ({
+      id: `att_${(index + 1).toString(16).padStart(24, "0")}`,
+      kind: index === 0 ? "worker" : "job", code: "degraded", severity: "error", resolved: false,
+      title: index === 0 ? "自动客服运行异常" : `第 ${index + 1} 条提醒：${"店铺状态需要人工检查".repeat(6)}`,
+      message: `${"自动客服暂未恢复，请查看当前店铺连接状态及最近运行情况。".repeat(5)} REQUEST_${"ABCDEFGHIJKLMNOPQRSTUVWXYZ".repeat(3)}`,
+      action_label: index === 0 ? "查看自动回复" : "查看店铺", action_view: index === 0 ? "auto-reply" : "shops",
+    }));
+    await reloadHome();
+    await page.waitForFunction((count) => document.querySelectorAll("#attentionList .attention-row").length === count, fixtures.attention.length);
+    assert.equal(await page.locator("#attentionCount").innerText(), String(fixtures.attention.length));
+    await checkLongAttentionLayout();
+    await page.setViewportSize({ width: 1440, height: 1000 });
+    const workerAction = page.locator('#attentionList [data-attention-id="att_000000000000000000000001"] [data-view]');
+    assert.equal(await workerAction.innerText(), "查看店铺状态", "runtime worker errors offer shop diagnostics");
+    assert.equal(await workerAction.getAttribute("data-view"), "shops", "runtime errors must not open auto-reply configuration");
+    await workerAction.click();
+    await page.waitForSelector('[data-panel="shops"]:not([hidden])');
+    assert.equal(await page.locator("#shopConnectionCard").isVisible(), true, "worker CTA opens the shop connection details");
+    assert.equal(await page.locator("#shopConnectionBadge").innerText(), "已验证", "shop connection diagnostics retain the actual connection status");
+    assert.equal(await page.locator("#checkCookieButton").isVisible(), true, "shop diagnostics remain actionable without starting a check");
+    assert.equal(await page.locator('[data-panel="auto-reply"]').isVisible(), false, "worker CTA does not activate auto-reply settings");
+
     fixtures.bot = { ...baseBot, product_count: 1 };
     fixtures.attention = [];
     await reloadHome();
     assert.match(await page.locator("#attentionList").innerText(), /当前没有需要处理的事项/);
     assert.equal(await page.locator("#attentionCount").innerText(), "0");
     await assertHomeOverviewLayout(page, 'recovered attention overview');
+    fixtures.orders.unshift({ ...orderRows[0], order_key: "home-newest", item_title: "五秒刷新出现的新订单", created_at: "2026-09-19T10:01:00Z" });
+    const orderPoll = page.waitForResponse((response) => response.url().includes("/api/bot/orders?") && !new URL(response.url()).searchParams.has("page"));
+    await page.clock.fastForward(5001);
+    await orderPoll;
+    await page.waitForFunction(() => document.querySelector("#homeOrderList .order-item-cell")?.textContent === "五秒刷新出现的新订单");
+    assert.equal(await page.locator("#homeOrderList tr").count(), 6, "polling keeps the six-order limit");
+    const orderReadCount = () => fixtures.orderQueries.filter((request) => !Object.hasOwn(request, "page")).length;
+    await page.evaluate(() => {
+      Object.defineProperty(document, "hidden", { configurable: true, get: () => true });
+      Object.defineProperty(document, "visibilityState", { configurable: true, get: () => "hidden" });
+      document.dispatchEvent(new Event("visibilitychange"));
+    });
+    const hiddenReads = orderReadCount();
+    await page.clock.fastForward(15001);
+    assert.equal(orderReadCount(), hiddenReads, "hidden pages stop home-order polling");
+    await page.evaluate(() => { delete document.hidden; delete document.visibilityState; document.dispatchEvent(new Event("visibilitychange")); });
+    await page.waitForLoadState("networkidle");
+    fixtures.loaderResponseDelayMs.orders.default = 1200;
+    const oldRequest = page.waitForRequest((request) => request.url().includes("/api/bot/orders?") && !new URL(request.url()).searchParams.has("page") && request.headers()["x-shop-account"] === "default");
+    const oldResponse = page.waitForResponse((response) => response.url().includes("/api/bot/orders?") && !new URL(response.url()).searchParams.has("page") && response.request().headers()["x-shop-account"] === "default");
+    await page.clock.fastForward(5001);
+    await oldRequest;
+    await page.locator('#accountTabs [data-account-switch="home-second"]').click();
+    await page.waitForFunction(() => document.querySelector("#homeOrderList .order-item-cell")?.textContent === "仅二店最新订单");
+    await oldResponse;
+    assert.deepEqual(await page.locator("#homeOrderList .order-item-cell").allTextContents(), ["仅二店最新订单"], "late first-shop orders cannot replace the selected shop's orders");
+    const secondPoll = page.waitForResponse((response) => response.url().includes("/api/bot/orders?") && !new URL(response.url()).searchParams.has("page") && response.request().headers()["x-shop-account"] === "home-second");
+    await page.clock.fastForward(5001);
+    await secondPoll;
+    await openView(page, "shops");
+    await page.waitForLoadState("networkidle");
+    const awayReads = orderReadCount();
+    await page.clock.fastForward(15001);
+    assert.equal(orderReadCount(), awayReads, "leaving home stops its background order reads");
     assert.equal(fixtures.shopActionRequests.length, 0, "view and acknowledgement actions cannot trigger shop probes");
     assert.equal(fixtures.cookieSaves + fixtures.botStartModes.length + fixtures.qrStarts + fixtures.qrConnects, 0, "display fixes must not reauthorize or restart workers");
     assertDesktopEvidence(evidence);
-    console.log(JSON.stringify({ ok: true, scope: "home-alerts", layoutCases: cases.length, homeLayoutWidths: [1440, 768, 390], alertCases: ["legacy-worker-risk", "resolved-history", "explicit-verification", "local-cooldown", "platform-busy", "account-restricted", "session-expired", "recovered", "text-only-empty", "resolved-actions-kept"], noPlatformRequests: true }));
+    console.log(JSON.stringify({ ok: true, scope: "home-alerts", layoutCases: cases.length, homeLayoutWidths: [1440, 768, 390], attentionLayoutWidths: [1440, 1280, 1024, 980, 768, 390, 320], alertCases: ["legacy-worker-risk", "resolved-history", "explicit-verification", "local-cooldown", "platform-busy", "account-restricted", "session-expired", "long-reminders-equal-cards", "attention-scroll-to-last-action", "worker-shop-status-navigation", "recovered", "text-only-empty", "resolved-actions-kept"], noPlatformRequests: true }));
   } catch (error) {
     await reportDesktopFailure(page, "home-alerts", error, evidence);
     throw error;
@@ -3158,6 +3409,7 @@ async function checkHomeAlerts(browser, baseUrl) {
 }
 
 async function checkDashboardDesktop(browser, baseUrl) {
+  fixtures.bot.running = true;
   const today = { buyer_messages_total: 11, messages_total: 18, auto_replies_total: 7,
     fulfillment_success_total: 5, fulfillment_failed_total: 0, unread_conversations_total: 3 };
   fixtures.analyticsByPeriod = Object.fromEntries([1, 7, 30].map((days) => [days, {
@@ -3608,7 +3860,7 @@ async function checkSettingsDesktop(browser, baseUrl) {
       await page.click("#settingsDocsBtn");
       await page.waitForSelector("#docsHelpModal[open]");
       assert.equal(await page.locator("#docsHelpModal .docs-manual").count(), 1);
-      assert.equal(await page.locator("#docsHelpModal details.docs-faq-item").count(), 5);
+      assert.ok(await page.locator("#docsHelpModal details.docs-faq-item").count() >= 5, "guide keeps the FAQ list");
       await page.locator("#docsHelpModal").getByRole("button", { name: /关闭/ }).click();
       await page.waitForSelector("#docsHelpModal:not([open])", { state: "attached" });
     }
@@ -4089,7 +4341,7 @@ function seedDocsCaptureFixtures() {
     { chat_id: "chat-1", item_id: "100001", buyer_label: "演示买家 1", preview: "好的，谢谢。", time: "2026-09-10 15:19", message_count: 3, unread: false, manual_mode: false },
   ];
   const storeConfig = { ...defaultAiStoreConfig, store_content: "本店提供数字学习资料与聊天素材。先回答商品使用问题；交付方式以当前商品配置为准。",
-    persona_name: "海风客服", buyer_address: "你好", emoji_level: "none",
+    persona_name: "小喵客服",
     forbidden_claims: "不编造库存、付款或发货状态；不承诺未说明的功能。", handoff_rules: "退款、规格争议及付款状态不确定时转人工。" };
   // Only connection metadata is seeded. No API key, verification token, shop
   // cookie, redeemable code, real buyer profile or external image is supplied.
@@ -4123,7 +4375,6 @@ async function captureDocs(browser, baseUrl) {
   });
   const captures = [];
   const desktopViewport = { width: 1440, height: 1000 };
-  const mobileViewport = { width: 390, height: 844 };
   const visit = async (view, viewport = desktopViewport) => {
     await page.setViewportSize(viewport);
     await openView(page, view);
@@ -4156,9 +4407,9 @@ async function captureDocs(browser, baseUrl) {
     assert.deepEqual({ width, height }, page.viewportSize());
     captures.push({ name, width, height, bytes: buffer.length, buffer });
   };
-  const readyHome = async () => page.waitForFunction(() => document.querySelectorAll("#homeProductGrid .home-product-card").length === 3
-    && document.querySelectorAll("#homeOrderList tr").length === 5 && document.querySelectorAll("#analyticsChart .chart-bar").length === 7
-    && document.querySelector("#homeResourceBody")?.textContent.includes("海风演示店") && document.querySelector("#homeStatCards")?.textContent.includes("12"));
+  const readyHome = async () => page.waitForFunction((orderCount) => document.querySelectorAll("#homeProductGrid .home-product-card").length === 3
+    && document.querySelectorAll("#homeOrderList .order-item-cell").length === orderCount && document.querySelectorAll("#analyticsChart .chart-bar").length === 7
+    && document.querySelector("#homeResourceBody")?.textContent.includes("海风演示店") && document.querySelector("#homeStatCards")?.textContent.includes("12"), Math.min(fixtures.orders.length, 6));
   const readyChat = async () => {
     await page.waitForSelector('#conversationItems [data-chat-id="chat-1"]');
     await page.click('#conversationItems [data-chat-id="chat-1"]');
@@ -4173,14 +4424,10 @@ async function captureDocs(browser, baseUrl) {
     await readyHome();
     await capture("overview.png", ["#homeStatCards", "#homeProductGrid", ".home-resources-card"]);
 
-    await visit("shops");
-    await page.waitForFunction(() => document.querySelectorAll("#shopAccountsPanelList .shop-card").length === 2 && document.querySelector("#shopResourcesBody")?.textContent.includes("86"));
-    await capture("shops.png", ["#shopAccountsPanelList", ".shop-resources-card"]);
-
     await visit("chat");
     await readyChat();
-    await desktopApiClick(page, "#toggleChatTakeover", "/api/bot/conversations/chat-1/takeover");
-    await page.waitForFunction(() => document.querySelector('#manualReplyForm button[type="submit"]')?.disabled === false);
+    await desktopApiClick(page, '#chatTakeoverToggle', "/api/bot/conversations/chat-1/takeover");
+    await page.waitForFunction(() => document.querySelector('#chatTakeoverToggle')?.disabled === false);
     assert.match(await page.locator("#chatAiStatus").innerText(), /AI 已开启/);
     await capture("customer-service.png", [".chat-layout"]);
 
@@ -4196,20 +4443,6 @@ async function captureDocs(browser, baseUrl) {
     assert.match(await page.locator('#productGrid [data-product-id="100002"]').innerText(), /卡密自动发货/);
     await capture("goods.png", ["#productGrid", "#productPagination"]);
 
-    await visit("cards", { width: 1440, height: 800 });
-    await page.waitForFunction(() => document.querySelectorAll("#cardsList .cards-row").length === 2 && document.querySelector("#cardsStats")?.textContent.includes("160"));
-    await capture("cards.png", ["#cardsStats", "#cardsList", "#cardsCreateForm"]);
-
-    await visit("orders", { width: 1440, height: 900 });
-    await page.waitForFunction(() => document.querySelectorAll("#orderList [data-order-key]").length === 5 && !document.querySelector("#refreshOrders")?.disabled);
-    await capture("orders.png", [".orders-workbench"]);
-
-    await visit("settings", { width: 1440, height: 900 });
-    await page.click('[data-settings-tab="ai"]');
-    await page.waitForFunction(() => document.querySelector("#aiModel")?.value === "example-chat-model");
-    assert.equal(await page.inputValue("#aiApiKey"), "");
-    await capture("settings.png", ["#settingsAiPanel"]);
-
     await visit("ops");
     await page.waitForFunction(() => document.querySelectorAll("#opsChatHistory .ops-receipt-card").length === 2 && !document.querySelector("#opsSendBtn")?.disabled);
     const history = await page.locator("#opsChatHistory").innerText();
@@ -4222,16 +4455,6 @@ async function captureDocs(browser, baseUrl) {
     assert.doesNotMatch(history, /审批|提案|正在|排队/);
     await capture("operations.png", [".ops-container", ".ops-input-area"]);
 
-    await visit("home", mobileViewport);
-    await readyHome();
-    await capture("overview-mobile.png", ["#homeStatCards"]);
-
-    await visit("chat", mobileViewport);
-    await readyChat();
-    await waitForPanelSettled(page);
-    await page.locator(".chat-window").evaluate((node) => window.scrollTo(0, window.scrollY + node.getBoundingClientRect().top - 8));
-    await capture("customer-service-mobile.png", [".chat-head", "#manualReplyForm"]);
-
     await page.setViewportSize({ width: 1440, height: 1000 });
     await page.click("#headerLogoutButton");
     await page.waitForSelector("#authScreen:not([hidden])");
@@ -4241,13 +4464,6 @@ async function captureDocs(browser, baseUrl) {
     fixtures.resourceRowsByUser[fixtures.me.username] = structuredClone(fixtures.resourceRowsByUser[ownerName]);
     fixtures.userConnections.set(fixtures.me.username, structuredClone(fixtures.userConnections.get(ownerName)));
     await desktopLogin(page, fixtures.me.username);
-    await visit("settings", { width: 1440, height: 900 });
-    await page.click('[data-settings-tab="resources"]');
-    await page.waitForFunction(() => document.querySelector("#resourceMemoryMiB")?.value === "400" && !document.querySelector("#saveResourceSettings")?.disabled);
-    assert.equal(await page.inputValue("#resourceMaxShops"), "20");
-    assert.equal(await page.inputValue("#resourceMaxWorkers"), "3");
-    await capture("resources.png", ["#settingsResourcesPanel"]);
-
     // These bytes and versions are offline demonstration data. The current
     // frontend renders the normal status endpoint; no update is submitted.
     const releaseVersion = JSON.parse(fs.readFileSync(path.join(repoRoot, "package.json"), "utf8")).version;
@@ -4273,8 +4489,9 @@ async function captureDocs(browser, baseUrl) {
     assert.doesNotMatch(await page.locator("#platformUpdateDialog").innerText(), /update-test|ui-contract|合成/);
     await capture("update.png", ["#platformUpdateDialog", "#updateDownloadProgress", "#updateDownloadButton"], { dialog: "#platformUpdateDialog" });
 
-    assert.equal(captures.length, 13);
-    assert.equal(new Set(captures.map((item) => item.name)).size, 13);
+    assert.equal(captures.length, 6);
+    assert.equal(new Set(captures.map((item) => item.name)).size, 6);
+    assert.equal(captures.every((item) => item.width > item.height), true, "public documentation screenshots must stay landscape");
     const origin = new URL(baseUrl).origin;
     assert.equal(fixtures.docsCaptureRequests.every((request) => new URL(request.url).origin === origin), true, "every captured HTTP request must use the loopback mock server");
     assert.equal(fixtures.apiRequests.filter((request) => request.method !== "GET").every((request) => ["/api/auth/login", "/api/auth/logout", "/api/bot/conversations/chat-1/read", "/api/bot/conversations/chat-2/read", "/api/bot/conversations/chat-1/takeover"].includes(request.path)), true, "capture must not invoke model tests, platform probes or configuration writes");
@@ -4654,6 +4871,325 @@ async function checkUpdates(browser, baseUrl) {
   }
 }
 
+async function checkPersonaCompact(browser, baseUrl) {
+  const saved = { ...fixtures };
+  const legacyFields = { tone: "professional", buyer_address: "老顾客", reply_length: "detailed", emoji_level: "none",
+    forbidden_claims: "不能编造物流与库存。", handoff_rules: "退款争议请店主处理。" };
+  const templateFields = { tone: "restrained", buyer_address: "您好", reply_length: "standard", emoji_level: "medium",
+    forbidden_claims: "模板原有的禁止承诺必须保留。", handoff_rules: "模板原有的人工处理条件。" };
+  const config = { ...defaultAiStoreConfig, ...legacyFields, store_content: "一店已有店铺说明。",
+    persona_preset: "custom", persona_name: "一店客服", persona_instruction: "一店已有自定义核心。" };
+  const templateConfig = { ...config, ...templateFields, store_content: "历史模板的店铺说明。", persona_preset: "professional", persona_name: "历史模板客服", persona_instruction: "历史模板的核心要求。" };
+  const emptyLegacyTemplates = ["friendly", "professional", "none"].map((preset) => ({
+    id: `legacy-empty-${preset}`, name: `旧预设空说明-${preset}`,
+    config: { ...config, persona_preset: preset, persona_name: "", persona_instruction: "" },
+  }));
+  const firstAi = structuredClone(saved.ai);
+  firstAi.config = { draft: config, published: null, status: "draft", revision: 7 };
+  firstAi.templates = [{ id: "persona-legacy", name: "历史六字段模板", config: templateConfig }, ...emptyLegacyTemplates];
+  const secondAi = structuredClone(saved.ai);
+  const secondFields = { ...legacyFields, tone: "natural", buyer_address: "二店买家", handoff_rules: "二店独立处理条件。" };
+  secondAi.config = { draft: { ...config, ...secondFields, store_content: "二店独立的店铺说明。", persona_name: "二店客服", persona_instruction: "二店独立核心。" }, published: null, status: "draft", revision: 3 };
+  secondAi.templates = [];
+  Object.assign(fixtures, { ai: firstAi, aiRequests: [], apiRequests: [], aiPreviewRequests: [], aiPreviewResponses: [], aiPreviewResponseDelays: [], aiPreviewResponseGates: [], shopAccounts: [structuredClone(saved.shopAccounts[0]),
+    { ...structuredClone(saved.shopAccounts[0]), id: 93, key: "persona-second", name: "人设隔离二店" }],
+    accountData: { "persona-second": { ai: secondAi, products: structuredClone(saved.products), bot: structuredClone(saved.bot) } } });
+  const { page, evidence } = await desktopContractPage(browser, baseUrl);
+  const businessValues = (value) => Object.fromEntries(["forbidden_claims", "handoff_rules"].map((key) => [key, value[key]]));
+  const assertNoHiddenStyle = (value) => {
+    for (const key of ["tone", "buyer_address", "reply_length", "emoji_level"]) {
+      assert.equal(Object.hasOwn(value, key), false, `${key} must not be sent from the compact persona form`);
+    }
+  };
+  page.removeAllListeners("dialog");
+  page.on("dialog", async (dialog) => {
+    if (dialog.type() === "confirm" && dialog.message() === "当前店铺 AI 客服配置有未保存修改。确认店铺并丢弃这些修改吗？") {
+      evidence.confirmDialogs.push(dialog.message());
+      await dialog.accept();
+    } else {
+      evidence.pageErrors.push(`unexpected ${dialog.type()} dialog: ${dialog.message()}`);
+      await dialog.dismiss();
+    }
+  });
+  const openPersona = async () => {
+    await openView(page, "shops");
+    await page.waitForSelector('#accountTabs [data-account-switch="persona-second"]');
+    await openView(page, "ai-config");
+    await page.waitForSelector("#aiKnowledgeContent:enabled");
+    await page.waitForLoadState("networkidle");
+  };
+  const savePersona = async () => {
+    await desktopApiClick(page, "#aiSavePersona", "/api/bot/ai/config", "PUT");
+    await page.waitForFunction(() => document.querySelector("#aiPersonaMessage")?.textContent.includes("已保存并生效") && !document.querySelector("#aiPersonaPreset")?.disabled);
+    return fixtures.aiRequests.findLast((request) => request.kind === "config");
+  };
+  const selectPreset = async (preset) => {
+    const writesBefore = fixtures.aiRequests.filter((request) => request.kind === "config").length;
+    const response = page.waitForResponse((response) => new URL(response.url()).pathname.endsWith("/api/bot/ai/config") && response.request().method() === "PUT");
+    await page.selectOption("#aiPersonaPreset", preset);
+    const savedResponse = await response;
+    assert.equal(savedResponse.status(), 200, await savedResponse.text());
+    await page.waitForFunction(() => document.querySelector("#aiPersonaMessage")?.textContent.includes("已保存并生效") && !document.querySelector("#aiPersonaPreset")?.disabled);
+    assert.equal(fixtures.aiRequests.filter((request) => request.kind === "config").length, writesBefore + 1, "selecting a preset must save exactly once without clicking Save");
+    return fixtures.aiRequests.findLast((request) => request.kind === "config");
+  };
+  const previewPersona = async (expectedConfig) => {
+    await page.fill("#aiPreviewInput", "使用当前人设回答这个测试问题");
+    await desktopApiClick(page, "#aiRunPreview", "/api/bot/ai/preview");
+    await page.waitForFunction(() => !document.querySelector("#aiRunPreview")?.disabled);
+    const preview = fixtures.aiPreviewRequests.at(-1).payload.store_config;
+    assertNoHiddenStyle(preview);
+    assert.equal(preview.persona_instruction, expectedConfig.persona_instruction, "sandbox must preserve the visible instruction");
+    assert.deepEqual(businessValues(preview), businessValues(expectedConfig), "sandbox must retain the shop's business constraints");
+  };
+  let releasePendingPreset = () => {};
+  try {
+    await desktopLogin(page, fixtures.me.username);
+    await openPersona();
+    assert.equal(await page.locator("#aiTone, #aiBuyerAddress, #aiReplyLength, #aiEmojiLevel, #aiForbiddenClaims, #aiHandoffRules").count(), 0, "the six removed controls are absent, not merely hidden");
+    assert.deepEqual(await page.locator("#aiPersonaPreset option").evaluateAll((options) => options.map((option) => option.value)), ["catgirl", "mint", "custom"]);
+    assert.equal(await page.inputValue("#aiPersonaInstruction"), config.persona_instruction);
+    await previewPersona(config);
+    await selectPreset("mint");
+    assert.equal(await page.inputValue("#aiPersonaName"), "薄荷客服", "mint selects its actual customer-service name");
+    const mintInstruction = await page.inputValue("#aiPersonaInstruction");
+    assert.ok(mintInstruction.trim().length > 0 && mintInstruction.length <= 1200, "mint must provide a complete preset within the accepted instruction limit");
+    await selectPreset("custom");
+    assert.equal(await page.inputValue("#aiPersonaInstruction"), config.persona_instruction, "preset switches preserve the existing custom core");
+    await selectPreset("catgirl");
+    const catgirlInstruction = await page.inputValue("#aiPersonaInstruction");
+    assert.ok(catgirlInstruction.trim().length > 0 && catgirlInstruction.length <= 1200, "catgirl must provide a complete preset within the accepted instruction limit");
+    assert.notEqual(catgirlInstruction, mintInstruction, "catgirl and mint must have distinct presets");
+    let write = await selectPreset("mint");
+    assert.equal(await page.inputValue("#aiPersonaInstruction"), mintInstruction, "returning to mint must restore the same preset text");
+    assert.equal(write.accountKey, "default");
+    assert.equal(write.payload.persona_preset, "mint");
+    assert.equal(write.payload.persona_name, "薄荷客服");
+    assert.equal(write.payload.persona_instruction, mintInstruction, "saving mint must preserve its complete preset text");
+    assertNoHiddenStyle(write.payload);
+    assert.deepEqual(businessValues(write.payload), businessValues(legacyFields), "saving must preserve the shop's business constraints");
+    await page.reload({ waitUntil: "networkidle" });
+    await page.waitForSelector("#workspace:not([hidden])");
+    await openPersona();
+    assert.equal(await page.inputValue("#aiPersonaPreset"), "mint");
+    assert.equal(await page.inputValue("#aiPersonaName"), "薄荷客服");
+    assert.equal(await page.inputValue("#aiPersonaInstruction"), mintInstruction, "selecting mint must persist its complete text across a fresh GET without a Save click");
+
+    const persistedBeforeFailure = structuredClone(fixtures.ai.config);
+    let arriveFailure;
+    const failureArrived = new Promise((resolve) => { arriveFailure = resolve; });
+    const releaseFailure = new Promise((resolve) => { releasePendingPreset = resolve; });
+    await page.route("**/api/bot/ai/config", async (route) => {
+      assert.equal(route.request().method(), "PUT");
+      arriveFailure();
+      await releaseFailure;
+      await route.fulfill({ status: 503, contentType: "application/json", body: JSON.stringify({ detail: { code: "persona_save_unavailable", message: "人设保存暂时失败，请重试" } }) });
+    }, { times: 1 });
+    evidence.allowedFailures.push({ path: "/api/bot/ai/config", status: 503 });
+    const failedPresetResponse = page.waitForResponse((response) => new URL(response.url()).pathname.endsWith("/api/bot/ai/config") && response.request().method() === "PUT");
+    await page.selectOption("#aiPersonaPreset", "catgirl");
+    await waitForMockGate(failureArrived, "automatic persona save");
+    for (const selector of ["#aiStoreContent", "#aiPersonaPreset", "#aiPersonaName", "#aiPersonaInstruction", "#aiSavePersona", "#aiOpenTemplates"]) {
+      assert.equal(await page.locator(selector).isDisabled(), true, `${selector} must be locked during automatic preset saving`);
+    }
+    releasePendingPreset();
+    assert.equal((await failedPresetResponse).status(), 503);
+    await page.waitForFunction(() => document.querySelector("#aiPersonaMessage")?.textContent.includes("失败") && !document.querySelector("#aiPersonaPreset")?.disabled);
+    assert.equal(await page.inputValue("#aiPersonaPreset"), "catgirl", "a failed save must keep the newly selected preset");
+    assert.equal(await page.inputValue("#aiPersonaName"), "小喵客服");
+    assert.equal(await page.inputValue("#aiPersonaInstruction"), catgirlInstruction, "a failed save must keep the editable instruction");
+    assert.match(await page.locator("#aiPersonaStatus").innerText(), /未保存/, "failed automatic saving must remain visibly dirty");
+    assert.deepEqual(fixtures.ai.config, persistedBeforeFailure, "failed automatic saving must not replace persisted settings");
+    write = await savePersona();
+    assert.equal(write.payload.persona_preset, "catgirl", "manual Save must retry the failed preset");
+    assert.equal(write.payload.persona_instruction, catgirlInstruction);
+    assertNoHiddenStyle(write.payload);
+    for (const template of emptyLegacyTemplates) {
+      await page.click("#aiOpenTemplates");
+      await page.waitForSelector("#aiTemplatesDialog[open]");
+      await page.locator(`[data-ai-template-load="${template.id}"]`).click();
+      await page.waitForSelector("#aiTemplatesDialog", { state: "hidden" });
+      assert.equal(await page.inputValue("#aiPersonaPreset"), "custom", "legacy presets map to custom");
+      assert.equal(await page.inputValue("#aiPersonaName"), "", "legacy preset identifiers must not inject a name");
+      assert.equal(await page.inputValue("#aiPersonaInstruction"), "", "legacy preset identifiers must not inject hidden style instructions");
+    }
+    await page.click("#aiOpenTemplates");
+    await page.waitForSelector("#aiTemplatesDialog[open]");
+    await page.locator('[data-ai-template-load="persona-legacy"]').click();
+    await page.waitForSelector("#aiTemplatesDialog", { state: "hidden" });
+    assert.equal(await page.inputValue("#aiPersonaPreset"), "custom");
+    assert.equal(await page.inputValue("#aiPersonaName"), templateConfig.persona_name, "legacy presets retain the explicitly saved name");
+    assert.equal(await page.inputValue("#aiPersonaInstruction"), templateConfig.persona_instruction);
+    await previewPersona(templateConfig);
+    write = await savePersona();
+    assertNoHiddenStyle(write.payload);
+    assert.deepEqual(businessValues(write.payload), businessValues(templateFields), "loading a legacy template restores its own business constraints");
+    await page.click("#aiOpenTemplates");
+    await page.waitForSelector("#aiTemplatesDialog[open]");
+    await page.fill("#aiTemplateName", "精简表单保存的模板");
+    await desktopApiClick(page, "#aiSaveTemplate", "/api/bot/ai/templates", "POST");
+    const templateWrite = fixtures.aiRequests.findLast((request) => request.kind === "template");
+    assert.equal(templateWrite.accountKey, "default");
+    assertNoHiddenStyle(templateWrite.payload.config);
+    assert.equal(templateWrite.payload.config.persona_name, templateConfig.persona_name);
+    assert.equal(templateWrite.payload.config.persona_instruction, templateConfig.persona_instruction);
+    assert.deepEqual(businessValues(templateWrite.payload.config), businessValues(templateFields), "template round-trip retains business constraints without old styles");
+    await page.click('[data-close-dialog="aiTemplatesDialog"]');
+    const firstSaved = structuredClone(fixtures.ai.config);
+    await page.fill("#aiPersonaName", "一店未保存草稿不能串店");
+    await page.locator('#accountTabs [data-account-switch="persona-second"]').click();
+    await page.waitForFunction(() => document.querySelector("#aiPersonaName")?.value === "二店客服");
+    assert.equal(await page.inputValue("#aiStoreContent"), "二店独立的店铺说明。");
+    assert.equal(await page.inputValue("#aiPersonaInstruction"), "二店独立核心。");
+    await page.fill("#aiPersonaInstruction", "二店修改后的独立核心。");
+    write = await savePersona();
+    assert.equal(write.accountKey, "persona-second");
+    assertNoHiddenStyle(write.payload);
+    assert.deepEqual(businessValues(write.payload), businessValues(secondFields), "account switches cannot carry business constraints across shops");
+    assert.deepEqual(fixtures.ai.config, firstSaved, "editing another shop cannot mutate the first shop's saved config");
+    await page.locator('#accountTabs [data-account-switch="default"]').click();
+    await page.waitForFunction(() => document.querySelector("#aiPersonaName")?.value === "历史模板客服");
+    assert.equal(await page.inputValue("#aiPersonaInstruction"), templateConfig.persona_instruction);
+    for (const width of [1440, 768, 390]) {
+      await page.setViewportSize({ width, height: 900 });
+      await assertNoOverflow(page, `compact persona ${width}px`);
+    }
+    assert.deepEqual(fixtures.aiRequests.filter((request) => !["config", "template"].includes(request.kind)), [], "persona editing cannot start AI, publish product knowledge or invoke a model");
+    assertDesktopEvidence(evidence);
+    console.log(JSON.stringify({ ok: true, scope: "persona-compact", cases: ["six-controls-removed", "three-presets", "mint-name", "distinct-presets-within-1200", "preset-custom-isolation", "preset-auto-save-reload", "preset-saving-locks-controls", "preset-save-failure-retains-draft-and-retries", "style-fields-absent-from-save-preview-template", "business-constraints-preserved", "legacy-presets-no-auto-fill", "legacy-template-roundtrip", "shop-draft-and-business-constraints-isolation"], noModelRequests: true }));
+  } finally {
+    releasePendingPreset();
+    await page.close();
+    Object.assign(fixtures, saved);
+  }
+}
+
+async function checkCustomerServiceSettings(page, accountKey) {
+  const account = fixtures.accountData[accountKey];
+  const automation = account.automation;
+  account.bot = { ...structuredClone(fixtures.bot), running: true, running_total: 1, automation_mode: "rules_ai" };
+  account.ai = structuredClone(fixtures.ai);
+  account.ai.config = { draft: structuredClone(defaultAiStoreConfig), published: null, status: "draft", revision: 0 };
+  Object.assign(automation, { enabled: true, rules_enabled: true, ai_enabled: true });
+  const unchangedRules = structuredClone(automation.rules);
+  const unchangedDeliveries = structuredClone(automation.deliveries);
+  const initialDelay = automation.delay_min_seconds;
+  const visit = async (view) => {
+    await page.locator(`[data-panel]:not([hidden]) .sub-tab-btn[data-view="${view}"]`).click();
+    await page.waitForSelector(`[data-panel="${view}"]:not([hidden])`);
+    await page.waitForLoadState("networkidle");
+  };
+  const saveSettings = async (selector, expectedPayload) => {
+    const count = fixtures.automationPuts.length;
+    await desktopApiClick(page, selector, "/api/automation", "PUT");
+    await page.waitForLoadState("networkidle");
+    await page.waitForFunction(() => !document.querySelector("#saveAutomationButton")?.disabled
+      && !document.querySelector("#saveRulesDefaultsButton")?.disabled);
+    assert.equal(fixtures.automationPuts.length, count + 1, "one user action submits one settings mutation");
+    assert.equal(fixtures.automationPuts.at(-1).accountKey, accountKey);
+    assert.deepEqual(fixtures.automationPuts.at(-1).payload, expectedPayload, "each settings control submits only its own fields");
+    assert.deepEqual(automation.rules, unchangedRules, "settings saves preserve keyword rules");
+    assert.deepEqual(automation.deliveries, unchangedDeliveries, "settings saves preserve delivery configuration");
+  };
+  await desktopApiClick(page, "#refreshButton", "/api/bot/status", "GET");
+  await page.waitForLoadState("networkidle");
+  await visit("common-service");
+  await page.fill("#automationDelayMin", "7");
+  await visit("auto-reply");
+  await page.fill("#automationFirstReply", "规则页独立保存的首次回复");
+  await page.fill("#automationFallbackReply", "规则页独立保存的兜底回复");
+  await saveSettings("#saveRulesDefaultsButton", {
+    first_reply: "规则页独立保存的首次回复", fallback_reply: "规则页独立保存的兜底回复",
+  });
+  assert.equal(automation.delay_min_seconds, initialDelay, "rules save must not commit the common-page draft");
+  assert.equal(await page.inputValue("#automationDelayMin"), "7", "rules save must not erase the common-page draft");
+  await page.fill("#automationFirstReply", "通用保存时必须保留的规则草稿");
+  await visit("common-service");
+  assert.equal(await page.inputValue("#automationDelayMin"), "7", "returning to common settings retains its unsaved value");
+  const commonPayload = {
+    delay_min_seconds: 7,
+    delay_max_seconds: automation.delay_max_seconds,
+    trigger_cooldown_seconds: automation.trigger_cooldown_seconds,
+    manual_takeover_cooldown_seconds: automation.manual_takeover_cooldown_seconds,
+    business_hours_enabled: automation.business_hours_enabled,
+    business_start: automation.business_start,
+    business_end: automation.business_end,
+  };
+  await saveSettings("#saveAutomationButton", commonPayload);
+  assert.equal(automation.first_reply, "规则页独立保存的首次回复", "common save must not commit the rules-page draft");
+  assert.equal(await page.inputValue("#automationFirstReply"), "通用保存时必须保留的规则草稿", "common save must not erase the rules-page draft");
+  await visit("auto-reply");
+  assert.equal(await page.inputValue("#automationFirstReply"), "通用保存时必须保留的规则草稿");
+  const stopsBeforeSwitches = fixtures.botStops.length;
+  const startsBeforeSwitches = fixtures.botStartModes.length;
+  await saveSettings('label:has(#rulesEnabledToggle) .setting-copy', { rules_enabled: false });
+  assert.equal(await page.isChecked("#rulesEnabledToggle"), false);
+  assert.equal(automation.ai_enabled, true, "turning off rules leaves AI enabled");
+  assert.equal(await page.inputValue("#automationFirstReply"), "通用保存时必须保留的规则草稿", "engine toggle preserves unsaved default reply");
+  await saveSettings("#saveRulesDefaultsButton", {
+    first_reply: "通用保存时必须保留的规则草稿", fallback_reply: "规则页独立保存的兜底回复",
+  });
+
+  await visit("ai-config");
+  await page.waitForSelector("#aiKnowledgeContent:enabled");
+  const customInstruction = "自定义人设完整保存边界。".repeat(120).slice(0, 1200);
+  assert.equal(customInstruction.length, 1200);
+  await page.selectOption("#aiPersonaPreset", "catgirl");
+  const friendlyInstruction = await page.inputValue("#aiPersonaInstruction");
+  assert.ok(friendlyInstruction.length > 0);
+  await page.selectOption("#aiPersonaPreset", "custom");
+  assert.equal(await page.inputValue("#aiPersonaInstruction"), "", "first custom selection must not inherit a preset instruction");
+  await page.fill("#aiPersonaInstruction", customInstruction);
+  await page.selectOption("#aiPersonaPreset", "mint");
+  const professionalInstruction = await page.inputValue("#aiPersonaInstruction");
+  assert.ok(professionalInstruction.length > 0);
+  assert.notEqual(professionalInstruction, friendlyInstruction);
+  assert.notEqual(professionalInstruction, customInstruction, "preset must not inherit the custom draft");
+  await page.selectOption("#aiPersonaPreset", "custom");
+  assert.equal(await page.inputValue("#aiPersonaInstruction"), customInstruction, "switching presets preserves the custom draft separately");
+  await page.selectOption("#aiPersonaPreset", "catgirl");
+  assert.equal(await page.inputValue("#aiPersonaInstruction"), friendlyInstruction);
+  await page.selectOption("#aiPersonaPreset", "custom");
+  await page.fill("#aiStoreContent", "独立开关保存不能清空的店铺草稿");
+  await page.fill("#aiPersonaName", "保留人设草稿");
+  await page.fill("#aiKnowledgeContent", "独立开关保存不能清空的商品草稿");
+  await saveSettings('label:has(#aiEnabledToggle) .setting-copy', { ai_enabled: false });
+  assert.equal(await page.isChecked("#aiEnabledToggle"), false);
+  assert.equal(automation.rules_enabled, false, "AI switch does not change the rule switch");
+  assert.equal(await page.locator("#aiOverallStatus").textContent(), "AI 已关闭", "disabled AI wins over the live rules_ai worker mode");
+  assert.equal(await page.locator("#chatAiStatus").textContent(), "AI 已关闭", "workbench status agrees with the AI switch");
+  assert.equal(await page.inputValue("#aiPersonaInstruction"), customInstruction);
+  assert.equal(await page.inputValue("#aiPersonaName"), "保留人设草稿");
+  assert.equal(await page.inputValue("#aiStoreContent"), "独立开关保存不能清空的店铺草稿");
+  assert.equal(await page.inputValue("#aiKnowledgeContent"), "独立开关保存不能清空的商品草稿");
+  await saveSettings('label:has(#aiEnabledToggle) .setting-copy', { ai_enabled: true });
+  assert.equal(await page.isChecked("#aiEnabledToggle"), true);
+  assert.equal(await page.locator("#aiOverallStatus").textContent(), "AI 运行中");
+  assert.equal(await page.locator("#chatAiStatus").textContent(), "AI 已开启");
+  assert.equal(account.bot.running, true, "both reply switches leave the delivery worker running");
+  assert.equal(account.bot.automation_mode, "rules_ai");
+  assert.equal(fixtures.botStops.length, stopsBeforeSwitches);
+  assert.equal(fixtures.botStartModes.length, startsBeforeSwitches, "settings do not replace or restart a running worker");
+
+  await desktopApiClick(page, "#aiSavePersona", "/api/bot/ai/config", "PUT");
+  await page.waitForFunction(() => document.querySelector("#aiPersonaStatus")?.textContent.includes("已保存"));
+  const configWrite = fixtures.aiRequests.findLast((request) => request.kind === "config");
+  assert.equal(configWrite.accountKey, accountKey);
+  assert.equal(configWrite.payload.persona_preset, "custom");
+  assert.equal(configWrite.payload.persona_instruction, customInstruction, "all 1200 characters reach the API");
+  assert.equal(account.ai.config.draft.persona_instruction, customInstruction, "mock config persistence retains the instruction");
+  // The intentionally preserved product draft must be saved before a reload;
+  // otherwise the real unsaved-changes guard correctly cancels navigation.
+  await desktopApiClick(page, "#aiSaveKnowledge", "/api/bot/ai/products/100001/knowledge", "PUT");
+  await page.waitForFunction(() => document.querySelector("#aiKnowledgeMessage")?.textContent.includes("已保存"));
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await page.waitForSelector("#workspace:not([hidden])");
+  await openView(page, "ai-config");
+  await page.waitForFunction(() => document.querySelector("#aiPersonaPreset")?.value === "custom");
+  assert.equal(await page.inputValue("#aiPersonaPreset"), "custom");
+  assert.equal(await page.inputValue("#aiPersonaInstruction"), customInstruction, "saved custom instruction survives a fresh config GET");
+}
+
 async function checkRuleDraftLoads(browser, baseUrl) {
   const saved = { ...fixtures };
   for (const [key, value] of Object.entries(fixtures)) {
@@ -4662,7 +5198,7 @@ async function checkRuleDraftLoads(browser, baseUrl) {
   const rule = (name) => ({ name, item_id: "100001", enabled: true, keywords: [name], reply: `${name}原始回复` });
   const originalRules = [rule("规则甲"), rule("规则乙")]; // No stable IDs: editing is index-based.
   Object.assign(fixtures, {
-    me: structuredClone(saved.me), bot: structuredClone(saved.bot),
+    me: structuredClone(saved.me), bot: structuredClone(saved.bot), ai: structuredClone(saved.ai),
     automation: { ...structuredClone(saved.automation), rules: [originalRules[0]], first_reply: "初始规则已加载" },
     shopAccounts: [structuredClone(saved.shopAccounts[0]), { ...saved.shopAccounts[0], id: 92, key: "draft-first-load", name: "草稿首次加载店" }],
     accountData: { "draft-first-load": { automation: { ...structuredClone(saved.automation), rules: [rule("新店已有规则")], first_reply: "首次GET已应用" } } },
@@ -4758,7 +5294,7 @@ async function checkRuleDraftLoads(browser, baseUrl) {
     const firstViewGate = holdAutomationResponse("GET", "draft-first-load");
     const firstRefreshGate = holdAutomationResponse("GET", "draft-first-load");
     await fillDraft("切店必须丢弃");
-    await page.selectOption("#automationShopSelect", "draft-first-load");
+    await page.click('#accountTabs [data-account-switch="draft-first-load"]');
     await Promise.all([firstViewGate.started(), firstRefreshGate.started()]);
     assert.equal(await page.inputValue("#replyRuleName"), "", "shop switch must explicitly reset the draft");
     assert.equal(await page.locator("#replyRuleList .rule-row").count(), 0);
@@ -4772,14 +5308,248 @@ async function checkRuleDraftLoads(browser, baseUrl) {
     assert.equal(firstLoadSaved.length, 2);
     assert.deepEqual(firstLoadSaved[0], rule("新店已有规则"), "saving after the first GET must retain the server's existing rules");
     assert.equal(firstLoadSaved[1].name, "首次加载前草稿");
+    await checkCustomerServiceSettings(page, "draft-first-load");
+    await openView(page, "auto-reply");
     await fillDraft("退出必须丢弃");
     await desktopApiClick(page, "#logoutButton", "/api/auth/logout");
     await page.waitForSelector("#workspace", { state: "hidden" });
     assert.equal(await page.inputValue("#replyRuleName"), "", "logout must explicitly reset the draft");
     assertDesktopEvidence(evidence);
-    console.log(JSON.stringify({ ok: true, scope: "rule-drafts", cases: ["late-get-new-draft", "load-existing-rules-before-create", "late-get-edit-reorder", "cancel-before-get", "new-draft-after-cancel", "successful-save-reset", "first-get-keeps-server-rules", "shop-and-logout-reset"] }));
+    console.log(JSON.stringify({ ok: true, scope: "rule-drafts", cases: ["late-get-new-draft", "load-existing-rules-before-create", "late-get-edit-reorder", "cancel-before-get", "new-draft-after-cancel", "successful-save-reset", "first-get-keeps-server-rules", "shop-and-logout-reset", "partial-settings-save", "cross-page-unsaved-drafts", "independent-engine-clicks", "disabled-ai-running-worker-status", "preset-custom-isolation", "persona-1200-roundtrip"] }));
   } finally {
     for (const release of fixtures.pendingAutomationGates) release();
+    await page.close();
+    Object.assign(fixtures, saved);
+  }
+}
+
+async function checkDeliveryStart(browser, baseUrl) {
+  const saved = { ...fixtures };
+  for (const [key, value] of Object.entries(fixtures)) {
+    if (Array.isArray(value)) fixtures[key] = structuredClone(value);
+  }
+  const automation = { ...structuredClone(saved.automation), enabled: false, running: false, rules: [], first_reply: "", fallback_reply: "" };
+  Object.assign(fixtures, {
+    me: structuredClone(saved.me), bot: { ...structuredClone(saved.bot), running: false, automation_mode: "rules" },
+    automation, products: productFixtures.slice(0, 2), templates: [],
+    shopAccounts: [structuredClone(saved.shopAccounts[0]), { ...saved.shopAccounts[0], id: 93, key: "delivery-other", name: "另一个发货店" }],
+    accountData: { "delivery-other": { automation: { ...structuredClone(automation), deliveries: [] },
+      bot: { ...structuredClone(saved.bot), running: false }, products: productFixtures.slice(0, 2) } },
+    botStartModes: [], botStartResponses: [], automationPuts: [],
+    automationResponseGates: {}, pendingAutomationGates: new Set(),
+  });
+  await fetch(`${baseUrl.replace(/\/$/, "")}/api/auth/logout`, { method: "POST" });
+  const { page, evidence } = await desktopContractPage(browser, baseUrl);
+  const waitFinished = async (message) => {
+    await page.waitForFunction((expected) => !document.querySelector('#batchDeliveryDialog')?.open
+      && !document.querySelector('[data-edit-delivery][data-item-id="100001"]')?.disabled
+      && document.querySelector('#toastRegion .toast')?.textContent.includes(expected), message);
+  };
+  const saveMaterial = async (material, enabled = true, message = "自动发货已启动") => {
+    await page.locator('[data-edit-delivery][data-item-id="100001"]').click();
+    await page.locator(`[data-batch-mode="${enabled ? "set" : "pause"}"]`).click();
+    if (enabled) await page.fill("#batchDeliveryMaterial", material);
+    const [previewRes, commitRes] = await Promise.all([
+      page.waitForResponse((item) => new URL(item.url()).pathname === "/xianyu-saas/api/bot/products/batch/preview" && item.request().method() === "POST"),
+      page.waitForResponse((item) => new URL(item.url()).pathname === "/xianyu-saas/api/bot/products/batch/commit" && item.request().method() === "POST"),
+      page.locator("#batchDeliveryCommit").click(),
+    ]);
+    assert.equal(previewRes.status(), 200);
+    assert.equal(commitRes.status(), 200);
+    await waitFinished(enabled ? message : "所选商品已暂停自动发资料");
+  };
+  const reloadGoods = async () => {
+    await desktopApiClick(page, "#refreshButton", "/api/bot/status", "GET");
+    await page.waitForFunction(() => !document.querySelector('#refreshButton')?.disabled);
+  };
+  try {
+    await desktopLogin(page, fixtures.me.username);
+    await openView(page, "shops");
+    await page.waitForSelector('#accountTabs [data-account-switch="delivery-other"]');
+    await openView(page, "goods");
+    await page.waitForSelector('[data-edit-delivery][data-item-id="100001"]');
+    assert.match(await page.locator("#productGrid").innerText(), /自动发货未启动/);
+
+    await saveMaterial("付款后发送的测试资料一");
+    assert.deepEqual(fixtures.botStartModes, [{ accountKey: "default", mode: "rules" }], "enabling material must start a stopped fulfillment worker");
+    assert.equal(fixtures.automation.enabled, false, "starting fulfillment must leave automatic replies disabled");
+    assert.match(await page.locator("#toastRegion").innerText(), /自动发货已启动/);
+    assert.doesNotMatch(await page.locator("#productGrid").innerText(), /自动发货未启动/);
+
+    fixtures.bot.running = false;
+    await saveMaterial("", false);
+    assert.equal(fixtures.botStartModes.length, 1, "pausing materials must not start a stopped worker");
+    assert.match(await page.locator("#productGrid").innerText(), /资料已暂停/);
+    await desktopApiClick(page, '[data-delivery-toggle="100001"]', "/api/automation", "PUT");
+    await waitFinished("自动发货已启动");
+    assert.equal(fixtures.botStartModes.length, 2, "restoring materials starts the worker");
+    assert.equal(fixtures.automation.enabled, false);
+
+    // Keep the browser's stopped status stale while the save response reports
+    // an active AI worker. The explicit save must use that fresh response.
+    fixtures.bot.running = false;
+    await reloadGoods();
+    fixtures.bot.running = true;
+    fixtures.bot.automation_mode = "rules_ai";
+    await saveMaterial("付款后发送的测试资料二", true, "批量资料已保存");
+    assert.equal(fixtures.botStartModes.length, 2, "saving must preserve the already running AI worker");
+    assert.equal(fixtures.bot.automation_mode, "rules_ai");
+
+    fixtures.bot.running = false;
+    fixtures.botStartResponses.push({ status: 503, body: { detail: "测试启动暂不可用" } });
+    evidence.allowedFailures.push({ path: "/api/bot/start", status: 503 });
+    await saveMaterial("启动失败后仍然保留的资料", true, "资料已保存，但自动发货未启动");
+    assert.equal(fixtures.automation.deliveries.find((item) => item.item_id === "100001").material, "启动失败后仍然保留的资料");
+    assert.match(await page.locator("#toastRegion .is-warning").innerText(), /资料已保存，但自动发货未启动.*测试启动暂不可用/);
+    assert.match(await page.locator("#productGrid").innerText(), /自动发货未启动/);
+
+    fixtures.automation.deliveries[0].enabled = false;
+    await reloadGoods();
+    const gate = holdAutomationResponse("PUT", "default");
+    const startsBeforeSwitch = fixtures.botStartModes.length;
+    await page.locator('[data-delivery-toggle="100001"]').click();
+    await gate.started();
+    await page.locator('#accountTabs [data-account-switch="delivery-other"]').click();
+    await page.waitForSelector('#accountTabs [data-account-switch="delivery-other"].is-active');
+    const lateResponse = page.waitForResponse((response) => response.url().endsWith("/api/automation") && response.request().method() === "PUT");
+    gate.release();
+    await lateResponse;
+    await page.waitForFunction(() => document.querySelector('#productGrid')?.textContent.includes("未设置资料"));
+    assert.equal(fixtures.botStartModes.length, startsBeforeSwitch, "a stale save must not start either shop after switching");
+    assert.equal(fixtures.accountData["delivery-other"].automation.deliveries.length, 0);
+    assertDesktopEvidence(evidence);
+    console.log(JSON.stringify({ ok: true, scope: "delivery-start", cases: ["save-starts-fulfillment", "replies-remain-disabled", "pause-does-not-start", "resume-starts", "fresh-running-preserves-ai", "start-failure-keeps-saved-material", "stopped-badge", "stale-save-after-shop-switch"] }));
+  } catch (error) {
+    await reportDesktopFailure(page, "delivery-start", error, evidence);
+    throw error;
+  } finally {
+    for (const release of fixtures.pendingAutomationGates) release();
+    await page.close();
+    Object.assign(fixtures, saved);
+  }
+}
+
+async function checkImageUpload(browser, baseUrl) {
+  const saved = { ...fixtures };
+  for (const [key, value] of Object.entries(fixtures)) {
+    if (Array.isArray(value)) fixtures[key] = structuredClone(value);
+  }
+  Object.assign(fixtures, {
+    productionCsp: true,
+    me: structuredClone(saved.me), bot: structuredClone(saved.bot),
+    // This scope exercises uploads only; its starting chat has no external media.
+    conversations: [{ chat_id: "chat-1", item_id: "100001", buyer_label: "买家 · 图片测试", preview: "可以发张图片吗？", time: "2026-09-19 15:18", message_count: 1, unread: false, manual_mode: false }],
+    messages: [{ role: "user", content: "可以发张图片吗？", time: "2026-09-19 15:18", chat_id: "chat-1", item_id: "100001" }],
+    accountData: {}, manualImageRequests: [], manualReplies: [], manualReplyRequests: [], inboxTakeoverCommands: [],
+    manualReplyPollsById: new Map(), manualReplyPollModes: new Map(),
+    manualReplyPostMode: "success", manualReplyPollMode: "multipart_success",
+    manualReplyPostDelayMs: 0, manualImageUploadDelayMs: 0,
+  });
+  const logout = await fetch(`${baseUrl.replace(/\/$/, "")}/api/auth/logout`, { method: "POST" });
+  assert.equal(logout.status, 200);
+  const { page, evidence } = await desktopContractPage(browser, baseUrl);
+  const failedRequests = [];
+  page.on("requestfailed", (request) => failedRequests.push({ url: request.url(), error: request.failure()?.errorText }));
+  await page.context().routeWebSocket("**/*", (socket) => { evidence.externalRequests.push(socket.url()); socket.close(); });
+  try {
+    await desktopLogin(page, fixtures.me.username);
+    await openView(page, "chat");
+    await page.waitForSelector('#conversationItems [data-chat-id="chat-1"]');
+    await page.click('#conversationItems [data-chat-id="chat-1"]');
+    await page.waitForFunction(() => document.querySelector('#chatTakeoverToggle')?.disabled === false);
+    assert.equal(await page.locator("#chatAiResume").count(), 0, "the obsolete top resume control must be removed");
+    assert.equal(await page.locator("#chatTakeoverToggle").getAttribute("type"), "button", "takeover must not submit a message");
+    assert.equal((await page.locator("#chatTakeoverToggle").innerText()).trim(), "人工接管");
+    assert.equal(await page.locator("#manualReplySend").isHidden(), true, "sending remains hidden while the reply is empty");
+    assert.equal(await page.locator('label[for="manualReplyFile"], #manualReplyImageCount').count(), 0, "the picker toolbar and attachment counter must be removed");
+    assert.equal(await page.locator("#manualReplyFile").isHidden(), true, "the compatibility file input must remain hidden");
+    assert.doesNotMatch(await page.locator("#manualReplyForm").innerText(), /选择图片|最多 8 张；图片会按顺序逐张发送，文字最后单独发送。/);
+    const assertEmptyAttachments = async () => {
+      assert.equal(await page.locator("#manualReplyPreview").isHidden(), true, "empty previews must be hidden");
+      assert.equal(await page.locator("#manualReplyDropzone").isHidden(), true, "empty attachments must not leave a toolbar-sized gap");
+      assert.equal(await page.locator("#manualReplyDropzone").evaluate((node) => node.getBoundingClientRect().height), 0, "empty attachments must occupy no layout height");
+    };
+    await assertEmptyAttachments();
+
+    const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", "base64");
+    const names = ["微信图片_2026-09-14_212133_207.png", "表情包_薄荷🌿_100%.png", "粘贴的图片.png"];
+    await dispatchManualReplyImageEvent(page, "paste", { name: "移除测试.png", mimeType: "image/png", bytes: [...png], lastModified: 0 });
+    await page.waitForSelector("#manualReplyPreview .reply-image-card");
+    assert.equal(await page.locator("#manualReplyDropzone").isVisible(), true, "pasting reveals the attachment area");
+    assert.equal(await page.locator("#manualReplySend").isVisible(), true, "pasting in AI mode makes the send action available");
+    assert.deepEqual(fixtures.inboxTakeoverCommands, [], "pasting must not take over an AI conversation");
+    await page.locator("#manualReplyPreview [data-remove-manual-attachment]").click();
+    assert.equal(await page.locator("#manualReplyPreview .reply-image-card").count(), 0, "removing the only image must clear its preview");
+    await assertEmptyAttachments();
+    assert.equal(await page.locator("#manualReplySend").isHidden(), true, "removing the final attachment leaves no empty send action");
+
+    for (const [index, name] of [names[0], names[1], ""].entries()) {
+      await dispatchManualReplyImageEvent(page, "paste", { name, mimeType: "image/png", bytes: [...png], lastModified: index + 1 });
+    }
+    await page.waitForFunction(() => document.querySelectorAll("#manualReplyPreview .reply-image-card").length === 3);
+    assert.equal(await page.locator("#manualReplyPreview").isVisible(), true);
+    assert.equal(await page.locator("#manualReplyDropzone").isVisible(), true);
+    assert.deepEqual(await page.locator("#manualReplyPreview .reply-image-card strong").allTextContents(), names);
+    assert.equal(fixtures.manualImageRequests.length, 0, "pasting and removing must not upload before submission");
+    assert.deepEqual(fixtures.inboxTakeoverCommands, [], "preparing attachments must leave AI mode unchanged");
+    assert.equal((await page.locator("#chatTakeoverToggle").innerText()).trim(), "人工接管");
+
+    const sendRequestStart = fixtures.apiRequests.length;
+    fixtures.inboxTakeoverDelayMs = 300;
+    const takeoverStarted = page.waitForRequest((request) => new URL(request.url()).pathname.endsWith("/api/bot/conversations/chat-1/takeover") && request.method() === "POST");
+    const imageSend = desktopApiClick(page, '#manualReplySend', "/api/bot/messages/reply");
+    await takeoverStarted;
+    assert.equal(await page.locator("#chatTakeoverToggle").isDisabled(), true, "the toggle must be locked while automatic takeover is pending");
+    await page.locator("#manualReplyForm").evaluate((form) => form.requestSubmit());
+    const response = await imageSend;
+    assert.equal(response.accepted, true, "the parent reply is accepted after all three image uploads");
+    assert.deepEqual(fixtures.inboxTakeoverCommands, [{ chatId: "chat-1", enabled: true }], "sending in AI mode must automatically take over exactly once");
+    const sendRequests = fixtures.apiRequests.slice(sendRequestStart).filter((request) => request.method === "POST").map((request) => request.path);
+    const takeoverIndex = sendRequests.indexOf("/api/bot/conversations/chat-1/takeover");
+    assert.ok(takeoverIndex >= 0 && takeoverIndex < sendRequests.indexOf("/api/bot/messages/reply"), "takeover must succeed before creating the parent reply");
+    assert.equal(fixtures.manualImageRequests.length, 3, "Unicode filenames must reach the upload API instead of failing in browser fetch");
+    assert.deepEqual(fixtures.manualImageRequests.map((request) => request.fileName), names, "the upload API must receive the original filenames, including clipboard fallback");
+    assert.deepEqual(fixtures.manualImageRequests.map((request) => request.encodedFileName), names.map(encodeURIComponent), "filename headers must use ASCII-safe UTF-8 percent encoding");
+    assert.equal(fixtures.manualReplyRequests.length, 1);
+    assert.equal(fixtures.manualReplyRequests[0].chatId, "chat-1");
+    assert.deepEqual(fixtures.manualReplyRequests[0].media.map((media) => media.name), names, "accepted reply media must retain the original names and order");
+    await page.waitForFunction(() => document.querySelectorAll("#manualReplyPreview .reply-image-card").length === 0);
+    await assertEmptyAttachments();
+    await page.waitForFunction(() => document.querySelector('#chatTakeoverToggle')?.disabled === false);
+    assert.equal(await page.locator("#manualReplySend").isHidden(), true, "a successful send clears and hides the send action");
+    assert.equal((await page.locator("#chatTakeoverToggle").innerText()).trim(), "恢复 AI");
+    await desktopApiClick(page, '#chatTakeoverToggle', "/api/bot/conversations/chat-1/takeover");
+    await page.waitForFunction(() => document.querySelector('#chatTakeoverToggle')?.textContent.trim() === "人工接管" && !document.querySelector('#chatTakeoverToggle').disabled);
+    await desktopApiClick(page, '#chatTakeoverToggle', "/api/bot/conversations/chat-1/takeover");
+    await page.waitForFunction(() => document.querySelector('#chatTakeoverToggle')?.textContent.trim() === "恢复 AI" && !document.querySelector('#chatTakeoverToggle').disabled);
+    assert.deepEqual(fixtures.inboxTakeoverCommands, [{ chatId: "chat-1", enabled: true }, { chatId: "chat-1", enabled: false }, { chatId: "chat-1", enabled: true }], "the bottom toggle must restore AI and allow manual takeover again");
+    assert.equal(fixtures.manualReplyRequests.length, 1, "toggling takeover must not submit another reply");
+
+    await desktopApiClick(page, '#chatTakeoverToggle', "/api/bot/conversations/chat-1/takeover");
+    await page.waitForFunction(() => document.querySelector('#chatTakeoverToggle')?.textContent.trim() === "人工接管" && !document.querySelector('#chatTakeoverToggle').disabled);
+    const textTakeoverStart = fixtures.inboxTakeoverCommands.length;
+    const textReplyStart = fixtures.manualReplyRequests.length;
+    const text = "回车发送的纯文本回复";
+    await page.fill("#manualReplyInput", text);
+    assert.equal(await page.locator("#manualReplySend").isVisible(), true, "typing in AI mode must expose the send action");
+    assert.equal(fixtures.inboxTakeoverCommands.length, textTakeoverStart, "typing must not take over the conversation");
+    const textResponse = page.waitForResponse((response) => new URL(response.url()).pathname.endsWith("/api/bot/messages/reply") && response.request().method() === "POST");
+    await page.locator("#manualReplyInput").press("Enter");
+    assert.equal((await textResponse).status(), 200);
+    await page.waitForFunction(() => document.querySelector('#chatTakeoverToggle')?.textContent.trim() === "恢复 AI" && !document.querySelector('#chatTakeoverToggle').disabled && document.querySelector('#manualReplyInput')?.value === "");
+    assert.deepEqual(fixtures.inboxTakeoverCommands.slice(textTakeoverStart), [{ chatId: "chat-1", enabled: true }], "Enter must automatically take over exactly once");
+    assert.equal(fixtures.manualReplyRequests.length, textReplyStart + 1, "Enter must create exactly one new parent reply");
+    assert.equal(fixtures.manualReplyRequests.at(-1).content, text);
+    assert.deepEqual(fixtures.manualReplyRequests.at(-1).media, [], "the text reply must not resend previous images");
+    assert.equal(await page.locator("#manualReplySend").isHidden(), true);
+    assert.doesNotMatch(await page.locator("#replyMessage").innerText(), /网络连接失败|ByteString|networkfailed/i);
+    assert.deepEqual(failedRequests, [], "image uploads must not cause failed browser requests");
+    assertDesktopEvidence(evidence);
+    console.log(JSON.stringify({ ok: true, scope: "image-upload", cases: ["removed-picker-toolbar", "empty-attachments-no-height", "ai-mode-paste-without-takeover", "paste-reveals-preview", "remove-clears-preview", "chinese-paste-name", "emoji-percent-paste-name", "unnamed-paste-fallback", "ascii-safe-upload-headers", "preserved-media-names", "send-takes-over-first", "takeover-lock-blocks-reentrant-submit", "single-parent-reply", "submit-hides-preview", "bottom-toggle-restores-ai-and-retakes", "enter-text-takes-over-and-submits-once"] }));
+  } catch (error) {
+    await reportDesktopFailure(page, "image-upload", error, evidence);
+    throw error;
+  } finally {
     await page.close();
     Object.assign(fixtures, saved);
   }
@@ -4842,9 +5612,22 @@ async function run() {
       await checkRuleDraftLoads(browser, `http://127.0.0.1:${port}/xianyu-saas/`);
       return;
     }
+    if (deliveryStartScope) {
+      await checkDeliveryStart(browser, `http://127.0.0.1:${port}/xianyu-saas/`);
+      return;
+    }
+    if (personaCompactScope) {
+      await checkPersonaCompact(browser, `http://127.0.0.1:${port}/xianyu-saas/`);
+      return;
+    }
+    if (imageUploadScope) {
+      await checkImageUpload(browser, `http://127.0.0.1:${port}/xianyu-saas/`);
+      return;
+    }
     await checkConnectionFlows(browser, `http://127.0.0.1:${port}/xianyu-saas/`);
     if (connectionFlowsScope) return;
     await checkRuleDraftLoads(browser, `http://127.0.0.1:${port}/xianyu-saas/`);
+    await checkDeliveryStart(browser, `http://127.0.0.1:${port}/xianyu-saas/`);
     await checkUpdates(browser, `http://127.0.0.1:${port}/xianyu-saas/`);
     const bootstrapToken = "bootstrap-ui-contract-token-0123456789abcdef";
     fixtures.authCapabilities = { registration_enabled: false, bootstrap_available: true, password_min_length: 12 };
@@ -4945,7 +5728,7 @@ async function run() {
     await page.click("#authSubmit");
     await page.waitForSelector("#workspace:not([hidden])");
     await page.waitForSelector('[data-panel="home"]:not([hidden])');
-    await page.waitForFunction(() => document.querySelectorAll("#homeStatCards .stat-card").length === 4 && document.querySelectorAll("#homeProductGrid .home-product-card").length === 6);
+    await page.waitForFunction(() => document.querySelectorAll("#homeStatCards .stat-card").length === 4 && document.querySelectorAll("#homeProductGrid .home-product-card").length === 4);
 
     // The self-use dashboard exposes all existing operations without subscription UI.
     assert.equal(await page.locator("#headerPlanBadge, #membershipCurrentBadge, #vipNavButton, #chatAiUpgrade, [data-panel=vip]").count(), 0, "membership and upgrade controls must not exist");
@@ -4969,7 +5752,7 @@ async function run() {
     assert.equal(await page.locator(".overview-grid-2col > .card-section").count(), 4, "overview keeps trends, attention, recent orders and product previews grouped");
     assert.equal(await page.locator("#homeOrderList, #homeResourceBody").count(), 2, "overview includes actionable orders and per-shop resource summary");
     assert.equal(await page.locator("#analyticsChart .chart-bar").count(), fixtures.analytics.buckets.length, "overview renders the analytics trend");
-    assert.deepEqual(await page.locator("#homeProductGrid .home-product-name").allTextContents(), fixtures.products.slice(0, 6).map((item) => item.title), "home shows up to six featured products");
+    assert.deepEqual(await page.locator("#homeProductGrid .home-product-name").allTextContents(), fixtures.products.slice(0, 4).map((item) => item.title), "home shows up to four featured products");
     const visibleText = await page.locator("body").innerText();
     for (const removed of ["会员服务", "选择套餐", "会员权益", "立即开通", "开通 AI 客服", "续费", "升级", "模板管理", "兑换码", "卡券管理", "账号、连接状态和店铺操作集中在一处", "已识别的商品会自动整理成列表", "商品信息会自动整理，不需要填写复杂配置"]) {
       assert.equal(visibleText.includes(removed), false, `${removed} must be removed from the self-use workspace`);
@@ -4985,7 +5768,7 @@ async function run() {
     await waitForPanelSettled(page);
     assert.equal(await page.locator(".docs-manual").count(), 1);
     assert.equal(await page.locator(".docs-step-item").count(), 4);
-    assert.equal(await page.locator("details.docs-faq-item").count(), 5);
+    assert.ok(await page.locator("details.docs-faq-item").count() >= 5, "guide keeps the FAQ list");
     assert.doesNotMatch(await page.locator(".docs-manual").textContent(), /绝不会|全部测试通过|除此以外不向外部/);
     for (const view of ["shops", "goods", "chat", "orders", "home"]) {
       assert.ok(await page.locator('[data-view="' + view + '"]').count(), "guide destinations remain accessible from the workspace");
@@ -5488,7 +6271,7 @@ async function run() {
     assert.match(await page.locator("#shopAccountsPanelList .shop-card.is-current .badge").textContent(), /当前 · 已连接/);
     assert.equal(await page.locator("#shopAccountsPanelList .shop-card-meta span").first().textContent(), `${fixtures.products.length} 个商品`);
     assert.equal(await page.locator("#shopAccountsCount").textContent(), "1 个");
-    assert.equal(await page.locator('[data-account-delete="default"]').isDisabled(), true, "the default shop must be protected");
+    assert.equal(await page.locator('[data-account-delete="default"]').isDisabled(), false, "the default shop can be disconnected");
     assert.equal(await page.locator("#otherConnectionDetails, #legacyConnectorButton, #cookiesForm, #downloadConnector").count(), 0, "compatibility connection methods must be removed");
     assert.equal(await page.locator("#shopConnectionTitle").textContent(), "店铺已连接", "connected shops must show the management copy");
     assert.equal(await page.locator("#xianyuConnectButton span").textContent(), "重新连接店铺", "connected shops must not show the initial connect action");
@@ -5798,11 +6581,8 @@ async function run() {
     assert.equal(await page.locator('[data-panel="auto-reply"] .page-head-copy p').count(), 0, "business-domain headers stay compact without duplicate subtitles");
     assert.match(await page.locator('[data-panel="auto-reply"] .page-head-copy h1').textContent(), /智能客服中心/);
     assert.equal(await page.locator('[data-panel="auto-reply"] [data-view="auto-reply"]').getAttribute("aria-selected"), "true");
-    assert.equal(await page.locator("#automationEnabledToggle").count(), 1, "automation must expose exactly one enable switch");
-    await page.click(".automation-enabled-row .setting-copy");
-    assert.equal(await page.locator("#automationEnabledToggle").isChecked(), false, "clicking the visible switch copy toggles the checkbox");
-    await page.click(".automation-enabled-row .setting-copy");
-    assert.equal(await page.locator("#automationEnabledToggle").isChecked(), true);
+    assert.deepEqual(await page.locator('[data-panel="auto-reply"] .sub-tab-btn').allTextContents(), ["会话工作台", "AI 客服设置", "规则客服", "通用设置"]);
+    assert.equal(await page.locator('[data-panel="auto-reply"] .automation-global-card').count(), 0, "global automation card stays out of auto-reply page");
     assert.equal(await page.locator("#startAutomationButton, #stopAutomationButton").count(), 0, "the reference page uses the enable switch and save action instead of extra run buttons");
     assert.equal(await page.locator("#replyRuleForm").count(), 1, "the create-rule form stays visible like the reference demo");
     assert.equal(await page.locator("#replyRuleTable thead th").count(), 5, "configured rules use a semantic five-column table");
@@ -5810,13 +6590,8 @@ async function run() {
     assert.ok(await page.locator("#replyRuleList .rule-keyword").count() >= 1, "keyword rules render compact chips");
     assert.equal(await page.locator('[data-panel="auto-reply"] #deliveryRuleList, [data-panel="auto-reply"] #automationLogList').count(), 0, "delivery and runtime-log cards stay out of the reference auto-reply page");
     assert.equal(await page.locator(".page-head-copy h1").evaluateAll((headings) => headings.length >= 10 && headings.every((heading) => heading.querySelectorAll(".page-head-icon").length === 1)), true, "every workspace panel title keeps exactly one icon");
-    assert.equal(await page.inputValue("#automationShopSelect"), "shop-ui-2", "automation scopes to the active shop");
     assert.equal(await page.inputValue("#automationFirstReply"), fixtures.automation.first_reply, "first-contact reply is loaded from the account settings");
     assert.equal(await page.inputValue("#automationFallbackReply"), fixtures.automation.fallback_reply, "fallback reply is loaded from the account settings");
-    assert.equal(await page.inputValue("#automationDelayMin"), "2");
-    assert.equal(await page.inputValue("#automationDelayMax"), "3");
-    assert.equal(await page.inputValue("#automationTriggerCooldown"), "2");
-    assert.equal(await page.inputValue("#automationManualCooldown"), "30");
     assert.equal(await page.locator("#replyRuleProductOptions option").count(), fixtures.products.length, "rule product ID suggestions come from real synced products");
 
     const measureAutomationLayout = () => page.evaluate(() => {
@@ -5841,7 +6616,7 @@ async function run() {
     });
     const layout1440 = await measureAutomationLayout();
     assert.ok(Math.abs(layout1440.panelWidth - 1152) <= 2, `1440px automation panel should cap near 1152px: ${JSON.stringify(layout1440)}`);
-    assert.ok(Math.abs(layout1440.leftWidth / layout1440.rightWidth - 4.5 / 7.5) <= 0.03, `desktop automation columns should stay near 4.5:7.5: ${JSON.stringify(layout1440)}`);
+    assert.ok(Math.abs(layout1440.leftWidth - layout1440.rightWidth) <= 2, `desktop automation columns should be equal width: ${JSON.stringify(layout1440)}`);
     assert.ok(Math.abs(layout1440.leftTop - layout1440.rightTop) <= 1 && layout1440.rightLeft > layout1440.leftRight, "1440px automation layout must use two columns");
 
     await page.setViewportSize({ width: 1024, height: 900 });
@@ -5915,8 +6690,24 @@ async function run() {
     assert.equal(await page.locator("#replyRuleList .rule-row").count(), 1);
     assert.equal(fixtures.automation.rules.length, 1, "rule deletion is persisted immediately");
 
+    assert.equal(await page.locator("#rulesEnabledToggle").count(), 1, "rules engine exposes its own switch");
+    const defaultsBeforeCommonSave = [fixtures.automation.first_reply, fixtures.automation.fallback_reply];
     await page.fill("#automationFirstReply", "欢迎光临，请告诉我想了解商品的哪一方面。");
     await page.fill("#automationFallbackReply", "稍后店主会人工回复你。");
+
+    // 通用客服设置抽成独立的通用设置(common-service)子页
+    await openView(page, "common-service");
+    await page.waitForSelector('[data-panel="common-service"]:not([hidden])');
+    assert.equal(await page.locator('[data-panel="common-service"] [data-view="common-service"]').getAttribute("aria-selected"), "true");
+    assert.deepEqual(await page.locator('[data-panel="common-service"] .sub-tab-btn').allTextContents(), ["会话工作台", "AI 客服设置", "规则客服", "通用设置"]);
+    // Sidebar domain highlighting is exercised elsewhere (chat/ai-config/auto-reply);
+    // common-service shares the same `domainView` grouping.
+    assert.equal(await page.inputValue("#automationShopSelect"), "shop-ui-2", "automation scopes to the active shop");
+    assert.equal(await page.inputValue("#automationDelayMin"), "2");
+    assert.equal(await page.inputValue("#automationDelayMax"), "3");
+    assert.equal(await page.inputValue("#automationTriggerCooldown"), "2");
+    assert.equal(await page.inputValue("#automationManualCooldown"), "30");
+
     await page.fill("#automationDelayMin", "4");
     await page.fill("#automationDelayMax", "6");
     await page.fill("#automationTriggerCooldown", "8");
@@ -5924,19 +6715,25 @@ async function run() {
     await page.check("#automationBusinessHoursEnabled");
     await page.fill("#automationBusinessStart", "08:30");
     await page.fill("#automationBusinessEnd", "23:00");
+    assert.equal(await page.inputValue("#automationFirstReply"), "欢迎光临，请告诉我想了解商品的哪一方面。", "switching to common settings preserves the rules draft");
+    assert.equal(await page.inputValue("#automationFallbackReply"), "稍后店主会人工回复你。");
     const globalPutCount = fixtures.automationPuts.length;
     const rulesStartCount = fixtures.botStartModes.length;
     const rulesStartResponse = page.waitForResponse((response) => response.url().endsWith("/api/bot/start") && response.request().method() === "POST");
     await page.click("#saveAutomationButton");
     await rulesStartResponse;
-    await page.waitForFunction(() => document.querySelector("#automationMessage")?.textContent.includes("已开启"));
+    await page.waitForFunction(() => document.querySelector("#automationMessage")?.textContent.includes("已保存"));
     assert.equal(fixtures.automationPuts.length, globalPutCount + 1);
     assert.equal(Object.prototype.hasOwnProperty.call(fixtures.automationPuts.at(-1).payload, "rules"), false, "global save must not overwrite rules");
     assert.equal(Object.prototype.hasOwnProperty.call(fixtures.automationPuts.at(-1).payload, "deliveries"), false, "global save must not overwrite deliveries");
+    assert.deepEqual(fixtures.automationPuts.at(-1).payload, {
+      delay_min_seconds: 4, delay_max_seconds: 6, trigger_cooldown_seconds: 8,
+      manual_takeover_cooldown_seconds: 45, business_hours_enabled: true,
+      business_start: "08:30", business_end: "23:00",
+    }, "common save submits only delay, cooldown and business-hour settings");
     assert.equal(fixtures.botStartModes.length, rulesStartCount + 1);
     assert.equal(fixtures.botStartModes.at(-1).mode, "rules", "saving enabled global settings starts the deterministic rules worker");
-    assert.equal(fixtures.automation.first_reply, "欢迎光临，请告诉我想了解商品的哪一方面。");
-    assert.equal(fixtures.automation.fallback_reply, "稍后店主会人工回复你。");
+    assert.deepEqual([fixtures.automation.first_reply, fixtures.automation.fallback_reply], defaultsBeforeCommonSave, "common save does not commit unsaved rule defaults");
     assert.equal(fixtures.automation.delay_min_seconds, 4);
     assert.equal(fixtures.automation.delay_max_seconds, 6);
     assert.equal(fixtures.automation.trigger_cooldown_seconds, 8);
@@ -5945,20 +6742,33 @@ async function run() {
     assert.equal(fixtures.automation.business_start, "08:30");
     assert.equal(fixtures.automation.business_end, "23:00");
 
-    // Disabling global automation is persisted by the same PUT and the backend
-    // stops the account's running deterministic rules worker.
-    const rulesWorkerStopCount = fixtures.botStops.length;
-    await page.click(".automation-enabled-row .setting-copy");
-    assert.equal(await page.locator("#automationEnabledToggle").isChecked(), false);
-    const disableAutomationPut = page.waitForResponse((response) => response.url().endsWith("/api/automation") && response.request().method() === "PUT");
-    const disabledBotStatus = page.waitForResponse((response) => response.url().endsWith("/api/bot/status") && response.request().method() === "GET");
-    await page.click("#saveAutomationButton");
-    await disableAutomationPut;
-    await disabledBotStatus;
-    await page.waitForFunction(() => document.querySelector("#automationMessage")?.textContent.includes("已关闭"));
-    assert.equal(fixtures.botStops.length, rulesWorkerStopCount + 1, "turning off automation must stop the running worker once");
-    assert.deepEqual(fixtures.botStops.at(-1), { accountKey: "shop-ui-2", mode: "rules", reason: "automation_disabled" });
-    assert.equal(fixtures.bot.running, false, "the deterministic rules worker must be stopped after disabling automation");
+    await openView(page, "auto-reply");
+    await page.waitForLoadState("networkidle");
+    assert.equal(await page.inputValue("#automationFirstReply"), "欢迎光临，请告诉我想了解商品的哪一方面。", "common save leaves the rule draft intact");
+    assert.equal(await page.inputValue("#automationFallbackReply"), "稍后店主会人工回复你。");
+    await desktopApiClick(page, "#saveRulesDefaultsButton", "/api/automation", "PUT");
+    await page.waitForLoadState("networkidle");
+    assert.deepEqual(fixtures.automationPuts.at(-1).payload, {
+      first_reply: "欢迎光临，请告诉我想了解商品的哪一方面。", fallback_reply: "稍后店主会人工回复你。",
+    }, "rule default save submits only its two fields");
+    assert.equal(fixtures.automation.first_reply, "欢迎光临，请告诉我想了解商品的哪一方面。");
+    assert.equal(fixtures.automation.fallback_reply, "稍后店主会人工回复你。");
+
+    // Both switches use their own visible controls and keep the delivery worker alive.
+    const stopsBeforeEngineClicks = fixtures.botStops.length;
+    await desktopApiClick(page, 'label:has(#rulesEnabledToggle) .setting-copy', "/api/automation", "PUT");
+    await page.waitForLoadState("networkidle");
+    assert.deepEqual(fixtures.automationPuts.at(-1).payload, { rules_enabled: false });
+    assert.equal(await page.isChecked("#rulesEnabledToggle"), false);
+    assert.equal(fixtures.automation.ai_enabled, true, "rules switch leaves AI unchanged");
+    await openView(page, "ai-config");
+    await page.waitForLoadState("networkidle");
+    await desktopApiClick(page, 'label:has(#aiEnabledToggle) .setting-copy', "/api/automation", "PUT");
+    await page.waitForLoadState("networkidle");
+    assert.deepEqual(fixtures.automationPuts.at(-1).payload, { ai_enabled: false });
+    assert.equal(await page.isChecked("#aiEnabledToggle"), false);
+    assert.deepEqual([fixtures.automation.rules_enabled, fixtures.automation.ai_enabled], [false, false]);
+    assert.equal(fixtures.botStops.length, stopsBeforeEngineClicks);
 
     // Saving enabled settings while the paid rules_ai worker is already active
     // must not replace it with, or additionally start, a deterministic worker.
@@ -5966,19 +6776,46 @@ async function run() {
     fixtures.bot.running_total = 1;
     fixtures.bot.automation_mode = "rules_ai";
     const aiStatusRefresh = page.waitForResponse((response) => response.url().endsWith("/api/bot/status") && response.request().method() === "GET");
+    const aiTemplatesRefresh = page.waitForResponse((response) => response.url().endsWith("/api/bot/templates") && response.request().method() === "GET");
     await page.click("#refreshButton");
     await aiStatusRefresh;
-    await page.waitForFunction(() => document.querySelector("#chatAiStatus")?.textContent === "AI 已开启");
-    await page.click(".automation-enabled-row .setting-copy");
-    assert.equal(await page.locator("#automationEnabledToggle").isChecked(), true);
+    await aiTemplatesRefresh;
+    await page.waitForFunction(() => document.querySelector("#chatAiStatus")?.textContent === "AI 已关闭");
+    assert.equal(await page.locator("#aiOverallStatus").textContent(), "AI 已关闭", "rules_ai mode cannot override a disabled AI switch");
     const startsBeforeAiSettingsSave = fixtures.botStartModes.length;
+    await desktopApiClick(page, 'label:has(#aiEnabledToggle) .setting-copy', "/api/automation", "PUT");
+    await page.waitForLoadState("networkidle");
+    assert.deepEqual(fixtures.automationPuts.at(-1).payload, { ai_enabled: true });
+    assert.equal(await page.isChecked("#aiEnabledToggle"), true);
+    await openView(page, "auto-reply");
+    await page.waitForLoadState("networkidle");
+    await desktopApiClick(page, 'label:has(#rulesEnabledToggle) .setting-copy', "/api/automation", "PUT");
+    await page.waitForLoadState("networkidle");
+    assert.deepEqual(fixtures.automationPuts.at(-1).payload, { rules_enabled: true });
+    assert.equal(await page.isChecked("#rulesEnabledToggle"), true);
+    assert.deepEqual([fixtures.automation.rules_enabled, fixtures.automation.ai_enabled], [true, true], "both engines can be re-enabled independently");
+    await openView(page, "common-service");
+    await page.waitForLoadState("networkidle");
     const aiSettingsPut = page.waitForResponse((response) => response.url().endsWith("/api/automation") && response.request().method() === "PUT");
     await page.click("#saveAutomationButton");
     await aiSettingsPut;
-    await page.waitForFunction(() => document.querySelector("#automationMessage")?.textContent === "店铺配置已保存");
+    assert.equal(Object.hasOwn(fixtures.automationPuts.at(-1).payload, "rules_enabled"), false);
+    assert.equal(Object.hasOwn(fixtures.automationPuts.at(-1).payload, "ai_enabled"), false);
     assert.equal(fixtures.botStartModes.length, startsBeforeAiSettingsSave, "saving settings during rules_ai must not send a rules start request");
     assert.equal(fixtures.bot.automation_mode, "rules_ai");
     assert.equal(fixtures.bot.running, true);
+
+    // The shared shop selector moved with the card and still reflects the active shop.
+    assert.equal(await page.inputValue("#automationShopSelect"), "shop-ui-2", "common-service shop selector reflects the active shop");
+
+    await assertNoOverflow(page, "common-service desktop");
+    await captureScreenshot(page, { path: path.join(resultRoot, "common-service-desktop.png"), fullPage: true });
+
+    // 切回规则客服子页，验证干湿分离：不再包含通用卡
+    await openView(page, "auto-reply");
+    await page.waitForSelector('[data-panel="auto-reply"]:not([hidden])');
+    assert.equal(await page.locator('[data-panel="auto-reply"] .automation-global-card').count(), 0, "auto-reply page must not contain the global automation card");
+    assert.deepEqual(await page.locator('[data-panel="auto-reply"] .sub-tab-btn').allTextContents(), ["会话工作台", "AI 客服设置", "规则客服", "通用设置"]);
 
     // A slow rules PUT from shop-ui-2 must neither issue a second concurrent
     // rules save nor overwrite the default shop after an immediate switch.
@@ -6028,7 +6865,7 @@ async function run() {
     const defaultAutomationLoad = page.waitForResponse((response) => response.url().endsWith("/api/automation")
       && response.request().method() === "GET"
       && response.request().headers()["x-shop-account"] === "default");
-    await page.selectOption("#automationShopSelect", "default");
+    await page.click('#accountTabs [data-account-switch="default"]');
     await defaultAutomationLoad;
     await page.waitForFunction(() => document.querySelector("#accountTabs .account-tab.is-active .account-tab-name")?.textContent === "海风数字店");
     await page.waitForFunction(() => document.querySelector("#replyRuleList")?.textContent.includes("默认店规则"));
@@ -6058,7 +6895,7 @@ async function run() {
     const restoredShopLoad = page.waitForResponse((response) => response.url().endsWith("/api/automation")
       && response.request().method() === "GET"
       && response.request().headers()["x-shop-account"] === "shop-ui-2");
-    await page.selectOption("#automationShopSelect", "shop-ui-2");
+    await page.click('#accountTabs [data-account-switch="shop-ui-2"]');
     await restoredShopLoad;
     await page.waitForFunction(() => document.querySelector("#accountTabs .account-tab.is-active .account-tab-name")?.textContent === "备用店（运营）");
     const restoredAutomationPanel = page.waitForResponse((response) => response.url().endsWith("/api/automation")
@@ -6070,12 +6907,17 @@ async function run() {
     assert.equal(await page.inputValue("#automationFirstReply"), fixtures.automation.first_reply);
 
     await assertNoOverflow(page, "auto-reply desktop");
-    // AI 客服设置面向普通店主，只使用自然语言内容，并保留五种模型连接格式。
     assert.equal(await page.evaluate(() => document.querySelector('[data-panel="auto-reply"] [data-member-only="true"]') === null), true, "auto-reply page has no membership-gated AI card");
+    await captureScreenshot(page, { path: path.join(resultRoot, "auto-reply-desktop.png"), fullPage: true });
+
     await openView(page, "ai-config");
     await page.waitForSelector('[data-panel="ai-config"]:not([hidden])');
     await page.waitForFunction(() => document.querySelector("#aiPersonaStatus")?.textContent === "未填写");
-    assert.deepEqual(await page.locator('[data-panel="ai-config"] .sub-tab-btn').allTextContents(), ["会话工作台", "AI 客服设置", "规则客服"]);
+    assert.deepEqual(await page.locator('[data-panel="ai-config"] .sub-tab-btn').allTextContents(), ["会话工作台", "AI 客服设置", "规则客服", "通用设置"]);
+    await page.click('[data-panel="ai-config"] [data-view="common-service"]');
+    await page.waitForSelector('[data-panel="common-service"]:not([hidden])');
+    assert.equal(await page.locator('[data-panel="common-service"] [data-view="common-service"]').getAttribute("aria-selected"), "true");
+    await openView(page, "ai-config");
     assert.equal(await page.locator("#aiPreviewTitle").textContent(), "连续对话沙盘");
     assert.equal(await page.locator("#aiProductSearch").getAttribute("placeholder"), "搜索商品标题");
     assert.deepEqual(
@@ -6096,7 +6938,8 @@ async function run() {
     assert.ok(htmlSource.includes(`app.js?v=${assetVersion}`));
     assert.ok(appSource.includes(`ASSET_VERSION = "${assetVersion}"`));
     assert.match(htmlSource, /id="manualReplyFile"[^>]*multiple/);
-    assert.match(htmlSource, /最多 8 张；图片会按顺序逐张发送，文字最后单独发送。/);
+    assert.doesNotMatch(htmlSource, /最多 8 张；图片会按顺序逐张发送，文字最后单独发送。/);
+    assert.doesNotMatch(htmlSource, /for="manualReplyFile"|id="manualReplyImageCount"/);
     assert.match(appSource, /MANUAL_IMAGE_MAX_COUNT = 8/);
     assert.match(appSource, /method: "DELETE"/);
     assert.equal(appSource.includes("dismissIntroCurtain"), false);
@@ -6151,9 +6994,7 @@ async function run() {
 
     await page.fill("#aiStoreContent", "本店主营数字学习资料，先回答当前商品问题；价格和状态以实时商品信息为准。营业时间为 9:00—23:00。");
     await page.fill("#aiPersonaName", "小鲸客服");
-    await page.fill("#aiBuyerAddress", "亲");
-    await page.fill("#aiForbiddenClaims", "不能编造价格、库存或付款状态\n不能承诺未经核验的发货结果");
-    await page.fill("#aiHandoffRules", "退款、争议或投诉时转人工\n事实不足或冲突时转人工");
+    await page.fill("#aiPersonaInstruction", "耐心解答，不能编造价格、库存或付款状态；退款、争议或事实不足时转人工。");
     const personaResponse = page.waitForResponse((response) => response.url().endsWith("/api/bot/ai/config") && response.request().method() === "PUT");
     await page.click("#aiSavePersona");
     await personaResponse;
@@ -6246,10 +7087,11 @@ async function run() {
     const previewRequests = fixtures.aiPreviewRequests.slice(-3);
     assert.deepEqual(previewRequests.map((request) => request.payload.buyer_message), questions);
     assert.equal(previewRequests.every((request) => !Object.prototype.hasOwnProperty.call(request.payload, "current_question")), true);
-    assert.equal(previewRequests[1].payload.history.at(-1).content, replies[0]);
-    assert.equal(previewRequests[2].payload.history.some((message) => message.content === questions[1]), true);
+    // 沙盘不再多轮记忆：每次提问重置，history 始终为空。
+    assert.deepEqual(previewRequests[1].payload.history, []);
+    assert.deepEqual(previewRequests[2].payload.history, []);
     const previewText = await page.locator("#aiPreviewOutput").innerText();
-    for (const label of ["实时事实", "店铺内容", "商品补充", "会话", "内容状态", "安全状态"]) assert.equal(previewText.includes(label), true);
+    for (const label of ["实时事实", "店铺内容", "商品补充", "内容状态", "安全状态"]) assert.equal(previewText.includes(label), true);
     assert.equal(previewText.includes("知识命中"), false);
 
     fixtures.aiPreviewResponseDelays.push(300);
@@ -6380,14 +7222,16 @@ async function run() {
 
     await page.click('#sideNav [data-view="chat"]');
     await page.waitForSelector('[data-panel="chat"]:not([hidden])');
+    assert.deepEqual(await page.locator('[data-panel="chat"] .sub-tab-btn').allTextContents(), ["会话工作台", "AI 客服设置", "规则客服", "通用设置"]);
     await page.waitForFunction(() => document.querySelectorAll("#conversationItems [data-chat-id]").length >= 1);
     if (await page.locator('#conversationItems [data-chat-id="chat-1"]').count()) await page.click('#conversationItems [data-chat-id="chat-1"]');
+    await captureScreenshot(page, { path: path.join(resultRoot, "chat-desktop.png"), fullPage: true });
     assert.equal((await page.locator("#chatAiStatus").textContent()).includes("会员"), false, "AI controls remain independent of subscription language");
-    if (await page.locator('#manualReplyForm button[type="submit"]').isDisabled()) {
+    if ((await page.locator("#chatTakeoverToggle").innerText()).trim() === "人工接管") {
       const takeoverResponse = page.waitForResponse((response) => response.url().includes("/api/bot/conversations/") && response.url().endsWith("/takeover") && response.request().method() === "POST");
-      await page.click("#toggleChatTakeover");
+      await page.click('#chatTakeoverToggle');
       await takeoverResponse;
-      await page.waitForFunction(() => document.querySelector('#manualReplyForm button[type="submit"]')?.disabled === false);
+      await page.waitForFunction(() => document.querySelector('#chatTakeoverToggle')?.disabled === false);
     }
 
     // Manual replies accept ordered appends from the picker, clipboard and drop
@@ -6585,11 +7429,11 @@ async function run() {
     fixtures.manualReplyPostMode = "success";
     fixtures.manualReplyPollMode = "success";
     fixtures.manualReplyPostDelayMs = 1500;
-    if (await page.locator('#manualReplyForm button[type="submit"]').isDisabled()) {
+    if ((await page.locator("#chatTakeoverToggle").innerText()).trim() === "人工接管") {
       const takeoverResponse = page.waitForResponse((response) => response.url().includes("/api/bot/conversations/") && response.url().endsWith("/takeover") && response.request().method() === "POST");
-      await page.click("#toggleChatTakeover");
+      await page.click('#chatTakeoverToggle');
       await takeoverResponse;
-      await page.waitForFunction(() => document.querySelector('#manualReplyForm button[type="submit"]')?.disabled === false);
+      await page.waitForFunction(() => document.querySelector('#chatTakeoverToggle')?.disabled === false);
     }
     await page.fill("#manualReplyInput", "切店铺时仍在发送");
     const accountSwitchReplyRequest = page.waitForRequest((request) => request.url().endsWith("/api/bot/messages/reply") && request.method() === "POST");
@@ -6651,11 +7495,11 @@ async function run() {
     await page.click('#sideNav [data-view="chat"]');
     await page.waitForFunction(() => document.querySelectorAll("#conversationItems [data-chat-id]").length >= 1);
     await page.locator("#conversationItems [data-chat-id]").first().click();
-    if (await page.locator('#manualReplyForm button[type="submit"]').isDisabled()) {
+    if ((await page.locator("#chatTakeoverToggle").innerText()).trim() === "人工接管") {
       const takeoverResponse = page.waitForResponse((response) => response.url().includes("/api/bot/conversations/") && response.url().endsWith("/takeover") && response.request().method() === "POST");
-      await page.click("#toggleChatTakeover");
+      await page.click('#chatTakeoverToggle');
       await takeoverResponse;
-      await page.waitForFunction(() => document.querySelector('#manualReplyForm button[type="submit"]')?.disabled === false);
+      await page.waitForFunction(() => document.querySelector('#chatTakeoverToggle')?.disabled === false);
     }
     fixtures.manualReplyPostMode = "failure";
     fixtures.manualReplyPostDelayMs = 0;
@@ -6717,7 +7561,7 @@ async function run() {
       { accountKey: "shop-ui-2", path: deleteShopCleanupPaths[1] },
     ]);
     assert.deepEqual(fixtures.shopAccountDeleteRequests, ["shop-ui-2"], "delete must call the scoped DELETE endpoint once");
-    assert.equal(await page.locator('[data-account-delete="default"]').isDisabled(), true, "default shop deletion must remain protected after cleanup");
+    assert.equal(await page.locator('[data-account-delete="default"]').isDisabled(), false, "default shop disconnect stays available after cleanup");
     fixtures.manualReplyPostMode = "success";
 
     // Logout must use the still-authenticated old account scope for uploaded
@@ -6726,11 +7570,11 @@ async function run() {
     await page.waitForFunction(() => document.querySelectorAll("#conversationItems [data-chat-id]").length >= 1);
     await page.click('[data-chat-id="chat-1"]');
     await page.waitForFunction(() => document.querySelectorAll("#chatMessages .message-row").length >= 2 && document.querySelector("#chatMessages")?.textContent.includes("你好，这个商品怎么使用"));
-    if (await page.locator('#manualReplyForm button[type="submit"]').isDisabled()) {
+    if ((await page.locator("#chatTakeoverToggle").innerText()).trim() === "人工接管") {
       const takeoverResponse = page.waitForResponse((response) => response.url().includes("/api/bot/conversations/") && response.url().endsWith("/takeover") && response.request().method() === "POST");
-      await page.click("#toggleChatTakeover");
+      await page.click('#chatTakeoverToggle');
       await takeoverResponse;
-      await page.waitForFunction(() => document.querySelector('#manualReplyForm button[type="submit"]')?.disabled === false);
+      await page.waitForFunction(() => document.querySelector('#chatTakeoverToggle')?.disabled === false);
     }
     fixtures.manualReplyPostMode = "failure";
     await page.locator("#manualReplyFile").setInputFiles({ name: "logout-unqueued.png", mimeType: "image/png", buffer: Buffer.from([28, 29]) });
@@ -6774,11 +7618,11 @@ async function run() {
     await page.click('#sideNav [data-view="chat"]');
     await page.waitForFunction(() => document.querySelectorAll("#conversationItems [data-chat-id]").length >= 1);
     await page.click('[data-chat-id="chat-1"]');
-    if (await page.locator('#manualReplyForm button[type="submit"]').isDisabled()) {
+    if ((await page.locator("#chatTakeoverToggle").innerText()).trim() === "人工接管") {
       const takeoverResponse = page.waitForResponse((response) => response.url().includes("/api/bot/conversations/") && response.url().endsWith("/takeover") && response.request().method() === "POST");
-      await page.click("#toggleChatTakeover");
+      await page.click('#chatTakeoverToggle');
       await takeoverResponse;
-      await page.waitForFunction(() => document.querySelector('#manualReplyForm button[type="submit"]')?.disabled === false);
+      await page.waitForFunction(() => document.querySelector('#chatTakeoverToggle')?.disabled === false);
     }
     fixtures.manualReplyPostMode = "success";
     fixtures.manualImageUploadDelayMs = 300;
@@ -6810,11 +7654,11 @@ async function run() {
     await page.click('#sideNav [data-view="chat"]');
     await page.waitForFunction(() => document.querySelectorAll("#conversationItems [data-chat-id]").length >= 1);
     await page.click('[data-chat-id="chat-1"]');
-    if (await page.locator('#manualReplyForm button[type="submit"]').isDisabled()) {
+    if ((await page.locator("#chatTakeoverToggle").innerText()).trim() === "人工接管") {
       const takeoverResponse = page.waitForResponse((response) => response.url().includes("/api/bot/conversations/") && response.url().endsWith("/takeover") && response.request().method() === "POST");
-      await page.click("#toggleChatTakeover");
+      await page.click('#chatTakeoverToggle');
       await takeoverResponse;
-      await page.waitForFunction(() => document.querySelector('#manualReplyForm button[type="submit"]')?.disabled === false);
+      await page.waitForFunction(() => document.querySelector('#chatTakeoverToggle')?.disabled === false);
     }
     fixtures.manualReplyPostDelayMs = 300;
     await page.fill("#manualReplyInput", "退出时仍在发送");

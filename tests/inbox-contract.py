@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import sqlite3
 import sys
@@ -27,6 +29,16 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 import app  # noqa: E402
 from account_storage import AccountStorage  # noqa: E402
+
+SCOPE_COOKIE = "unb=123456; _m_h5_tk=offline_scope; cookie2=offline-scope"
+
+
+def seed_owned_snapshot(user_id, item_ids):
+    app.write_secret(user_id, "shop_snapshot.json", json.dumps({
+        "version": 1, "account_ref": hashlib.sha256(b"123456").hexdigest()[:16],
+        "nickname": "offline-owned-shop", "products": [{"id": item_id, "title": "本店商品"} for item_id in item_ids],
+        "product_count": len(item_ids), "synced_at": "offline", "truncated": False,
+    }))
 
 
 def seed_chat(root: Path) -> None:
@@ -58,6 +70,104 @@ def seed_chat(root: Path) -> None:
         )
 
 
+def check_customer_conversation_scope(client, user_id, root):
+    """Only positively identified customer chats are visible; history is retained."""
+    cookie = SCOPE_COOKIE
+    app.write_secret(user_id, "cookies.txt", cookie)
+    # A current explicit foreign decision takes precedence over snapshot membership.
+    seed_owned_snapshot(user_id, ["100001", "100002", "700006"])
+    account_ref = hashlib.sha256(b"123456").hexdigest()[:16]
+    other_ref = hashlib.sha256(b"654321").hexdigest()[:16]
+    baseline_unread = client.get("/api/bot/conversations").json()["unread_messages_total"]
+    samples = [
+        ("scope-owned", "700001", "owned", "700001", account_ref),
+        ("scope-unknown", "700002", "unknown", "700002", account_ref),
+        ("scope-old-identity", "700003", "owned", "700003", other_ref),
+        ("scope-old-item", "700004", "owned", "799999", account_ref),
+        ("scope-no-item", "", "owned", "700005", account_ref),
+        ("scope-foreign", "700006", "foreign", "700006", account_ref),
+    ]
+    with sqlite3.connect(root / "chat_history.db") as con:
+        con.execute("""CREATE TABLE customer_conversation_scope (
+            chat_id TEXT PRIMARY KEY, item_id TEXT NOT NULL, account_ref TEXT NOT NULL,
+            scope TEXT NOT NULL CHECK(scope IN ('owned', 'foreign', 'unknown')),
+            checked_at REAL NOT NULL)""")
+        for chat_id, item_id, scope, scope_item, identity in samples:
+            con.execute("""INSERT INTO messages(user_id, item_id, role, content, timestamp, chat_id, source_id)
+                VALUES (?, ?, 'user', '归属检查消息', '2026-09-19 10:00:00', ?, ?)""",
+                ("peer-scope", item_id, chat_id, chat_id))
+            con.execute("INSERT INTO customer_conversation_scope VALUES (?, ?, ?, ?, ?)",
+                        (chat_id, scope_item, identity, scope, 2_000_000_000))
+        # An image/follow-up without item metadata keeps the latest nonempty context.
+        con.execute("""INSERT INTO messages(user_id, item_id, role, content, timestamp, chat_id, source_id)
+            VALUES ('peer-scope', '', 'user', '外店后续消息', '2026-09-19 10:01:00', 'scope-foreign', 'scope-foreign-followup')""")
+        history_count = con.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+    visible = client.get("/api/bot/conversations?limit=20").json()
+    visible_ids = {row["chat_id"] for row in visible["conversations"]}
+    assert visible_ids == {"chat-alpha", "chat-beta", "scope-owned"}
+    assert visible["unread_messages_total"] == baseline_unread + 1
+    assert client.get("/api/bot/conversations?limit=1").json()["conversations"][0]["chat_id"] == "scope-owned", "unknown and foreign chats must be filtered before LIMIT"
+    assert client.get("/api/bot/conversations?search=外店后续消息").json()["conversations"] == []
+    default_messages = client.get("/api/bot/messages").json()["messages"]
+    assert default_messages and all(row["chat_id"] == "scope-owned" for row in default_messages)
+    assert [row["chat_id"] for row in client.get("/api/bot/conversations?search=归属检查消息").json()["conversations"]] == ["scope-owned"]
+    for chat_id, *_rest in samples[1:]:
+        hidden_messages = client.get(f"/api/bot/messages?chat_id={chat_id}&search=消息").json()
+        assert hidden_messages["messages"] == [] and hidden_messages["match_count"] == 0
+        assert app.records.conversation_exists(user_id, chat_id) is False
+        assert app.records.append_manual_draft(user_id, "不得写入", chat_id) is None
+        for action, payload in (("read", {"read": True}), ("takeover", {"enabled": True})):
+            assert client.post(f"/api/bot/conversations/{chat_id}/{action}", json=payload).status_code == 404
+        assert client.post(f"/api/bot/messages/image?chat_id={chat_id}", content=b"\x89PNG\r\n\x1a\ncontract-image",
+                           headers={"Content-Type": "image/png", "X-File-Name": "blocked.png"}).status_code == 404
+        reply = client.post("/api/bot/messages/reply", json={"chat_id": chat_id, "content": "不得发送"},
+                            headers={"Idempotency-Key": f"scope-blocked-reply-{chat_id}"})
+        assert reply.status_code == 404 and reply.json()["detail"]["code"] == "conversation_not_found"
+    with sqlite3.connect(root / "chat_history.db") as con:
+        assert con.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == history_count
+        assert con.execute("SELECT COUNT(*) FROM manual_reply_drafts WHERE chat_id LIKE 'scope-%'").fetchone()[0] == 0
+    seed_owned_snapshot(user_id, ["100001", "100002", "700002", "700006"])
+    assert app.records.conversation_exists(user_id, "scope-unknown") is True, "a verified snapshot is independent positive ownership evidence"
+    assert app.records.conversation_exists(user_id, "scope-foreign") is False, "explicit foreign scope overrides snapshot membership"
+    seed_owned_snapshot(user_id, ["100001", "100002", "700006"])
+    app.write_secret(user_id, "cookies.txt", "unb=not-a-platform-id; _m_h5_tk=offline_scope")
+    assert client.get("/api/bot/conversations").json()["conversations"] == [], "owned scopes require a valid current shop identity"
+    app.write_secret(user_id, "cookies.txt", cookie)
+    # Previously queued work is no longer reachable through an idempotent retry.
+    with sqlite3.connect(root / "chat_history.db") as con:
+        con.execute("INSERT INTO customer_conversation_scope VALUES (?, ?, ?, 'foreign', ?)",
+                    ("chat-alpha", "100001", account_ref, 2_000_000_000))
+    assert client.get("/api/bot/messages/reply/inbox-image-reply-0001").status_code == 404
+    retry = client.post("/api/bot/messages/reply", json={"chat_id": "chat-alpha", "content": "不得重试"},
+                        headers={"Idempotency-Key": "inbox-image-reply-0001"})
+    assert retry.status_code == 404
+    # Neither an old scope nor a snapshot for another identity proves current ownership.
+    app.write_secret(user_id, "cookies.txt", "unb=654321; _m_h5_tk=offline_other; cookie2=offline-other-scope")
+    assert app.records.conversation_exists(user_id, "scope-foreign") is False
+    assert app.records.conversation_exists(user_id, "scope-owned") is False
+    assert app.records.conversation_exists(user_id, "chat-beta") is False
+    assert app.records.conversation_exists(user_id, "scope-old-identity") is True
+    app.write_secret(user_id, "cookies.txt", cookie)
+    with sqlite3.connect(root / "chat_history.db") as con:
+        con.execute("""INSERT INTO messages(user_id, item_id, role, content, timestamp, chat_id, source_id)
+            VALUES ('peer-scope', '700007', 'user', '新商品上下文', '2026-09-19 10:02:00', 'scope-foreign', 'scope-item-changed')""")
+    assert app.records.conversation_exists(user_id, "scope-foreign") is False, "a new item still needs positive ownership evidence"
+    seed_owned_snapshot(user_id, ["100001", "100002", "700006", "700007"])
+    assert app.records.conversation_exists(user_id, "scope-foreign") is True, "an old foreign item must not override a verified new item"
+    assert client.get("/api/bot/messages?chat_id=scope-foreign").json()["messages"]
+    # When every chat is foreign, default selection must not fall back to its drafts.
+    with sqlite3.connect(root / "chat_history.db") as con:
+        con.execute("""INSERT INTO messages(user_id, item_id, role, content, timestamp, chat_id, source_id)
+            VALUES ('peer-scope', '700008', 'user', '补全商品上下文', '2026-09-19 10:03:00', 'scope-no-item', 'scope-now-has-item')""")
+        for (chat_id,) in con.execute("SELECT DISTINCT chat_id FROM messages WHERE COALESCE(chat_id, '') != ''").fetchall():
+            item_id = con.execute("SELECT item_id FROM messages WHERE chat_id=? AND item_id!='' ORDER BY id DESC LIMIT 1", (chat_id,)).fetchone()[0]
+            con.execute("""INSERT INTO customer_conversation_scope VALUES (?, ?, ?, 'foreign', ?)
+                ON CONFLICT(chat_id) DO UPDATE SET item_id=excluded.item_id, account_ref=excluded.account_ref,
+                    scope=excluded.scope, checked_at=excluded.checked_at""", (chat_id, item_id, account_ref, 2_000_000_000))
+    assert client.get("/api/bot/conversations").json()["conversations"] == []
+    assert client.get("/api/bot/messages").json()["messages"] == []
+
+
 def main() -> None:
     client = TestClient(app.app)
     app.db.create_user(
@@ -78,6 +188,13 @@ def main() -> None:
     storage = AccountStorage(str(RUN_DIR / "tenants"))
     root = storage.ensure_account_dir(user_id, "default")
     seed_chat(root)
+    app.write_secret(user_id, "cookies.txt", SCOPE_COOKIE)
+    with sqlite3.connect(root / "chat_history.db") as con:
+        assert con.execute("SELECT 1 FROM sqlite_master WHERE name='customer_conversation_scope'").fetchone() is None
+    missing_proof = client.get("/api/bot/conversations").json()
+    assert missing_proof["conversations"] == [] and missing_proof["unread_messages_total"] == 0
+    assert client.get("/api/bot/messages?chat_id=chat-alpha").json()["messages"] == []
+    seed_owned_snapshot(user_id, ["100001", "100002"])
 
     initial = client.get("/api/bot/conversations?limit=20")
     assert initial.status_code == 200
@@ -87,6 +204,21 @@ def main() -> None:
     assert rows[1]["unread"] is True and rows[1]["unread_count"] == 1
     assert initial.json()["unread_total"] == 2
     assert initial.json()["unread_messages_total"] == 3
+
+    # Names belong to an exact chat/peer pair; no name keeps the existing fallback.
+    with sqlite3.connect(root / "chat_history.db") as con:
+        con.execute("""CREATE TABLE conversation_peer_names (
+            chat_id TEXT NOT NULL, peer_id TEXT NOT NULL, nickname TEXT NOT NULL,
+            observed_at REAL NOT NULL, PRIMARY KEY(chat_id, peer_id))""")
+        con.executemany("INSERT INTO conversation_peer_names VALUES (?, ?, ?, ?)", [
+            ("chat-alpha", "buyer-alpha", "小鹿🦌", 2_000_000_000),
+            ("chat-beta", "some-other-peer", "不应串用的名字", 2_000_000_000),
+        ])
+    named_rows = {row["chat_id"]: row for row in client.get("/api/bot/conversations").json()["conversations"]}
+    assert named_rows["chat-alpha"]["buyer_label"] == "买家 · 小鹿🦌"
+    assert named_rows["chat-beta"]["buyer_label"] == rows[0]["buyer_label"]
+    by_name = client.get("/api/bot/conversations", params={"search": "小鹿"})
+    assert [row["chat_id"] for row in by_name.json()["conversations"]] == ["chat-alpha"]
 
     # The original alpha message must remain searchable after it falls outside
     # the latest 200 rows returned by the message endpoint.
@@ -197,7 +329,8 @@ def main() -> None:
 
     assert client.post("/api/bot/conversations/other-account/read", json={"read": True}).status_code == 404
     assert client.get("/api/bot/conversations", headers={"X-Shop-Account": "missing"}).status_code == 404
-    print("inbox contract: search, unread cursor, takeover persistence and account scope passed")
+    check_customer_conversation_scope(client, user_id, root)
+    print("inbox contract: search, unread cursor, takeover persistence, account scope and positive customer-conversation ownership passed")
 
 
 if __name__ == "__main__":

@@ -4,7 +4,7 @@
 
   const API_PREFIX = "/xianyu-saas";
   const QR_LOGIN_POLL_MS = 1500;
-  const ASSET_VERSION = "20260916-01";
+  const ASSET_VERSION = "20260920-06";
   const AI_TEXT_PLACEHOLDERS = new Set(["无", "暂无", "没有", "未填写", "待填写", "待补充", "占位", "n/a", "na", "none", "null", "todo", "tbd"]);
   const ICONS = API_PREFIX + "/assets/icons.svg?v=" + ASSET_VERSION + "#";
   // 旧版视图 key → 新版视图 key（历史会话/书签兜底）。
@@ -57,8 +57,9 @@
       draft: null,
     },
     ops: newOpsState(),
-    automation: { rules: [], deliveries: [], running: false, strategy: "standard", enabled: true },
+    automation: { rules: [], deliveries: [], running: false, strategy: "standard", rules_enabled: true, ai_enabled: true },
     automationEditor: { type: "", index: -1 },
+    automationDrafts: {},
     ai: {
       status: null,
       connection: null,
@@ -232,7 +233,7 @@
 
   function domainView(view) {
     const normalized = normalizeView(view);
-    if (["chat", "ai-config", "auto-reply"].includes(normalized)) return "chat";
+    if (["chat", "ai-config", "auto-reply", "common-service"].includes(normalized)) return "chat";
     if (["goods", "templates", "cards"].includes(normalized)) return "goods";
     if (normalized === "settings" || normalized === "docs") return "settings";
     if (normalized === "ops") return "ops";
@@ -350,7 +351,7 @@
       const raw = JSON.parse(window.localStorage.getItem(key) || "{}");
       state.inbox = {
         search: typeof raw.search === "string" ? raw.search.slice(0, 120) : "",
-        filter: ["unread", "takeover"].includes(raw.filter) ? raw.filter : "all",
+        filter: ["unread", "takeover", "needs_human"].includes(raw.filter) ? raw.filter : "all",
         readAt: raw.readAt && typeof raw.readAt === "object" ? raw.readAt : {},
         takeover: raw.takeover && typeof raw.takeover === "object" ? raw.takeover : {},
       };
@@ -367,7 +368,7 @@
       // bodies and any platform credentials never enter browser storage.
       window.localStorage.setItem(key, JSON.stringify({
         search: String(state.inbox.search || "").slice(0, 120),
-        filter: ["unread", "takeover"].includes(state.inbox.filter) ? state.inbox.filter : "all",
+        filter: ["unread", "takeover", "needs_human"].includes(state.inbox.filter) ? state.inbox.filter : "all",
         readAt: state.inbox.readAt || {},
         takeover: state.inbox.takeover || {},
       }));
@@ -500,7 +501,7 @@
       const count = active && state.products.length ? state.products.length : Number(account.product_count || account.products_count || 0);
       const sync = account.last_sync_at ? formatDate(account.last_sync_at) : "--";
       const label = accountLabel(account);
-      const deleteLabel = account.key === "default" ? "默认店铺不可删除" : "断开" + label;
+      const deleteLabel = "断开" + label;
       const switchLabel = active ? "当前店铺" : "切换到" + label;
       const healthCode = accountHealthCode(effectiveAccount);
       const isError = ["expired", "session_expired", "cookie_expired", "cookie_invalid", "cookie_incomplete", "restricted", "account_restricted", "verification_required"].includes(healthCode);
@@ -517,7 +518,7 @@
         '<button class="button button-secondary button-compact" type="button" data-shop-action="check" data-shop-key="' + esc(account.key) + '" aria-label="检测' + esc(label) + '" title="重新检测"><span>检测</span></button>' +
         '<button class="button ' + (needsReconnect ? "button-primary" : "button-secondary") + ' button-compact" type="button" data-shop-action="reconnect" data-shop-key="' + esc(account.key) + '" aria-label="重连' + esc(label) + '" title="重新连接"><span>重新连接</span></button>' +
         '<button class="button button-secondary button-compact" type="button" data-account-rename="' + esc(account.key) + '" aria-label="修改' + esc(label) + '名称" title="修改名称"><span>改名</span></button>' +
-        '<button class="button button-secondary button-danger-soft button-compact" type="button" data-account-delete="' + esc(account.key) + '" aria-label="' + esc(deleteLabel) + '" title="' + esc(deleteLabel) + '"' + (account.key === "default" ? " disabled" : "") + '><span>断开</span></button>' +
+        '<button class="button button-secondary button-danger-soft button-compact" type="button" data-account-delete="' + esc(account.key) + '" aria-label="' + esc(deleteLabel) + '" title="' + esc(deleteLabel) + '"><span>断开</span></button>' +
         '</div></article>';
     }).join("") : '<div class="automation-empty">还没有店铺账号，先添加一个店铺。</div>';
     const list = $("#shopAccountsPanelList");
@@ -669,6 +670,36 @@
     response_invalid: ["响应无效", "badge-red", "模型服务返回了无法识别的响应"],
   };
 
+  const AI_PERSONA_PRESETS = {
+    catgirl: {
+      name: "小喵客服",
+      desc: "软萌机灵，带一点小得意，偶尔一句喵",
+      instruction: [
+        "性格：你是店铺的小喵客服，软萌、机灵、亲近人，带一点害羞和小得意。熟悉后可以轻轻撒娇、接个玩笑，但有自己的分寸。可爱来自自然的反应和细心，不靠装傻。",
+        "口吻：像在聊天窗口里认真搭话，多用简短口语，长短句自然变化。可以偶尔用“嗯嗯”“欸”“嘿嘿”，或在句尾带一个“喵”；一条回复最多一个“喵”，也不用每轮都带。不固定称呼，不以“亲”“亲亲”或“主人”开头。",
+        "回应：先回答买家最关心的事，再补必要说明。被夸时可以有一点小得意，面对犹豫时温柔地帮对方理清选择；一次只追问一个关键缺项。不反复自我介绍，不写括号动作、舞台描写或大段撒娇，不用整齐划一的客服套话。",
+        "分寸：价格、付款、发货、退款或投诉要说清楚，收起撒娇、玩笑和口癖。资料没有写的就说明还不能确定，不把设想说成已经完成的操作；人格不改变店铺规则与商品事实。",
+        "语感参考（不要照抄）：问清需求时像“嗯嗯，你想确认哪一款呀？”，收到感谢时像“嘿嘿，能帮上就好。”，拿不准时像“这点我还不能确定，不随口答应你。”",
+      ].join("\n"),
+    },
+    mint: {
+      name: "薄荷客服",
+      desc: "开朗直爽，元气热心，有一点小冒失",
+      instruction: [
+        "性格：你是店铺的薄荷客服，开朗直爽、元气足、自来熟，好奇心强，愿意主动帮人。想到好办法会有一点小得意，偶尔露出轻微的冒失感，但遇到正事认真负责；不故意答错来扮可爱。",
+        "口吻：说话轻快、有反应，像热心又好聊的熟人。自然使用“欸”“好呀”“嗯嗯”这类短小起手，偶尔一个感叹号；可以有一句很短的补充或自我修正，接着把重点讲清。别把每句话都喊得很兴奋，也不固定加“喵”或套用冷淡、清冷的腔调。",
+        "回应：对买家的问题先积极接住，再给能落实的说明。随口闲聊可以顺着接一句，有好奇心但不跑题；推荐时讲清适合的情况，不强推。被纠正就爽快认错并改正，不找借口。不固定称呼，不以“亲”“亲亲”或“主人”开头，也不擅自给买家起昵称。",
+        "分寸：买家着急、遇到故障或谈售后时，放低情绪强度，少感叹、少玩笑，先回应具体困扰。只按已知商品和店铺资料说话，不夸口包办，不把未执行的查询或处理说成已完成。不讲虚构经历、背景设定或剧情，也不使用角色专属称呼与台词。",
+        "语感参考（不要照抄）：确认需求时像“好呀，你最在意的是哪一点？”，发现理解偏差时像“欸，明白了，你说的是另一种情况。”，被指出错误时像“是我刚才理解偏了，重新说。”",
+      ].join("\n"),
+    },
+    custom: {
+      name: "自定义",
+      desc: "自由定义人设核心要求，设定专属表达风格与规则",
+      instruction: "",
+    },
+  };
+
   function emptyAiState() {
     return {
       status: null,
@@ -679,9 +710,12 @@
       selectedItemId: "",
       knowledge: null,
       versions: [],
+      businessConstraints: null,
       productSearch: "",
       verificationToken: "",
       testedFingerprint: "",
+      customPersonaInstruction: "",
+      personaSaving: false,
       loadGeneration: 0,
       productGeneration: 0,
       knowledgeGeneration: 0,
@@ -708,7 +742,11 @@
     const preview = $("#aiGeneratedKnowledgePreview");
     if (preview) preview.hidden = true;
     text("#aiGeneratedKnowledgeRaw", "");
-    clearAiPreview();
+    state.ai.previewGeneration += 1;
+    state.ai.previewHistory = [];
+    state.ai.previewBusy = false;
+    setBusy($("#aiRunPreview"), false);
+    if ($("#aiPreviewOutput")) $("#aiPreviewOutput").innerHTML = "<span>回复后会显示实际回复、使用资料、内容状态与安全状态。</span>";
     setBusy($("#aiExtractKnowledge"), false);
     setBusy($("#aiSaveKnowledge"), false);
   }
@@ -724,6 +762,7 @@
     next.extractionGeneration = Number(state.ai?.extractionGeneration || 0) + 1;
     next.previewGeneration = Number(state.ai?.previewGeneration || 0) + 1;
     state.ai = next;
+    renderAiPersonaBusy();
     clearAiProductTransientUi();
   }
 
@@ -803,16 +842,14 @@
   }
 
   function aiStoreFormValue() {
+    const constraints = state.ai?.businessConstraints || {};
     return {
       store_content: String($("#aiStoreContent")?.value || "").trim(),
-      persona_preset: String($("#aiPersonaPreset")?.value || "friendly"),
+      persona_preset: String($("#aiPersonaPreset")?.value || "catgirl"),
       persona_name: String($("#aiPersonaName")?.value || "").trim(),
-      tone: String($("#aiTone")?.value || "friendly"),
-      buyer_address: String($("#aiBuyerAddress")?.value || "").trim(),
-      reply_length: String($("#aiReplyLength")?.value || "short"),
-      emoji_level: String($("#aiEmojiLevel")?.value || "low"),
-      forbidden_claims: String($("#aiForbiddenClaims")?.value || "").trim(),
-      handoff_rules: String($("#aiHandoffRules")?.value || "").trim(),
+      persona_instruction: String($("#aiPersonaInstruction")?.value || "").trim(),
+      forbidden_claims: String(constraints.forbidden_claims || ""),
+      handoff_rules: String(constraints.handoff_rules || ""),
     };
   }
 
@@ -822,26 +859,41 @@
 
   function writeAiStoreForm(config, { setBaseline = true } = {}) {
     const clean = config && typeof config === "object" ? config : {};
-    const values = {
-      store_content: String(clean.store_content ?? clean.common_knowledge ?? ""),
-      persona_preset: String(clean.persona_preset || "friendly"),
-      persona_name: String(clean.persona_name || ""),
-      tone: String(clean.tone || "friendly"),
-      buyer_address: String(clean.buyer_address || ""),
-      reply_length: String(clean.reply_length || "short"),
-      emoji_level: String(clean.emoji_level || "low"),
+    const rawPreset = String(clean.persona_preset || "catgirl");
+    const preset = rawPreset === "catgirl" || rawPreset === "mint" ? rawPreset : "custom";
+    const defaultInstruction = AI_PERSONA_PRESETS[preset]?.instruction || "";
+    const rawInstruction = clean.persona_instruction !== undefined && clean.persona_instruction !== null
+      ? String(clean.persona_instruction)
+      : "";
+    const defaultName = preset === "custom" ? "" : AI_PERSONA_PRESETS[preset]?.name || "";
+    const constraints = {
       forbidden_claims: naturalLanguageValue(clean.forbidden_claims),
       handoff_rules: naturalLanguageValue(clean.handoff_rules),
+    };
+    if (!state.ai) state.ai = emptyAiState();
+    state.ai.businessConstraints = constraints;
+
+    const values = {
+      store_content: String(clean.store_content ?? clean.common_knowledge ?? ""),
+      persona_preset: preset,
+      persona_name: String(clean.persona_name !== undefined && clean.persona_name !== null && clean.persona_name !== ""
+        ? clean.persona_name
+        : defaultName),
+      persona_instruction: preset === "catgirl" && rawInstruction.trim() === "亲切、克制地回答，可少量使用“喵”；必须先准确回答当前问题。"
+        ? defaultInstruction
+        : rawInstruction.trim() || defaultInstruction,
+      forbidden_claims: constraints.forbidden_claims,
+      handoff_rules: constraints.handoff_rules,
     };
     if ($("#aiStoreContent")) $("#aiStoreContent").value = values.store_content;
     if ($("#aiPersonaPreset")) $("#aiPersonaPreset").value = values.persona_preset;
     if ($("#aiPersonaName")) $("#aiPersonaName").value = values.persona_name;
-    if ($("#aiTone")) $("#aiTone").value = values.tone;
-    if ($("#aiBuyerAddress")) $("#aiBuyerAddress").value = values.buyer_address;
-    if ($("#aiReplyLength")) $("#aiReplyLength").value = values.reply_length;
-    if ($("#aiEmojiLevel")) $("#aiEmojiLevel").value = values.emoji_level;
-    if ($("#aiForbiddenClaims")) $("#aiForbiddenClaims").value = values.forbidden_claims;
-    if ($("#aiHandoffRules")) $("#aiHandoffRules").value = values.handoff_rules;
+    if ($("#aiPersonaInstruction")) $("#aiPersonaInstruction").value = values.persona_instruction;
+    if (preset === "custom") {
+      state.ai.customPersonaInstruction = values.persona_instruction;
+    } else {
+      state.ai.customPersonaInstruction = "";
+    }
     if (setBaseline) {
       state.ai.baseline.config = aiStoreBaselineValue(values);
       state.ai.dirty.config = false;
@@ -1055,7 +1107,7 @@
     }
     const config = aiStoreFormValue();
     if (!hasMeaningfulAIText(config.store_content)) {
-      formMessage("#aiTemplateMessage", "请先填写店铺与客服说明");
+      formMessage("#aiTemplateMessage", "请先填写店铺说明");
       return;
     }
     const context = captureAccountContext();
@@ -1181,7 +1233,7 @@
       badge.textContent = product ? statusInfo[0] : "请选择商品";
       badge.className = "badge " + (product ? statusInfo[1] : "badge-muted");
     }
-    if (textarea && product && !preserveText) {
+    if (textarea && product && !preserveText && !state.ai.dirty.knowledge) {
       const value = aiKnowledgeContent(state.ai.knowledge);
       textarea.value = value;
       state.ai.baseline.knowledge = value;
@@ -1199,19 +1251,25 @@
 
   function renderAiConfig({ preserveEditors = false } = {}) {
     if (!$("[data-panel=\"ai-config\"]")) return;
+    renderAiPersonaBusy();
     const account = currentAccount();
     text("#aiConfigShopName", accountLabel(account));
     const connection = state.ai?.connection || {};
     const statusCode = connectionStatusCode(connection, state.ai?.status);
     const statusInfo = connectionStatusInfo(statusCode);
     const overall = $("#aiOverallStatus");
-    const aiRunning = Boolean(state.bot?.running && state.bot?.automation_mode === "rules_ai");
+    const aiEnabled = state.automation?.ai_enabled !== false;
+    const aiRunning = Boolean(state.bot?.running && state.bot?.automation_mode === "rules_ai" && aiEnabled);
     if (overall) {
-      overall.textContent = aiRunning ? "AI 运行中" : statusCode === "verified" ? "AI 已暂停" : statusInfo[0];
-      overall.className = "badge " + (aiRunning ? "badge-green" : statusCode === "verified" ? "badge-amber" : statusInfo[1]);
+      overall.textContent = aiRunning ? "AI 运行中" : !aiEnabled ? "AI 已关闭" : statusCode === "verified" ? "AI 已就绪" : statusInfo[0];
+      overall.className = "badge " + (aiRunning ? "badge-green" : !aiEnabled ? "badge-muted" : statusCode === "verified" ? "badge-amber" : statusInfo[1]);
+    }
+    const aiToggle = $("#aiEnabledToggle");
+    if (aiToggle && document.activeElement !== aiToggle) {
+      aiToggle.checked = state.automation?.ai_enabled !== false;
     }
     renderAiConfigSummary();
-    if (!preserveEditors) {
+    if (!preserveEditors && !state.ai.dirty.config) {
       writeAiStoreForm(aiConfigDraft(state.ai.config));
     }
     const configStatus = String(state.ai?.config?.content_status || state.ai?.config?.status || (aiStoreHasContent() ? "saved" : "unconfigured"));
@@ -1540,31 +1598,47 @@
   const testAiConnection = testUnifiedAiConnection;
   const saveAiConnection = saveUnifiedAiConnection;
 
+  function renderAiPersonaBusy() {
+    const busy = Boolean(state.ai?.personaSaving);
+    setBusy($("#aiSavePersona"), busy);
+    $$("#aiStoreForm input, #aiStoreForm textarea, #aiStoreForm select, #aiOpenTemplates").forEach((control) => { control.disabled = busy; });
+  }
+
   async function saveAiPersona() {
+    const ai = state.ai;
+    if (ai.personaSaving) return;
     const config = aiStoreFormValue();
     if (!hasMeaningfulAIText(config.store_content)) {
-      formMessage("#aiPersonaMessage", "请填写有实际信息的店铺与客服说明，空内容不会生效");
+      formMessage("#aiPersonaMessage", "请填写有实际信息的店铺说明，空内容不会生效");
       return;
     }
-    const button = $("#aiSavePersona");
     const context = captureAccountContext();
-    setBusy(button, true);
+    const customInstruction = ai.customPersonaInstruction;
+    ai.personaSaving = true;
+    renderAiPersonaBusy();
+    formMessage("#aiPersonaMessage", "正在保存…", true);
     try {
       const expectedRevision = Number(state.ai.config?.revision || 0);
       const result = await accountScopedApi(context, "/api/bot/ai/config", {
         method: "PUT",
         body: JSON.stringify({ ...config, expected_revision: expectedRevision }),
       });
-      if (!accountContextMatches(context)) return;
+      if (state.ai !== ai || !accountContextMatches(context)) return;
       state.ai.config = result?.config || result || { draft: config, status: "saved" };
       writeAiStoreForm(aiConfigDraft(state.ai.config));
+      if (config.persona_preset !== "custom") ai.customPersonaInstruction = customInstruction;
       renderAiConfig({ preserveEditors: true });
       formMessage("#aiPersonaMessage", "店铺客服内容已保存并生效", true);
       showToast("店铺客服内容已保存并生效");
     } catch (error) {
-      if (accountContextMatches(context)) formMessage("#aiPersonaMessage", error.message || "店铺客服内容保存失败");
+      if (state.ai === ai && accountContextMatches(context)) {
+        ai.dirty.config = true;
+        text("#aiPersonaStatus", "有未保存修改");
+        formMessage("#aiPersonaMessage", error.message || "店铺客服内容保存失败");
+      }
     } finally {
-      if (accountContextMatches(context)) setBusy(button, false);
+      ai.personaSaving = false;
+      if (state.ai === ai && accountContextMatches(context)) renderAiPersonaBusy();
     }
   }
 
@@ -1690,29 +1764,23 @@
     const raw = result?.sources || result?.used_sources || result?.context_sources || [];
     const values = Array.isArray(raw) ? raw : Object.entries(raw || {}).filter(([, used]) => Boolean(used)).map(([key]) => key);
     const labels = {
+      real_time_product_facts: "实时事实",
       realtime_facts: "实时事实", product_facts: "实时事实", facts: "实时事实",
       store_content: "店铺内容", store: "店铺内容",
       product_content: "商品补充", product_knowledge: "商品补充", knowledge: "商品补充",
+      conversation_history: "会话",
       conversation: "会话", history: "会话", session: "会话",
     };
     return Array.from(new Set(values.map((value) => labels[String(value)] || String(value)).filter(Boolean)));
   }
 
-  function renderAiPreviewHistory() {
-    const host = $("#aiPreviewHistory");
-    if (!host) return;
-    const history = Array.isArray(state.ai?.previewHistory) ? state.ai.previewHistory.slice(-6) : [];
-    host.innerHTML = history.length ? history.map((message) => '<div class="ai-preview-turn is-' + (message.role === "assistant" ? "assistant" : "user") + '"><strong>' + (message.role === "assistant" ? "客服" : "买家") + '</strong><span>' + esc(message.content) + "</span></div>").join("") : "<span>还没有模拟对话。</span>";
-  }
-
-  function clearAiPreview() {
-    state.ai.previewGeneration += 1;
-    state.ai.previewHistory = [];
-    state.ai.previewBusy = false;
-    setBusy($("#aiRunPreview"), false);
-    if ($("#aiPreviewInput")) $("#aiPreviewInput").value = "";
-    if ($("#aiPreviewOutput")) $("#aiPreviewOutput").innerHTML = "<span>回复后会显示实际回复、使用资料、内容状态与安全状态。</span>";
-    renderAiPreviewHistory();
+  function aiSafetyStatusText(status) {
+    const raw = String(status || "").trim().toLowerCase();
+    if (!raw || raw === "passed" || raw === "pass" || raw === "ok" || raw === "已通过安全检查") return "已通过安全检查";
+    if (raw === "refuse_sensitive_request" || raw.includes("sensitive") || raw.includes("refuse") || raw === "已拒绝内部信息索取") return "已拒绝内部信息索取";
+    if (raw.includes("handoff") || raw === "已按转人工条件处理") return "已按转人工条件处理";
+    if (raw === "已拦截") return "已拦截";
+    return "已拦截";
   }
 
   async function runAiPreview() {
@@ -1727,7 +1795,8 @@
     const output = $("#aiPreviewOutput");
     const scope = captureAiProductScope(itemId);
     const generation = ++state.ai.previewGeneration;
-    const history = (state.ai.previewHistory || []).slice(-6).map((message) => ({ role: message.role, content: message.content }));
+    // 沙盘不做多轮记忆：每次提问都重置，只展示本次实际回复。
+    const history = [];
     const storeConfig = aiStoreFormValue();
     const payload = { buyer_message: question, store_config: storeConfig, history };
     if (itemId) {
@@ -1757,11 +1826,32 @@
       }
       const sources = previewSources(result);
       const knowledgeStatus = String(result?.knowledge_status || result?.content_status || aiKnowledgeStatus(null, state.ai.knowledge));
-      const safety = String(result?.safety_status || result?.safety?.status || result?.safety || "已通过安全检查");
-      state.ai.previewHistory = history.concat([{ role: "user", content: question }, ...(reply ? [{ role: "assistant", content: reply }] : [])]).slice(-6);
+      const safety = aiSafetyStatusText(result?.safety_status || result?.safety?.status || result?.safety || "passed");
       if (String($("#aiPreviewInput").value).trim() === question) $("#aiPreviewInput").value = "";
-      renderAiPreviewHistory();
-      output.innerHTML = '<div class="ai-preview-answer"><strong>实际回复</strong><div>' + esc(reply || "本次未生成可发送回复，请转人工处理") + '</div></div><div class="ai-preview-details"><div><strong>使用资料</strong><span>' + esc(sources.length ? sources.join("、") : "未标明") + '</span></div><div><strong>内容状态</strong><span>' + esc(aiKnowledgeStatusInfo(knowledgeStatus)[0]) + '</span></div><div><strong>安全状态</strong><span>' + esc(safety) + "</span></div></div>";
+      const emptyReasonText = (() => {
+        const decision = String(result?.decision || "").toLowerCase();
+        const reason = String(result?.reason_code || result?.reason || "").toLowerCase();
+        if (decision === "handoff") {
+          return "本次未自动回复（已按转人工条件处理）";
+        }
+        if (reason.includes("forbidden")) {
+          return "本次未自动回复（命中禁止承诺，已拦截）";
+        }
+        if (reason.includes("contact") || reason.includes("off_platform")) {
+          return "本次未自动回复（包含疑似站外联系方式，已拦截）";
+        }
+        if (reason.includes("sensitive") || reason.includes("secret") || reason.includes("refuse")) {
+          return "本次未自动回复（涉及内部信息保护，已拦截）";
+        }
+        if (reason.includes("duplicate") || reason.includes("repeat")) {
+          return "本次未自动回复（避免重复回复）";
+        }
+        if (reason.includes("dangerous")) {
+          return "本次未自动回复（涉及不安全履约，已拦截）";
+        }
+        return "本次未自动回复";
+      })();
+      output.innerHTML = '<div class="ai-preview-answer"><strong>实际回复</strong><div>' + esc(reply || emptyReasonText) + '</div></div><div class="ai-preview-details"><div><strong>使用资料</strong><span>' + esc(sources.length ? sources.join("、") : "未标明") + '</span></div><div><strong>内容状态</strong><span>' + esc(aiKnowledgeStatusInfo(knowledgeStatus)[0]) + '</span></div><div><strong>安全状态</strong><span>' + esc(safety) + "</span></div></div>";
     } catch (error) {
       if (aiProductScopeMatches(scope) && generation === state.ai.previewGeneration) output.innerHTML = '<span>沙盘测试失败：' + esc(error.message || "请稍后重试") + "</span>";
     } finally {
@@ -1780,9 +1870,11 @@
     "[data-open-batch-delivery]",
     "[data-edit-delivery]",
     "[data-delivery-toggle]",
-    "#batchDeliveryCheck",
     "#batchDeliveryCommit",
     "#saveAutomationButton",
+    "#saveRulesDefaultsButton",
+    "#rulesEnabledToggle",
+    "#aiEnabledToggle",
     "#chatAiStart",
     "#chatAiStop",
   ];
@@ -1795,8 +1887,7 @@
       $$(selector).forEach((node) => { node.disabled = anyBusy; });
     });
     if (!anyBusy) {
-      const commit = $("#batchDeliveryCommit");
-      if (commit) commit.disabled = !state.batchDelivery.previewToken;
+      updateBatchDeliveryCommitState();
       $$('[data-open-batch-delivery]').forEach((button) => { button.disabled = !state.products.length; });
     }
   }
@@ -2432,6 +2523,7 @@
       retryAction: "start",
       operation: "",
       polling: false,
+      autoRetried: false,
     };
     renderQrLogin();
   }
@@ -2527,6 +2619,24 @@
       await finishQrLogin(generation, result);
     } catch (error) {
       if (state.qrLogin !== login) return;
+      const detail = error?.detail && typeof error.detail === "object" ? error.detail : {};
+      const retryDelay = Number(detail.retry_after);
+      if (
+        !login.autoRetried
+        && detail.auto_retry === true
+        && Number.isFinite(retryDelay)
+        && retryDelay <= 8
+        && qrRemaining(login.expiresAt) > retryDelay
+      ) {
+        // Short, self-clearing contention: retry the completion once on our own
+        // instead of showing a "press retry" state.
+        login.autoRetried = true;
+        login.operation = "";
+        login.status = "syncing";
+        renderQrLogin();
+        window.setTimeout(() => { void completeQrLogin(generation); }, Math.max(0.5, retryDelay) * 1000);
+        return;
+      }
       applyQrLoginError(error, "complete");
     } finally {
       if (state.qrLogin === login) {
@@ -2841,7 +2951,8 @@
     resetConversationCommands();
     state.config = null;
     state.bot = null;
-    state.automation = { rules: [], deliveries: [], running: false, strategy: "standard", enabled: true };
+    state.automation = { rules: [], deliveries: [], running: false, strategy: "standard", rules_enabled: true, ai_enabled: true };
+    state.automationDrafts = {};
     resetAiState();
     resetOpsState();
     state.settingsAi = { connection: null, verificationToken: "", testedFingerprint: "", draft: null };
@@ -3015,7 +3126,7 @@
     state.confirmAction = null;
     state.config = null;
     state.bot = null;
-    state.automation = { rules: [], deliveries: [], running: false, strategy: "standard", enabled: true };
+    state.automation = { rules: [], deliveries: [], running: false, strategy: "standard", rules_enabled: true, ai_enabled: true };
     resetAiState();
     resetReplyRuleForm();
     state.attention = [];
@@ -3055,7 +3166,7 @@
     state.templateEditorOpenGeneration += 1;
     state.templateEditor = { editingId: "", productIds: [] };
     state.cardsEditor = { editingId: "", mode: "import" };
-    const preserveViews = new Set(["shops", "orders", "settings", "ops", "goods", "templates", "cards", "auto-reply", "chat", "ai-config"]);
+    const preserveViews = new Set(["shops", "orders", "settings", "ops", "goods", "templates", "cards", "auto-reply", "chat", "ai-config", "common-service"]);
     const returnView = preserveViews.has(state.view) ? state.view : "home";
     renderAccountSwitcher();
     renderOverview();
@@ -3184,7 +3295,25 @@
 
   function confirmDeleteShopAccount(accountKey) {
     const account = state.accounts.find((item) => item.key === accountKey);
-    if (!account || account.key === "default") return;
+    if (!account) return;
+    if (account.key === "default") {
+      text("#confirmTitle", "断开店铺连接");
+      text("#confirmMessage", "断开后会停止该店铺的自动客服并清除本地登录信息，可随时重新扫码绑定。");
+      text("#confirmAction", "确认断开");
+      state.confirmAction = () => runManualReplyDestructiveAction(async () => {
+        await api("/api/bot/accounts/default", { method: "DELETE" });
+        await loadAccounts();
+        await refreshState();
+        renderAccountSwitcher();
+        renderOverview();
+        showView("shops", true);
+        showToast("店铺已断开");
+      });
+      const disconnectDialog = $("#confirmDialog");
+      if (typeof disconnectDialog?.showModal === "function") disconnectDialog.showModal();
+      else disconnectDialog?.setAttribute("open", "");
+      return;
+    }
     text("#confirmTitle", "删除店铺");
     text("#confirmMessage", "删除后会停止该店铺的自动处理并从列表隐藏，其他店铺不受影响。");
     text("#confirmAction", "确认删除");
@@ -3395,6 +3524,9 @@
   }
 
   function renderProductDeliveryBadge(info) {
+    if (info.configured && info.enabled && info.delivery !== "conflict" && !state.bot?.running) {
+      return '<span class="badge badge-amber">自动发货未启动</span>';
+    }
     if (info.delivery === "pan") {
       return info.enabled
         ? '<span class="badge badge-green">网盘自动发货</span>'
@@ -3474,7 +3606,7 @@
 
     const homeGrid = $("#homeProductGrid");
     if (homeGrid) {
-      const featured = state.products.slice(0, 6);
+      const featured = state.products.slice(0, 4);
       homeGrid.innerHTML = featured.length ? featured.map((product) => {
         const info = getProductDeliveryInfo(product);
         const active = info.configured && info.enabled;
@@ -4041,6 +4173,44 @@
     }
   }
 
+  function currentAccountKey() {
+    return String(state.activeAccountKey || "default");
+  }
+
+  function getAutomationDrafts(accountKey = currentAccountKey()) {
+    if (!state.automationDrafts) state.automationDrafts = {};
+    if (!state.automationDrafts[accountKey]) state.automationDrafts[accountKey] = {};
+    return state.automationDrafts[accountKey];
+  }
+
+  function captureAutomationDraft(kind, accountKey = currentAccountKey()) {
+    const drafts = getAutomationDrafts(accountKey);
+    if (kind === "rules_defaults") {
+      drafts.rules_defaults = {
+        first_reply: $("#automationFirstReply")?.value ?? "",
+        fallback_reply: $("#automationFallbackReply")?.value ?? "",
+      };
+    } else if (kind === "general") {
+      drafts.general = {
+        delay_min_seconds: $("#automationDelayMin")?.value ?? "",
+        delay_max_seconds: $("#automationDelayMax")?.value ?? "",
+        trigger_cooldown_seconds: $("#automationTriggerCooldown")?.value ?? "",
+        manual_takeover_cooldown_seconds: $("#automationManualCooldown")?.value ?? "",
+        business_hours_enabled: Boolean($("#automationBusinessHoursEnabled")?.checked),
+        business_start: $("#automationBusinessStart")?.value ?? "",
+        business_end: $("#automationBusinessEnd")?.value ?? "",
+      };
+    }
+  }
+
+  function clearAutomationDraft(kind, accountKey = currentAccountKey()) {
+    const drafts = state.automationDrafts?.[accountKey];
+    if (drafts) {
+      if (kind === "rules_defaults") delete drafts.rules_defaults;
+      else if (kind === "general") delete drafts.general;
+    }
+  }
+
   function renderAutomation() {
     const rules = Array.isArray(state.automation?.rules) ? state.automation.rules : [];
 
@@ -4053,7 +4223,8 @@
     }
 
     const fields = {
-      enabled: $("#automationEnabledToggle"),
+      rulesEnabled: $("#rulesEnabledToggle"),
+      aiEnabled: $("#aiEnabledToggle"),
       firstReply: $("#automationFirstReply"),
       fallbackReply: $("#automationFallbackReply"),
       delayMin: $("#automationDelayMin"),
@@ -4064,16 +4235,49 @@
       businessStart: $("#automationBusinessStart"),
       businessEnd: $("#automationBusinessEnd"),
     };
-    if (fields.enabled && document.activeElement !== fields.enabled) fields.enabled.checked = state.automation?.enabled !== false;
-    if (fields.firstReply && document.activeElement !== fields.firstReply) fields.firstReply.value = state.automation?.first_reply || "";
-    if (fields.fallbackReply && document.activeElement !== fields.fallbackReply) fields.fallbackReply.value = state.automation?.fallback_reply || "";
-    if (fields.delayMin && document.activeElement !== fields.delayMin) fields.delayMin.value = Number(state.automation?.delay_min_seconds || 0);
-    if (fields.delayMax && document.activeElement !== fields.delayMax) fields.delayMax.value = Number(state.automation?.delay_max_seconds || 0);
-    if (fields.triggerCooldown && document.activeElement !== fields.triggerCooldown) fields.triggerCooldown.value = Number(state.automation?.trigger_cooldown_seconds || 0);
-    if (fields.manualCooldown && document.activeElement !== fields.manualCooldown) fields.manualCooldown.value = Number(state.automation?.manual_takeover_cooldown_seconds || 0);
-    if (fields.businessHours && document.activeElement !== fields.businessHours) fields.businessHours.checked = Boolean(state.automation?.business_hours_enabled);
-    if (fields.businessStart && document.activeElement !== fields.businessStart) fields.businessStart.value = state.automation?.business_start || "09:00";
-    if (fields.businessEnd && document.activeElement !== fields.businessEnd) fields.businessEnd.value = state.automation?.business_end || "23:30";
+    if (fields.rulesEnabled && document.activeElement !== fields.rulesEnabled) {
+      fields.rulesEnabled.checked = state.automation?.rules_enabled !== false;
+    }
+    if (fields.aiEnabled && document.activeElement !== fields.aiEnabled) {
+      fields.aiEnabled.checked = state.automation?.ai_enabled !== false;
+    }
+
+    const accountKey = currentAccountKey();
+    const drafts = state.automationDrafts?.[accountKey] || {};
+
+    if (drafts.rules_defaults) {
+      if (fields.firstReply && document.activeElement !== fields.firstReply) {
+        fields.firstReply.value = drafts.rules_defaults.first_reply ?? "";
+      }
+      if (fields.fallbackReply && document.activeElement !== fields.fallbackReply) {
+        fields.fallbackReply.value = drafts.rules_defaults.fallback_reply ?? "";
+      }
+    } else {
+      if (fields.firstReply && document.activeElement !== fields.firstReply) {
+        fields.firstReply.value = state.automation?.first_reply || "";
+      }
+      if (fields.fallbackReply && document.activeElement !== fields.fallbackReply) {
+        fields.fallbackReply.value = state.automation?.fallback_reply || "";
+      }
+    }
+
+    if (drafts.general) {
+      if (fields.delayMin && document.activeElement !== fields.delayMin) fields.delayMin.value = drafts.general.delay_min_seconds;
+      if (fields.delayMax && document.activeElement !== fields.delayMax) fields.delayMax.value = drafts.general.delay_max_seconds;
+      if (fields.triggerCooldown && document.activeElement !== fields.triggerCooldown) fields.triggerCooldown.value = drafts.general.trigger_cooldown_seconds;
+      if (fields.manualCooldown && document.activeElement !== fields.manualCooldown) fields.manualCooldown.value = drafts.general.manual_takeover_cooldown_seconds;
+      if (fields.businessHours && document.activeElement !== fields.businessHours) fields.businessHours.checked = Boolean(drafts.general.business_hours_enabled);
+      if (fields.businessStart && document.activeElement !== fields.businessStart) fields.businessStart.value = drafts.general.business_start;
+      if (fields.businessEnd && document.activeElement !== fields.businessEnd) fields.businessEnd.value = drafts.general.business_end;
+    } else {
+      if (fields.delayMin && document.activeElement !== fields.delayMin) fields.delayMin.value = Number(state.automation?.delay_min_seconds || 0);
+      if (fields.delayMax && document.activeElement !== fields.delayMax) fields.delayMax.value = Number(state.automation?.delay_max_seconds || 0);
+      if (fields.triggerCooldown && document.activeElement !== fields.triggerCooldown) fields.triggerCooldown.value = Number(state.automation?.trigger_cooldown_seconds || 0);
+      if (fields.manualCooldown && document.activeElement !== fields.manualCooldown) fields.manualCooldown.value = Number(state.automation?.manual_takeover_cooldown_seconds || 0);
+      if (fields.businessHours && document.activeElement !== fields.businessHours) fields.businessHours.checked = Boolean(state.automation?.business_hours_enabled);
+      if (fields.businessStart && document.activeElement !== fields.businessStart) fields.businessStart.value = state.automation?.business_start || "09:00";
+      if (fields.businessEnd && document.activeElement !== fields.businessEnd) fields.businessEnd.value = state.automation?.business_end || "23:30";
+    }
 
     const ruleProductOptions = $("#replyRuleProductOptions");
     if (ruleProductOptions) {
@@ -4109,19 +4313,58 @@
     text("#replyRuleCount", rules.length + " 条");
   }
 
-  function collectAutomation(enabledOverride = null) {
+  function collectAutomation(options = {}) {
+    const kind = typeof options === "string" ? options : options?.kind;
+    if (kind === "general") {
+      return {
+        delay_min_seconds: Number($("#automationDelayMin")?.value) || 0,
+        delay_max_seconds: Number($("#automationDelayMax")?.value) || 0,
+        trigger_cooldown_seconds: Number($("#automationTriggerCooldown")?.value) || 0,
+        manual_takeover_cooldown_seconds: Number($("#automationManualCooldown")?.value) || 0,
+        business_hours_enabled: Boolean($("#automationBusinessHoursEnabled")?.checked),
+        business_start: $("#automationBusinessStart")?.value || "09:00",
+        business_end: $("#automationBusinessEnd")?.value || "23:30",
+      };
+    }
+    if (kind === "rules_defaults") {
+      return {
+        first_reply: ($("#automationFirstReply")?.value ?? "").trim(),
+        fallback_reply: ($("#automationFallbackReply")?.value ?? "").trim(),
+      };
+    }
+    if (kind === "rules_toggle") {
+      return {
+        rules_enabled: typeof options?.rules_enabled === "boolean"
+          ? options.rules_enabled
+          : Boolean($("#rulesEnabledToggle")?.checked),
+      };
+    }
+    if (kind === "ai_toggle") {
+      return {
+        ai_enabled: typeof options?.ai_enabled === "boolean"
+          ? options.ai_enabled
+          : Boolean($("#aiEnabledToggle")?.checked),
+      };
+    }
+    const rulesToggle = $("#rulesEnabledToggle");
+    const aiToggle = $("#aiEnabledToggle");
     return {
       strategy: state.automation?.strategy || "standard",
-      enabled: typeof enabledOverride === "boolean" ? enabledOverride : $("#automationEnabledToggle").checked,
-      first_reply: $("#automationFirstReply").value.trim(),
-      fallback_reply: $("#automationFallbackReply").value.trim(),
-      delay_min_seconds: Number($("#automationDelayMin").value) || 0,
-      delay_max_seconds: Number($("#automationDelayMax").value) || 0,
-      trigger_cooldown_seconds: Number($("#automationTriggerCooldown").value) || 0,
-      manual_takeover_cooldown_seconds: Number($("#automationManualCooldown").value) || 0,
-      business_hours_enabled: $("#automationBusinessHoursEnabled").checked,
-      business_start: $("#automationBusinessStart").value || "09:00",
-      business_end: $("#automationBusinessEnd").value || "23:30",
+      rules_enabled: typeof options?.rules_enabled === "boolean"
+        ? options.rules_enabled
+        : (rulesToggle ? rulesToggle.checked : state.automation?.rules_enabled !== false),
+      ai_enabled: typeof options?.ai_enabled === "boolean"
+        ? options.ai_enabled
+        : (aiToggle ? aiToggle.checked : state.automation?.ai_enabled !== false),
+      first_reply: ($("#automationFirstReply")?.value ?? "").trim(),
+      fallback_reply: ($("#automationFallbackReply")?.value ?? "").trim(),
+      delay_min_seconds: Number($("#automationDelayMin")?.value) || 0,
+      delay_max_seconds: Number($("#automationDelayMax")?.value) || 0,
+      trigger_cooldown_seconds: Number($("#automationTriggerCooldown")?.value) || 0,
+      manual_takeover_cooldown_seconds: Number($("#automationManualCooldown")?.value) || 0,
+      business_hours_enabled: Boolean($("#automationBusinessHoursEnabled")?.checked),
+      business_start: $("#automationBusinessStart")?.value || "09:00",
+      business_end: $("#automationBusinessEnd")?.value || "23:30",
     };
   }
 
@@ -4132,32 +4375,44 @@
   function attentionCopy(item) {
     const code = !item?.kind || item.kind === "shop_account" ? item?.error_code || item?.code : "";
     const requestStatus = ["risk_control", "risk_cooldown", "verification_required"].includes(code);
+    let action = String(item?.action_label || "查看店铺");
+    let view = String(item?.action_view || "shops");
+
+    if (item?.kind === "worker") {
+      action = "查看店铺状态";
+      view = "shops";
+    }
+
     return {
       title: String((requestStatus && COOKIE_STATUS_LABELS[code]) || item?.title || "需要处理"),
       message: String((requestStatus && COOKIE_ERROR_COPY[code]) || item?.message || "当前店铺有一项真实运行状态需要确认。"),
-      action: String(item?.action_label || "查看店铺"),
+      action,
       tone: item?.severity === "error" ? "error" : "warning",
-      view: String(item?.action_view || "shops"),
+      view,
     };
   }
 
   function renderAttention() {
     const panel = $("#attentionPanel");
     const list = $("#attentionList");
+    const footer = $("#attentionFooter");
     if (!panel || !list) return;
-    const items = (Array.isArray(state.attention) ? state.attention : [])
-      .filter((item) => item && typeof item === "object" && item.id)
-      .slice(0, 8);
+    const allItems = (Array.isArray(state.attention) ? state.attention : [])
+      .filter((item) => item && typeof item === "object" && item.id);
     const pendingTotal = attentionPendingTotal();
     panel.hidden = false;
     text("#attentionCount", pendingTotal);
     const count = $("#attentionCount");
     if (count) count.className = "badge " + (pendingTotal ? "badge-red" : "badge-green");
-    if (!items.length) {
+    if (footer) {
+      footer.hidden = true;
+      footer.innerHTML = "";
+    }
+    if (!allItems.length) {
       list.innerHTML = '<div class="attention-empty">当前没有需要处理的事项</div>';
       return;
     }
-    list.innerHTML = items.map((item) => {
+    list.innerHTML = allItems.map((item) => {
       const copy = attentionCopy(item);
       const resolved = Boolean(item.resolved);
       const icon = resolved ? "circle-check" : copy.tone === "error" ? "circle-alert" : "clock";
@@ -4243,7 +4498,10 @@
       ...buckets.map((b) => Math.max(Number(b?.buyer_messages_total ?? b?.messages_total ?? 0), Number(b?.auto_replies_total || 0))),
       1
     );
-    chart.innerHTML = buckets.map((bucket) => {
+    const labelCount = Math.min(buckets.length, Math.max(2, Math.min(6, Math.floor(chart.clientWidth / 65))));
+    const labelIndexes = new Set(Array.from({ length: labelCount }, (_, index) =>
+      Math.round(index * (buckets.length - 1) / Math.max(1, labelCount - 1))));
+    chart.innerHTML = buckets.map((bucket, index) => {
       const buyerVal = Number(bucket?.buyer_messages_total ?? bucket?.messages_total ?? 0);
       const replyVal = Number(bucket?.auto_replies_total || 0);
       const buyerHeight = peak > 0 && buyerVal > 0 ? Math.max(4, Math.round((buyerVal / peak) * 100)) : 0;
@@ -4256,7 +4514,7 @@
           '<svg class="chart-bar-fill is-buyer" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true"><rect x="0" y="' + (100 - buyerHeight) + '" width="100" height="' + buyerHeight + '" rx="10"></rect></svg>' +
           '<svg class="chart-bar-fill is-reply" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true"><rect x="0" y="' + (100 - replyHeight) + '" width="100" height="' + replyHeight + '" rx="10"></rect></svg>' +
         '</div>' +
-        '<span class="chart-bar-label">' + esc(label) + '</span></div>';
+        '<span class="chart-bar-label' + (labelIndexes.has(index) ? '' : ' is-skipped') + '"' + (labelIndexes.has(index) ? '' : ' aria-hidden="true"') + '>' + esc(label) + '</span></div>';
     }).join("");
   }
 
@@ -4311,7 +4569,7 @@
       return "采样中...";
     }
     if (s === "stopped" || w === "stopped" || w === "disabled") {
-      return "已停止";
+      return "—";
     }
     if (s === "unavailable" || account.cpu_percent === null || account.cpu_percent === undefined) {
       return "--";
@@ -4332,6 +4590,10 @@
   }
 
   function formatMemoryLimitCell(account) {
+    if (!account) return "--";
+    if (account.worker_state === "stopped" || account.metrics_state === "stopped" || account.worker_state === "disabled" || account.enabled === false) {
+      return "--";
+    }
     if (account.memory_limit_bytes === null || account.memory_limit_bytes === undefined) return "--";
     return formatMemoryBytes(account.memory_limit_bytes);
   }
@@ -4393,6 +4655,28 @@
       return '<span class="badge badge-muted">已停止</span>';
     }
     return '<span class="badge badge-muted">未知</span>';
+  }
+
+  const RUNTIME_STATE_META = {
+    disabled: ["badge-muted", "已停用"],
+    waiting_login: ["badge-blue", "等待登录"],
+    starting: ["badge-blue", "启动中"],
+    stopping: ["badge-amber", "停止中"],
+    running_replies: ["badge-green", "运行中 · 自动回复"],
+    running_delivery_only: ["badge-green", "运行中 · 仅自动发货"],
+    running_idle: ["badge-green", "运行中"],
+    capacity_limited: ["badge-amber", "已达运行上限"],
+    degraded: ["badge-red", "异常"],
+    offline: ["badge-muted", "未连接"],
+    stopped: ["badge-muted", "已停止"],
+    unknown: ["badge-muted", "未知"],
+  };
+
+  function formatRuntimeStateBadge(account) {
+    const state = account && account.runtime_state;
+    const meta = state ? RUNTIME_STATE_META[state] : null;
+    if (!meta) return formatWorkerStatusBadge(account);
+    return '<span class="badge ' + meta[0] + '">' + esc(meta[1]) + '</span>';
   }
 
   function formatSampledTime(timestamp) {
@@ -4462,7 +4746,7 @@
     }
     const accounts = Array.isArray(state.resources.accounts) ? state.resources.accounts.slice(0, 5) : [];
     if (!accounts.length) {
-      tbody.innerHTML = '<tr><td colspan="7" class="table-cell-empty">暂无店铺客服运行记录</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="7" class="table-cell-empty">暂无店铺运行记录</td></tr>';
       renderResourcesMessages();
       return;
     }
@@ -4472,7 +4756,7 @@
       const activeTag = isActive ? ' <span class="badge badge-muted resource-current-badge">当前店</span>' : '';
       return '<tr class="' + (isActive ? "resource-row-active" : "") + '">' +
         '<td><strong>' + name + '</strong>' + activeTag + '</td>' +
-        '<td>' + formatWorkerStatusBadge(account) + '</td>' +
+        '<td>' + formatRuntimeStateBadge(account) + '</td>' +
         '<td><code>' + esc(formatCpuUsage(account)) + '</code></td>' +
         '<td><strong class="resource-mem-val">' + esc(formatMemoryBytes(account.rss_bytes)) + '</strong></td>' +
         '<td>' + esc(formatMemoryLimitCell(account)) + '</td>' +
@@ -4497,7 +4781,7 @@
     }
     const accounts = Array.isArray(state.resources.accounts) ? state.resources.accounts : [];
     if (!accounts.length) {
-      tbody.innerHTML = '<tr><td colspan="7" class="table-cell-empty">暂无店铺客服运行记录</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="7" class="table-cell-empty">暂无店铺运行记录</td></tr>';
       renderResourcesMessages();
       return;
     }
@@ -4507,7 +4791,7 @@
       const activeTag = isActive ? ' <span class="badge badge-muted resource-current-badge">当前店</span>' : '';
       return '<tr class="' + (isActive ? "resource-row-active" : "") + '">' +
         '<td><strong>' + name + '</strong>' + activeTag + '</td>' +
-        '<td>' + formatWorkerStatusBadge(account) + '</td>' +
+        '<td>' + formatRuntimeStateBadge(account) + '</td>' +
         '<td><code>' + esc(formatCpuUsage(account)) + '</code></td>' +
         '<td><strong class="resource-mem-val">' + esc(formatMemoryBytes(account.rss_bytes)) + '</strong></td>' +
         '<td>' + esc(formatMemoryLimitCell(account)) + '</td>' +
@@ -4632,7 +4916,10 @@
     const generation = state.resourcesGeneration;
     const username = state.me?.username;
     try {
-      await loadShopResources({ silent: true });
+      await Promise.all([
+        loadShopResources({ silent: true }),
+        state.view === "home" ? loadHomePreview() : Promise.resolve(),
+      ]);
     } catch {
       // Polling errors handled within loadShopResources
     } finally {
@@ -4656,14 +4943,16 @@
   }
 
   function renderAiStatus() {
-    const aiRunning = Boolean(state.bot?.running && state.bot?.automation_mode === "rules_ai");
-    const rulesRunning = Boolean(state.bot?.running && state.bot?.automation_mode === "rules");
+    const aiEnabled = state.automation?.ai_enabled !== false;
+    const aiRunning = Boolean(state.bot?.running && state.bot?.automation_mode === "rules_ai" && aiEnabled);
+    const rulesEnabled = state.automation?.rules_enabled !== false;
+    const rulesRunning = Boolean(state.bot?.running && state.bot?.automation_mode === "rules" && rulesEnabled);
     const available = aiConnectionVerified() && aiStoreHasContent();
     const connected = shopStateView(state.bot || {}).connection === "connected";
-    text("#chatAiStatus", aiRunning ? "AI 已开启" : rulesRunning ? "规则回复运行中" : available ? "AI 已暂停" : "AI 连接待配置");
-    $("#chatAiStatus").className = "badge " + (aiRunning || rulesRunning ? "badge-green" : available ? "badge-amber" : "badge-muted");
-    $("#chatAiStart").hidden = aiRunning || !connected;
-    $("#chatAiStart").disabled = aiRunning || !connected;
+    text("#chatAiStatus", aiRunning ? "AI 已开启" : !aiEnabled ? "AI 已关闭" : rulesRunning ? "规则回复运行中" : available ? "AI 已就绪" : "AI 连接待配置");
+    $("#chatAiStatus").className = "badge " + (aiRunning || rulesRunning ? "badge-green" : !aiEnabled ? "badge-muted" : available ? "badge-amber" : "badge-muted");
+    $("#chatAiStart").hidden = aiRunning || !connected || !aiEnabled;
+    $("#chatAiStart").disabled = aiRunning || !connected || !aiEnabled;
     $("#chatAiStop").hidden = !aiRunning;
     $("#chatAiStop").disabled = !aiRunning;
   }
@@ -4730,9 +5019,11 @@
     const query = String(state.inbox?.search || "").trim().toLowerCase();
     const unreadOnly = state.inbox?.filter === "unread";
     const takeoverOnly = state.inbox?.filter === "takeover";
+    const needsHumanOnly = state.inbox?.filter === "needs_human";
     return (state.conversations || []).filter((conversation) => {
       if (unreadOnly && !conversationUnread(conversation)) return false;
       if (takeoverOnly && !conversationTakeover(conversation)) return false;
+      if (needsHumanOnly && !conversation?.needs_human) return false;
       if (!query || conversation.search_match === true) return true;
       const haystack = [
         conversation.buyer_label,
@@ -4764,6 +5055,13 @@
       count.textContent = String(unread);
     }
     if (filterCount) filterCount.textContent = String(unread);
+    const needsHumanTotal = Number(
+      state.inbox?.needsHumanTotal !== undefined
+        ? state.inbox.needsHumanTotal
+        : (state.conversations || []).filter((item) => item?.needs_human).length
+    );
+    const needsHumanFilterCount = $("#conversationNeedsHumanFilterCount");
+    if (needsHumanFilterCount) needsHumanFilterCount.textContent = String(needsHumanTotal);
   }
 
   function renderConversations() {
@@ -4779,7 +5077,9 @@
           ? "当前没有未读对话"
           : state.inbox?.filter === "takeover" && hasAny
             ? "当前没有人工接管对话"
-            : "还没有对话记录";
+            : state.inbox?.filter === "needs_human" && hasAny
+              ? "当前没有待人工对话"
+              : "还没有对话记录";
       list.innerHTML = '<div class="conversation-empty">' + esc(copy) + "</div>";
       return;
     }
@@ -4787,10 +5087,11 @@
       const active = conversation.chat_id === state.selectedChatId;
       const unread = conversationUnread(conversation);
       const takeover = conversationTakeover(conversation);
-      return '<button class="conversation-item' + (active ? " is-active" : "") + (unread ? " is-unread" : "") + '" type="button" data-chat-id="' + esc(conversation.chat_id) + '" aria-label="' + esc((conversation.buyer_label || "买家咨询") + (unread ? "，未读" : "")) + '">' +
+      const needsHuman = Boolean(conversation.needs_human);
+      return '<button class="conversation-item' + (active ? " is-active" : "") + (unread ? " is-unread" : "") + '" type="button" data-chat-id="' + esc(conversation.chat_id) + '" aria-label="' + esc((conversation.buyer_label || "买家咨询") + (needsHuman ? "，待人工" : "") + (unread ? "，未读" : "")) + '">' +
         '<span class="conversation-avatar">买</span>' +
         '<span class="conversation-copy"><strong>' + esc(conversation.buyer_label || "买家咨询") + '</strong><small>' + esc(conversation.preview || "暂无消息") + '</small></span>' +
-        '<span class="conversation-item-meta"><span class="conversation-time">' + esc(formatDate(conversation.time)) + '</span>' + (takeover ? '<span class="conversation-mode">人工</span>' : unread ? '<i class="conversation-unread-dot" aria-label="未读"></i>' : "") + '</span></button>';
+        '<span class="conversation-item-meta"><span class="conversation-time">' + esc(formatDate(conversation.time)) + '</span>' + (needsHuman ? '<span class="badge badge-amber">待人工</span>' : "") + (takeover ? '<span class="conversation-mode">人工</span>' : unread ? '<i class="conversation-unread-dot" aria-label="未读"></i>' : "") + '</span></button>';
     }).join("");
   }
 
@@ -4854,6 +5155,7 @@
     const input = $("#manualReplyInput");
     if (!reply || !input) return;
     input.value = String(reply.content || "");
+    renderManualReplyActions();
     input.focus();
     formMessage("#replyMessage", "已填入快捷短语", true);
   }
@@ -4978,6 +5280,7 @@
     if (!mode) return;
     if (mode === "message-media") {
       target.closest?.(".message-media-image")?.classList.add("is-broken");
+      if (target.nextElementSibling) target.nextElementSibling.hidden = false;
       target.remove?.();
       return;
     }
@@ -4989,7 +5292,7 @@
     return normaliseMessageMedia(value, fallbackType, content).map((item) => {
       const label = item.label || messageMediaTypeLabel(item.type);
       if (item.type === "image" && item.url) {
-        return '<a class="message-media-image" href="' + esc(item.url) + '" target="_blank" rel="noopener noreferrer"><img src="' + esc(item.url) + '" alt="' + esc(item.alt || "图片") + '" loading="lazy" referrerpolicy="no-referrer" data-image-fallback="message-media"><span>' + esc(label) + '</span></a>';
+        return '<a class="message-media-image" href="' + esc(item.url) + '" target="_blank" rel="noopener noreferrer"><img src="' + esc(item.url) + '" alt="' + esc(item.alt || "图片") + '" loading="lazy" referrerpolicy="no-referrer" data-image-fallback="message-media"><span hidden>图片加载失败，点击查看</span></a>';
       }
       if (item.url) {
         return '<a class="message-media-link" href="' + esc(item.url) + '" target="_blank" rel="noopener noreferrer">' + esc(label) + ' · 查看</a>';
@@ -5038,10 +5341,8 @@
   function renderManualReplyAttachment() {
     const attachments = state.manualReply.attachments;
     const preview = $("#manualReplyPreview");
-    const count = $("#manualReplyImageCount");
     const dropzone = $("#manualReplyDropzone");
     const locked = state.manualReply.submitting || state.manualReply.uploading || state.manualReply.cleaning || manualReplyOperationInFlight();
-    if (count) count.textContent = attachments.length + " / " + MANUAL_IMAGE_MAX_COUNT + " 张";
     if (preview) {
       preview.hidden = !attachments.length;
       preview.innerHTML = attachments.map((attachment, index) => {
@@ -5064,7 +5365,10 @@
           '</article>';
       }).join("");
     }
-    if (dropzone) dropzone.classList.toggle("has-attachment", attachments.length > 0);
+    if (dropzone) {
+      dropzone.hidden = !attachments.length;
+      dropzone.classList.toggle("has-attachment", attachments.length > 0);
+    }
     setManualReplyDragActive(state.manualReply.dragging);
   }
 
@@ -5073,8 +5377,8 @@
     const selectedFiles = Array.from(files || []).filter(Boolean);
     if (!selectedFiles.length) return false;
     const selected = state.conversations.find((item) => String(item.chat_id) === String(state.selectedChatId));
-    if (!selected || !conversationTakeover(selected)) {
-      formMessage("#replyMessage", "请先人工接管当前对话再发送图片");
+    if (!selected) {
+      formMessage("#replyMessage", "请先选择一个对话");
       return false;
     }
     if (state.manualReply.attachments.length + selectedFiles.length > MANUAL_IMAGE_MAX_COUNT) {
@@ -5117,7 +5421,7 @@
       method: "POST",
       headers: {
         "Content-Type": file.type,
-        "X-File-Name": manualImageFileName(file),
+        "X-File-Name-Encoded": encodeURIComponent(manualImageFileName(file)),
       },
       body: file,
       timeoutMs: MANUAL_REPLY_UPLOAD_TIMEOUT_MS,
@@ -5312,6 +5616,26 @@
     return safeStatus === "unknown" ? "回复状态暂时无法确认，请刷新查看" : "回复已排队，等待闲鱼确认";
   }
 
+  function renderManualReplyActions() {
+    const selected = state.conversations.find((item) => String(item.chat_id) === String(state.selectedChatId));
+    const input = $("#manualReplyInput");
+    const send = $("#manualReplySend");
+    const toggle = $("#chatTakeoverToggle");
+    const locked = state.manualReply.submitting || state.manualReply.uploading || state.manualReply.cleaning || manualReplyOperationInFlight();
+    const hasContent = Boolean(input.value.trim() || state.manualReply.attachments.length);
+    const takenOver = conversationTakeover(selected);
+    input.disabled = !selected || locked;
+    input.placeholder = selected ? "输入回复内容（Enter 发送，Shift+Enter 换行）" : "选择一个对话后回复";
+    send.hidden = !hasContent;
+    send.disabled = !selected || locked || !hasContent;
+    toggle.disabled = !selected || locked;
+    toggle.querySelector("span").textContent = takenOver ? "恢复 AI" : "人工接管";
+    toggle.querySelector("use").setAttribute("href", ICONS + (takenOver ? "bot" : "shield-check"));
+    toggle.setAttribute("aria-pressed", String(takenOver));
+    $("#manualReplyFile").disabled = !selected || locked;
+    $("#manualReplyDropzone").classList.toggle("is-disabled", !selected || locked);
+  }
+
   function renderChat(options = {}) {
     renderConversations();
     renderQuickReplies();
@@ -5332,44 +5656,31 @@
     const selectedTakeover = conversationTakeover(selected);
     const selectedUnread = conversationUnread(selected);
     const takeoverBadge = $("#chatTakeoverBadge");
-    const takeoverButton = $("#toggleChatTakeover");
     const readButton = $("#markConversationRead");
     if (takeoverBadge) {
       takeoverBadge.hidden = !selected || !selectedTakeover;
       takeoverBadge.textContent = "人工接管";
       takeoverBadge.className = "badge badge-amber";
     }
-    if (takeoverButton) {
-      takeoverButton.hidden = !selected;
-      takeoverButton.setAttribute("aria-label", selectedTakeover ? "恢复 AI 自动处理" : "人工接管当前对话");
-      takeoverButton.innerHTML = '<svg class="icon"><use href="' + ICONS + '' + (selectedTakeover ? "bot" : "shield-check") + '"></use></svg><span>' + (selectedTakeover ? "恢复 AI" : "人工接管") + "</span>";
-    }
     if (readButton) {
       readButton.hidden = !selected || !selectedUnread;
       readButton.disabled = !selected || !selectedUnread;
     }
-    const input = $("#manualReplyInput");
-    const submit = $("#manualReplyForm button[type=submit]");
-    const upload = $("#manualReplyFile");
-    const uploadButton = $(".reply-image-button");
-    const dropzone = $("#manualReplyDropzone");
-    const hasSelection = Boolean(state.selectedChatId);
-    const replyLocked = state.manualReply.submitting || state.manualReply.uploading || state.manualReply.cleaning || manualReplyOperationInFlight();
-    input.disabled = !hasSelection || replyLocked;
-    submit.disabled = !hasSelection || !selectedTakeover || replyLocked;
-    if (upload) upload.disabled = !hasSelection || !selectedTakeover || replyLocked;
-    if (uploadButton) uploadButton.classList.toggle("is-disabled", !hasSelection || !selectedTakeover || replyLocked);
-    if (dropzone) dropzone.classList.toggle("is-disabled", !hasSelection || !selectedTakeover || replyLocked);
-    if (!hasSelection) input.placeholder = "选择一个对话后回复";
-    else input.placeholder = selectedTakeover ? "输入回复内容（Enter 发送，Shift+Enter 换行）" : "需要人工处理时，先点击“人工接管”";
+    const hasSelection = Boolean(selected);
+    renderManualReplyActions();
     renderManualReplyAttachment();
     const area = $("#chatMessages");
     const nearBottom = area ? area.scrollHeight - area.scrollTop - area.clientHeight < 48 : true;
-    if (!state.messages.length) {
+    // Internal "no reply" outcomes carry no content; never render them as an
+    // empty chat bubble.
+    const messages = state.messages.filter(
+      (item) => item.role !== "assistant_no_reply" && item.role !== "assistant_cancelled"
+    );
+    if (!messages.length) {
       area.innerHTML = '<div class="chat-empty"><svg class="icon"><use href="' + ICONS + 'message-square-text"></use></svg><p>' + (hasSelection ? "这个对话还没有消息" : "还没有对话记录") + '</p></div>';
       return;
     }
-    area.innerHTML = state.messages.map((item) => {
+    area.innerHTML = messages.map((item) => {
       const buyer = item.role === "user";
       const manual = item.role === "assistant_manual" || item.role === "assistant_manual_draft";
       const role = buyer ? "买家" : item.role === "assistant_manual_draft" ? "仅草稿" : manual ? "人工回复" : "AI 客服";
@@ -5402,7 +5713,7 @@
   function renderHomeOrders() {
     const homeList = $("#homeOrderList");
     if (!homeList) return;
-    const orders = Array.isArray(state.orders) ? state.orders.slice(0, 5) : [];
+    const orders = Array.isArray(state.orders) ? state.orders.slice(0, 6) : [];
     if (!orders.length) {
       homeList.innerHTML = '<tr><td colspan="5" class="table-cell-empty">暂无最近订单</td></tr>';
       return;
@@ -5976,9 +6287,10 @@
     // Rule edits address the displayed array by index, so keep that snapshot
     // until an explicit reset. New drafts must still receive existing rules.
     const editingRules = state.automationEditor?.type === "rule" ? state.automation.rules : null;
-    state.automation = data || { rules: [], deliveries: [], running: false, strategy: "standard", enabled: true };
+    state.automation = data || { rules: [], deliveries: [], running: false, strategy: "standard", rules_enabled: true, ai_enabled: true };
     if (editingRules) state.automation.rules = editingRules;
     renderAutomation();
+    renderAiConfig();
     // Loading is not an editor reset: a same-account GET can finish after typing.
     renderProducts();
   }
@@ -6031,40 +6343,56 @@
     }
   }
 
-  async function toggleConversationTakeover() {
-    const selected = state.conversations.find((item) => String(item.chat_id) === String(state.selectedChatId));
-    if (!selected) return;
+  async function setConversationTakeover(selected, enabled) {
     const chatId = String(selected.chat_id);
     const command = beginConversationCommand("takeover", chatId);
-    const previous = conversationTakeover(selected);
-    const next = !previous;
-    state.inbox.takeover[chatId] = next;
-    // Reflect the optimistic command in the same fields used by the server
-    // response.  This keeps the UI deterministic while the request is in flight.
-    selected.takeover = next;
-    persistInboxPreferences();
-    renderChat();
     try {
       const result = await api("/api/bot/conversations/" + encodeURIComponent(chatId) + "/takeover", {
         method: "POST",
-        body: JSON.stringify({ enabled: next }),
+        body: JSON.stringify({ enabled }),
+        suppressSessionReset: true,
       });
-      if (!conversationCommandMatches(command)) return;
-      mergeConversationUpdate(result?.conversation || result?.item);
-      renderChat();
-      showToast(next ? "已暂停 AI，当前对话由人工处理" : "已恢复 AI 自动处理");
-    } catch (error) {
-      if (!conversationCommandMatches(command)) return;
-      if (unsupportedInboxCommand(error)) {
-        showToast(next ? "已暂停本机视图中的自动处理" : "已恢复本机视图中的 AI", "warning");
-        return;
+      if (!conversationCommandMatches(command)) return false;
+      const update = result?.conversation || result?.item;
+      if (!update || String(update.chat_id) !== chatId || serverConversationTakeover(update) !== enabled) {
+        throw new Error(enabled ? "人工接管未生效，请重试" : "恢复 AI 未生效，请重试");
       }
-      selected.takeover = previous;
-      if (previous) state.inbox.takeover[chatId] = true;
-      else delete state.inbox.takeover[chatId];
+      mergeConversationUpdate(update);
+      state.inbox.takeover[chatId] = enabled;
       persistInboxPreferences();
       renderChat();
-      showToast(error.message || "人工接管切换失败", "error");
+      return true;
+    } catch (error) {
+      if (conversationCommandMatches(command)) {
+        formMessage("#replyMessage", error.message || (enabled ? "人工接管失败" : "恢复 AI 失败"));
+      }
+      return false;
+    }
+  }
+
+  async function toggleConversationTakeover() {
+    if (state.manualReply.submitting || state.manualReply.uploading || state.manualReply.cleaning || manualReplyOperationInFlight()) return;
+    const selected = state.conversations.find((item) => String(item.chat_id) === String(state.selectedChatId));
+    if (!selected) return;
+    const chatId = String(selected.chat_id);
+    const epoch = state.accountEpoch;
+    const accountKey = state.activeAccountKey;
+    const generation = state.manualReply.generation;
+    const next = !conversationTakeover(selected);
+    let finishOperation;
+    const operation = { cancelled: false, promise: new Promise((resolve) => { finishOperation = resolve; }) };
+    state.manualReply.operation = operation;
+    renderChat();
+    try {
+      const ok = await setConversationTakeover(selected, next);
+      if (ok && !operation.cancelled && manualReplyContextMatches(chatId, epoch, accountKey, generation)) {
+        formMessage("#replyMessage", "");
+        showToast(next ? "已暂停 AI，当前对话由人工处理" : "已恢复 AI 自动处理");
+      }
+    } finally {
+      if (state.manualReply.operation === operation) state.manualReply.operation = null;
+      finishOperation();
+      if (manualReplyContextMatches(chatId, epoch, accountKey, generation)) renderChat();
     }
   }
 
@@ -6082,9 +6410,13 @@
     const params = new URLSearchParams({ limit: "100" });
     if (state.inbox?.search) params.set("search", state.inbox.search);
     if (state.inbox?.filter === "unread") params.set("unread_only", "true");
+    if (state.inbox?.filter === "needs_human") params.set("needs_human_only", "true");
     const conversationData = await api("/api/bot/conversations?" + params.toString());
     if (!contextMatches()) return;
     state.conversations = Array.isArray(conversationData?.conversations) ? conversationData.conversations : [];
+    if (conversationData && typeof conversationData.needs_human_total === "number") {
+      state.inbox.needsHumanTotal = conversationData.needs_human_total;
+    }
     const hasConversation = (candidate) => state.conversations.some((item) => String(item.chat_id || "") === candidate);
     const currentChatId = String(state.selectedChatId || "");
     let nextChatId = requestedChatId && hasConversation(requestedChatId)
@@ -6209,6 +6541,43 @@
     }
   }
 
+  let recentOrdersLoad = null;
+
+  async function loadRecentOrders() {
+    if (!state.me) return;
+    const context = captureAccountContext();
+    if (recentOrdersLoad && accountContextMatches(recentOrdersLoad.context)) {
+      return recentOrdersLoad.promise;
+    }
+    const request = { context, promise: null };
+    recentOrdersLoad = request;
+    request.promise = (async () => {
+      try {
+        const data = await accountScopedApi(context, "/api/bot/orders?limit=6");
+        if (!accountContextMatches(context)) return;
+        state.orders = Array.isArray(data?.orders) ? data.orders.slice(0, 6) : [];
+        renderHomeOrders();
+      } catch {
+        // Keep the last received preview; the visible home page retries next tick.
+      } finally {
+        if (recentOrdersLoad === request) recentOrdersLoad = null;
+      }
+    })();
+    return request.promise;
+  }
+
+  let homePreviewLoad = null;
+
+  async function loadHomePreview() {
+    const context = captureAccountContext();
+    if (homePreviewLoad && accountContextMatches(homePreviewLoad.context)) return homePreviewLoad.promise;
+    const request = { context, promise: null };
+    homePreviewLoad = request;
+    request.promise = Promise.all([loadRecentOrders(), loadProducts({ force: true }).catch(() => {})])
+      .finally(() => { if (homePreviewLoad === request) homePreviewLoad = null; });
+    return request.promise;
+  }
+
   async function loadOrders() {
     if (!state.me) return;
     const context = captureAccountContext();
@@ -6217,15 +6586,7 @@
       if (!accountContextMatches(context)) return;
       syncOrdersShopSelect();
     }
-    try {
-      const data = await accountScopedApi(context, "/api/bot/orders?limit=50");
-      if (accountContextMatches(context)) {
-        state.orders = Array.isArray(data?.orders) ? data.orders : [];
-        renderHomeOrders();
-      }
-    } catch {
-      // Home order preview error does not block orders workbench
-    }
+    await loadRecentOrders();
     if (accountContextMatches(context) && state.view === "orders") {
       await loadOrderPage();
     }
@@ -7898,7 +8259,7 @@
     return `
       <div class="ops-error-card">
         <div class="ops-error-head">
-          <svg class="icon"><use href="/xianyu-saas/assets/icons.svg?v=20260908-02#circle-alert"></use></svg>
+          <svg class="icon"><use href="/xianyu-saas/assets/icons.svg?v=20260919-03#circle-alert"></use></svg>
           <strong>${escapeHtml(err.message || "操作执行异常")}</strong>
         </div>
         <div class="ops-error-meta">${meta}</div>
@@ -8325,7 +8686,7 @@
       container.innerHTML = `
         <div class="ops-empty-panel">
           <div class="ops-empty-icon">
-            <svg class="icon"><use href="/xianyu-saas/assets/icons.svg?v=20260908-02#sparkles"></use></svg>
+            <svg class="icon"><use href="/xianyu-saas/assets/icons.svg?v=20260919-03#sparkles"></use></svg>
           </div>
           <h3>智能运维 Agent 已就绪</h3>
           <p>请在下方输入自然语言指令。Agent 将分析您的意图，自动安全地配置客服知识库、回复规则或发货策略。</p>
@@ -8348,7 +8709,7 @@
       html += `
         <div class="ops-msg-wrap ops-msg-assistant">
           <div class="ops-bubble-assistant ops-run-progress">
-            <svg class="icon spin"><use href="/xianyu-saas/assets/icons.svg?v=20260908-02#refresh-cw"></use></svg>
+            <svg class="icon spin"><use href="/xianyu-saas/assets/icons.svg?v=20260919-03#refresh-cw"></use></svg>
             <span>正在加载运维历史记录…</span>
           </div>
         </div>
@@ -8449,7 +8810,7 @@
       html += `
         <div class="ops-msg-wrap ops-msg-assistant">
           <div class="ops-bubble-assistant ops-run-progress">
-            <svg class="icon spin"><use href="/xianyu-saas/assets/icons.svg?v=20260908-02#refresh-cw"></use></svg>
+            <svg class="icon spin"><use href="/xianyu-saas/assets/icons.svg?v=20260919-03#refresh-cw"></use></svg>
             <span>${escapeHtml(progressText)}</span>
           </div>
         </div>
@@ -8468,7 +8829,7 @@
       let retryBtn = "";
       if (isTerminalFailure && isRecoverable) {
         const runId = r.id || r.run_id;
-        retryBtn = `<button type="button" class="button button-secondary button-compact ops-retry-btn" data-retry-run="${escapeHtml(runId)}"><svg class="icon"><use href="/xianyu-saas/assets/icons.svg?v=20260908-02#refresh-cw"></use></svg><span>重试失败任务</span></button>`;
+        retryBtn = `<button type="button" class="button button-secondary button-compact ops-retry-btn" data-retry-run="${escapeHtml(runId)}"><svg class="icon"><use href="/xianyu-saas/assets/icons.svg?v=20260919-03#refresh-cw"></use></svg><span>重试失败任务</span></button>`;
       }
 
       html += `
@@ -8594,6 +8955,7 @@
     if (view === "home") {
       void loadOverviewSignals();
       void loadShopResources({ silent: true });
+      void loadHomePreview();
     }
     if (view === "shops") {
       renderAccountSwitcher();
@@ -8607,7 +8969,11 @@
       void loadProductDeliveryStatus();
     }
     if (view === "auto-reply") loadAutomation().catch((error) => showToast(error.message, "error"));
-    if (view === "ai-config") loadAiConfig().catch((error) => showToast(error.message || "AI 配置读取失败", "error"));
+    if (view === "common-service") loadAutomation().catch((error) => showToast(error.message, "error"));
+    if (view === "ai-config") {
+      void loadAutomation().catch(() => {});
+      loadAiConfig().catch((error) => showToast(error.message || "AI 配置读取失败", "error"));
+    }
     if (view === "chat") {
       loadMessages().catch((error) => showToast(error.message, "error"));
     }
@@ -8675,6 +9041,9 @@
     }
     if (state.view === "orders") {
       await loadOrders();
+      if (!refreshContextMatches(context)) return false;
+    } else if (state.view === "home") {
+      await loadRecentOrders();
       if (!refreshContextMatches(context)) return false;
     }
     if (state.view === "settings") {
@@ -8762,20 +9131,20 @@
   async function sendManualReply(event) {
     event.preventDefault();
     if (state.manualReply.submitting || state.manualReply.uploading || state.manualReply.cleaning || manualReplyOperationInFlight()) return;
-    const input = $("#manualReplyInput");
-    const content = input.value.trim();
-    const hasAttachment = state.manualReply.attachments.length > 0;
-    if (!content && !hasAttachment) {
-      formMessage("#replyMessage", "请输入回复内容或选择图片");
-      return;
-    }
     if (!state.selectedChatId) {
       formMessage("#replyMessage", "请先选择一个对话");
       return;
     }
     const selected = state.conversations.find((item) => String(item.chat_id) === String(state.selectedChatId));
-    if (!conversationTakeover(selected)) {
-      formMessage("#replyMessage", "请先人工接管当前对话再发送");
+    if (!selected) {
+      formMessage("#replyMessage", "请先选择一个对话");
+      return;
+    }
+    const input = $("#manualReplyInput");
+    const content = input.value.trim();
+    const hasAttachment = state.manualReply.attachments.length > 0;
+    if (!content && !hasAttachment) {
+      formMessage("#replyMessage", "请输入回复内容或粘贴图片");
       return;
     }
     const chatId = String(state.selectedChatId);
@@ -8802,6 +9171,8 @@
     setBusy(button, true);
     renderChat();
     try {
+      if (!conversationTakeover(selected) && !await setConversationTakeover(selected, true)) return;
+      if (operation.cancelled || !manualReplyContextMatches(chatId, epoch, accountKey, generation)) return;
       const media = [];
       for (let index = 0; index < state.manualReply.attachments.length; index += 1) {
         if (operation.cancelled) return;
@@ -8873,6 +9244,7 @@
       } finally {
         if (state.manualReply.operation === operation) state.manualReply.operation = null;
         finishOperation();
+        if (manualReplyContextMatches(chatId, epoch, accountKey, generation)) renderChat();
       }
     }
   }
@@ -9095,15 +9467,23 @@
     else dialog?.setAttribute("open", "");
   }
 
+  function updateBatchDeliveryCommitState() {
+    const commit = $("#batchDeliveryCommit");
+    if (!commit) return;
+    const payload = collectBatchDelivery();
+    const hasItems = payload.item_ids.length > 0;
+    const hasValidMaterial = !payload.enabled || Boolean(payload.material);
+    commit.disabled = !hasItems || !hasValidMaterial;
+  }
+
   function invalidateBatchDeliveryPreview() {
     state.batchDelivery.generation = Number(state.batchDelivery.generation || 0) + 1;
     state.batchDelivery.previewToken = "";
     state.batchDelivery.preview = null;
     const preview = $("#batchDeliveryPreview");
     if (preview) preview.hidden = true;
-    const commit = $("#batchDeliveryCommit");
-    if (commit) commit.disabled = true;
     formMessage("#batchDeliveryMessage", "");
+    updateBatchDeliveryCommitState();
   }
 
   function updateBatchDeliverySelection() {
@@ -9115,6 +9495,7 @@
       all.checked = Boolean(items.length) && selected === items.length;
       all.indeterminate = selected > 0 && selected < items.length;
     }
+    updateBatchDeliveryCommitState();
   }
 
   function renderBatchDeliveryMode() {
@@ -9172,9 +9553,37 @@
       const result = await accountScopedApi(context, "/api/automation", { method: "PUT", body: JSON.stringify({ deliveries: nextDeliveries }) });
       if (!accountContextMatches(context)) return;
       state.automation = result.automation || Object.assign({}, state.automation, { deliveries: nextDeliveries });
+      if (state.deliveryStatus?.items) {
+        nextDeliveries.forEach((del) => {
+          const id = String(del.item_id);
+          const existing = state.deliveryStatus.items.get(id);
+          if (existing) {
+            existing.enabled = del.enabled !== false;
+          }
+        });
+      }
       renderAutomation();
       renderProducts();
-      showToast(current.enabled === false ? "商品资料已恢复" : "商品资料已暂停");
+      const restoring = current.enabled === false;
+      const workerRunning = Boolean(result?.automation?.running ?? state.bot?.running);
+      if (restoring && !workerRunning) {
+        try {
+          await accountScopedApi(context, "/api/bot/start", { method: "POST", body: JSON.stringify({ mode: "rules" }) });
+          if (!accountContextMatches(context)) return;
+          state.bot = Object.assign({}, state.bot, { running: true, automation_mode: state.bot?.automation_mode || "rules" });
+          renderAutomation();
+          renderProducts();
+          showToast("自动发货已启动");
+        } catch (startError) {
+          if (accountContextMatches(context)) {
+            renderAutomation();
+            renderProducts();
+            showToast("商品资料已恢复，但自动发货未启动: " + (startError.message || "启动失败"), "warning");
+          }
+        }
+      } else {
+        showToast(restoring ? "商品资料已恢复" : "商品资料已暂停");
+      }
     } catch (error) {
       if (accountContextMatches(context)) showToast(error.message || "商品资料状态修改失败", "error");
     } finally {
@@ -9199,130 +9608,202 @@
     return "";
   }
 
-  async function previewBatchDelivery() {
+  async function commitBatchDelivery(event) {
+    event.preventDefault();
     const payload = collectBatchDelivery();
     const validationError = validateBatchDelivery(payload);
     if (validationError) {
       formMessage("#batchDeliveryMessage", validationError);
       return;
     }
-    const button = $("#batchDeliveryCheck");
-    const context = captureAccountContext();
+    const button = $("#batchDeliveryCommit");
     setBusy(button, true);
     invalidateBatchDeliveryPreview();
     const generation = state.batchDelivery.generation;
+    const context = captureAccountContext();
     try {
-      const result = await accountScopedApi(context, "/api/bot/products/batch/preview", { method: "POST", body: JSON.stringify(payload) });
+      // 1. 先自动执行检查/影响范围预览
+      const previewResult = await accountScopedApi(context, "/api/bot/products/batch/preview", { method: "POST", body: JSON.stringify(payload) });
       if (!accountContextMatches(context) || generation !== state.batchDelivery.generation) return;
-      const preview = result.preview || result;
+      const preview = previewResult.preview || previewResult;
       const token = String(preview.preview_token || preview.token || "");
       if (!token) throw new ApiError("检查结果无效，请稍后重试");
       state.batchDelivery.previewToken = token;
       state.batchDelivery.preview = preview;
       const changes = Number(preview.change_count || 0);
       const unchanged = Number(preview.unchanged_count || 0);
-      text("#batchDeliveryPreviewTitle", changes ? "检查完成，可以保存" : "当前设置无需修改");
+      text("#batchDeliveryPreviewTitle", changes ? "检查完成，正在保存..." : "当前设置无需修改");
       text("#batchDeliveryPreviewMessage", "将修改 " + changes + " 个商品" + (unchanged ? "，" + unchanged + " 个保持不变。" : "。"));
       $("#batchDeliveryPreview").hidden = false;
-      $("#batchDeliveryCommit").disabled = changes < 1;
-      formMessage("#batchDeliveryMessage", "");
-    } catch (error) {
-      if (accountContextMatches(context) && generation === state.batchDelivery.generation) {
-        formMessage("#batchDeliveryMessage", error.message || "检查失败，请稍后重试");
+      if (changes < 1) {
+        button.disabled = true;
+        formMessage("#batchDeliveryMessage", "所选商品设置无变更，无需保存");
+        setBusy(button, false);
+        return;
       }
-    } finally {
-      setBusy(button, false);
-    }
-  }
 
-  async function commitBatchDelivery(event) {
-    event.preventDefault();
-    const payload = collectBatchDelivery();
-    const validationError = validateBatchDelivery(payload);
-    if (validationError || !state.batchDelivery.previewToken) {
-      formMessage("#batchDeliveryMessage", validationError || "请先检查本次修改");
-      return;
-    }
-    payload.preview_token = state.batchDelivery.previewToken;
-    const mutation = beginAutomationMutation("deliveries", "#batchDeliveryMessage");
-    if (!mutation) return;
-    const button = $("#batchDeliveryCommit");
-    const context = mutation.context;
-    const generation = state.batchDelivery.generation;
-    setBusy(button, true);
-    try {
-      const result = await accountScopedApi(context, "/api/bot/products/batch/commit", { method: "POST", body: JSON.stringify(payload) });
-      if (!accountContextMatches(context) || generation !== state.batchDelivery.generation) return;
-      const previousById = new Map((state.automation?.deliveries || []).map((item) => [String(item.item_id), item]));
-      const selectedIds = new Set(payload.item_ids.map(String));
-      const serverAutomation = result.automation || state.automation;
-      const serverDeliveries = Array.isArray(serverAutomation?.deliveries) ? serverAutomation.deliveries : [];
-      const deliveries = serverDeliveries.map((item) => {
-        const itemId = String(item.item_id || "");
-        const previous = previousById.get(itemId);
-        return Object.assign({}, item, {
-          material: selectedIds.has(itemId) && payload.enabled ? payload.material : String(previous?.material || ""),
+      // 2. 校验通过后再保存
+      payload.preview_token = token;
+      const mutation = beginAutomationMutation("deliveries", "#batchDeliveryMessage");
+      if (!mutation) {
+        setBusy(button, false);
+        return;
+      }
+      try {
+        const result = await accountScopedApi(mutation.context, "/api/bot/products/batch/commit", { method: "POST", body: JSON.stringify(payload) });
+        if (!accountContextMatches(mutation.context) || generation !== state.batchDelivery.generation) return;
+        const previousById = new Map((state.automation?.deliveries || []).map((item) => [String(item.item_id), item]));
+        const selectedIds = new Set(payload.item_ids.map(String));
+        const serverAutomation = result.automation || state.automation;
+        const serverDeliveries = Array.isArray(serverAutomation?.deliveries) ? serverAutomation.deliveries : [];
+        const deliveries = serverDeliveries.map((item) => {
+          const itemId = String(item.item_id || "");
+          const previous = previousById.get(itemId);
+          return Object.assign({}, item, {
+            material: selectedIds.has(itemId) && payload.enabled ? payload.material : String(previous?.material || ""),
+          });
         });
-      });
-      state.automation = Object.assign({}, serverAutomation, { deliveries });
-      renderAutomation();
-      renderProducts();
-      closeDialog("batchDeliveryDialog");
-      state.batchDelivery = { enabled: true, previewToken: "", preview: null, generation: Number(state.batchDelivery?.generation || 0) + 1 };
-      showToast(payload.enabled ? "批量资料已保存" : "所选商品已暂停自动发资料");
+        state.automation = Object.assign({}, serverAutomation, { deliveries });
+        if (state.deliveryStatus?.items) {
+          deliveries.forEach((del) => {
+            const id = String(del.item_id);
+            const existing = state.deliveryStatus.items.get(id);
+            const configured = Boolean(String(del.material || "").trim());
+            const enabled = del.enabled !== false;
+            if (existing) {
+              existing.configured = configured;
+              existing.enabled = enabled;
+            } else {
+              state.deliveryStatus.items.set(id, {
+                item_id: id,
+                delivery: del.delivery || "material",
+                configured,
+                enabled,
+                template_id: null,
+              });
+            }
+          });
+        }
+        renderAutomation();
+        renderProducts();
+        closeDialog("batchDeliveryDialog");
+        state.batchDelivery = { enabled: true, previewToken: "", preview: null, generation: Number(state.batchDelivery?.generation || 0) + 1 };
+        const workerRunning = Boolean(serverAutomation?.running ?? state.bot?.running);
+        if (payload.enabled && !workerRunning) {
+          try {
+            await accountScopedApi(mutation.context, "/api/bot/start", { method: "POST", body: JSON.stringify({ mode: "rules" }) });
+            if (!accountContextMatches(mutation.context)) return;
+            state.bot = Object.assign({}, state.bot, { running: true, automation_mode: state.bot?.automation_mode || "rules" });
+            renderAutomation();
+            renderProducts();
+            showToast("自动发货已启动");
+          } catch (startError) {
+            if (accountContextMatches(mutation.context)) {
+              renderProducts();
+              showToast("资料已保存，但自动发货未启动: " + (startError.message || "启动失败"), "warning");
+            }
+          }
+        } else {
+          showToast(payload.enabled ? "批量资料已保存" : "所选商品已暂停自动发资料");
+        }
+      } finally {
+        if (state.automationMutationOwner === mutation) {
+          endAutomationMutation(mutation);
+        }
+      }
     } catch (error) {
       if (accountContextMatches(context) && generation === state.batchDelivery.generation) {
         invalidateBatchDeliveryPreview();
-        formMessage("#batchDeliveryMessage", error.message || "保存失败，请重新检查");
+        formMessage("#batchDeliveryMessage", error.message || "保存失败，请稍后重试");
       }
     } finally {
-      if (state.automationMutationOwner === mutation) {
-        setBusy(button, false);
-        endAutomationMutation(mutation);
-        button.disabled = !state.batchDelivery.previewToken;
-      }
+      setBusy(button, false);
+      updateBatchDeliveryCommitState();
     }
   }
 
   async function saveAutomation(options = {}) {
-    const button = options.button || $("#saveAutomationButton");
-    const payload = collectAutomation(options.enabled);
+    const kind = typeof options === "string" ? options : options?.kind;
+    const button = options.button || (kind === "rules_defaults" ? $("#saveRulesDefaultsButton") : $("#saveAutomationButton"));
+    const payload = collectAutomation(options);
     const mutation = beginAutomationMutation("settings");
     if (!mutation) return false;
     const context = mutation.context;
-    if (options.manageBusy !== false) setBusy(button, true);
+    if (options.manageBusy !== false && button) setBusy(button, true);
+    const prevRulesEnabled = state.automation?.rules_enabled !== false;
+    const prevAiEnabled = state.automation?.ai_enabled !== false;
     try {
       const result = await accountScopedApi(context, "/api/automation", { method: "PUT", body: JSON.stringify(payload) });
       if (!accountContextMatches(context)) return false;
       state.automation = result.automation || state.automation;
+      clearAutomationDraft(kind, context.accountKey);
       const connected = shopStateView(state.bot || {}).connection === "connected";
       const rulesConfigured = (state.automation.rules || []).some((rule) => rule.enabled !== false && String(rule.reply || "").trim());
-      const defaultsConfigured = [payload.first_reply, payload.fallback_reply].some((item) => String(item || "").trim());
+      const defaultsConfigured = [state.automation.first_reply, state.automation.fallback_reply].some((item) => String(item || "").trim());
       const deliveryConfigured = (state.automation.deliveries || []).some((item) => item.enabled !== false && String(item.material || "").trim());
-      const rulesRunning = Boolean(state.bot?.running && state.bot?.automation_mode === "rules");
-      const aiRunning = Boolean(state.bot?.running && state.bot?.automation_mode === "rules_ai");
-      let message = "店铺配置已保存";
-      if (payload.enabled && connected && !rulesRunning && !aiRunning && (rulesConfigured || defaultsConfigured || deliveryConfigured)) {
+      const rulesEnabled = state.automation?.rules_enabled !== false;
+      const aiEnabled = state.automation?.ai_enabled !== false;
+      const anyEnabled = rulesEnabled || aiEnabled;
+      if (anyEnabled && connected && !state.bot?.running && (rulesConfigured || defaultsConfigured || deliveryConfigured || aiEnabled)) {
         await accountScopedApi(context, "/api/bot/start", { method: "POST", body: JSON.stringify({ mode: "rules" }) });
         if (!accountContextMatches(context)) return false;
         await refreshState();
         if (!accountContextMatches(context)) return false;
-        message = "店铺配置已保存，自动回复已开启";
-      } else if (!payload.enabled) {
+      } else if (!anyEnabled) {
         await refreshState();
         if (!accountContextMatches(context)) return false;
-        message = "店铺配置已保存，自动回复已关闭";
+      }
+      const rulesChanged = rulesEnabled !== prevRulesEnabled;
+      const aiChanged = aiEnabled !== prevAiEnabled;
+      let message;
+      if (kind === "rules_toggle") {
+        message = rulesEnabled ? "规则客服已开启" : "规则客服已关闭";
+      } else if (kind === "ai_toggle") {
+        message = aiEnabled ? "智能客服(AI)已开启" : "智能客服(AI)已关闭";
+      } else if (kind === "rules_defaults") {
+        message = "规则默认回复已保存";
+      } else if (kind === "general") {
+        message = "通用自动化设置已保存";
+      } else {
+        if (rulesChanged && aiChanged) {
+          message = rulesEnabled && aiEnabled ? "规则客服与智能客服已开启"
+            : (!rulesEnabled && !aiEnabled) ? "规则客服与智能客服已关闭"
+            : `${rulesEnabled ? "规则客服已开启" : "规则客服已关闭"} · ${aiEnabled ? "智能客服(AI)已开启" : "智能客服(AI)已关闭"}`;
+        } else if (rulesChanged) {
+          message = rulesEnabled ? "规则客服已开启" : "规则客服已关闭";
+        } else if (aiChanged) {
+          message = aiEnabled ? "智能客服(AI)已开启" : "智能客服(AI)已关闭";
+        } else {
+          message = "配置已保存";
+        }
       }
       renderAutomation();
-      formMessage("#automationMessage", message, true);
+      renderAiConfig({ preserveEditors: true });
+      if (kind === "rules_defaults") {
+        formMessage("#rulesDefaultsMessage", message, true);
+      } else if (kind === "general") {
+        formMessage("#automationMessage", message, true);
+      } else {
+        formMessage("#automationMessage", message, true);
+        formMessage("#rulesDefaultsMessage", message, true);
+      }
       showToast(message);
       return true;
     } catch (error) {
-      if (accountContextMatches(context)) formMessage("#automationMessage", error.message);
+      if (accountContextMatches(context)) {
+        if (kind === "rules_defaults") {
+          formMessage("#rulesDefaultsMessage", error.message);
+        } else if (kind === "general") {
+          formMessage("#automationMessage", error.message);
+        } else {
+          formMessage("#automationMessage", error.message);
+          formMessage("#rulesDefaultsMessage", error.message);
+        }
+      }
       return false;
     } finally {
       if (state.automationMutationOwner === mutation) {
-        if (options.manageBusy !== false) setBusy(button, false);
+        if (options.manageBusy !== false && button) setBusy(button, false);
         endAutomationMutation(mutation);
       }
     }
@@ -9359,7 +9840,7 @@
       return;
     }
     if (!aiStoreHasContent()) {
-      showToast("请先填写并保存店铺与客服说明", "warning");
+      showToast("请先填写并保存店铺说明", "warning");
       showView("ai-config", true);
       return;
     }
@@ -9530,6 +10011,17 @@
     $("#closeSidebar").addEventListener("click", () => setSidebarOpen(false));
     $(".sidebar-scrim").addEventListener("click", () => setSidebarOpen(false));
     window.addEventListener("resize", syncSidebarAccessibility);
+    if (typeof ResizeObserver !== "undefined" && $("#analyticsChart")) {
+      let chartWidth = 0;
+      const chartResize = new ResizeObserver(([entry]) => {
+        const width = Math.round(entry.contentRect.width);
+        if (width > 0 && width !== chartWidth) {
+          chartWidth = width;
+          renderAnalyticsChart();
+        }
+      });
+      chartResize.observe($("#analyticsChart"));
+    }
     document.addEventListener("keydown", (event) => {
       if (event.key === "Escape" && $("#sidebar").classList.contains("is-open")) {
         setSidebarOpen(false);
@@ -9627,9 +10119,23 @@
       renderBatchDeliveryMode();
       invalidateBatchDeliveryPreview();
     }));
-    $("#batchDeliveryCheck").addEventListener("click", previewBatchDelivery);
     $("#batchDeliveryForm").addEventListener("submit", commitBatchDelivery);
-    $("#saveAutomationButton").addEventListener("click", saveAutomation);
+    $("#saveAutomationButton").addEventListener("click", () => saveAutomation({ kind: "general", button: $("#saveAutomationButton") }));
+    $("#saveRulesDefaultsButton")?.addEventListener("click", () => saveAutomation({ kind: "rules_defaults", button: $("#saveRulesDefaultsButton") }));
+    ["#automationFirstReply", "#automationFallbackReply"].forEach((selector) => {
+      $(selector)?.addEventListener("input", () => captureAutomationDraft("rules_defaults"));
+    });
+    [
+      "#automationDelayMin",
+      "#automationDelayMax",
+      "#automationTriggerCooldown",
+      "#automationManualCooldown",
+      "#automationBusinessStart",
+      "#automationBusinessEnd",
+    ].forEach((selector) => {
+      $(selector)?.addEventListener("input", () => captureAutomationDraft("general"));
+    });
+    $("#automationBusinessHoursEnabled")?.addEventListener("change", () => captureAutomationDraft("general"));
     $("#aiConnectionForm").addEventListener("submit", saveAiConnection);
     $("#aiTestConnection").addEventListener("click", testAiConnection);
     $("#aiDeleteKey").addEventListener("click", confirmDeleteAiKey);
@@ -9651,7 +10157,31 @@
     $("#aiSaveKnowledge").addEventListener("click", saveAiKnowledge);
     $("#aiDisableKnowledge").addEventListener("click", confirmDisableAiKnowledge);
     $("#aiRunPreview").addEventListener("click", runAiPreview);
-    $("#aiClearPreview").addEventListener("click", clearAiPreview);
+    $("#aiPersonaPreset")?.addEventListener("change", (event) => {
+      const preset = String(event.currentTarget.value || "catgirl");
+      const nameEl = $("#aiPersonaName");
+      const instructionEl = $("#aiPersonaInstruction");
+      if (preset === "catgirl" || preset === "mint") {
+        if (nameEl) nameEl.value = AI_PERSONA_PRESETS[preset]?.name || "";
+        if (instructionEl) instructionEl.value = AI_PERSONA_PRESETS[preset]?.instruction || "";
+      } else if (preset === "custom") {
+        if (instructionEl) {
+          instructionEl.value = state.ai.customPersonaInstruction !== undefined && state.ai.customPersonaInstruction !== null
+            ? state.ai.customPersonaInstruction
+            : "";
+        }
+      }
+      state.ai.dirty.config = true;
+      text("#aiPersonaStatus", "有未保存修改");
+      formMessage("#aiPersonaMessage", "有未保存修改");
+      void saveAiPersona();
+    });
+    $("#aiPersonaInstruction")?.addEventListener("input", (event) => {
+      const preset = String($("#aiPersonaPreset")?.value || "");
+      if (preset === "custom") {
+        state.ai.customPersonaInstruction = event.currentTarget.value;
+      }
+    });
     $("#aiProvider").addEventListener("change", () => {
       if ($("#aiApiKey")) $("#aiApiKey").value = "";
       renderAiProviderFields();
@@ -9667,8 +10197,21 @@
     $("#aiPreviewInput").addEventListener("keydown", (event) => {
       if (event.key === "Enter" && !event.shiftKey && !event.isComposing) { event.preventDefault(); void runAiPreview(); }
     });
-    $("#automationEnabledToggle").addEventListener("change", (event) => {
-      state.automation.enabled = event.currentTarget.checked;
+    $("#rulesEnabledToggle")?.addEventListener("change", async (event) => {
+      const toggle = event.currentTarget;
+      const context = captureAccountContext();
+      const saved = await saveAutomation({ kind: "rules_toggle", button: toggle });
+      if (!saved && accountContextMatches(context)) {
+        toggle.checked = state.automation?.rules_enabled !== false;
+      }
+    });
+    $("#aiEnabledToggle")?.addEventListener("change", async (event) => {
+      const toggle = event.currentTarget;
+      const context = captureAccountContext();
+      const saved = await saveAutomation({ kind: "ai_toggle", button: toggle });
+      if (!saved && accountContextMatches(context)) {
+        toggle.checked = state.automation?.ai_enabled !== false;
+      }
     });
     $("#automationShopSelect")?.addEventListener("change", (event) => {
       const key = String(event.currentTarget.value || "").trim();
@@ -9682,6 +10225,7 @@
       syncResourcePolling();
       if (!document.hidden && shouldPollResources()) {
         void loadShopResources({ silent: true });
+        if (state.view === "home") void loadHomePreview();
       }
     });
     $("#refreshShopResources")?.addEventListener("click", () => {
@@ -9703,7 +10247,7 @@
       $("#conversationSearch")?.focus();
     });
     const selectInboxFilter = (filter) => {
-      state.inbox.filter = ["unread", "takeover"].includes(filter) ? filter : "all";
+      state.inbox.filter = ["unread", "takeover", "needs_human"].includes(filter) ? filter : "all";
       persistInboxPreferences();
       renderChat();
       scheduleInboxReload();
@@ -9721,7 +10265,7 @@
     $("#markConversationRead").addEventListener("click", () => {
       void markConversationRead(state.selectedChatId).catch(() => {});
     });
-    $("#toggleChatTakeover").addEventListener("click", () => {
+    $("#chatTakeoverToggle").addEventListener("click", () => {
       void toggleConversationTakeover();
     });
     $("#refreshOrders")?.addEventListener("click", () => loadOrders().catch((error) => showToast(error.message, "error")));
@@ -9873,6 +10417,7 @@
     $("#cardsCreateForm").addEventListener("submit", createCardPool);
     $("#quickReplyForm")?.addEventListener("submit", addQuickReply);
     $("#manualReplyForm").addEventListener("submit", sendManualReply);
+    $("#manualReplyInput").addEventListener("input", renderManualReplyActions);
     $("#manualReplyInput").addEventListener("keydown", (event) => {
       if (event.key !== "Enter" || event.shiftKey || event.isComposing || event.keyCode === 229) return;
       event.preventDefault();

@@ -324,6 +324,75 @@ def main() -> None:
     assert deleted_remote_runtime["pid"] is None
     assert app.db.get_shop_account(user_id, account_key="delete-remote")["enabled"] == 0
 
+    # 停止无法确认时绝不能伪装成已断开：返回 409，保留降级运行态与身份记录。
+    stuck_response = client.post(
+        "/api/bot/accounts", json={"key": "stuck-stop", "name": "未停止店铺"}
+    )
+    assert stuck_response.status_code == 200, stuck_response.text
+    stuck_account = app.db.get_shop_account(user_id, account_key="stuck-stop")
+    app.db.persist_worker_runtime(
+        user_id,
+        stuck_account["id"],
+        desired_state="running",
+        mode="rules",
+        state="running",
+        pid=55001,
+        generation=1,
+        expected_generation=0,
+    )
+    with (
+        patch.object(app, "bot_process_id", return_value=55001),
+        patch.object(app, "bot_stop", return_value=(False, "stop_failed")) as stuck_stop,
+        patch.object(app, "bot_terminate_pid") as same_pid_stop,
+    ):
+        stuck_delete = client.delete("/api/bot/accounts/stuck-stop")
+    assert stuck_delete.status_code == 409, stuck_delete.text
+    assert stuck_delete.json()["detail"]["code"] == "worker_stop_unconfirmed"
+    assert stuck_stop.call_count == 2
+    same_pid_stop.assert_not_called()
+    stuck_runtime = app.db.get_worker_runtime(user_id, stuck_account["id"])
+    assert stuck_runtime["desired_state"] == "stopped"
+    assert stuck_runtime["state"] == "degraded"
+    assert stuck_runtime["pid"] == 55001
+    assert app.db.get_shop_account(user_id, account_key="stuck-stop")["enabled"] == 1
+
+    # Both local and durable PIDs fail the first stop. Neither one succeeding
+    # alone on retry is enough to disable the account or discard the other PID.
+    for local_stopped, durable_stopped in ((False, True), (True, False), (True, True)):
+        previous = app.db.get_worker_runtime(user_id, stuck_account["id"])
+        generation = int(previous["generation"])
+        app.db.persist_worker_runtime(
+            user_id,
+            stuck_account["id"],
+            desired_state="running",
+            mode="rules",
+            state="running",
+            pid=55002,
+            generation=generation + 1,
+            expected_generation=generation,
+        )
+        with (
+            patch.object(app, "bot_process_id", return_value=55001),
+            patch.object(app, "bot_stop", side_effect=[
+                (False, "stop_failed"),
+                (local_stopped, "stopped" if local_stopped else "stop_failed"),
+            ]) as local_stop,
+            patch.object(app, "bot_terminate_pid", side_effect=[
+                (False, "still_alive"),
+                (durable_stopped, "stopped" if durable_stopped else "still_alive"),
+            ]) as durable_stop,
+        ):
+            two_pid_delete = client.delete("/api/bot/accounts/stuck-stop")
+        assert local_stop.call_count == 2
+        assert durable_stop.call_count == 2
+        assert all(call.args == (user_id, 55002, "stuck-stop") for call in durable_stop.call_args_list)
+        both_stopped = local_stopped and durable_stopped
+        assert two_pid_delete.status_code == (200 if both_stopped else 409), two_pid_delete.text
+        two_pid_runtime = app.db.get_worker_runtime(user_id, stuck_account["id"])
+        assert two_pid_runtime["state"] == ("stopped" if both_stopped else "degraded")
+        assert two_pid_runtime["pid"] == (None if both_stopped else 55001 if durable_stopped else 55002)
+        assert app.db.get_shop_account(user_id, account_key="stuck-stop")["enabled"] == (0 if both_stopped else 1)
+
     # A stale sync callback must not overwrite a name entered concurrently by
     # the owner after the sync captured its account row.
     rename_race = client.post("/api/bot/accounts", json={"key": "rename-race", "name": ""})
@@ -356,6 +425,45 @@ def main() -> None:
     assert second_root.joinpath("cookies.txt").read_text() == second_cookie
     assert json.loads(default_root.joinpath("shop_snapshot.json").read_text())["products"][0]["title"] == "商品-111111"
     assert json.loads(second_root.joinpath("shop_snapshot.json").read_text())["products"][0]["title"] == "商品-222222"
+
+    # Losing the lease before stopping, before retrying, or before committing
+    # the stop intent must not change auto_resume or clear the connection.
+    default_account = app.db.get_shop_account(user_id, account_key="default")
+    for fail_at in (1, 3, 5):
+        app.db.set_worker_auto_resume(user_id, default_account["id"], 1)
+        lease_checks = {"count": 0}
+
+        def expire_stop_lease(*_args, **_kwargs):
+            lease_checks["count"] += 1
+            if lease_checks["count"] == fail_at:
+                raise app.HTTPException(503, "synthetic expired lease")
+
+        with (
+            patch.object(app, "_ensure_account_lease", side_effect=expire_stop_lease),
+            patch.object(app, "bot_process_id", return_value=None),
+            patch.object(app, "bot_stop", return_value=(False, "stop_failed")) as lease_stop,
+            patch.object(app.db, "set_worker_auto_resume", wraps=app.db.set_worker_auto_resume) as set_auto_resume,
+        ):
+            expired_delete = client.delete("/api/bot/accounts/default")
+        assert expired_delete.status_code == 503, expired_delete.text
+        assert lease_stop.call_count == (fail_at - 1) // 2
+        set_auto_resume.assert_not_called()
+        assert app.db.get_worker_runtime(user_id, default_account["id"])["auto_resume"] == 1
+        assert default_root.joinpath("cookies.txt").read_text() == default_cookie
+        assert app.db.get_shop_account(user_id, account_key="default")["status"] == default_account["status"]
+
+    # 停止异常且无可查询 PID：不得据“无 PID”推断为已停止，也不得清 cookie/连接。
+    with (
+        patch.object(app, "bot_process_id", return_value=None),
+        patch.object(app, "bot_stop", return_value=(False, "stop_failed")),
+        patch.object(app, "bot_terminate_pid", return_value=(True, "stopped")) as default_stop,
+    ):
+        default_delete = client.delete("/api/bot/accounts/default")
+    assert default_delete.status_code == 409, default_delete.text
+    assert default_delete.json()["detail"]["code"] == "worker_stop_unconfirmed"
+    default_stop.assert_not_called()
+    assert default_root.joinpath("cookies.txt").read_text() == default_cookie
+    assert client.get("/api/bot/status").json()["shop_name"] == "店铺-111111"
 
     # Automation rules and delivery mappings are account-local.  The second
     # account must not inherit the first account's keyword or material.

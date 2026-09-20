@@ -69,9 +69,13 @@ class ProcReader:
 
 class ShopResources:
     def __init__(self, db, settings, process_snapshot, identity_validator, *, reader=None,
-                 clock=time.monotonic, wall_clock=time.time, interval=5.0):
+                 clock=time.monotonic, wall_clock=time.time, interval=5.0, monitor=None):
         self.db, self.settings = db, settings
         self.process_snapshot, self.identity_validator = process_snapshot, identity_validator
+        # Optional read-only projection of the account's login/reply/delivery
+        # intent so the UI can distinguish "online but delivery-only" from
+        # "online with AI replies" without guessing from the process alone.
+        self.monitor = monitor
         self.reader = reader or ProcReader()
         self.clock, self.wall_clock = clock, wall_clock
         self.interval = max(1.0, float(interval))
@@ -87,6 +91,46 @@ class ShopResources:
         return (current is not None and current["account_key"] == account["account_key"]
                 and current["generation"] == account["generation"])
 
+    @staticmethod
+    def _runtime_state(account, result, monitor):
+        """Collapse worker/auth/settings facts into one UI-facing state."""
+        if not account["enabled"]:
+            return "disabled"
+        if monitor.get("reauth_required"):
+            return "waiting_login"
+        worker_state = result.get("worker_state")
+        if worker_state in {"starting", "stopping"}:
+            return worker_state
+        if worker_state == "running":
+            if monitor.get("reply_enabled") is True:
+                return "running_replies"
+            if monitor.get("delivery_enabled") is True:
+                return "running_delivery_only"
+            return "running_idle"
+        if worker_state in {"capacity_limited", "degraded", "waiting_login"}:
+            return worker_state
+        if worker_state == "unknown":
+            return "unknown"
+        if monitor.get("connected") is False:
+            return "offline"
+        return "stopped"
+
+    def _monitor(self, uid, account_key):
+        empty = {"connected": None, "reauth_required": False,
+                 "reply_enabled": None, "delivery_enabled": None}
+        if self.monitor is None:
+            return empty
+        try:
+            value = self.monitor(int(uid), str(account_key)) or {}
+        except Exception:
+            return empty
+        return {
+            "connected": value.get("connected") if isinstance(value.get("connected"), bool) else None,
+            "reauth_required": bool(value.get("reauth_required")),
+            "reply_enabled": value.get("reply_enabled") if isinstance(value.get("reply_enabled"), bool) else None,
+            "delivery_enabled": value.get("delivery_enabled") if isinstance(value.get("delivery_enabled"), bool) else None,
+        }
+
     def _sample(self, uid, account, configured_limit):
         key = (uid, int(account["id"]))
         result = {"account_id": int(account["id"]), "key": account["account_key"],
@@ -95,6 +139,12 @@ class ShopResources:
             "cpu_percent": None, "rss_bytes": None, "vms_bytes": None, "uptime_seconds": None,
             "memory_limit_bytes": None, "configured_memory_limit_bytes": configured_limit,
             "pending_restart": None, "sampled_at": None, "message": "暂时无法采样"}
+        monitor = self._monitor(uid, account["account_key"])
+        result.update(monitor)
+
+        def finalize():
+            result["runtime_state"] = self._runtime_state(account, result, monitor)
+            return result
         try:
             first = self.process_snapshot(uid, account["account_key"])
             result["worker_state"] = first.get("state", "unknown")
@@ -106,7 +156,7 @@ class ShopResources:
                 # adoption. Do not read it or pretend its consumption is zero.
                 if account["runtime_pid"] and first.get("state") == "stopped":
                     result.update(worker_state="unknown", message="进程归属尚未确认")
-                    return result
+                    return finalize()
                 second = self.process_snapshot(uid, account["account_key"])
                 if self._identity(second) != self._identity(first) or second.get("state") != first.get("state") or not self._current(uid, account):
                     raise SampleUnavailable("changed")
@@ -116,7 +166,7 @@ class ShopResources:
                 if first.get("state") == "stopped":
                     state = account["runtime_state"]
                     result["worker_state"] = "disabled" if not account["enabled"] else state if state in {"waiting_login", "capacity_limited", "degraded"} else "stopped"
-                return result
+                return finalize()
             if type(pid) is not int or pid <= 0 or not self.identity_validator(uid, pid, account["account_key"]):
                 raise SampleUnavailable("invalid_identity")
             now = self.clock()
@@ -128,7 +178,7 @@ class ShopResources:
                     raise SampleUnavailable("changed")
                 result.update(cached["metrics"])
                 result["pending_restart"] = (result["memory_limit_bytes"] != configured_limit)
-                return result
+                return finalize()
             point = self.reader.read(pid)
             second = self.process_snapshot(uid, account["account_key"])
             if (self._identity(second) != self._identity(first) or point["identity"] != fingerprint[-1]
@@ -159,7 +209,7 @@ class ShopResources:
             self._cache.pop(key, None)
             if isinstance(error, SampleUnavailable) and str(error) in {"invalid_identity", "changed"}:
                 result["worker_state"] = "unknown"
-        return result
+        return finalize()
 
     def page(self, uid, cursor=0, limit=50):
         policy = self.settings.read()

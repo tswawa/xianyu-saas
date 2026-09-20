@@ -1,6 +1,6 @@
 # 生产部署指南
 
-本文档介绍如何在服务器或本地主机上部署 xianyu-saas，支持 **Docker Compose（推荐部署方式）**、**Linux systemd 原生服务** 以及 **Windows 宿主机环境（Docker 容器）**。
+本文档介绍两种部署方式：**Docker Compose（推荐）**与 **Ubuntu 原生安装**。Windows 用户使用 Docker Desktop 运行同一套 Docker 部署。
 
 ## 部署方式一：Docker Compose（推荐）
 
@@ -12,7 +12,7 @@
 ### 2. 获取 Release 安装包
 从 GitHub Releases 下载正式版源码安装包：
 ```bash
-VERSION=0.4.5
+VERSION=0.4.6
 curl -fLO "https://github.com/tswawa/xianyu-saas/releases/download/v${VERSION}/xianyu-saas-${VERSION}-source.zip"
 unzip -q "xianyu-saas-${VERSION}-source.zip"
 cd "xianyu-saas-${VERSION}"
@@ -90,10 +90,10 @@ docker compose up -d --build
 
 ### 2. 首次安装
 
-从官方 GitHub Releases 下载对应架构的安装器，执行 `install` 命令。以下命令安装 0.4.5，ARM64 机器请将 `ARCH` 改为 `aarch64`：
+从官方 GitHub Releases 下载对应架构的安装器，执行 `install` 命令。以下命令安装 0.4.6，ARM64 机器请将 `ARCH` 改为 `aarch64`：
 
 ```bash
-VERSION=0.4.5
+VERSION=0.4.6
 ARCH=x86_64  # ARM64 改为 aarch64
 curl -fLO "https://github.com/tswawa/xianyu-saas/releases/download/v${VERSION}/xianyu-saas-${VERSION}-linux-${ARCH}"
 chmod +x "xianyu-saas-${VERSION}-linux-${ARCH}"
@@ -135,7 +135,7 @@ sudo xianyu-saas doctor
 
 ---
 
-## 部署方式三：Windows 环境部署（Docker 容器）
+## Windows 上使用 Docker Desktop
 
 在 Windows 系统上，请使用 Docker Desktop 运行：
 
@@ -145,6 +145,10 @@ sudo xianyu-saas doctor
 ---
 
 ## 系统升级与版本维护
+
+0.4.6 是当前维护起点，之前版本不再提供功能修复。已接入内置更新功能的 v0.4.5 可以从网页升级到 0.4.6，现有账号、店铺配置与业务数据保留；旧版明确手动停止的店铺不会因本次升级而自动启动。
+
+0.4.6 新增了薄荷人设等配置，旧版不能完整识别。升级并使用新配置后，不要主动降级到旧版；启动失败时恢复上一版本代码的机制不等于任意版本之间的数据回滚。
 
 ### 版本识别与发布更新机制
 控制台界面显示当前运行进程加载的代码版本、构建元数据以及从服务端缓存获取的最新发布信息。系统在服务端默认每 6 小时（21600 秒，可通过 `SAAS_UPDATE_CHECK_INTERVAL_SECONDS` 调整）异步探测一次发布版本，全站共享数据库缓存与租约，不重复请求 GitHub；浏览器在页面可见时每 5 分钟读取本地缓存，发现新版本后在版本徽标变黄提示。自动探测仅作发现，绝不触发静默安装。
@@ -170,7 +174,7 @@ sudo xianyu-saas doctor
 5. **健康检查与自动回滚**：新版本启动后，启动器等待 `/health` 接口就绪并核对版本；若新版本在超时时间内未通过健康检查，启动器尝试将 `current` 软链接切回上一版本并重启；
 6. **边界说明**：自动回滚仅针对应用代码目录的软链接切换，系统不自动备份或回滚业务数据库；
 7. **镜像免重构**：Docker 部署中的普通代码更新直接在可写代码存储中切换，**无需重新构建 Docker 镜像**；
-8. **运行状态说明**：切换版本会短暂中断服务；重启后使用现有数据库与店铺配置，重新建立运行连接。
+8. **运行状态说明**：切换版本会短暂中断服务；重启后使用现有数据库与店铺配置，重新建立运行连接。网页显示更新完成后刷新页面。
 
 ### 依赖或底层运行环境变动时的升级
 
@@ -187,7 +191,7 @@ sudo xianyu-saas doctor
   ```
   管理器将下载新版独立运行时包并刷新 systemd 服务。
 
-### 历史实例修复与向后兼容
+### 旧安装迁移
 
 - **旧版 Docker 实例升级**：既有旧版 Docker 安装未接入内置启动器时，**重新运行安装脚本不会自动迁移或替换已有容器镜像**（脚本重跑仅执行 `docker start` 启动既有容器）。如需切换到内置文件更新机制，需在维护窗口停止并清理旧容器后，使用包含新机制的源码重新构建启动应用容器；
 - **Ubuntu 旧版实例修复**：使用包含新机制的官方安装器，指定包含启动器的新版本执行安装。安装器核验旧安装的签名与服务模板后，保留数据并切换到新运行时包；同版本旧包缺少启动器时不能靠重装模板补齐。未知或修改过的历史布局仍会拒绝自动接入。

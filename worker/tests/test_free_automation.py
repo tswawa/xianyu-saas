@@ -9,10 +9,18 @@ import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
+from context_manager import ChatContextManager
 from XianyuAgent import LLMNotReadyError, LLMServiceError, LLMTimeoutError
-from main import XianyuLive, load_automation_settings, load_reply_rules, validate_runtime_env, within_business_hours
+from main import (
+    XianyuLive,
+    _split_reply_bubbles,
+    load_automation_settings,
+    load_reply_rules,
+    validate_runtime_env,
+    within_business_hours,
+)
 
 
 API_ITEM = "1001"
@@ -52,7 +60,7 @@ class FakeApi:
             "data": {
                 "commonData": {
                     "orderId": ORDER_ID,
-                    "itemId": MATERIAL_ITEM,
+                    "itemId": _item_id,
                     "seller": True,
                 }
             }
@@ -740,6 +748,30 @@ class FreeAutomationTests(unittest.IsolatedAsyncioTestCase):
         outcome = agent.context_manager.get_source_message("assistant:cooldown-2")
         self.assertEqual(outcome["role"], "assistant_no_reply")
 
+    async def test_rules_switch_disables_deterministic_replies(self):
+        agent, _bot = self.build_agent(
+            mode="rules",
+            rules={"version": 1, "rules": [
+                {"id": "kw", "keywords": ["价格"], "reply": "规则命中回复", "enabled": True},
+            ]},
+            settings={"rules_enabled": False, "ai_enabled": False, "fallback_reply": "兜底回复"},
+        )
+        await agent._process_buyer_chat(CHAT_ID, BUYER_ID, API_ITEM, "价格多少", "rules-off-1")
+        agent.send_text_reliably.assert_not_awaited()
+        outcome = agent.context_manager.get_source_message("assistant:rules-off-1")
+        self.assertEqual(outcome["role"], "assistant_no_reply")
+
+    async def test_ai_switch_disables_ai_replies(self):
+        agent, _bot = self.build_agent(
+            mode="rules_ai",
+            rules={"version": 1, "rules": []},
+            settings={"rules_enabled": True, "ai_enabled": False},
+        )
+        await agent._process_buyer_chat(CHAT_ID, BUYER_ID, API_ITEM, "随便问问", "ai-off-1")
+        agent.send_text_reliably.assert_not_awaited()
+        outcome = agent.context_manager.get_source_message("assistant:ai-off-1")
+        self.assertEqual(outcome["role"], "assistant_no_reply")
+
     async def test_manual_exit_during_delay_is_rechecked_before_send(self):
         agent, _bot = self.build_agent(
             rules={"version": 1, "rules": []},
@@ -945,7 +977,7 @@ class FreeAutomationTests(unittest.IsolatedAsyncioTestCase):
         agent, _bot = self.build_agent(rules={"version": 1, "rules": []})
         self.assertFalse(agent.automation_settings["enabled"])
 
-    async def test_hot_reload_zero_delay_disables_startup_typing_fallback(self):
+    async def test_hot_reload_zero_delay_yields_no_delay(self):
         settings_path = self.state / "automation_settings.json"
         agent, _bot = self.build_agent(
             settings={
@@ -956,7 +988,6 @@ class FreeAutomationTests(unittest.IsolatedAsyncioTestCase):
                 "delay_max_seconds": 3,
             }
         )
-        agent.simulate_human_typing = True
         write_json(settings_path, {
             "version": 1,
             "strategy": "standard",
@@ -1353,6 +1384,7 @@ class FreeAutomationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(agent.send_text_reliably.await_count, 2)
 
     async def test_rules_ai_readiness_failures_cancel_without_closing_websocket(self):
+        # 发送前就绪校验失败不重试（重试只针对生成调用）。
         for index, error in enumerate(
             (
                 LLMNotReadyError("disabled"),
@@ -1386,6 +1418,411 @@ class FreeAutomationTests(unittest.IsolatedAsyncioTestCase):
                     f"assistant:{source_id}"
                 )
                 self.assertEqual(outcome["role"], "assistant_cancelled")
+
+    async def test_transient_llm_failure_retries_then_replies(self):
+        class FlakyBot(FakeBot):
+            def generate_reply_result(self, *args, **kwargs):
+                self.calls += 1
+                if self.calls == 1:
+                    raise LLMServiceError("unavailable")
+                return {
+                    "reply": "重试后成功",
+                    "decision": "reply",
+                    "reason_code": "ok",
+                    "config_revision": 7,
+                }
+
+        bot = FlakyBot()
+        agent, _ = self.build_agent(
+            mode="rules_ai", bot=bot, rules={"version": 1, "rules": []}
+        )
+        agent.llm_retry_delay = 0
+        websocket = AsyncMock()
+        agent.ws = websocket
+        agent.connection_ready.set()
+        agent.send_msg = AsyncMock(return_value=None)
+        agent.send_text_reliably = XianyuLive.send_text_reliably.__get__(
+            agent, XianyuLive
+        )
+
+        await agent._process_buyer_chat(
+            "flaky-chat", BUYER_ID, API_ITEM, "真实问题", "flaky-source"
+        )
+
+        self.assertEqual(bot.calls, 2)
+        agent.send_msg.assert_awaited()
+        outcome = agent.context_manager.get_source_message("assistant:flaky-source")
+        self.assertEqual(outcome["role"], "assistant")
+        self.assertIn("重试后成功", outcome["content"])
+
+    async def test_real_sends_are_serialized_and_spaced(self):
+        agent, _ = self.build_agent(mode="rules", rules={"version": 1, "rules": []})
+        agent.send_text_reliably = XianyuLive.send_text_reliably.__get__(agent, XianyuLive)
+        agent.outbound_min_interval = 0.2
+        agent.outbound_jitter = 0.0
+        agent.connection_ready.set()
+        agent.ws = SimpleNamespace()
+        in_flight = 0
+        overlaps = 0
+        starts = []
+
+        async def fake_send(_ws, _cid, _toid, _text, **_kwargs):
+            nonlocal in_flight, overlaps
+            in_flight += 1
+            overlaps = max(overlaps, in_flight)
+            starts.append(time.monotonic())
+            await asyncio.sleep(0.05)
+            in_flight -= 1
+            return None
+
+        agent.send_msg = fake_send
+        await asyncio.gather(
+            agent.send_text_reliably("c1", "b1", "第一条", message_key="k1"),
+            agent.send_text_reliably("c1", "b1", "第二条", message_key="k2"),
+            agent.send_text_reliably("c1", "b1", "第三条", message_key="k3"),
+        )
+
+        self.assertEqual(overlaps, 1, "real sends must never overlap")
+        self.assertEqual(len(starts), 3)
+        for earlier, later in zip(starts, starts[1:]):
+            self.assertGreaterEqual(later - earlier, 0.15)
+
+    async def test_send_slot_released_on_failure(self):
+        agent, _ = self.build_agent(mode="rules", rules={"version": 1, "rules": []})
+        agent.outbound_min_interval = 0.05
+        agent.outbound_jitter = 0.0
+        seen = []
+
+        async def failing():
+            seen.append("fail")
+            await asyncio.sleep(0.02)
+            raise RuntimeError("boom")
+
+        async def succeeding():
+            seen.append("ok")
+            return "sent"
+
+        with self.assertRaises(RuntimeError):
+            await agent._send_with_pacing(failing)
+        result = await agent._send_with_pacing(succeeding)
+        self.assertEqual(result, "sent")
+        self.assertEqual(seen, ["fail", "ok"])
+
+    async def test_sends_wait_for_connection_then_do_not_overlap(self):
+        agent, _ = self.build_agent(mode="rules", rules={"version": 1, "rules": []})
+        agent.send_text_reliably = XianyuLive.send_text_reliably.__get__(agent, XianyuLive)
+        agent.outbound_min_interval = 0.1
+        agent.outbound_jitter = 0.0
+        agent.connection_ready.clear()
+        agent.ws = SimpleNamespace()
+        sent = []
+        in_flight = 0
+        overlaps = 0
+
+        async def fake_send(_ws, _cid, _toid, text, **_kwargs):
+            nonlocal in_flight, overlaps
+            sent.append(text)
+            in_flight += 1
+            overlaps = max(overlaps, in_flight)
+            await asyncio.sleep(0.02)
+            in_flight -= 1
+            return None
+
+        agent.send_msg = fake_send
+        tasks = [
+            asyncio.create_task(
+                agent.send_text_reliably("c1", "b1", f"m{index}", message_key=f"k{index}")
+            )
+            for index in range(3)
+        ]
+        await asyncio.sleep(0.05)
+        self.assertEqual(sent, [], "sends must queue until the connection is ready")
+        agent.connection_ready.set()
+        await asyncio.gather(*tasks)
+        self.assertEqual(sorted(sent), ["m0", "m1", "m2"])
+        self.assertEqual(overlaps, 1, "ready sends must never overlap")
+
+    async def test_reconnect_retry_keeps_uuid_and_spacing(self):
+        agent, _ = self.build_agent(mode="rules", rules={"version": 1, "rules": []})
+        agent.send_text_reliably = XianyuLive.send_text_reliably.__get__(agent, XianyuLive)
+        agent.outbound_min_interval = 0.1
+        agent.outbound_jitter = 0.0
+        agent.connection_ready.set()
+        websocket = SimpleNamespace(close=AsyncMock(side_effect=lambda: agent.connection_ready.set()))
+        agent.ws = websocket
+        attempts = []
+        uuids = []
+        starts = []
+
+        async def flaky_send(_ws, _cid, _toid, text, message_uuid=None, **_kwargs):
+            attempts.append(text)
+            uuids.append(message_uuid)
+            starts.append(time.monotonic())
+            if len(attempts) == 1:
+                raise ConnectionError("offline")
+            return None
+
+        agent.send_msg = flaky_send
+        await agent.send_text_reliably("c1", "b1", "内容", message_key="stable-key")
+
+        self.assertEqual(len(attempts), 2, "a failed attempt must be retried once")
+        self.assertEqual(uuids[0], uuids[1], "reconnect retry must reuse the same UUID")
+        self.assertGreaterEqual(starts[1] - starts[0], 0.09)
+        self.assertTrue(agent.connection_ready.is_set(), "the refreshed connection must stay ready")
+
+    async def test_failed_send_does_not_tear_down_newer_connection(self):
+        agent, _ = self.build_agent(mode="rules", rules={"version": 1, "rules": []})
+        agent.send_text_reliably = XianyuLive.send_text_reliably.__get__(agent, XianyuLive)
+        agent.outbound_min_interval = 0.0
+        agent.outbound_jitter = 0.0
+        agent.connection_ready.set()
+        stale_ws = SimpleNamespace(close=AsyncMock())
+        fresh_ws = SimpleNamespace(close=AsyncMock())
+        agent.ws = stale_ws
+        calls = {"n": 0}
+
+        async def send_once(_ws, _cid, _toid, _text, **_kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                agent.ws = fresh_ws
+                raise ConnectionError("stale connection")
+            return None
+
+        agent.send_msg = send_once
+        await asyncio.wait_for(
+            agent.send_text_reliably("c1", "b1", "内容", message_key="k"), timeout=1.0
+        )
+
+        self.assertEqual(calls["n"], 2)
+        stale_ws.close.assert_not_awaited()
+        fresh_ws.close.assert_not_awaited()
+        self.assertTrue(agent.connection_ready.is_set())
+
+    async def test_cancelled_send_releases_slot(self):
+        agent, _ = self.build_agent(mode="rules", rules={"version": 1, "rules": []})
+        agent.send_text_reliably = XianyuLive.send_text_reliably.__get__(agent, XianyuLive)
+        agent.outbound_min_interval = 0.05
+        agent.outbound_jitter = 0.0
+        agent.connection_ready.set()
+        agent.ws = SimpleNamespace()
+        started = asyncio.Event()
+
+        async def slow_send(_ws, _cid, _toid, _text, **_kwargs):
+            started.set()
+            await asyncio.sleep(5)
+            return None
+
+        agent.send_msg = slow_send
+        task = asyncio.create_task(
+            agent.send_text_reliably("c1", "b1", "慢消息", message_key="k-slow")
+        )
+        await asyncio.wait_for(started.wait(), timeout=1.0)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        agent.send_msg = AsyncMock(return_value=None)
+        await asyncio.wait_for(
+            agent.send_text_reliably("c1", "b1", "后续消息", message_key="k-next"),
+            timeout=1.0,
+        )
+
+    async def test_customer_scope_nickname_storage_is_scoped_and_keeps_newest_name(self):
+        context = ChatContextManager(db_path=str(self.state / "nickname-history.db"))
+        self.assertTrue(context.set_conversation_peer_name("chat-a", "peer-a", " 新昵称\n🌿 ", 200))
+        self.assertFalse(context.set_conversation_peer_name("chat-a", "peer-a", "旧昵称", 100))
+        self.assertFalse(context.set_conversation_peer_name("chat-a", "peer-a", "\x00\n", 300))
+        self.assertFalse(context.set_conversation_peer_name("chat-a", "peer-a", {"name": "错误"}, 300))
+        self.assertTrue(context.set_conversation_peer_name("chat-b", "peer-a", "另一会话", 100))
+        self.assertTrue(context.set_conversation_peer_name("chat-a", "peer-b", "另一买家", 100))
+        with sqlite3.connect(context.db_path) as con:
+            rows = con.execute(
+                "SELECT chat_id, peer_id, nickname, observed_at FROM conversation_peer_names ORDER BY chat_id, peer_id"
+            ).fetchall()
+        self.assertEqual(rows, [
+            ("chat-a", "peer-a", "新昵称 🌿", 200.0),
+            ("chat-a", "peer-b", "另一买家", 100.0),
+            ("chat-b", "peer-a", "另一会话", 100.0),
+        ])
+
+    async def test_customer_scope_nickname_uses_platform_names_and_ignores_self_and_system(self):
+        agent, _ = self.build_agent(mode="rules", settings={
+            "version": 1, "rules_enabled": False, "ai_enabled": False,
+        })
+        base_time = int(time.time() * 1000) - 1000
+
+        def message(timestamp, *, sender=BUYER_ID, nickname=None, title=None, system=False):
+            payload = {"1": {
+                "2": f"{CHAT_ID}@goofish", "5": str(timestamp),
+                "10": {"senderUserId": sender, "senderNick": nickname, "reminderTitle": title,
+                       "reminderContent": "咨询消息中的文字不作为昵称",
+                       "reminderUrl": f"fleamarket://message_chat?itemId={API_ITEM}"},
+            }}
+            if system:
+                payload["3"] = {"needPush": "false"}
+            return payload
+
+        def names():
+            with sqlite3.connect(agent.context_manager.db_path) as con:
+                return con.execute(
+                    "SELECT peer_id, nickname, observed_at FROM conversation_peer_names WHERE chat_id=? ORDER BY peer_id",
+                    (CHAT_ID,),
+                ).fetchall()
+
+        await agent._process_chat_message(message(base_time, nickname="平台昵称", title="标题备用名"))
+        self.assertEqual(names(), [(BUYER_ID, "平台昵称", base_time / 1000)])
+        await agent._process_chat_message(message(base_time + 100, title="新昵称"))
+        self.assertEqual(names(), [(BUYER_ID, "新昵称", (base_time + 100) / 1000)])
+        await agent._process_chat_message(message(base_time - 100, nickname="旧回放昵称"))
+        await agent._process_chat_message(message(base_time + 200, sender=agent.myid, nickname="店主昵称"))
+        await agent._process_chat_message(message(base_time + 300, nickname="系统提醒", system=True))
+        await agent._process_chat_message(message(base_time + 400))
+        self.assertEqual(names(), [(BUYER_ID, "新昵称", (base_time + 100) / 1000)])
+        agent.send_text_reliably.assert_not_awaited()
+
+    async def test_customer_scope_blocks_foreign_chats_for_every_reply_strategy(self):
+        for mode, rules, settings in (
+            ("rules_ai", {"version": 1, "rules": []}, {"version": 1}),
+            ("rules_ai", {"version": 1, "rules": [{"id": "greeting", "keywords": ["你好"], "reply": "规则回复"}]}, {"version": 1}),
+            ("rules", {"version": 1, "rules": []}, {"version": 1, "first_reply": "首次回复", "fallback_reply": "兜底回复"}),
+        ):
+            agent, bot = self.build_agent(mode=mode, rules=rules, settings=settings)
+            agent.xianyu.get_message_head_info = Mock(return_value={"data": {"commonData": {
+                "itemId": API_ITEM, "seller": False,
+            }}})
+            await agent._process_buyer_chat(CHAT_ID, BUYER_ID, API_ITEM, "你好", "foreign")
+            agent.send_text_reliably.assert_not_awaited()
+            self.assertEqual(bot.calls, 0)
+            self.assertIsNone(agent.context_manager.get_source_message("foreign"))
+        # Incoming seller replies and our outgoing shopping messages are both excluded.
+        for sender in (BUYER_ID, agent.myid):
+            await agent._process_chat_message({"1": {
+                "2": f"{CHAT_ID}@goofish", "5": str(int(time.time() * 1000)),
+                "10": {"senderUserId": sender, "reminderContent": "你好",
+                       "reminderUrl": f"fleamarket://message_chat?itemId={API_ITEM}"},
+            }})
+        self.assertEqual(len(agent.context_manager.get_context_by_chat(CHAT_ID)), 2)
+        self.assertEqual(agent.context_manager.latest_item_id_by_chat(CHAT_ID), API_ITEM)
+        agent.send_text_reliably.assert_not_awaited()
+
+    async def test_customer_scope_foreign_item_replaces_old_owned_context(self):
+        agent, bot = self.build_agent(mode="rules_ai")
+        ref = hashlib.sha256(agent.myid.encode()).hexdigest()[:16]
+        write_json(self.state / "shop_snapshot.json", {
+            "version": 1, "account_ref": ref, "products": [{"id": API_ITEM}],
+        })
+        agent.context_manager.add_message_by_chat(CHAT_ID, BUYER_ID, API_ITEM, "user", "旧商品咨询", source_id="old-item")
+        agent.xianyu.get_message_head_info = Mock(return_value={"data": {"commonData": {
+            "itemId": PAN_ITEM, "seller": False,
+        }}})
+        for index, url in enumerate((f"fleamarket://message_chat?itemId={PAN_ITEM}", "")):
+            await agent._process_chat_message({"1": {
+                "2": f"{CHAT_ID}@goofish", "5": str(int(time.time() * 1000)),
+                "10": {"senderUserId": BUYER_ID, "reminderContent": f"外店回复{index}", "reminderUrl": url},
+            }})
+        self.assertEqual(agent.context_manager.latest_item_id_by_chat(CHAT_ID), PAN_ITEM)
+        self.assertEqual(agent.context_manager.get_customer_conversation_scope(CHAT_ID, PAN_ITEM, ref)["scope"], "foreign")
+        self.assertEqual(bot.calls, 0)
+        agent.send_text_reliably.assert_not_awaited()
+
+    async def test_customer_scope_accepts_verified_snapshot_without_platform_lookup(self):
+        agent, bot = self.build_agent(mode="rules_ai")
+        write_json(self.state / "shop_snapshot.json", {
+            "version": 1, "account_ref": hashlib.sha256(agent.myid.encode()).hexdigest()[:16],
+            "products": [{"id": API_ITEM}],
+        })
+        agent.xianyu.get_message_head_info = Mock(side_effect=AssertionError("unnecessary lookup"))
+        await agent._process_buyer_chat(CHAT_ID, BUYER_ID, API_ITEM, "你好", "own-snapshot")
+        self.assertEqual(bot.calls, 1)
+        agent.send_text_reliably.assert_awaited()
+        agent.xianyu.get_message_head_info.assert_not_called()
+
+    async def test_customer_scope_can_verify_unsynced_presale_listing(self):
+        agent, bot = self.build_agent(mode="rules_ai")
+        # A pre-sale chat has no order ID. A snapshot miss alone is not foreign.
+        write_json(self.state / "shop_snapshot.json", {
+            "version": 1, "account_ref": hashlib.sha256(agent.myid.encode()).hexdigest()[:16],
+            "products": [], "truncated": True,
+        })
+        agent.xianyu.get_message_head_info = Mock(return_value={"data": {"commonData": {
+            "itemId": API_ITEM, "seller": True,
+        }}})
+        await agent._process_buyer_chat(CHAT_ID, BUYER_ID, API_ITEM, "你好", "own-head")
+        self.assertEqual(bot.calls, 1)
+        agent.send_text_reliably.assert_awaited()
+        agent.xianyu.get_message_head_info.assert_called_once()
+
+    async def test_customer_scope_unknown_is_silent_and_wrong_account_snapshot_is_not_proof(self):
+        agent, bot = self.build_agent(mode="rules_ai")
+        write_json(self.state / "shop_snapshot.json", {
+            "version": 1, "account_ref": "another-account", "products": [{"id": API_ITEM}],
+        })
+        for index, result in enumerate(({}, {"data": {"commonData": {"itemId": PAN_ITEM, "seller": True}}},
+                                       {"data": {"commonData": {"itemId": API_ITEM}}}, RuntimeError("offline"))):
+            agent.xianyu.get_message_head_info = Mock(side_effect=result) if isinstance(result, Exception) else Mock(return_value=result)
+            chat_id = str(8000 + index)
+            for attempt in range(2):
+                await agent._process_buyer_chat(chat_id, BUYER_ID, API_ITEM, "你好", f"unknown-{index}-{attempt}")
+            self.assertEqual(agent.xianyu.get_message_head_info.call_count, 1)
+        agent.send_text_reliably.assert_not_awaited()
+        self.assertEqual(bot.calls, 0)
+
+    async def test_customer_scope_cancels_pending_replay_and_rechecks_before_send(self):
+        agent, bot = self.build_agent(mode="rules_ai")
+        ref = hashlib.sha256(agent.myid.encode()).hexdigest()[:16]
+        agent.context_manager.prepare_assistant_reply(CHAT_ID, agent.myid, API_ITEM, "旧回复", "assistant:foreign-draft")
+        agent.context_manager.set_customer_conversation_scope(CHAT_ID, API_ITEM, ref, "foreign")
+        await agent._process_buyer_chat(CHAT_ID, BUYER_ID, API_ITEM, "你好", "foreign-draft")
+        self.assertEqual(agent.context_manager.get_source_message("assistant:foreign-draft")["role"], "assistant_cancelled")
+        agent.send_text_reliably.assert_not_awaited()
+        self.assertEqual(bot.calls, 0)
+        transmissions = []
+        async def change_role_before_send(*args, **kwargs):
+            agent.context_manager.set_customer_conversation_scope(CHAT_ID, API_ITEM, ref, "foreign")
+            await kwargs["before_attempt"]()
+            transmissions.append(args)
+        agent.context_manager.set_customer_conversation_scope(CHAT_ID, API_ITEM, ref, "owned")
+        agent.send_text_reliably = change_role_before_send
+        await agent._process_buyer_chat(CHAT_ID, BUYER_ID, API_ITEM, "你好", "changed-role")
+        self.assertEqual(transmissions, [])
+        self.assertEqual(agent.context_manager.get_source_message("assistant:changed-role")["role"], "assistant_cancelled")
+
+    async def test_expired_buyer_message_is_stored_without_replying(self):
+        agent, bot = self.build_agent(
+            mode="rules_ai",
+            bot=FakeBot("过期消息不应发送"),
+            rules={"version": 1, "rules": []},
+        )
+        agent.send_text_reliably = AsyncMock()
+        old_ms = int((time.time() - 3600) * 1000)
+        message = {
+            "1": {
+                "2": f"{CHAT_ID}@goofish",
+                "5": str(old_ms),
+                "10": {
+                    "senderUserId": BUYER_ID,
+                    "reminderUrl": f"fleamarket://message_chat?itemId={API_ITEM}",
+                    "reminderContent": "停机期间错过的买家问题",
+                },
+            }
+        }
+
+        outcome = await agent._process_chat_message(message, "expired-inbound-1")
+
+        self.assertEqual(outcome, "ignored_expired_message")
+        agent.send_text_reliably.assert_not_awaited()
+        self.assertEqual(bot.calls, 0)
+        conn = sqlite3.connect(agent.context_manager.db_path)
+        try:
+            rows = conn.execute(
+                "SELECT content FROM messages WHERE chat_id = ? AND role = 'user'",
+                (CHAT_ID,),
+            ).fetchall()
+        finally:
+            conn.close()
+        self.assertTrue(
+            any("停机期间错过的买家问题" in row[0] for row in rows),
+            "expired buyer message must still be stored for manual review",
+        )
 
     async def test_rules_ai_readiness_runs_before_every_reconnect_send_attempt(self):
         agent, bot = self.build_agent(
@@ -1424,8 +1861,13 @@ class FreeAutomationTests(unittest.IsolatedAsyncioTestCase):
         )
         agent._generate_llm_reply = AsyncMock(
             side_effect=[
+                # 瞬时错误重试 3 次后仍失败 → 不再重试
                 asyncio.TimeoutError(),
+                asyncio.TimeoutError(),
+                asyncio.TimeoutError(),
+                # 非瞬时/未知错误不重试
                 RuntimeError("temporary failure"),
+                # 空回复
                 ("   ", "reply", "ok", 7),
             ]
         )
@@ -1439,7 +1881,7 @@ class FreeAutomationTests(unittest.IsolatedAsyncioTestCase):
                 f"rules-ai-fallback-{index}",
             )
 
-        self.assertEqual(agent._generate_llm_reply.await_count, 3)
+        self.assertEqual(agent._generate_llm_reply.await_count, 5)
         agent.send_text_reliably.assert_not_awaited()
         for index in range(3):
             outcome = agent.context_manager.get_source_message(
@@ -1638,6 +2080,41 @@ class FreeAutomationTests(unittest.IsolatedAsyncioTestCase):
         order = agent.delivery_store.get_order(agent._canonical_order_key(ORDER_ID))
         self.assertEqual(order.status, "manual_review")
         self.assertEqual(order.reason, "unsupported_quantity")
+
+
+class ConversationFlagTests(unittest.TestCase):
+    def test_needs_human_flag_roundtrip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = ChatContextManager(db_path=os.path.join(tmp, "chat_history.db"))
+            self.assertFalse(manager.conversation_needs_human("chat-1"))
+            manager.set_conversation_needs_human("chat-1", True)
+            self.assertTrue(manager.conversation_needs_human("chat-1"))
+            manager.set_conversation_needs_human("chat-1", False)
+            self.assertFalse(manager.conversation_needs_human("chat-1"))
+
+
+class ReplyBubbleTests(unittest.TestCase):
+    def test_short_reply_stays_single_bubble(self):
+        self.assertEqual(_split_reply_bubbles("在的，亲～"), ["在的，亲～"])
+
+    def test_long_reply_splits_on_sentence_boundaries(self):
+        text = (
+            "亲，这款是数字学习资料哦。下单后按平台流程自动发货，"
+            "一般很快就能收到。有其他问题随时问我。"
+        )
+        bubbles = _split_reply_bubbles(text, max_chars=20)
+        self.assertGreater(len(bubbles), 1)
+        self.assertEqual("".join(bubbles), text)
+
+    def test_bubble_count_is_capped(self):
+        text = "。".join(["这是一句比较长的客服说明内容"] * 8) + "。"
+        bubbles = _split_reply_bubbles(text, max_chars=10, max_count=3)
+        self.assertLessEqual(len(bubbles), 3)
+        self.assertEqual("".join(bubbles), text)
+
+    def test_links_are_never_split(self):
+        text = "亲，资料在这里 https://example.com/a/very/long/path 请查收，有需要再找我。"
+        self.assertEqual(_split_reply_bubbles(text, max_chars=10), [text])
 
 
 if __name__ == "__main__":

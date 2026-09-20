@@ -523,6 +523,40 @@ class ChatContextManager:
             (cutoff,),
         )
 
+        # 会话级“待人工”标记：AI 判定转人工时置位，用户接管/回复后清除。
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS conversation_flags (
+            chat_id TEXT PRIMARY KEY,
+            needs_human INTEGER NOT NULL DEFAULT 0,
+            updated_at DATETIME NOT NULL
+        )
+        ''')
+        cursor.execute('''
+        CREATE INDEX IF NOT EXISTS idx_conversation_flags_pending
+        ON conversation_flags (needs_human, updated_at)
+        ''')
+
+        # Keep customer-side ownership separate from the retained chat history.
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS customer_conversation_scope (
+            chat_id TEXT PRIMARY KEY,
+            item_id TEXT NOT NULL,
+            account_ref TEXT NOT NULL,
+            scope TEXT NOT NULL CHECK(scope IN ('owned', 'foreign', 'unknown')),
+            checked_at REAL NOT NULL
+        )
+        ''')
+
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS conversation_peer_names (
+            chat_id TEXT NOT NULL,
+            peer_id TEXT NOT NULL,
+            nickname TEXT NOT NULL,
+            observed_at REAL NOT NULL,
+            PRIMARY KEY (chat_id, peer_id)
+        )
+        ''')
+
         # 创建基于会话ID的议价次数表
         cursor.execute('''
         CREATE TABLE IF NOT EXISTS chat_bargain_counts (
@@ -1231,6 +1265,67 @@ class ChatContextManager:
         finally:
             conn.close()
 
+    def set_conversation_peer_name(self, chat_id, peer_id, nickname, observed_at=None):
+        """Store platform sender names without allowing old events to overwrite them."""
+        if not isinstance(nickname, str):
+            return False
+        chat_id = str(chat_id or "").strip()
+        peer_id = str(peer_id or "").strip()
+        nickname = " ".join(re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", nickname).split())[:80]
+        if not chat_id or len(chat_id) > 256 or not peer_id or len(peer_id) > 256 or not nickname:
+            return False
+        try:
+            observed_at = float(self.now_fn() if observed_at is None else observed_at)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if not math.isfinite(observed_at) or observed_at < 0:
+            return False
+        with sqlite3.connect(self.db_path, timeout=10) as conn:
+            cursor = conn.execute(
+                """INSERT INTO conversation_peer_names(chat_id, peer_id, nickname, observed_at)
+                   VALUES (?, ?, ?, ?)
+                   ON CONFLICT(chat_id, peer_id) DO UPDATE
+                   SET nickname=excluded.nickname, observed_at=excluded.observed_at
+                   WHERE excluded.observed_at >= conversation_peer_names.observed_at""",
+                (chat_id, peer_id, nickname, observed_at),
+            )
+            return cursor.rowcount == 1
+
+    def set_customer_conversation_scope(self, chat_id, item_id, account_ref, scope, checked_at=None):
+        """Persist verified conversation ownership without modifying message history."""
+        chat_id = str(chat_id or "").strip()
+        item_id = str(item_id or "").strip()
+        account_ref = str(account_ref or "").strip()
+        if not chat_id or len(chat_id) > 256 or len(item_id) > 128:
+            raise ValueError("invalid conversation scope identity")
+        if not re.fullmatch(r"[0-9a-f]{16}", account_ref) or scope not in {"owned", "foreign", "unknown"}:
+            raise ValueError("invalid conversation scope")
+        checked_at = float(self.now_fn() if checked_at is None else checked_at)
+        if not math.isfinite(checked_at) or checked_at < 0:
+            raise ValueError("invalid conversation scope timestamp")
+        with sqlite3.connect(self.db_path, timeout=10) as conn:
+            conn.execute(
+                """INSERT INTO customer_conversation_scope(chat_id, item_id, account_ref, scope, checked_at)
+                   VALUES (?, ?, ?, ?, ?)
+                   ON CONFLICT(chat_id) DO UPDATE SET item_id=excluded.item_id,
+                       account_ref=excluded.account_ref, scope=excluded.scope, checked_at=excluded.checked_at""",
+                (chat_id, item_id, account_ref, scope, checked_at),
+            )
+
+    def get_customer_conversation_scope(self, chat_id, item_id, account_ref):
+        """Return a scope only for the same shop identity and current item."""
+        try:
+            with sqlite3.connect(self.db_path, timeout=10) as conn:
+                conn.row_factory = sqlite3.Row
+                row = conn.execute(
+                    """SELECT chat_id, item_id, account_ref, scope, checked_at
+                       FROM customer_conversation_scope WHERE chat_id=? AND item_id=? AND account_ref=?""",
+                    (str(chat_id or "").strip(), str(item_id or "").strip(), str(account_ref or "").strip()),
+                ).fetchone()
+                return dict(row) if row is not None else None
+        except (sqlite3.Error, TypeError, ValueError):
+            return None
+
     def save_item_info(self, item_id, item_data):
         """
         保存商品信息到数据库
@@ -1785,6 +1880,41 @@ class ChatContextManager:
         except Exception:
             conn.rollback()
             raise
+        finally:
+            conn.close()
+
+    def set_conversation_needs_human(self, chat_id, enabled):
+        """Mark or clear the per-conversation pending-human flag."""
+        chat = str(chat_id or "").strip()
+        if not chat:
+            raise ValueError("chat id is required")
+        now = self._now_iso()
+        conn = sqlite3.connect(self.db_path, timeout=10)
+        try:
+            conn.execute(
+                """
+                INSERT INTO conversation_flags(chat_id, needs_human, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(chat_id) DO UPDATE SET
+                    needs_human = excluded.needs_human,
+                    updated_at = excluded.updated_at
+                """,
+                (chat, 1 if enabled else 0, now),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        return bool(enabled)
+
+    def conversation_needs_human(self, chat_id):
+        conn = sqlite3.connect(self.db_path, timeout=10)
+        conn.row_factory = sqlite3.Row
+        try:
+            row = conn.execute(
+                "SELECT needs_human FROM conversation_flags WHERE chat_id = ?",
+                (str(chat_id),),
+            ).fetchone()
+            return bool(row and int(row["needs_human"] or 0))
         finally:
             conn.close()
 

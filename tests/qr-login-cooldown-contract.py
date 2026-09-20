@@ -20,12 +20,14 @@ os.environ.update({
     "SAAS_DB": str(RUN / "control.db"), "SAAS_TENANTS_DIR": str(RUN / "tenants"),
     "SAAS_BOT_ROOT": str(RUN / "no-worker"), "SAAS_RESTORE_WORKERS": "0",
     "SAAS_TESTING": "1", "SAAS_SHOP_SYNC_COOLDOWN_SECONDS": "60",
+    "SAAS_XIANYU_LOGIN_COOLDOWN_SECONDS": "5",
     "SAAS_PLATFORM_AI_BASE_URL": "", "SAAS_PLATFORM_AI_KEY": "",
     "SAAS_COOKIE_SECURE": "0", "SAAS_PUBLIC_ORIGIN": "http://testserver",
     "SAAS_TRUSTED_HOSTS": "testserver",
 })
 sys.path.insert(0, str(ROOT / "backend"))
 import app
+import bot_manager
 import db as db_module
 import job_consumer
 import shop_sync
@@ -68,6 +70,161 @@ def expect_http(code, callback, remaining=None):
     raise AssertionError(f"expected {code}")
 
 
+def expect_sync(code, callback, remaining=None):
+    try:
+        callback()
+    except shop_sync.ShopSyncError as error:
+        assert error.code == code, error.code
+        if remaining is not None:
+            assert math.ceil(error.retry_after) == remaining, error.retry_after
+        return error
+    raise AssertionError(f"expected {code}")
+
+
+def check_worker_login_transition(first, clock, make_manager):
+    """Keep the complete login/worker seam real; replace only external I/O."""
+    def run_case(label, stale_pid, *, recognized=True):
+        clock.sleep(61)
+        uid = first.create_user(f"qr-worker-{label}", "offline-password")
+        user = first.get_user_by_id(uid)
+        account = first.ensure_default_shop_account(uid)
+        account_id = account["id"]
+        bot_manager.ensure_dir(uid, initialize=True)
+        old_cookie = "unb=777777; _m_h5_tk=old_offline; cookie2=old"
+        _, old_values = shop_sync.parse_cookie_header(old_cookie)
+        old_snapshot = {
+            "version": 1, "account_ref": shop_sync.account_ref(old_values),
+            "nickname": "old-worker-shop", "products": [], "product_count": 0,
+            "synced_at": "offline-old", "truncated": False,
+        }
+        old_auth = json.dumps({"version": 1, "code": "session_expired",
+                               "reauthorization_required": True})
+        app.write_secret(uid, "cookies.txt", old_cookie)
+        shop_sync.save_snapshot(uid, old_snapshot)
+        app.write_secret(uid, bot_manager.AUTH_STATUS_FILE, old_auth)
+        saved_snapshot = app.read_secret(uid, "shop_snapshot.json")
+        first.persist_worker_runtime(
+            uid, account_id, desired_state="running", mode="rules", state="degraded",
+            pid=stale_pid, generation=7, last_error="session_expired",
+        )
+        manager = make_manager(cooldown_seconds=0)
+        events = []
+        verified = {}
+
+        class Process:
+            pid = 900_000 + uid
+            returncode = None
+
+            def poll(self):
+                return self.returncode
+
+        process = Process()
+
+        def verify(cookie):
+            assert app.read_secret(uid, "cookies.txt") == old_cookie
+            assert app.read_secret(uid, "shop_snapshot.json") == saved_snapshot
+            assert app.read_secret(uid, bot_manager.AUTH_STATUS_FILE) == old_auth
+            assert first.get_worker_runtime(uid, account_id)["pid"] == stale_pid
+            _, values = shop_sync.parse_cookie_header(cookie)
+            verified.update({**old_snapshot, "account_ref": shop_sync.account_ref(values),
+                             "nickname": "new-worker-shop", "synced_at": "offline-new"})
+            events.append("verified")
+            return dict(verified)
+
+        def spawn(worker_uid, mode, key, limits):
+            assert (worker_uid, mode, key) == (uid, "rules", (uid, "default"))
+            runtime = first.get_worker_runtime(uid, account_id)
+            assert runtime["pid"] is None and runtime["state"] == "waiting_login"
+            assert runtime["last_error"] == "login_replace:pid_reused"
+            assert runtime["generation"] == 7 and runtime["desired_state"] == "running"
+            assert "unb=123456" in app.read_secret(uid, "cookies.txt")
+            assert shop_sync.load_verified_snapshot(uid) == verified
+            assert shop_sync.load_sync_state(uid)["code"] == "verified"
+            assert first.get_shop_account(uid, account_id=account_id)["status"] == "ready"
+            auth = bot_manager.auth_status(uid)
+            assert auth["code"] == "ok" and auth["reauthorization_required"] is False
+            assert first.get_control_lease(f"worker-control:{uid}:{account_id}")["owner"]
+            process._saas_resource_limits = dict(limits)
+            events.append("spawned")
+            return process, None, None
+
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(app, "qr_logins", manager))
+            stack.enter_context(patch.object(app, "sync_shop", verify))
+            spawn_mock = stack.enter_context(patch.object(bot_manager, "_spawn_process", side_effect=spawn))
+            guards = [
+                stack.enter_context(patch.object(module, name, create=True,
+                                                 side_effect=AssertionError("must not signal a reused or unknown PID")))
+                for module, name in ((bot_manager.os, "kill"), (bot_manager.os, "killpg"),
+                                     (bot_manager.os, "pidfd_open"), (bot_manager.signal, "pidfd_send_signal"))
+            ]
+            if not recognized:
+                stack.enter_context(patch.object(bot_manager, "_pid_alive", return_value=True))
+                stack.enter_context(patch.object(bot_manager, "_proc_cmdline", return_value=[]))
+            try:
+                login_id = app.start_xianyu_login(user, account)["login_id"]
+                assert manager.poll(uid, login_id)["status"] == "confirmed"
+                clock.sleep(shop_sync.REQUEST_INTERVAL)
+                complete = lambda: app.complete_xianyu_login(
+                    app.XianyuLoginCompleteIn(login_id=login_id), user, account)
+                if recognized:
+                    result = complete()
+                    assert result["status"] == "connected" and result["connected"] is True
+                    assert result["worker"] == {
+                        "desired_running": True, "state": "running", "running": True, "code": "started",
+                    }, result["worker"]
+                    runtime = first.get_worker_runtime(uid, account_id)
+                    assert runtime["pid"] == process.pid and runtime["state"] == "running"
+                    assert runtime["generation"] == 8 and runtime["last_error"] == ""
+                    assert events == ["verified", "spawned"]
+                    spawn_mock.assert_called_once()
+                else:
+                    detail = expect_http("pid_mismatch", complete)
+                    assert detail["can_retry_login"] is False
+                    assert app.read_secret(uid, "cookies.txt") == old_cookie
+                    assert app.read_secret(uid, "shop_snapshot.json") == saved_snapshot
+                    assert app.read_secret(uid, bot_manager.AUTH_STATUS_FILE) == old_auth
+                    runtime = first.get_worker_runtime(uid, account_id)
+                    assert runtime["pid"] == stale_pid and runtime["state"] == "degraded"
+                    assert runtime["last_error"] == "login_replace:pid_mismatch"
+                    assert runtime["generation"] == 7 and runtime["desired_state"] == "running"
+                    assert events == ["verified"]
+                    spawn_mock.assert_not_called()
+                assert first.get_control_lease(f"shop-connect:{uid}:{account_id}")["owner"] == ""
+                assert first.get_control_lease(f"worker-control:{uid}:{account_id}")["owner"] == ""
+                for guard in guards:
+                    guard.assert_not_called()
+            finally:
+                process.returncode = 0
+                bot_manager.stop(uid)
+                manager.shutdown()
+
+    run_case("api-pid", os.getpid())
+    if sys.platform == "linux":
+        failures = []
+
+        def complete_from_api_thread():
+            try:
+                native_id = threading.get_native_id()
+                assert native_id != os.getpid()
+                # Real /proc data proves this TID belongs to the current API process.
+                assert bot_manager._proc_tgid(native_id) == os.getpid()
+                run_case("api-thread", native_id)
+            except BaseException as error:
+                failures.append(error)
+
+        thread = threading.Thread(target=complete_from_api_thread)
+        thread.start()
+        thread.join(10)
+        assert not thread.is_alive(), "login completion must not wait for its own API thread to exit"
+        if failures:
+            raise failures[0]
+    # Unreadable unrelated identities remain fail-closed, even when alive.
+    unknown_pid = 2_000_000_001
+    assert bot_manager._proc_tgid(unknown_pid) is None
+    run_case("unknown-pid", unknown_pid, recognized=False)
+
+
 def main():
     clock = Clock()
     first = app.db
@@ -86,7 +243,7 @@ def main():
     app.write_secret(uid, "cookies.txt", old_cookie, "default")
     app.write_secret(uid, "cookies.txt", old_cookie, "other")
 
-    def make_manager(coord=coordinator):
+    def make_manager(coord=coordinator, cooldown_seconds=None):
         holder = {}
 
         class Session(fixtures.FakeSession):
@@ -101,11 +258,13 @@ def main():
             sessions.append(session)
             return session
 
+        options = {} if cooldown_seconds is None else {"cooldown_seconds": cooldown_seconds}
         manager = xianyu_login.XianyuLoginManager(
             session_factory=factory, qr_factory=fixtures.svg_factory, clock=clock,
-            cooldown_seconds=0, poll_interval_seconds=0, sweep_interval_seconds=5,
-            acquire_hook=coord.acquire, renew_hook=coord.renew, release_hook=coord.release,
+            poll_interval_seconds=0, sweep_interval_seconds=5,
+            acquire_hook=coord.acquire_qr, renew_hook=coord.renew, release_hook=coord.release,
             before_request_hook=coord.before_request, after_request_hook=coord.after_request,
+            **options,
         )
         holder["manager"] = manager
         managers.append(manager)
@@ -135,9 +294,11 @@ def main():
 
     consumer = job_consumer.JobConsumer(second, sync_func=lambda _cookie: (_ for _ in ()).throw(
         AssertionError("old cookie must not reach platform during QR")), owner="offline-consumer")
+    real_pause = app._pause_account_worker_for_login_replace
+    real_autostart = app._autostart_account_worker
     try:
         with ExitStack() as stack:
-            # Production cooldown remains 60s. Only time and upstream are fake.
+            # Background sync remains 60s; explicit QR authorization keeps its own 5s limit.
             stack.enter_context(patch.dict(os.environ, {"SAAS_TESTING": "0"}))
             for module in (db_module, app, shop_sync, shop_sync_service, job_consumer):
                 stack.enter_context(patch.object(module, "time", clock))
@@ -147,29 +308,56 @@ def main():
             manager = make_manager()
             stack.enter_context(patch.object(app, "qr_logins", manager))
             assert shop_sync.SYNC_COOLDOWN_SECONDS == 60
+            assert manager._cooldown == xianyu_login.DEFAULT_COOLDOWN_SECONDS == 5
             first.acquire_control_lease(sync_key, "old-check", lease_seconds=5, cooldown_seconds=60)
-            first.release_control_lease(sync_key, "old-check")
-            expect_http("sync_cooldown", start, 60)
+            expect_http("sync_busy", start, 5)
             assert not sessions and not requests
-            clock.sleep(10.25)
-            expect_http("sync_cooldown", start, 50)
+            first.release_control_lease(sync_key, "old-check")
+            expect_sync("sync_cooldown", lambda: coordinator.acquire(uid, "default", "background-check", 150), 60)
+            assert first.reserve_shop_connection(connect_key, "default-db-policy", sync_key) == {
+                "code": "sync_cooldown", "retry_after": 60,
+            }, "the database default must retain background sync cooldowns"
+            assert not sessions and not requests
             assert first.get_control_lease(sync_key)["cooldown_until"] == 2_000_000_060
 
-            # Assert the actual HTTP envelope, not only an exception helper.
+            # QR generation succeeds through the real route during that same cooldown.
             app.app.dependency_overrides[app.Auth.current_user] = lambda: user
             app.app.dependency_overrides[app.current_shop_account] = lambda: account
-            response = TestClient(app.app).post("/api/bot/login/start", headers={
+            headers = {
                 "Origin": "http://testserver", "X-SaaS-Browser-Intent": "browser-write",
-            })
+            }
+            response = TestClient(app.app).post("/api/bot/login/start", headers=headers)
+            assert response.status_code == 200, response.text
+            early_id = response.json()["login_id"]
+            assert b"<svg" in manager.qr_svg(uid, early_id)
+            assert requests and first.get_control_lease(connect_key)["owner"] == early_id
+            expect_sync("sync_busy", lambda: peer.acquire_qr(uid, "default", "peer-qr", 150))
+            manager.cancel(uid, early_id)
+            request_count = len(requests)
+            response = TestClient(app.app).post("/api/bot/login/start", headers=headers)
             assert response.status_code == 429, response.text
-            assert response.headers["retry-after"] == "50"
-            assert response.json()["detail"]["retry_after"] == 50
+            assert response.headers["retry-after"] == "5"
+            assert response.json()["detail"]["code"] == "login_cooldown"
+            assert response.json()["detail"]["retry_after"] == 5
             app.app.dependency_overrides.clear()
-            assert not sessions
+            clock.sleep(4)
+            expect_http("login_cooldown", start, 1)
+            assert len(requests) == request_count, "local QR cooldown performs no upstream request"
+            clock.sleep(1)
+            early_id = start()["login_id"]
+            assert b"<svg" in manager.qr_svg(uid, early_id)
+            manager.cancel(uid, early_id)
+            assert first.get_control_lease(sync_key)["cooldown_until"] == 2_000_000_060
+            expect_sync("sync_cooldown", lambda: coordinator.acquire(uid, "default", "background-check", 150), 55)
+
+            # The remaining lease/concurrency cases isolate their own deadlines.
+            manager = make_manager(cooldown_seconds=0)
+            stack.enter_context(patch.object(app, "qr_logins", manager))
 
             shop_sync._trip_circuit()
+            request_count = len(requests)
             expect_http("risk_cooldown", start, 600)
-            assert not requests
+            assert len(requests) == request_count, "QR-specific acquire must still honor risk protection"
             clock.sleep(601)
             login_id = start()["login_id"]
             assert first.get_control_lease("shop-sync:egress")["owner"] == ""
@@ -188,7 +376,7 @@ def main():
                 assert deferred["attempts"] == 0 and deferred["status"] == "retry"
                 assert deferred["available_at"] > clock()
             # Another shop is independent while this user is still scanning.
-            peer_manager = make_manager(peer)
+            peer_manager = make_manager(peer, cooldown_seconds=0)
             other_id = peer_manager.start(uid, "other")["login_id"]
             peer_manager.cancel(uid, other_id, "other")
             manager.cancel(uid, login_id)
@@ -250,7 +438,10 @@ def main():
             release.set()
             thread.join(3)
             assert not thread.is_alive() and outcomes == ["completed"]
-            expect_http("sync_cooldown", start, 60)
+            expect_sync("sync_cooldown", lambda: coordinator.acquire(uid, "default", "background-after-sync", 150), 60)
+            post_sync_id = start()["login_id"]
+            assert b"<svg" in manager.qr_svg(uid, post_sync_id)
+            manager.cancel(uid, post_sync_id)
             clock.sleep(61)
 
             # Failure after reservation releases only this QR's ownership.
@@ -264,7 +455,7 @@ def main():
             def race(coord, owner):
                 barrier.wait()
                 try:
-                    results.append(coord.acquire(uid, "default", owner, 150))
+                    results.append(coord.acquire_qr(uid, "default", owner, 150))
                 except shop_sync.ShopSyncError as error:
                     results.append(error)
             threads = [threading.Thread(target=race, args=(coordinator, "race-a")),
@@ -318,9 +509,8 @@ def main():
             assert first.get_job(rows[0]["id"])["attempts"] == 1
             assert first.get_job(rows[0]["id"])["status"] == "completed"
             assert consumer.SUPPORTED_KINDS == ("shop_sync", "ops_run")
-            before = len(requests)
-            expect_http("sync_cooldown", start, 60)
-            assert len(requests) == before
+            # An explicit login replace clears the background sync cooldown so a
+            # following login start is not artificially blocked.
 
             # A rejected candidate cannot overwrite the previous ready account.
             clock.sleep(61)
@@ -384,7 +574,10 @@ def main():
             assert first.get_control_lease(connect_key)["owner"] == ""
             assert shop_sync._circuit_until() > 0
             assert first.get_control_lease(sync_key)["cooldown_until"] > 0
-        print("qr-login-cooldown-contract: atomic preflight, dual-DB exclusion, 60/90/600s protection, generation, retry budget and verified swap passed")
+            with patch.object(app, "_pause_account_worker_for_login_replace", real_pause), \
+                 patch.object(app, "_autostart_account_worker", real_autostart):
+                check_worker_login_transition(first, clock, make_manager)
+        print("qr-login-cooldown-contract: QR 5s/background 60s isolation, atomic preflight, dual-DB exclusion, 90/600s protection, generation, retry budget, verified swap and real worker transition passed")
     finally:
         app.app.dependency_overrides.clear()
         for manager in managers:

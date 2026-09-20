@@ -23,6 +23,7 @@ from shop_sync import (
     _circuit_until,
     check_sync_circuit,
     account_ref,
+    note_sync,
     parse_cookie_header,
     reserve_sync,
     save_snapshot,
@@ -53,7 +54,13 @@ class ShopConnectionCoordinator:
     def __init__(self, db):
         self.db = db
 
-    def acquire(self, user_id, account_key, owner, seconds):
+    def acquire_qr(self, user_id, account_key, owner, seconds):
+        """Explicit QR authorization does not inherit a completed sync's cooldown."""
+        return self.acquire(
+            user_id, account_key, owner, seconds, ignore_sync_cooldown=True,
+        )
+
+    def acquire(self, user_id, account_key, owner, seconds, *, ignore_sync_cooldown=False):
         account = self.db.get_shop_account(user_id, account_key=account_key)
         if account is None or not account["enabled"]:
             raise ShopSyncPersistenceError("店铺账号已停用")
@@ -66,6 +73,7 @@ class ShopConnectionCoordinator:
         result = self.db.reserve_shop_connection(
             lease["key"], owner, lease["sync_key"], lease_seconds=seconds,
             risk_until=_circuit_until(),
+            ignore_sync_cooldown=ignore_sync_cooldown,
         )
         if result["code"] != "acquired":
             raise ShopSyncError(result["code"], "店铺连接暂时等待，请稍后再试", result["retry_after"])
@@ -242,7 +250,17 @@ def _run_shop_sync_owned(
             raise control_lease_error(db, egress_lease_key, egress_result)
 
         check_sync_circuit()
-        cooldown = 0 if os.environ.get("SAAS_TESTING") == "1" else SYNC_COOLDOWN_SECONDS
+        # An explicit login/replace is user-initiated and must never be blocked
+        # by the anti-abuse cooldown that guards background syncs; otherwise the
+        # first scan always fails and only a manual retry after the timer works.
+        if replace_cookie:
+            clear_cooldown = getattr(db, "arm_control_lease_cooldown", None)
+            if callable(clear_cooldown):
+                try:
+                    clear_cooldown(sync_lease_key, 0)
+                except (OSError, ValueError, TypeError):
+                    pass
+        cooldown = 0 if (replace_cookie or os.environ.get("SAAS_TESTING") == "1") else SYNC_COOLDOWN_SECONDS
         lease_result = db.acquire_control_lease(
             sync_lease_key, sync_lease_owner,
             lease_seconds=SYNC_MAX_SECONDS + 120, cooldown_seconds=cooldown,
@@ -250,7 +268,11 @@ def _run_shop_sync_owned(
         if lease_result != "acquired":
             raise control_lease_error(db, sync_lease_key, lease_result)
         ensure_account_current()
-        if account_key == "default":
+        if replace_cookie:
+            # Explicit login bypasses the anti-abuse check but still records the
+            # sync time so following background syncs stay cooled down.
+            note_sync(user_id, account_key)
+        elif account_key == "default":
             reserve_sync_func(user_id)
         else:
             reserve_sync_func(user_id, account_key)

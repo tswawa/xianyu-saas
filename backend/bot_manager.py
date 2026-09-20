@@ -28,6 +28,7 @@ from account_storage import (
     normalize_account_key,
 )
 from automation import AutomationValidationError, normalise_settings, rules_document
+from fulfillment_config import FulfillmentConfig, FulfillmentConfigError, has_enabled_delivery
 from platform_ai import issue_token, revoke_token
 from runtime_settings import validate_limits
 from shop_sync import (
@@ -287,6 +288,18 @@ def _proc_cmdline(pid: int) -> list[str]:
     return [part.decode("utf-8", "replace") for part in raw.split(b"\0") if part]
 
 
+def _proc_tgid(pid: int) -> int | None:
+    """Identify the process owning a Linux task ID, including non-leader threads."""
+    try:
+        status = (Path("/proc") / str(int(pid)) / "status").read_text(encoding="utf-8")
+        for line in status.splitlines():
+            if line.startswith("Tgid:"):
+                return int(line.split(":", 1)[1].strip())
+    except (OSError, TypeError, ValueError):
+        pass
+    return None
+
+
 def _expected_worker_pid(
     user_id: int,
     pid: int,
@@ -363,6 +376,11 @@ def adopt(
         pid = int(pid)
     except (TypeError, ValueError):
         return False, "pid_invalid"
+    if pid == os.getpid() or _proc_tgid(pid) == os.getpid():
+        # The supervising API/consumer cannot also be its own account worker.
+        # Container restarts may reuse a durable worker PID for this process
+        # or one of its threads (Linux shares the PID/TID number space).
+        return False, "pid_reused"
     if not _pid_alive(pid):
         return False, "pid_dead"
     # Validate identity even for an AI worker.  A live, unrelated PID must be
@@ -418,6 +436,10 @@ def terminate_pid(
         pid = int(pid)
     except (TypeError, ValueError):
         return False, "pid_invalid"
+    if pid == os.getpid() or _proc_tgid(pid) == os.getpid():
+        # Retire the stale worker reference, never signal the current supervisor.
+        # False means no process was terminated; callers must handle the reason.
+        return False, "pid_reused"
     if not _pid_alive(pid):
         return True, "already_dead"
     if not _expected_worker_pid(user_id, pid, account_key):
@@ -836,6 +858,17 @@ def _automation_settings(user_id: int, account_key: str | None = DEFAULT_ACCOUNT
         raise OSError("automation control files are missing or invalid") from error
 
 
+def _worker_automation_enabled(user_id: int, account_key: str) -> bool:
+    """Keep configured order delivery independent of the reply switch."""
+    if _automation_settings(user_id, account_key)["enabled"]:
+        return True
+    try:
+        products = FulfillmentConfig(_storage()).read_products(user_id, account_key)
+        return has_enabled_delivery(products, load_verified_snapshot(user_id, account_key))
+    except FulfillmentConfigError as error:
+        raise OSError("delivery control file is missing or invalid") from error
+
+
 def _env_for(
     user_id: int,
     internal_token: str | None = None,
@@ -868,11 +901,12 @@ def _env_for(
             "AUTOMATION_SETTINGS_FILE": os.path.join(account_path, "automation_settings.json"),
             "AUTOMATION_STRATEGY": automation_settings["strategy"],
             "AUTOMATION_MODE": mode,
-            # Managed workers always read live delay values from the strict
-            # account settings file; legacy environment-based typing delay is
-            # disabled so a hot update to zero takes effect immediately.
-            "SIMULATE_HUMAN_TYPING": "False",
-            "MAX_REPLY_DELAY": "25",
+            # 全局发送节流：任意两条对外消息之间严格间隔（阶梯式，串行发送），
+            # 避免多买家并发咨询时瞬间连发触发平台风控。
+            "OUTBOUND_MIN_INTERVAL": os.environ.get("OUTBOUND_MIN_INTERVAL", "3"),
+            "OUTBOUND_JITTER": os.environ.get("OUTBOUND_JITTER", "0"),
+            # Managed workers read every reply delay from the strict account
+            # settings file only; there is no environment-based typing delay.
             "LOG_LEVEL": "INFO",
             "PYTHONUNBUFFERED": "1",
             "TOKEN_STARTUP_JITTER_SECONDS": str(
@@ -1097,13 +1131,37 @@ def start(
     mode = _normalise_mode(automation_mode)
     key = _proc_key(user_id, account_key)
     with _lock:
-        if key in _transitions or key in _start_reservations:
+        if key in _start_reservations:
+            return False, "transition_in_progress"
+        pending_transition = _transitions.get(key)
+        if pending_transition is not None and pending_transition.terminating:
             return False, "transition_in_progress"
         current = _procs.get(key)
         generation = _generations.get(key, 0)
-        if current is not None and current.poll() is None and _modes.get(key) == mode:
+        if (
+            pending_transition is None
+            and current is not None
+            and current.poll() is None
+            and _modes.get(key) == mode
+        ):
             _desired_running[key] = True
             return True, "already_running"
+    if pending_transition is not None:
+        # A previous stop never confirmed. Retry terminating it instead of
+        # leaving the shop permanently blocked by a stale transition.
+        terminated, reason = _terminate_process(pending_transition.proc)
+        with _lock:
+            pending_transition.terminated = terminated
+            pending_transition.reason = reason
+            pending_transition.terminating = False
+            if terminated:
+                _close_file(pending_transition.log_file)
+                pending_transition.log_file = None
+                if _transitions.get(key) is pending_transition:
+                    _transitions.pop(key, None)
+            pending_transition.done.set()
+        if not terminated:
+            return False, "transition_in_progress"
     limits = _runtime_limits()
     reservation = None
     with _lock:
@@ -1510,7 +1568,7 @@ def _transition_snapshot_inner(
 ) -> str | None:
     """Retire one exact generation and publish a replacement only after persistence."""
     key = (user_id, account_key)
-    if target_mode is not None and not _automation_settings(user_id, account_key)["enabled"]:
+    if target_mode is not None and not _worker_automation_enabled(user_id, account_key):
         return None
     with _lock:
         if (
@@ -1523,7 +1581,7 @@ def _transition_snapshot_inner(
         mode = _modes.get(key)
         if target_mode is not None and mode != "rules_ai":
             return None
-        if target_mode is not None and not _automation_settings(user_id, account_key)["enabled"]:
+        if target_mode is not None and not _worker_automation_enabled(user_id, account_key):
             return None
         log_file = _log_files.pop(key, None)
         transition = _ProcessTransition(proc, mode or "rules", log_file)
@@ -1585,13 +1643,13 @@ def _transition_snapshot_inner(
         transition.reason = "resource_settings_unavailable"
         transition.done.set()
         return "stopped"
-    automation_enabled = _automation_settings(user_id, account_key)["enabled"]
+    automation_enabled = _worker_automation_enabled(user_id, account_key)
     with _lock:
         if (
             _transitions.get(key) is not transition
             or not _desired_running.get(key, False)
             or not automation_enabled
-            or not _automation_settings(user_id, account_key)["enabled"]
+            or not _worker_automation_enabled(user_id, account_key)
         ):
             _transitions.pop(key, None)
             transition.done.set()
@@ -1637,7 +1695,7 @@ def _transition_snapshot_inner(
                 persisted
                 and _transitions.get(key) is transition
                 and _desired_running.get(key, False)
-                and _automation_settings(user_id, account_key)["enabled"]
+                and _worker_automation_enabled(user_id, account_key)
             )
             if publish:
                 _register_process_locked(

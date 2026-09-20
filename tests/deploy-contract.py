@@ -404,7 +404,7 @@ def _assert_application_serving_contract() -> None:
             expected_security = {
                 "content-security-policy": (
                     "default-src 'self'; base-uri 'none'; connect-src 'self'; font-src 'self'; "
-                    "form-action 'self'; frame-ancestors 'none'; img-src 'self'; object-src 'none'; "
+                    "form-action 'self'; frame-ancestors 'none'; img-src 'self' blob:; object-src 'none'; "
                     "script-src 'self'; style-src 'self'"
                 ),
                 "permissions-policy": "camera=(), geolocation=(), microphone=()",

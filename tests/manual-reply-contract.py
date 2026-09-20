@@ -3,12 +3,14 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sqlite3
 import sys
 import tempfile
 from pathlib import Path
+from urllib.parse import quote
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -30,7 +32,7 @@ import app  # noqa: E402
 from account_storage import AccountStorage  # noqa: E402
 
 
-def seed_chat(root: Path, buyer: str, item: str, *, legacy_draft: bool = False) -> None:
+def seed_chat(root: Path, buyer: str, item: str, *, account_ref: str, legacy_draft: bool = False) -> None:
     with sqlite3.connect(root / "chat_history.db") as con:
         con.executescript(
             """
@@ -43,6 +45,13 @@ def seed_chat(root: Path, buyer: str, item: str, *, legacy_draft: bool = False) 
                 timestamp DATETIME,
                 chat_id TEXT,
                 source_id TEXT
+            );
+            CREATE TABLE customer_conversation_scope (
+                chat_id TEXT PRIMARY KEY,
+                item_id TEXT NOT NULL,
+                account_ref TEXT NOT NULL,
+                scope TEXT NOT NULL CHECK(scope IN ('owned', 'foreign', 'unknown')),
+                checked_at REAL NOT NULL
             );
             """
         )
@@ -59,6 +68,10 @@ def seed_chat(root: Path, buyer: str, item: str, *, legacy_draft: bool = False) 
                ) VALUES (?, ?, 'user', 'another contract message',
                          '2026-08-17 10:01:00', 'no-takeover', ?)""",
             (buyer, item, f"buyer:{buyer}:other"),
+        )
+        con.executemany(
+            "INSERT INTO customer_conversation_scope VALUES (?, ?, ?, 'owned', ?)",
+            [(chat_id, item, account_ref, 2_000_000_000) for chat_id in ("shared-chat", "no-takeover")],
         )
         if legacy_draft:
             con.executescript(
@@ -342,8 +355,11 @@ def main() -> None:
     storage = AccountStorage(str(RUN_DIR / "tenants"))
     default_root = storage.ensure_account_dir(user_id, "default")
     secondary_root = storage.ensure_account_dir(user_id, "secondary")
-    seed_chat(default_root, "buyer-default", "item-default", legacy_draft=True)
-    seed_chat(secondary_root, "buyer-secondary", "item-secondary")
+    for account, root, platform_id in (("default", default_root, "123456"), ("secondary", secondary_root, "654321")):
+        app.write_secret(user_id, "cookies.txt", f"unb={platform_id}; _m_h5_tk=offline_contract; cookie2=offline", account)
+        seed_chat(root, f"buyer-{account}", f"item-{account}",
+                  account_ref=hashlib.sha256(platform_id.encode("utf-8")).hexdigest()[:16],
+                  legacy_draft=account == "default")
 
     for account in ("default", "secondary"):
         response = client.post(
@@ -381,6 +397,25 @@ def main() -> None:
     )
     assert conflict.status_code == 409
     assert conflict.json()["detail"]["code"] == "idempotency_conflict"
+
+    with sqlite3.connect(default_root / "chat_history.db") as con:
+        queued_before_upload = con.execute("SELECT COUNT(*) FROM manual_reply_drafts").fetchone()[0]
+    for original_name in ("售后截图.jpg", "使用说明📦😀.jpg"):
+        named_upload = client.post(
+            "/api/bot/messages/image?chat_id=shared-chat",
+            headers={"Content-Type": "image/jpeg", "X-File-Name": "legacy-fallback.jpg",
+                     "X-File-Name-Encoded": quote(original_name, safe="")},
+            content=b"\xff\xd8\xff\xd9",
+        )
+        assert named_upload.status_code == 200
+        named_media = named_upload.json()["media"]
+        assert named_media["name"] == original_name and named_media["label"] == original_name
+        assert (default_root / named_media["path"]).is_file()
+        removed = client.request("DELETE", "/api/bot/messages/image", json={"path": named_media["path"]})
+        assert removed.status_code == 200 and removed.json() == {"ok": True, "deleted": True}
+        assert not (default_root / named_media["path"]).exists()
+    with sqlite3.connect(default_root / "chat_history.db") as con:
+        assert con.execute("SELECT COUNT(*) FROM manual_reply_drafts").fetchone()[0] == queued_before_upload
 
     image_upload = client.post(
         "/api/bot/messages/image?chat_id=shared-chat",

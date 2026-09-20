@@ -53,10 +53,10 @@ class XianyuApis:
         self,
         request_timeout=DEFAULT_REQUEST_TIMEOUT,
         sleep_func=None,
-        token_max_attempts=3,
-        login_max_attempts=2,
-        item_max_attempts=3,
-        trade_max_attempts=3,
+        token_max_attempts=2,
+        login_max_attempts=1,
+        item_max_attempts=1,
+        trade_max_attempts=1,
         token_backoff=DEFAULT_TOKEN_BACKOFF,
         request_backoff=DEFAULT_REQUEST_BACKOFF,
     ):
@@ -210,6 +210,20 @@ class XianyuApis:
             return "platform_busy"
         return "token_unavailable"
 
+    @staticmethod
+    def _looks_like_risk_control(response):
+        """识别风控滑块/验证页（punish、RGV587、USER_VALIDATE），避免把风控当普通错误反复重试。"""
+        try:
+            text = str(getattr(response, "text", "") or "")[:8192].upper()
+            final_url = str(getattr(response, "url", "") or "").lower()
+        except Exception:
+            return False
+        if "/punish" in final_url or "x5secdata" in final_url:
+            return True
+        return any(signal in text for signal in (
+            "RGV587", "USER_VALIDATE", "_____TMD_____", "/PUNISH",
+        ))
+
     def _post_json(self, url, **kwargs):
         try:
             response = self.session.post(url, timeout=self.request_timeout, **kwargs)
@@ -220,8 +234,12 @@ class XianyuApis:
         try:
             payload = response.json()
         except (TypeError, ValueError) as exc:
+            if self._looks_like_risk_control(response):
+                raise XianyuAuthenticationError("risk_control") from exc
             raise XianyuApiError("response_invalid") from exc
         if not isinstance(payload, dict):
+            if self._looks_like_risk_control(response):
+                raise XianyuAuthenticationError("risk_control")
             raise XianyuApiError("response_invalid")
         return response, payload
 
@@ -233,6 +251,7 @@ class XianyuApis:
         *,
         attempts,
         value_type=None,
+        headers=None,
     ):
         """Issue one signed request with a finite retry budget on the shared session."""
         data_val = json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
@@ -256,10 +275,16 @@ class XianyuApis:
             if value_type:
                 params["valueType"] = value_type
             try:
+                request_headers = dict(headers) if headers else None
                 with self._session_lock:
                     token = self.session.cookies.get("_m_h5_tk", "").split("_")[0]
                     params["sign"] = generate_sign(params["t"], token, data_val)
-                    response, result = self._post_json(endpoint, params=params, data=data)
+                    if request_headers is None:
+                        response, result = self._post_json(endpoint, params=params, data=data)
+                    else:
+                        response, result = self._post_json(
+                            endpoint, params=params, data=data, headers=request_headers
+                        )
             except Exception as exc:
                 last_error_code = exc.code if isinstance(exc, XianyuApiError) else "network_error"
                 logger.warning("订单核验接口请求异常 code={}", last_error_code)
@@ -323,6 +348,74 @@ class XianyuApis:
             attempts=self.trade_max_attempts,
             value_type="string",
         )
+
+    SELLER_ORIGIN_HEADERS = {
+        "origin": "https://seller.goofish.com",
+        "referer": "https://seller.goofish.com/",
+    }
+    SOLD_ORDER_QUERY_CODES = (
+        "ALL",
+        "NOT_PAY",
+        "NOT_SHIP",
+        "SHIPPED",
+        "TRADE_SUCCESS",
+        "TRADE_CLOSED",
+        "REFUND",
+    )
+    MAX_SOLD_ORDER_ROWS_PER_PAGE = 50
+    MAX_SOLD_ORDER_PAGES = 20
+
+    def get_sold_orders(self, page_number=1, rows_per_page=20, query_code="NOT_SHIP", order_ids=""):
+        """List seller-side orders on seller.goofish.com.
+
+        ``query_code="NOT_SHIP"`` selects orders awaiting shipment. The seller API
+        validates the request origin, so the per-call headers point at
+        seller.goofish.com instead of the session default. Response shape:
+        ``{"items", "next_page", "total_count"}``; ``total_count`` becomes 0 on an
+        out-of-range page, so callers must paginate on ``next_page``.
+        """
+        if type(page_number) is not int or not 1 <= page_number <= 10_000:
+            raise ValueError("page_number is invalid")
+        if type(rows_per_page) is not int or not 1 <= rows_per_page <= self.MAX_SOLD_ORDER_ROWS_PER_PAGE:
+            raise ValueError("rows_per_page is invalid")
+        if query_code not in self.SOLD_ORDER_QUERY_CODES:
+            raise ValueError("query_code is invalid")
+        if order_ids is None:
+            order_ids = ""
+        if not isinstance(order_ids, str) or len(order_ids) > 4096 or any(
+            character not in "0123456789, " for character in order_ids
+        ):
+            raise ValueError("order_ids is invalid")
+        payload = {
+            "pageNumber": page_number,
+            "rowsPerPage": rows_per_page,
+            "orderIds": order_ids.strip(),
+            "queryCode": query_code,
+            "orderSearchParam": "{}",
+        }
+        result = self._signed_mtop_request(
+            "mtop.taobao.idle.trade.merchant.sold.get",
+            "https://h5api.m.goofish.com/h5/mtop.taobao.idle.trade.merchant.sold.get/1.0/",
+            payload,
+            attempts=self.trade_max_attempts,
+            value_type="string",
+            headers=self.SELLER_ORIGIN_HEADERS,
+        )
+        module = {}
+        if isinstance(result, dict):
+            data = result.get("data")
+            if isinstance(data, dict):
+                candidate = data.get("module")
+                if isinstance(candidate, dict):
+                    module = candidate
+        items = module.get("items")
+        if not isinstance(items, list):
+            items = []
+        return {
+            "items": items,
+            "next_page": bool(module.get("nextPage")),
+            "total_count": module.get("totalCount") or 0,
+        }
 
     def upload_media(self, media_path):
         """Upload one seller image and return the bounded platform response."""

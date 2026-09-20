@@ -17,13 +17,14 @@ import os
 import re
 import secrets
 import sqlite3
+import sys
 import stat
 import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import unquote, urlsplit, urlunsplit
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
@@ -37,7 +38,7 @@ from account_leases import AccountLease, AccountLeaseError, acquire_account_leas
 from fulfillment_config import (
     FulfillmentConfig, FulfillmentConfigError,
     normalise_template_input, normalise_template_item_ids, template_public,
-    upsert_template, remove_template, digest as fulfillment_digest,
+    upsert_template, remove_template, digest as fulfillment_digest, has_enabled_delivery,
 )
 from ai_customer_service import AIServiceError, catgirl_preset, service as ai_service
 from ai_provider_adapters import provider_catalog
@@ -103,6 +104,7 @@ import records
 from shop_sync import (
     CANONICAL_STATUS_CODES,
     ShopSyncError,
+    clear_connection as clear_shop_connection,
     load_verified_snapshot,
     parse_cookie_header,
     reserve_sync,
@@ -123,6 +125,7 @@ from runtime_settings import RuntimeSettings, RuntimeSettingsError
 from shop_resources import ShopResources
 import bot_manager as worker_manager
 
+logger = logging.getLogger("xianyu-saas-api")
 
 ADMIN_TOKEN = os.environ.get("SAAS_ADMIN_TOKEN", "")
 SESSION_COOKIE = "xianyu_saas_session"
@@ -206,7 +209,7 @@ SHOP_LOGIN_REQUEST_BODY_LIMIT = 1024
 STATIC_SECURITY_HEADERS = {
     "Content-Security-Policy": (
         "default-src 'self'; base-uri 'none'; connect-src 'self'; font-src 'self'; "
-        "form-action 'self'; frame-ancestors 'none'; img-src 'self'; object-src 'none'; "
+        "form-action 'self'; frame-ancestors 'none'; img-src 'self' blob:; object-src 'none'; "
         "script-src 'self'; style-src 'self'"
     ),
     "Permissions-Policy": "camera=(), geolocation=(), microphone=()",
@@ -360,7 +363,7 @@ _api_process_lock = _acquire_api_process_lock()
 db = DB()
 _qr_connections = ShopConnectionCoordinator(db)
 qr_logins = XianyuLoginManager(
-    acquire_hook=_qr_connections.acquire,
+    acquire_hook=_qr_connections.acquire_qr,
     renew_hook=_qr_connections.renew,
     release_hook=_qr_connections.release,
     before_request_hook=_qr_connections.before_request,
@@ -372,7 +375,52 @@ operations_service = OperationsService(db, ai_service)
 fulfillment_config = FulfillmentConfig(ai_service.storage)
 runtime_settings = RuntimeSettings(db)
 worker_manager.configure_resource_limits(runtime_settings.read)
-shop_resources = ShopResources(db, runtime_settings, worker_manager.managed_resource_snapshot, worker_manager._expected_worker_pid)
+
+
+def _shop_resource_monitor(user_id: int, account_key: str) -> dict:
+    """Read-only login/reply/delivery intent for the resource monitor.
+
+    Defined before the monitor is constructed but resolves the API helpers at
+    call time. Any failure degrades to unknown rather than breaking sampling.
+    """
+    try:
+        connected = bool(bot_status(int(user_id), str(account_key)).get("connected"))
+    except Exception:
+        connected = None
+    try:
+        reauth_required = bool(
+            _read_auth_status(int(user_id), str(account_key)).get("reauthorization_required")
+        )
+    except Exception:
+        reauth_required = True
+    try:
+        settings = _read_automation_settings(int(user_id), str(account_key))
+        legacy = settings.get("enabled", True)
+        reply_enabled = (
+            settings.get("rules_enabled", legacy) is not False
+            or settings.get("ai_enabled", legacy) is not False
+        )
+    except Exception:
+        reply_enabled = None
+    try:
+        delivery_enabled = _has_enabled_account_delivery(int(user_id), str(account_key))
+    except Exception:
+        delivery_enabled = None
+    return {
+        "connected": connected,
+        "reauth_required": reauth_required,
+        "reply_enabled": reply_enabled,
+        "delivery_enabled": delivery_enabled,
+    }
+
+
+shop_resources = ShopResources(
+    db,
+    runtime_settings,
+    worker_manager.managed_resource_snapshot,
+    worker_manager._expected_worker_pid,
+    monitor=_shop_resource_monitor,
+)
 def _probe_interval_seconds():
     try:
         interval = int(os.environ.get("SAAS_UPDATE_CHECK_INTERVAL_SECONDS", "21600"))
@@ -1284,6 +1332,8 @@ class AutomationIn(BaseModel):
     deliveries: list | None = None
     strategy: str | None = None
     enabled: bool | None = None
+    rules_enabled: bool | None = None
+    ai_enabled: bool | None = None
     first_reply: str | None = None
     fallback_reply: str | None = None
     delay_min_seconds: int | None = None
@@ -1358,6 +1408,8 @@ class AIConfigIn(BaseModel):
     store_content: str | None = None
     persona_preset: str | None = None
     persona_name: str | None = None
+    persona_instruction: str | None = None
+    # Accept stale clients' retired style fields; normalization discards them.
     tone: str | None = None
     buyer_address: str | None = None
     reply_length: str | None = None
@@ -1602,7 +1654,6 @@ def _public_ai_config(payload: dict) -> dict:
             key: config.get(key)
             for key in (
                 "store_content", "persona_preset", "persona_name", "persona_instruction",
-                "tone", "buyer_address", "reply_length", "emoji_level",
                 "forbidden_claims", "handoff_rules", "enabled",
             )
         },
@@ -1864,7 +1915,8 @@ def _persist_worker_stopped(
 
 
 def _stop_confirmed(ok: bool, reason: str) -> bool:
-    return bool(ok or reason in {"not_running", "already_dead", "stopped"})
+    # A positively identified reused PID no longer refers to this shop's worker.
+    return bool(ok or reason in {"not_running", "already_dead", "stopped", "pid_reused"})
 
 
 def _stop_account_worker_locked(
@@ -2018,27 +2070,39 @@ def _require_account_worker_configuration(
     mode: str,
     *,
     require_rules_content: bool,
+    allow_unconfigured: bool = False,
 ) -> None:
-    """Validate every control document before a worker can start or be adopted."""
+    """Validate every control document before a worker can start or be adopted.
+
+    ``allow_unconfigured`` is used by the default-on runtime paths: the shop
+    runtime is expected to stay online even when no reply rule or delivery is
+    configured yet, so an empty configuration is not an error there. Corrupt
+    or unreadable control documents still fail closed because the reads below
+    always run.
+    """
     user_id = int(user["id"])
     account_key = str(account["account_key"])
     document = _read_rules_document(
         user_id, user, account_key, persist_legacy=False
     )
     settings = _read_automation_settings(user_id, account_key)
-    if settings.get("enabled") is False:
+    legacy_enabled = settings.get("enabled", True)
+    rules_enabled = settings.get("rules_enabled", legacy_enabled) is not False
+    ai_enabled = settings.get("ai_enabled", legacy_enabled) is not False
+    any_engine_enabled = rules_enabled or ai_enabled
+    deliveries_set = False
+    if not any_engine_enabled or (require_rules_content and mode == "rules"):
+        deliveries_set = _has_enabled_account_delivery(user_id, account_key)
+    if not any_engine_enabled and not deliveries_set and not allow_unconfigured:
         raise HTTPException(
             409,
-            detail={"code": "automation_disabled", "message": "请先开启自动处理"},
+            detail={"code": "automation_disabled", "message": "请先开启规则客服、智能客服或配置订单自动发货"},
         )
     if require_rules_content and mode == "rules":
-        snapshot = load_verified_snapshot(user_id, account_key)
-        products = _read_products_document(user_id, account_key)
         rules_set = any(
             rule.get("enabled") and rule.get("reply")
             for rule in document["rules"]
         )
-        deliveries_set = bool(deliveries_from_products(products, snapshot))
         configured = (
             rules_set
             or deliveries_set
@@ -2047,7 +2111,7 @@ def _require_account_worker_configuration(
         )
     else:
         configured = True
-    if not configured:
+    if not configured and not allow_unconfigured:
         raise HTTPException(
             409,
             detail={
@@ -2134,6 +2198,7 @@ def _start_account_worker_locked(
     *,
     validate_configuration: bool,
     automatic: bool,
+    allow_unconfigured: bool = False,
 ) -> str:
     """Start one account while its worker-control lease is held."""
     user_id = int(user["id"])
@@ -2150,6 +2215,7 @@ def _start_account_worker_locked(
             account,
             mode,
             require_rules_content=validate_configuration,
+            allow_unconfigured=allow_unconfigured,
         )
     except HTTPException as exc:
         if automatic:
@@ -2255,6 +2321,14 @@ def _start_account_worker_locked(
     return reason
 
 
+def _runtime_auto_resume(runtime) -> bool:
+    """True unless an explicit stop cleared the default-on runtime marker."""
+    try:
+        return bool(runtime["auto_resume"])
+    except (KeyError, IndexError, TypeError):
+        return True
+
+
 def _autostart_account_worker(user_id: int, account) -> dict:
     """Clear verified auth state and resume durable running intent idempotently."""
     if maintenance_active():
@@ -2302,7 +2376,9 @@ def _autostart_account_worker(user_id: int, account) -> dict:
             return _worker_transition_payload(user_id, account, "auth_status_clear_failed")
         if maintenance_active():
             return _maintenance_worker_transition_payload(user_id, account)
-        if runtime is None or runtime["desired_state"] != "running":
+        if runtime is None or (
+            runtime["desired_state"] != "running" and not _runtime_auto_resume(runtime)
+        ):
             return _worker_transition_payload(user_id, account)
         user = db.get_user_by_id(user_id)
         if user is None:
@@ -2327,6 +2403,7 @@ def _autostart_account_worker(user_id: int, account) -> dict:
                 lease,
                 validate_configuration=False,
                 automatic=True,
+                allow_unconfigured=True,
             )
         except HTTPException as exc:
             detail = exc.detail if isinstance(exc.detail, dict) else {}
@@ -2836,6 +2913,16 @@ def _read_products_document(user_id: int, account_key: str = "default") -> dict:
         raise HTTPException(error.status_code, str(error)) from error
 
 
+def _has_enabled_account_delivery(user_id: int, account_key: str) -> bool:
+    try:
+        return has_enabled_delivery(
+            _read_products_document(user_id, account_key),
+            load_verified_snapshot(user_id, account_key),
+        )
+    except FulfillmentConfigError as error:
+        raise HTTPException(error.status_code, str(error)) from error
+
+
 def _write_products_document(user_id, account_key, document, *, before=None, ensure_current=None):
     try:
         before = fulfillment_config.read_products(user_id, account_key) if before is None else before
@@ -2964,6 +3051,8 @@ def _automation_payload(user, account=None, persist_legacy: bool = True) -> dict
         "deliveries": deliveries_from_products(products, snapshot),
         "strategy": settings["strategy"],
         "enabled": settings["enabled"],
+        "rules_enabled": settings.get("rules_enabled", settings["enabled"]),
+        "ai_enabled": settings.get("ai_enabled", settings["enabled"]),
         "first_reply": settings.get("first_reply", ""),
         "fallback_reply": settings.get("fallback_reply", ""),
         "delay_min_seconds": settings.get("delay_min_seconds", 0),
@@ -3403,6 +3492,7 @@ def save_automation(
     _require_permission(user, "automation.rules")
     values = (
         body.rules, body.deliveries, body.strategy, body.enabled,
+        body.rules_enabled, body.ai_enabled,
         body.first_reply, body.fallback_reply, body.delay_min_seconds,
         body.delay_max_seconds, body.trigger_cooldown_seconds,
         body.manual_takeover_cooldown_seconds, body.business_hours_enabled,
@@ -3446,7 +3536,8 @@ def _save_automation_locked(body: AutomationIn, user, account, leases=()):
             raise HTTPException(400, str(exc)) from exc
     settings = None
     setting_fields = (
-        "strategy", "enabled", "first_reply", "fallback_reply",
+        "strategy", "enabled", "rules_enabled", "ai_enabled",
+        "first_reply", "fallback_reply",
         "delay_min_seconds", "delay_max_seconds", "trigger_cooldown_seconds",
         "manual_takeover_cooldown_seconds", "business_hours_enabled",
         "business_start", "business_end",
@@ -3465,6 +3556,16 @@ def _save_automation_locked(body: AutomationIn, user, account, leases=()):
             value = getattr(body, name)
             if value is not None:
                 candidate[name] = value
+        # Keep the legacy master switch and the per-engine switches consistent
+        # whichever one the caller sends.
+        if body.enabled is not None and body.rules_enabled is None and body.ai_enabled is None:
+            candidate["rules_enabled"] = body.enabled
+            candidate["ai_enabled"] = body.enabled
+        elif body.rules_enabled is not None or body.ai_enabled is not None:
+            candidate["enabled"] = (
+                candidate.get("rules_enabled", True) is not False
+                or candidate.get("ai_enabled", True) is not False
+            )
         try:
             settings = normalise_settings(candidate)
         except AutomationValidationError as exc:
@@ -3496,11 +3597,9 @@ def _save_automation_locked(body: AutomationIn, user, account, leases=()):
                                      ensure_current=ensure_delivery_write)
         if settings is not None:
             write_secret(user["id"], "automation_settings.json", json.dumps(settings, ensure_ascii=False, separators=(",", ":")), account_key)
-            if body.enabled is False:
-                worker_lease = next((lease for lease, _owner in leases if getattr(lease, "key", "").startswith("worker-control:")), None)
-                confirmed, reason = _stop_account_worker_locked(user["id"], account, "automation_disabled", worker_lease)
-                if not confirmed:
-                    raise OSError(reason)
+            # The shop runtime is default-on and independent of the reply
+            # switch: disabling replies never stops the worker that also serves
+            # paid-order delivery. Only an explicit stop may do that.
     except OSError as exc:
         raise HTTPException(503, "自动化设置保存失败，请稍后重试") from exc
     return {"ok": True, "automation": _automation_payload(user, account)}
@@ -3692,8 +3791,7 @@ def delete_shop_account(account_key: str, user=Depends(Auth.current_user)):
         normalize_account_key(key)
     except ValueError:
         raise HTTPException(400, "店铺账号标识无效") from None
-    if key == DEFAULT_ACCOUNT_ID:
-        raise HTTPException(409, "默认店铺不能删除，请清除连接后重新绑定")
+    disconnect_only = key == DEFAULT_ACCOUNT_ID
     row = db.get_shop_account(user["id"], account_key=key)
     if row is None or not row["enabled"]:
         raise HTTPException(404, "店铺账号不存在或已停用")
@@ -3706,19 +3804,62 @@ def delete_shop_account(account_key: str, user=Depends(Auth.current_user)):
         unavailable_message="店铺状态暂时不可用，请稍后重试",
     )
     try:
-        try:
-            confirmed, reason = _stop_account_worker_locked(
-                user["id"], row, "account_deleted", lease
+        for attempt in range(2):
+            try:
+                # Retry the complete stop path: local and durable PIDs can both
+                # survive the first attempt and must both be confirmed stopped.
+                confirmed, reason = _stop_account_worker_locked(
+                    user["id"], row, "account_disconnected" if disconnect_only else "account_deleted", lease
+                )
+            except HTTPException:
+                # Lost ownership is not a process-stop failure we may retry.
+                raise
+            except Exception as exc:
+                confirmed, reason = False, type(exc).__name__
+            if confirmed:
+                break
+            if attempt == 0:
+                logger.warning(
+                    "店铺操作未能确认 worker 已停止，尝试二次终止 account_id=%s reason=%s",
+                    row["id"],
+                    reason,
+                )
+        # Only the current lease owner may change the durable recovery intent.
+        _ensure_account_lease(lease, "店铺状态租约已失效，请重试")
+        # An explicit disconnect must not be silently resurrected on restart,
+        # even when both stop attempts leave a retryable failure.
+        db.set_worker_auto_resume(user["id"], row["id"], 0)
+        if not confirmed:
+            # Keep identity records and the retryable degraded runtime instead of
+            # disguising a live process as disconnected.
+            raise HTTPException(
+                409,
+                detail={
+                    "code": "worker_stop_unconfirmed",
+                    "message": "店铺自动客服进程尚未退出，请稍后重试",
+                },
             )
-            if not confirmed:
-                raise RuntimeError(reason)
-        except Exception as exc:
-            raise HTTPException(503, "店铺仍在停止，请稍后重试") from exc
         try:
             qr_logins.clear_user(user["id"], preserve_cooldown=False, account_key=key)
         except Exception:
             pass
         _ensure_account_lease(lease, "店铺状态租约已失效，请重试")
+        if disconnect_only:
+            # Keep the legacy default row but clear its verified connection.
+            try:
+                write_secret(user["id"], "cookies.txt", "", key)
+            except OSError:
+                pass
+            try:
+                clear_shop_connection(user["id"], key)
+            except OSError:
+                pass
+            try:
+                _clear_auth_status(user["id"], key)
+            except OSError:
+                pass
+            updated = db.update_shop_account(user["id"], account_id=row["id"], status="unconfigured")
+            return {"ok": True, "disconnected": True, "account": _shop_account_payload(updated, user["id"])}
         updated = db.disable_shop_account(user["id"], row["id"])
         return {"ok": True, "account": _shop_account_payload(updated, user["id"])}
     finally:
@@ -3758,8 +3899,8 @@ def _attention_display(item: dict) -> dict:
         runtime_label = runtime_labels.get(code, code or "状态异常")
         title = title or "自动客服需要检查"
         message = message or f"自动客服当前状态：{runtime_label}。"
-        action_view = "auto-reply"
-        action_label = "查看自动规则"
+        action_view = "shops"
+        action_label = "查看店铺状态"
         severity = severity or "error"
     elif kind == "manual_reply":
         action_view = "chat"
@@ -4645,6 +4786,7 @@ def start_bot(
             validate_configuration=True,
             automatic=False,
         )
+        db.set_worker_auto_resume(user["id"], account["id"], 1)
         return {"ok": True, "reason": reason}
     finally:
         _release_account_lease(lease, owner)
@@ -4668,6 +4810,9 @@ def stop_bot(user=Depends(Auth.current_user), account=Depends(current_shop_accou
             raise HTTPException(503, "机器人状态保存失败，请稍后重试") from exc
         if not confirmed:
             raise HTTPException(503, detail={"code": reason, "message": "机器人进程尚未确认停止，请稍后重试"})
+        # An explicit stop is authoritative and must survive restarts; only a
+        # new explicit start (or enabling the account) turns auto-resume back on.
+        db.set_worker_auto_resume(user["id"], account["id"], 0)
         return {"ok": reason != "not_running", "reason": reason}
     finally:
         _release_account_lease(lease, owner)
@@ -4773,10 +4918,17 @@ def _qr_complete_http_error(error, user_id, login_id, account_key):
         "login_expires_in": 0, "can_retry_login": False,
     }
     delay = detail.get("retry_after")
-    temporary = detail.get("code") in {"sync_cooldown", "risk_cooldown", "sync_busy"}
+    code = detail.get("code")
+    temporary = code in {"sync_cooldown", "risk_cooldown", "sync_busy"}
     state["can_retry_login"] = bool(
         temporary and state["can_retry_login"] and type(delay) is int
         and 0 <= delay < state["login_expires_in"]
+    )
+    # Short, self-clearing contention is safe for the UI to retry once by
+    # itself. Platform risk cooldowns never auto-retry.
+    detail["auto_retry"] = bool(
+        code in {"sync_busy", "sync_cooldown"}
+        and type(delay) is int and 0 <= delay <= 8
     )
     detail.update(state)
     if not temporary and detail.get("code") not in {
@@ -4802,6 +4954,13 @@ def complete_xianyu_login(
     _require_permission(user, "shop.configure")
     account_key = str(account["account_key"])
     worker_paused = False
+    # Re-arm the default-on runtime before the verified replace runs so its
+    # completion path can resume the worker and clear any stale auth status
+    # (for example after an explicit disconnect set auto_resume=0).
+    try:
+        db.set_worker_auto_resume(user["id"], account["id"], 1)
+    except Exception:
+        pass
 
     def pause_worker_after_verification():
         nonlocal worker_paused
@@ -4821,10 +4980,10 @@ def complete_xianyu_login(
     except XianyuLoginError as error:
         raise _qr_complete_http_error(error, user["id"], body.login_id, account_key) from None
 
-    try:
+    def run_complete_sync():
         lease_reader = getattr(qr_logins, "connection_lease", None)
         lease = lease_reader(user["id"], body.login_id, account_key) if callable(lease_reader) else None
-        snapshot = _run_shop_sync(
+        return _run_shop_sync(
             user["id"],
             cookie_header,
             replace_cookie=True,
@@ -4832,7 +4991,35 @@ def complete_xianyu_login(
             before_replace_persist=pause_worker_after_verification,
             connection_lease=lease,
         )
+
+    try:
+        try:
+            snapshot = run_complete_sync()
+        except ShopSyncError as retryable:
+            # A short sync_busy/sync_cooldown right after scanning is a transient
+            # rate-limit, not a real identification failure. Wait it out and try
+            # once more so the first click succeeds instead of asking the user to
+            # press "retry" after a timer.
+            delay = retryable.retry_after
+            if retryable.code in {"sync_busy", "sync_cooldown"} and delay is not None and 0 <= float(delay) <= 5:
+                time.sleep(min(float(delay), 5.0) + 0.2)
+                snapshot = run_complete_sync()
+            else:
+                raise
     except Exception as error:
+        error_code = getattr(error, "code", None)
+        if error_code is None and isinstance(error, HTTPException) and isinstance(error.detail, dict):
+            error_code = error.detail.get("code")
+        print(
+            "[qr-complete-failed] code=%s type=%s retry_after=%s"
+            % (
+                error_code or "unknown",
+                type(error).__name__,
+                getattr(error, "retry_after", None),
+            ),
+            file=sys.stderr,
+            flush=True,
+        )
         if worker_paused:
             _autostart_account_worker(user["id"], account)
         try:
@@ -5437,6 +5624,7 @@ def get_conversations(
     limit: int = 50,
     search: str = "",
     unread_only: bool = False,
+    needs_human_only: bool = False,
 ):
     _require_permission(user, "records.read")
     search = str(search or "").strip()
@@ -5448,6 +5636,7 @@ def get_conversations(
         str(account["account_key"]),
         search=search,
         unread_only=bool(unread_only),
+        needs_human_only=bool(needs_human_only),
     )
     totals = records.conversation_unread_totals(
         user["id"], str(account["account_key"]), search=search
@@ -5456,7 +5645,12 @@ def get_conversations(
         "conversations": rows,
         "unread_total": int(totals["conversations"]),
         "unread_messages_total": int(totals["messages"]),
-        "filters": {"search": search, "unread_only": bool(unread_only)},
+        "needs_human_total": int(totals.get("needs_human", 0)),
+        "filters": {
+            "search": search,
+            "unread_only": bool(unread_only),
+            "needs_human_only": bool(needs_human_only),
+        },
     }
 
 
@@ -5540,11 +5734,18 @@ async def upload_manual_image(
             raise HTTPException(413, "图片不能超过 8 MB")
         chunks.append(chunk)
     payload = b"".join(chunks)
+    filename = request.headers.get("x-file-name", "")
+    encoded_filename = request.headers.get("x-file-name-encoded")
+    if encoded_filename is not None:
+        try:
+            filename = unquote(encoded_filename, encoding="utf-8", errors="strict")
+        except UnicodeDecodeError:
+            raise HTTPException(400, "图片文件名编码无效") from None
     try:
         media = records.save_manual_image(
             user["id"],
             payload,
-            request.headers.get("x-file-name", ""),
+            filename,
             request.headers.get("content-type", ""),
             str(account["account_key"]),
         )
@@ -5825,8 +6026,9 @@ def _ensure_internal_ai_runtime_ready(
 ) -> dict:
     account_key = str(account["account_key"])
     settings = _read_automation_settings(user["id"], account_key)
-    if settings.get("enabled") is not True:
-        raise HTTPException(409, detail={"code": "automation_disabled", "message": "自动回复已停用"})
+    legacy_enabled = settings.get("enabled", True)
+    if settings.get("ai_enabled", legacy_enabled) is False:
+        raise HTTPException(409, detail={"code": "automation_disabled", "message": "智能客服(AI)已停用"})
     _read_rules_document(user["id"], user, account_key, persist_legacy=False)
     try:
         return ai_service.ensure_reply_ready(
@@ -6491,7 +6693,11 @@ def restore_desired_workers(_pending=None):
     first_pass = _pending is None
     pending = []
     for runtime in (db.list_worker_runtimes() if first_pass else _pending):
-        if runtime["desired_state"] != "running" and not runtime["pid"]:
+        if (
+            runtime["desired_state"] != "running"
+            and not runtime["pid"]
+            and not _runtime_auto_resume(runtime)
+        ):
             continue
         user_id = int(runtime["user_id"])
         account_id = int(runtime["account_id"])
@@ -6529,7 +6735,7 @@ def restore_desired_workers(_pending=None):
                 )
                 continue
             account_key = str(_runtime_value(account, "account_key", "default"))
-            if runtime["desired_state"] != "running":
+            if runtime["desired_state"] != "running" and not _runtime_auto_resume(runtime):
                 _stop_account_worker_locked(user_id, account, "restore_stopped")
                 continue
             if user is None or not account["enabled"] or _runtime_value(user, "disabled_at") is not None:
@@ -6560,6 +6766,7 @@ def restore_desired_workers(_pending=None):
                         account,
                         mode,
                         require_rules_content=False,
+                        allow_unconfigured=True,
                     )
                 except HTTPException as exc:
                     code = _worker_configuration_error_code(exc)
@@ -6615,7 +6822,7 @@ def restore_desired_workers(_pending=None):
                         stopped, stop_reason = bot_terminate_pid(
                             user_id, persisted_pid, account_key
                         )
-                        if not stopped and stop_reason not in {"already_dead"}:
+                        if not _stop_confirmed(stopped, stop_reason):
                             _persist_restore_runtime(
                                 runtime,
                                 state="degraded",
@@ -6635,7 +6842,7 @@ def restore_desired_workers(_pending=None):
                     stopped, stop_reason = bot_terminate_pid(
                         user_id, persisted_pid, account_key
                     )
-                    if not stopped and stop_reason not in {"already_dead"}:
+                    if not _stop_confirmed(stopped, stop_reason):
                         _persist_restore_runtime(
                             runtime,
                             state="degraded",
@@ -6643,7 +6850,7 @@ def restore_desired_workers(_pending=None):
                             last_error=f"orphan_{stop_reason}",
                         )
                         continue
-                elif adopt_reason not in {"pid_dead", "pid_invalid"}:
+                elif adopt_reason not in {"pid_dead", "pid_invalid", "pid_reused"}:
                     # A live PID that is not our worker must never be killed or
                     # shadowed by a duplicate automatic process.
                     _persist_restore_runtime(
@@ -6735,7 +6942,7 @@ def _enter_update_maintenance(_state):
             if account is None:
                 raise RuntimeError("update_drain_unavailable")
             stopped, reason = bot_terminate_pid(int(runtime["user_id"]), int(runtime["pid"]), str(account["account_key"]))
-            if not stopped and reason not in {"already_dead", "pid_dead", "pid_invalid"}:
+            if not _stop_confirmed(stopped, reason) and reason not in {"pid_dead", "pid_invalid"}:
                 raise RuntimeError("update_drain_unavailable")
     if worker_manager.running_count() != 0:
         raise RuntimeError("update_drain_pending")

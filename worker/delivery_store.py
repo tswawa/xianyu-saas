@@ -1017,6 +1017,37 @@ class DeliveryStore:
             return None
         return dict(row)
 
+    def find_chat_binding(self, buyer_id: str, item_id: str, max_age: float = 30 * 86400) -> Optional[str]:
+        """Return the single verified chat_id bound to a buyer+item, or None.
+
+        The pending-order scanner uses this to resolve a conversation from facts
+        already recorded from verified sessions. Ambiguity or absence returns
+        None, so the caller never guesses a conversation to deliver into.
+        """
+        if max_age <= 0:
+            raise ValueError("chat binding max age must be positive")
+        buyer_id = str(buyer_id or "")
+        item_id = str(item_id or "")
+        if not buyer_id or not item_id:
+            return None
+        now = self.now_fn()
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                """
+                SELECT chat_id, observed_at FROM chat_bindings
+                WHERE buyer_id = ? AND item_id = ? AND conflicted = 0
+                ORDER BY observed_at DESC
+                """,
+                (buyer_id, item_id),
+            ).fetchall()
+        finally:
+            conn.close()
+        fresh = [row for row in rows if now - row["observed_at"] <= max_age]
+        if len(fresh) != 1:
+            return None
+        return str(fresh[0]["chat_id"])
+
     def record_payment_event(
         self,
         order_key: str,

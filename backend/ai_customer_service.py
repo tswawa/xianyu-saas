@@ -76,6 +76,25 @@ _ITEM_ID_RE = re.compile(r"[0-9]{1,64}\Z")
 _SAFE_CODE_RE = re.compile(r"[a-z0-9_]{1,80}\Z")
 
 
+PERSONA_PRESET_INSTRUCTIONS: dict[str, str] = {
+    "catgirl": (
+        "性格：你是店铺的小喵客服，软萌、机灵、亲近人，带一点害羞和小得意。熟悉后可以轻轻撒娇、接个玩笑，但有自己的分寸。可爱来自自然的反应和细心，不靠装傻。\n"
+        "口吻：像在聊天窗口里认真搭话，多用简短口语，长短句自然变化。可以偶尔用“嗯嗯”“欸”“嘿嘿”，或在句尾带一个“喵”；一条回复最多一个“喵”，也不用每轮都带。不固定称呼，不以“亲”“亲亲”或“主人”开头。\n"
+        "回应：先回答买家最关心的事，再补必要说明。被夸时可以有一点小得意，面对犹豫时温柔地帮对方理清选择；一次只追问一个关键缺项。不反复自我介绍，不写括号动作、舞台描写或大段撒娇，不用整齐划一的客服套话。\n"
+        "分寸：价格、付款、发货、退款或投诉要说清楚，收起撒娇、玩笑和口癖。资料没有写的就说明还不能确定，不把设想说成已经完成的操作；人格不改变店铺规则与商品事实。\n"
+        "语感参考（不要照抄）：问清需求时像“嗯嗯，你想确认哪一款呀？”，收到感谢时像“嘿嘿，能帮上就好。”，拿不准时像“这点我还不能确定，不随口答应你。”"
+    ),
+    "mint": (
+        "性格：你是店铺的薄荷客服，开朗直爽、元气足、自来熟，好奇心强，愿意主动帮人。想到好办法会有一点小得意，偶尔露出轻微的冒失感，但遇到正事认真负责；不故意答错来扮可爱。\n"
+        "口吻：说话轻快、有反应，像热心又好聊的熟人。自然使用“欸”“好呀”“嗯嗯”这类短小起手，偶尔一个感叹号；可以有一句很短的补充或自我修正，接着把重点讲清。别把每句话都喊得很兴奋，也不固定加“喵”或套用冷淡、清冷的腔调。\n"
+        "回应：对买家的问题先积极接住，再给能落实的说明。随口闲聊可以顺着接一句，有好奇心但不跑题；推荐时讲清适合的情况，不强推。被纠正就爽快认错并改正，不找借口。不固定称呼，不以“亲”“亲亲”或“主人”开头，也不擅自给买家起昵称。\n"
+        "分寸：买家着急、遇到故障或谈售后时，放低情绪强度，少感叹、少玩笑，先回应具体困扰。只按已知商品和店铺资料说话，不夸口包办，不把未执行的查询或处理说成已完成。不讲虚构经历、背景设定或剧情，也不使用角色专属称呼与台词。\n"
+        "语感参考（不要照抄）：确认需求时像“好呀，你最在意的是哪一点？”，发现理解偏差时像“欸，明白了，你说的是另一种情况。”，被指出错误时像“是我刚才理解偏了，重新说。”"
+    ),
+}
+_LEGACY_CATGIRL_INSTRUCTION = "亲切、克制地回答，可少量使用“喵”；必须先准确回答当前问题。"
+
+
 ERROR_MESSAGES = {
     "credential_store_unavailable": "AI 凭据存储暂时不可用",
     "connection_unconfigured": "当前店铺尚未配置 AI 连接",
@@ -311,6 +330,20 @@ def product_facts(product: dict) -> dict:
     return facts
 
 
+def _facts_have_content(facts: dict) -> bool:
+    """Whether live facts carry anything beyond the item identifier."""
+    if not isinstance(facts, dict):
+        return False
+    if str(facts.get("title") or "").strip() or str(facts.get("description") or "").strip():
+        return True
+    if str(facts.get("status") or "").strip():
+        return True
+    if facts.get("price") not in ("", None) or facts.get("stock") not in ("", None):
+        return True
+    skus = facts.get("skus")
+    return bool(isinstance(skus, list) and skus)
+
+
 def identity_fingerprint(product: dict) -> str:
     """Fingerprint semantic product identity, excluding live price/stock/status."""
     facts = product_facts(product)
@@ -439,13 +472,9 @@ def empty_store_config() -> dict:
         "common_knowledge": "",
         "persona_preset": "catgirl",
         "persona_name": "小喵客服",
-        "persona_instruction": "亲切、克制地回答，可少量使用“喵”；必须先准确回答当前问题。",
-        "tone": "friendly",
-        "buyer_address": "亲",
-        "reply_length": "short",
-        "emoji_level": "low",
-        "forbidden_claims": "不得编造价格、库存、规格或商品状态\n不得声称已付款、已到账、已发货或已退款\n不得引导站外联系或交易",
-        "handoff_rules": "退款、争议或投诉\n付款、订单、发货状态无法核实时\n商品事实不足或冲突时",
+        "persona_instruction": PERSONA_PRESET_INSTRUCTIONS["catgirl"],
+        "forbidden_claims": "",
+        "handoff_rules": "",
         # Deprecated compatibility field. Runtime generation never sends it.
         "fallback_reply": "",
     }
@@ -464,28 +493,34 @@ def _natural_lines(value: Any, *, maximum: int = 50, item_limit: int = 300) -> s
     return "\n".join(_bounded_list(value, maximum=maximum, item_limit=item_limit))
 
 
+# 旧版本内置默认文案（非用户填写）。读取时按“未设置”处理，避免我们替店主做决定。
+LEGACY_DEFAULT_HANDOFF_RULES = "退款、争议或投诉\n付款、订单、发货状态无法核实时\n商品事实不足或冲突时"
+LEGACY_DEFAULT_FORBIDDEN_CLAIMS = "不得编造价格、库存、规格或商品状态\n不得声称已付款、已到账、已发货或已退款\n不得引导站外联系或交易"
+
+
 def normalize_store_config(value: Any) -> dict:
     if not isinstance(value, dict):
         raise AIServiceError("invalid_payload", 400)
     defaults = empty_store_config()
-    allowed = set(defaults) | {"content"}
+    # Old clients and saved configs may still send retired style controls.
+    # Accept their keys without retaining or using them in the reply context.
+    allowed = set(defaults) | {"content", "tone", "buyer_address", "reply_length", "emoji_level"}
     if set(value) - allowed:
         raise AIServiceError("invalid_payload", 400)
     enabled = value.get("enabled", defaults["enabled"])
     if not isinstance(enabled, bool):
         raise AIServiceError("invalid_payload", 400)
     preset = _bounded_text(value.get("persona_preset", defaults["persona_preset"]), 32).lower()
-    if preset not in {"none", "professional", "friendly", "catgirl", "custom"}:
+    if preset not in {"none", "professional", "friendly", "catgirl", "mint", "custom"}:
         raise AIServiceError("invalid_payload", 400)
-    tone = _bounded_text(value.get("tone", defaults["tone"]), 32).lower()
-    if tone not in {"natural", "professional", "friendly", "lively", "restrained"}:
-        raise AIServiceError("invalid_payload", 400)
-    reply_length = _bounded_text(value.get("reply_length", defaults["reply_length"]), 32).lower()
-    if reply_length not in {"short", "standard", "detailed"}:
-        raise AIServiceError("invalid_payload", 400)
-    emoji_level = _bounded_text(value.get("emoji_level", defaults["emoji_level"]), 32).lower()
-    if emoji_level not in {"none", "low", "medium"}:
-        raise AIServiceError("invalid_payload", 400)
+    if preset == "mint":
+        defaults["persona_name"] = "薄荷客服"
+    persona_instruction = _bounded_text(value.get("persona_instruction", ""), 1200)
+    if preset in PERSONA_PRESET_INSTRUCTIONS and (
+        not persona_instruction
+        or (preset == "catgirl" and persona_instruction == _LEGACY_CATGIRL_INSTRUCTION)
+    ):
+        persona_instruction = PERSONA_PRESET_INSTRUCTIONS[preset]
     raw_content = value.get("store_content")
     if raw_content is None:
         raw_content = value.get("content")
@@ -499,13 +534,15 @@ def normalize_store_config(value: Any) -> dict:
         "common_knowledge": content,
         "persona_preset": preset,
         "persona_name": _bounded_text(value.get("persona_name", defaults["persona_name"]), 80),
-        "persona_instruction": _bounded_text(value.get("persona_instruction", defaults["persona_instruction"]), 1200),
-        "tone": tone,
-        "buyer_address": _bounded_text(value.get("buyer_address", defaults["buyer_address"]), 40),
-        "reply_length": reply_length,
-        "emoji_level": emoji_level,
-        "forbidden_claims": _natural_lines(value.get("forbidden_claims", defaults["forbidden_claims"])),
-        "handoff_rules": _natural_lines(value.get("handoff_rules", defaults["handoff_rules"])),
+        "persona_instruction": persona_instruction,
+        "forbidden_claims": (
+            "" if _natural_lines(value.get("forbidden_claims", defaults["forbidden_claims"])) == LEGACY_DEFAULT_FORBIDDEN_CLAIMS
+            else _natural_lines(value.get("forbidden_claims", defaults["forbidden_claims"]))
+        ),
+        "handoff_rules": (
+            "" if _natural_lines(value.get("handoff_rules", defaults["handoff_rules"])) == LEGACY_DEFAULT_HANDOFF_RULES
+            else _natural_lines(value.get("handoff_rules", defaults["handoff_rules"]))
+        ),
         "fallback_reply": "",
     }
 
@@ -642,10 +679,6 @@ def _prompt_store_config(value: dict) -> dict:
         "persona_preset": clean["persona_preset"],
         "persona_name": _prompt_text(clean["persona_name"], 60),
         "persona_instruction": _prompt_text(clean["persona_instruction"], 500),
-        "tone": clean["tone"],
-        "buyer_address": _prompt_text(clean["buyer_address"], 30),
-        "reply_length": clean["reply_length"],
-        "emoji_level": clean["emoji_level"],
         "forbidden_claims": _prompt_text(clean["forbidden_claims"], 2_000),
         "handoff_rules": _prompt_text(clean["handoff_rules"], 2_000),
     }
@@ -2027,10 +2060,7 @@ class AIService:
     def _persona_payload(store_config: dict) -> dict:
         return {
             key: store_config.get(key)
-            for key in (
-                "persona_preset", "persona_name", "persona_instruction", "tone",
-                "buyer_address", "reply_length", "emoji_level",
-            )
+            for key in ("persona_preset", "persona_name", "persona_instruction")
         }
 
     def compile_effective_context(
@@ -2100,6 +2130,7 @@ class AIService:
         knowledge_override: dict | None,
         require_enabled: bool,
         allow_sandbox_defaults: bool = False,
+        tolerant_item: bool = False,
     ) -> tuple[dict, dict | None, dict | None, str, int, str, int | None]:
         settings = self.get_config(*scope)
         published = settings.get("published") if isinstance(settings.get("published"), dict) else None
@@ -2135,23 +2166,50 @@ class AIService:
         knowledge = None
         knowledge_status = "not_selected"
         if item_id:
-            product = self.product(*scope, item_id)
-            trusted_facts = product_facts(product)
+            trusted_facts = None
+            try:
+                product = self.product(*scope, item_id)
+            except AIServiceError as exc:
+                # 实时回复允许商品暂不在本店快照内（快照滞后/未覆盖），降级处理；
+                # 沙盘预览仍保持严格报错。
+                if not tolerant_item or exc.code != "item_not_found":
+                    raise
+            else:
+                trusted_facts = product_facts(product)
             if item_context is not None:
                 if not isinstance(item_context, dict):
                     raise AIServiceError("invalid_payload", 400)
                 claimed_id = item_context.get("id") or item_context.get("item_id") or item_context.get("itemId")
-                if claimed_id is not None and _safe_item_id(claimed_id) != trusted_facts["item_id"]:
+                if (
+                    trusted_facts is not None
+                    and claimed_id is not None
+                    and _safe_item_id(claimed_id) != trusted_facts["item_id"]
+                ):
                     raise AIServiceError("item_not_found", 404)
-                facts = product_facts({**item_context, "id": item_id})
+                candidate_facts = product_facts({**item_context, "id": item_id})
+                if (
+                    _facts_have_content(candidate_facts)
+                    or trusted_facts is None
+                    or not _facts_have_content(trusted_facts)
+                ):
+                    facts = candidate_facts
+                else:
+                    facts = trusted_facts
             else:
                 facts = trusted_facts
             if knowledge_override is not None:
                 knowledge = normalize_knowledge(knowledge_override)
                 knowledge_status = "draft_override" if knowledge_has_content(knowledge) else "unconfigured"
             else:
-                current = self.get_knowledge(*scope, item_id)
-                if current["status"] == "published":
+                try:
+                    current = self.get_knowledge(*scope, item_id)
+                except AIServiceError as exc:
+                    if not tolerant_item or exc.code != "item_not_found":
+                        raise
+                    current = None
+                if current is None:
+                    knowledge_status = "unavailable"
+                elif current["status"] == "published":
                     knowledge = current["published"]["knowledge"]
                     knowledge_status = "published"
                 else:
@@ -2186,6 +2244,7 @@ class AIService:
             store_config_override=None,
             knowledge_override=None,
             require_enabled=True,
+            tolerant_item=True,
         )
         compiled = self.compile_effective_context(
             current_message=message,
@@ -2273,7 +2332,7 @@ service = AIService()
 
 __all__ = [
     "AIService", "AIServiceError", "AgentProviderError", "CONNECTION_FILE", "CONNECTION_SECRET_FILE",
-    "KNOWLEDGE_DIR", "SETTINGS_FILE", "SNAPSHOT_FILE", "TEMPLATES_FILE", "catgirl_preset",
+    "KNOWLEDGE_DIR", "PERSONA_PRESET_INSTRUCTIONS", "SETTINGS_FILE", "SNAPSHOT_FILE", "TEMPLATES_FILE", "catgirl_preset",
     "empty_knowledge", "empty_store_config", "facts_fingerprint", "identity_fingerprint",
     "knowledge_has_content", "normalize_knowledge", "normalize_store_config", "product_facts",
     "service", "snapshot_fingerprint", "store_config_has_content",

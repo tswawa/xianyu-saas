@@ -148,6 +148,34 @@ def products_document(value):
     return copy.deepcopy(value)
 
 
+def has_enabled_delivery(document, snapshot):
+    """Whether a verified shop has a configured, enabled delivery listener.
+
+    Inventory availability is checked per order; temporary stock exhaustion
+    must not disable the listener before the owner replenishes it.
+    """
+    products = products_document(document)
+    available = {
+        str(row.get("id"))
+        for row in (snapshot or {}).get("products", [])
+        if isinstance(row, dict)
+    }
+    for entry in products["types"]:
+        if entry.get("enabled", True) is not True or not available.intersection(item_ids(entry)):
+            continue
+        if entry["delivery"] == "material":
+            payload = entry.get("payload", entry.get("material", ""))
+            if isinstance(payload, str) and payload.strip():
+                return True
+        elif entry["delivery"] == "pan":
+            tags = entry.get("resource_match")
+            if isinstance(tags, list) and tags and all(isinstance(tag, str) and tag.strip() for tag in tags):
+                return True
+        elif entry["delivery"] == "redeem":
+            return True
+    return False
+
+
 def normalise_template_item_ids(raw, snapshot, preserved_item_ids=None):
     if not isinstance(raw, dict):
         raise FulfillmentConfigError()

@@ -660,6 +660,28 @@ class XianyuApiResilienceTests(unittest.TestCase):
             "ret": ["SUCCESS::调用成功"], "data": {"title": "CAPTCHA RGV587 被挤爆"},
         }))
 
+    def test_punish_page_maps_to_risk_control_without_retry(self):
+        api = XianyuApis()
+
+        class FakeResponse:
+            url = "https://h5api.m.goofish.com:443//h5/x/_____tmd_____/punish?x5secdata=abc"
+            text = "<html><script>RGV587_ERROR</script></html>"
+            status_code = 200
+            headers = {}
+
+            def json(self):
+                raise ValueError("not json")
+
+        class FakeSession:
+            def post(self, *_args, **_kwargs):
+                return FakeResponse()
+
+        self.assertTrue(XianyuApis._looks_like_risk_control(FakeResponse()))
+        api.session = FakeSession()
+        with self.assertRaises(XianyuAuthenticationError) as ctx:
+            api._post_json("https://h5api.m.goofish.com/h5/x")
+        self.assertEqual(ctx.exception.code, "risk_control")
+
     def test_all_request_paths_keep_risk_and_explicit_verification_protected(self):
         calls = (
             lambda api: api.get_token("device"),

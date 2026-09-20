@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -115,8 +116,102 @@ def _test_worker_runtime_configuration() -> None:
                 log_file.close()
 
 
+def _test_legacy_worker_runtime_migration() -> None:
+    from db import DB
+
+    with tempfile.TemporaryDirectory(prefix="xianyu-worker-migration-") as root:
+        path = Path(root) / "legacy.db"
+        legacy = sqlite3.connect(path)
+        legacy.row_factory = sqlite3.Row
+        try:
+            # Frozen v0.4.5 worker_runtimes schema: no auto_resume column.
+            legacy.execute(
+                """
+                CREATE TABLE worker_runtimes (
+                    user_id INTEGER NOT NULL,
+                    account_id INTEGER NOT NULL,
+                    desired_state TEXT NOT NULL DEFAULT 'stopped',
+                    mode TEXT NOT NULL DEFAULT 'rules',
+                    state TEXT NOT NULL DEFAULT 'stopped',
+                    pid INTEGER,
+                    generation INTEGER NOT NULL DEFAULT 0,
+                    started_at REAL,
+                    heartbeat_at REAL,
+                    exit_code INTEGER,
+                    last_error TEXT NOT NULL DEFAULT '',
+                    updated_at REAL NOT NULL,
+                    PRIMARY KEY(user_id, account_id)
+                )
+                """
+            )
+            cases = (
+                (1, "stopped", "stopped", None, 0),
+                (2, "running", "running", 42002, 1),
+                (3, "running", "error", None, 1),
+                (4, "stopped", "error", None, 1),
+                (5, "running", "stopped", None, 1),
+                (6, "stopped", "stopped", 42006, 1),
+                (7, "stopped", "degraded", None, 1),
+            )
+            for account_id, desired, state, pid, _expected in cases:
+                legacy.execute(
+                    """
+                    INSERT INTO worker_runtimes(
+                        user_id, account_id, desired_state, mode, state, pid,
+                        generation, started_at, heartbeat_at, exit_code, last_error, updated_at
+                    ) VALUES (77, ?, ?, 'rules_ai', ?, ?, 4, 100, 200, 0, 'legacy-record', 300)
+                    """,
+                    (account_id, desired, state, pid),
+                )
+            legacy.commit()
+            before = {
+                int(row["account_id"]): dict(row)
+                for row in legacy.execute("SELECT * FROM worker_runtimes")
+            }
+        finally:
+            legacy.close()
+
+        migrated = DB(str(path))
+        try:
+            for account_id, _desired, _state, _pid, expected in cases:
+                row = dict(migrated.get_worker_runtime(77, account_id))
+                assert row.pop("auto_resume") == expected, (account_id, row)
+                assert row == before[account_id], (account_id, row, before[account_id])
+            # A later explicit start/stop must survive subsequent initialization.
+            assert migrated.set_worker_auto_resume(77, 1, True)
+            assert migrated.set_worker_auto_resume(77, 2, False)
+            after = [dict(row) for row in migrated.list_worker_runtimes()]
+        finally:
+            migrated.con.close()
+
+        reopened = DB(str(path))
+        try:
+            assert [dict(row) for row in reopened.list_worker_runtimes()] == after
+            # Records created after the migration keep the default-on contract.
+            reopened.con.execute(
+                "INSERT INTO worker_runtimes(user_id, account_id, updated_at) VALUES (77, 8, 400)"
+            )
+            assert reopened.get_worker_runtime(77, 8)["auto_resume"] == 1
+        finally:
+            reopened.con.close()
+
+        fresh = DB(str(Path(root) / "fresh.db"))
+        try:
+            fresh.con.execute(
+                "INSERT INTO worker_runtimes(user_id, account_id, updated_at) VALUES (77, 1, 400)"
+            )
+            fresh.con.commit()
+            fresh._init()
+            assert fresh.get_worker_runtime(77, 1)["auto_resume"] == 1
+        finally:
+            fresh.con.close()
+
+    print("worker-runtime migration: legacy stops preserved, other state unchanged, defaults and reinitialization passed")
+
+
 def main() -> None:
     user_id = 77
+    _test_legacy_worker_runtime_migration()
     _test_worker_runtime_configuration()
 
     # A verified deterministic worker can be attached without spawning a
@@ -222,6 +317,71 @@ def main() -> None:
     ):
         assert bot_manager.adopt(user_id, 45124, "rules") == (False, "pid_mismatch")
         assert bot_manager.terminate_pid(user_id, 45124) == (False, "pid_mismatch")
+
+    # A container may reuse the old worker's numeric PID for this very API.
+    # This is positive identity evidence, not permission to signal the process.
+    with (
+        patch.object(bot_manager.os, "getpid", return_value=45141),
+        patch.object(bot_manager.os, "kill") as own_kill,
+        patch.object(bot_manager.os, "killpg") as own_killpg,
+        patch.object(bot_manager.os, "pidfd_open") as own_pidfd,
+        patch.object(bot_manager, "_expected_worker_pid") as own_identity,
+    ):
+        assert bot_manager.adopt(user_id, 45141, "rules") == (False, "pid_reused")
+        assert bot_manager.adopt(user_id, 45141, "rules_ai") == (False, "pid_reused")
+        assert bot_manager.terminate_pid(user_id, 45141) == (False, "pid_reused")
+    own_kill.assert_not_called()
+    own_killpg.assert_not_called()
+    own_pidfd.assert_not_called()
+    own_identity.assert_not_called()
+
+    # Linux can reuse a dead worker PID for a non-leader API thread. Such TIDs
+    # have a readable /proc/<tid> but are absent from /proc directory listings.
+    if sys.platform.startswith("linux"):
+        thread_ready = threading.Event()
+        thread_done = threading.Event()
+        native_ids = []
+
+        def hold_api_thread():
+            native_ids.append(threading.get_native_id())
+            thread_ready.set()
+            thread_done.wait(10)
+
+        api_thread = threading.Thread(target=hold_api_thread)
+        api_thread.start()
+        try:
+            assert thread_ready.wait(5)
+            tid = native_ids[0]
+            assert tid != os.getpid()
+            assert bot_manager._proc_tgid(tid) == os.getpid()
+            with (
+                patch.object(bot_manager.os, "kill") as thread_kill,
+                patch.object(bot_manager.os, "killpg") as thread_killpg,
+                patch.object(bot_manager.os, "pidfd_open") as thread_pidfd,
+                patch.object(bot_manager, "_expected_worker_pid") as thread_identity,
+            ):
+                assert bot_manager.adopt(user_id, tid, "rules") == (False, "pid_reused")
+                assert bot_manager.adopt(user_id, tid, "rules_ai") == (False, "pid_reused")
+                assert bot_manager.terminate_pid(user_id, tid) == (False, "pid_reused")
+            thread_kill.assert_not_called()
+            thread_killpg.assert_not_called()
+            thread_pidfd.assert_not_called()
+            thread_identity.assert_not_called()
+        finally:
+            thread_done.set()
+            api_thread.join(5)
+
+    # An unreadable identity for any other live PID still fails closed.
+    with (
+        patch.object(bot_manager.os, "getpid", return_value=45141),
+        patch.object(bot_manager, "_proc_tgid", return_value=None),
+        patch.object(bot_manager, "_pid_alive", return_value=True),
+        patch.object(bot_manager, "_proc_cmdline", return_value=[]),
+        patch.object(bot_manager.os, "pidfd_open") as unreadable_pidfd,
+    ):
+        assert bot_manager.adopt(user_id, 45142, "rules") == (False, "pid_mismatch")
+        assert bot_manager.terminate_pid(user_id, 45142) == (False, "pid_mismatch")
+    unreadable_pidfd.assert_not_called()
 
     # A verified orphan is bound to a pidfd before signalling.  No numeric PID
     # kill fallback is allowed after a separated identity check.
@@ -494,8 +654,11 @@ def main() -> None:
         class StaleListedDB(FakeDB):
             def acquire_control_lease(self, key, owner, **kwargs):
                 result = super().acquire_control_lease(key, owner, **kwargs)
+                # An explicit stop clears auto_resume; a concurrent stop that
+                # still carried the default-on marker would resume by design.
                 self.row["desired_state"] = "stopped"
                 self.row["pid"] = None
+                self.row["auto_resume"] = 0
                 return result
 
         stale_listed_db = StaleListedDB(
@@ -518,6 +681,7 @@ def main() -> None:
                 "mode": "rules",
                 "desired_state": "stopped",
                 "state": "degraded",
+                "auto_resume": 0,
             }
         )
         with (
@@ -541,6 +705,7 @@ def main() -> None:
                 "mode": "rules",
                 "desired_state": "stopped",
                 "state": "degraded",
+                "auto_resume": 0,
             }
         )
         with (
@@ -586,6 +751,56 @@ def main() -> None:
             app.restore_desired_workers()
         assert start.called is False
         assert mismatch_db.updates[-1][2]["last_error"] == "worker_pid_mismatch"
+
+        # Explicit AI start retires a PID now owned by this API before spawning.
+        reused_start_db = FakeDB({
+            "user_id": 84, "account_id": 1, "pid": 45141, "mode": "rules_ai",
+            "desired_state": "stopped", "state": "degraded", "auto_resume": 1,
+        })
+        reused_account = {"id": 1, "account_key": "default", "enabled": 1}
+
+        def start_after_retirement(*_args):
+            assert reused_start_db.row["pid"] is None
+            return True, "started"
+
+        with (
+            patch.object(app, "db", reused_start_db),
+            patch.object(bot_manager.os, "getpid", return_value=45141),
+            patch.object(bot_manager.os, "pidfd_open") as reused_start_pidfd,
+            patch.object(app, "bot_process_id", return_value=None),
+            patch.object(app, "bot_status", return_value={"connected": True}),
+            patch.object(app, "_require_account_worker_configuration"),
+            patch.object(app, "bot_start", side_effect=start_after_retirement) as reused_start,
+            patch.object(app, "_persist_worker_started") as reused_persist,
+        ):
+            result = app._start_account_worker_locked(
+                {"id": 84}, reused_account, "rules_ai", None,
+                validate_configuration=True, automatic=False,
+            )
+        assert result == "started"
+        reused_start.assert_called_once_with(84, "rules_ai")
+        reused_persist.assert_called_once_with(84, "rules_ai", False, reused_account)
+        reused_start_pidfd.assert_not_called()
+
+        # Startup recovery also discards only that proven stale PID and resumes
+        # an auto-resumable account even if a failed manual start set stopped.
+        reused_restore_db = FakeDB({
+            "user_id": 85, "account_id": 1, "pid": 45141, "mode": "rules_ai",
+            "desired_state": "stopped", "state": "degraded", "auto_resume": 1,
+        })
+        with (
+            patch.object(app, "db", reused_restore_db),
+            patch.object(bot_manager.os, "getpid", return_value=45141),
+            patch.object(bot_manager.os, "pidfd_open") as reused_restore_pidfd,
+            patch.object(app, "bot_status", return_value={"connected": True}),
+            patch.object(app, "bot_start", return_value=(True, "started")) as reused_restore_start,
+            patch.object(app, "_persist_worker_started") as reused_restore_persist,
+        ):
+            app.restore_desired_workers()
+        assert reused_restore_db.row["pid"] is None
+        reused_restore_start.assert_called_once_with(85, "rules_ai", "default")
+        reused_restore_persist.assert_called_once_with(85, "rules_ai", already_running=False)
+        reused_restore_pidfd.assert_not_called()
 
         ai_db = FakeDB(
             {"user_id": 9, "account_id": 1, "pid": 9001, "mode": "rules_ai"}
@@ -732,4 +947,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    if "--migration-only" in sys.argv:
+        _test_legacy_worker_runtime_migration()
+    else:
+        main()

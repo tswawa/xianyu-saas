@@ -227,6 +227,43 @@ class SamplingContracts(Fixture):
         self.reader.after = change
         self.assertEqual(self.one()["metrics_state"], "unavailable")
 
+    def test_runtime_state_reflects_login_and_engine_intent(self):
+        def page_with(intent, process_state="running"):
+            self.process["state"] = process_state
+            monitor = ShopResources(
+                self.db, self.settings,
+                lambda uid, key: dict(self.process), lambda *_: self.valid,
+                reader=self.reader, clock=lambda: self.now, wall_clock=lambda: 1000 + self.now,
+                monitor=lambda uid, key: dict(intent),
+            )
+            return monitor.page(1)["accounts"][0]
+
+        replies_on = page_with({"connected": True, "reauth_required": False,
+                                "reply_enabled": True, "delivery_enabled": True})
+        self.assertEqual(replies_on["runtime_state"], "running_replies")
+        self.assertIs(replies_on["connected"], True)
+        self.assertIs(replies_on["reply_enabled"], True)
+        self.assertIs(replies_on["delivery_enabled"], True)
+
+        delivery_only = page_with({"connected": True, "reauth_required": False,
+                                   "reply_enabled": False, "delivery_enabled": True})
+        self.assertEqual(delivery_only["runtime_state"], "running_delivery_only")
+
+        idle = page_with({"connected": True, "reauth_required": False,
+                          "reply_enabled": False, "delivery_enabled": False})
+        self.assertEqual(idle["runtime_state"], "running_idle")
+
+        reauth = page_with({"connected": False, "reauth_required": True,
+                            "reply_enabled": True, "delivery_enabled": False},
+                           process_state="stopped")
+        self.assertEqual(reauth["runtime_state"], "waiting_login")
+
+        with self.db._lock, self.db.con:
+            self.db.con.execute("UPDATE shop_accounts SET enabled=0 WHERE id=?", (self.first["id"],))
+        disabled = page_with({"connected": True, "reauth_required": False,
+                              "reply_enabled": True, "delivery_enabled": True})
+        self.assertEqual(disabled["runtime_state"], "disabled")
+
     def test_stopping_is_not_zero_and_unregistered_pid_is_not_sampled(self):
         self.process["state"] = "stopping"
         self.assertEqual(self.one()["rss_bytes"], 32 * MIB)
