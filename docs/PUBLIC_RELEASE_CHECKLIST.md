@@ -22,7 +22,7 @@
 - [ ] 整批改动完成后在本地集中验证：按本批改动风险针对性运行相关测试，并执行 `git diff --check` 确认无格式或空白问题；
 - [ ] 推送待发布的 `v*` 标签后，由 `.github/workflows/release.yml` 的 `validate` 阶段统一执行完整 CI 检查，且 `validate` 与 `standalone` 阶段全部通过。
 
-## 5. 14 项发布资产完整性与签名
+## 5. 当前正式版的 14 项发布资产完整性与签名
 - [ ] Docker 资产 4 项完整（`source.zip`、`.docker.manifest.json`、`.docker.manifest.sig`、`.manifest.json`）；
 - [ ] Ubuntu x86_64 资产 4 项完整（管理器、`.tar.gz`、`.manifest.json`、`.manifest.sig`）；
 - [ ] Ubuntu ARM64 资产 4 项完整（管理器、`.tar.gz`、`.manifest.json`、`.manifest.sig`）；
@@ -30,6 +30,8 @@
 - [ ] 流水线中 `scripts/verify-public-release.py` 在本地打包后及远端上传后二次下载核验均成功通过。
 
 ## 6. 发布页面与说明核对
+- [ ] 发布正文只包含用户可感知的功能、修复与必要升级信息，不含文档整理、截图制作、测试执行或内部协作记录；
 - [ ] GitHub Release 正文按「变更在前、三个下载入口与文档链接在后」排布，包含版本核心变更说明；
 - [ ] 包含三个明确的用户下载入口（Docker `source.zip`、Ubuntu x86_64 管理器、Ubuntu ARM64 管理器）及 `README.md` 文档链接，不重复冗长命令；
-- [ ] 确认 Release 状态已由 Draft 转为正式发布（`draft=false`）。
+- [ ] 确认当前正式版 Release 为 `draft=false`、`prerelease=false`，且为 Latest；
+- [ ] v0.4.6 以前的历史 Release 均标记为测试版（`prerelease=true`），上传附件为空；正文指向当前正式版，无失效下载入口。
