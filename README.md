@@ -130,13 +130,13 @@ AI 客服与规则客服分别控制启停。规则开启时先匹配关键词�
 
 ## 安装
 
-当前正式版为 **[0.4.6](https://github.com/tswawa/xianyu-saas/releases/tag/v0.4.6)**。选择一种部署方式即可。后续维护以 0.4.6 为起点，旧版请升级后使用。
+当前正式版为 **[0.4.7](https://github.com/tswawa/xianyu-saas/releases/tag/v0.4.7)**。选择一种部署方式即可。后续维护以 0.4.6 为起点，旧版请升级后使用。
 
 | 部署方式 | 下载 |
 | --- | --- |
-| Docker（推荐） | [源码安装包](https://github.com/tswawa/xianyu-saas/releases/download/v0.4.6/xianyu-saas-0.4.6-source.zip) |
-| Ubuntu x86_64 | [安装器](https://github.com/tswawa/xianyu-saas/releases/download/v0.4.6/xianyu-saas-0.4.6-linux-x86_64) |
-| Ubuntu ARM64 | [安装器](https://github.com/tswawa/xianyu-saas/releases/download/v0.4.6/xianyu-saas-0.4.6-linux-aarch64) |
+| Docker（推荐） | [源码安装包](https://github.com/tswawa/xianyu-saas/releases/download/v0.4.7/xianyu-saas-0.4.7-source.zip) |
+| Ubuntu x86_64 | [安装器](https://github.com/tswawa/xianyu-saas/releases/download/v0.4.7/xianyu-saas-0.4.7-linux-x86_64) |
+| Ubuntu ARM64 | [安装器](https://github.com/tswawa/xianyu-saas/releases/download/v0.4.7/xianyu-saas-0.4.7-linux-aarch64) |
 
 安装请使用上表文件。其他清单与签名由程序处理；GitHub 自动生成的 “Source code” 归档不是这里的源码安装包。
 
@@ -145,7 +145,7 @@ AI 客服与规则客服分别控制启停。规则开启时先匹配关键词�
 需要 Linux Docker Engine 与 Compose 插件。Windows 用户请先启动 Docker Desktop，再在 WSL2 的 Linux 文件系统中运行以下命令。
 
 ```bash
-VERSION=0.4.6
+VERSION=0.4.7
 curl -fLO "https://github.com/tswawa/xianyu-saas/releases/download/v${VERSION}/xianyu-saas-${VERSION}-source.zip"
 unzip -q "xianyu-saas-${VERSION}-source.zip"
 cd "xianyu-saas-${VERSION}"
@@ -161,7 +161,7 @@ Docker 默认仅映射本机端口。远程访问、域名与 HTTPS 配置见[�
 支持 Ubuntu 22.04、24.04 和 Debian 12，需要 systemd。根据处理器架构选择 `x86_64` 或 `aarch64`。
 
 ```bash
-VERSION=0.4.6
+VERSION=0.4.7
 ARCH=x86_64  # ARM64 改为 aarch64
 curl -fLO "https://github.com/tswawa/xianyu-saas/releases/download/v${VERSION}/xianyu-saas-${VERSION}-linux-${ARCH}"
 chmod +x "xianyu-saas-${VERSION}-linux-${ARCH}"
@@ -227,7 +227,7 @@ sudo "./xianyu-saas-${VERSION}-linux-${ARCH}" install --version "$VERSION"
 
 普通代码更新无需重建 Docker 镜像。新版本启动失败时会尝试恢复上一版本；文件更新保留现有业务数据和配置，不自动备份或还原数据库。
 
-已接入内置更新功能的 v0.4.5 可按以上步骤升级到 v0.4.6。升级后不建议降回旧版，旧版无法完整识别本版新增配置。其他旧安装、依赖或数据格式变化时的升级方式，见[部署指南](docs/DEPLOYMENT.md)。
+已接入内置更新功能的 v0.4.5、v0.4.6 可按以上步骤升级到当前正式版。升级后不建议降回旧版，旧版可能无法完整识别新增配置。其他旧安装、依赖或数据格式变化时的升级方式，见[部署指南](docs/DEPLOYMENT.md)。
 
 ## 更多截图
 

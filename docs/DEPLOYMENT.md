@@ -12,7 +12,7 @@
 ### 2. 获取 Release 安装包
 从 GitHub Releases 下载正式版源码安装包：
 ```bash
-VERSION=0.4.6
+VERSION=0.4.7
 curl -fLO "https://github.com/tswawa/xianyu-saas/releases/download/v${VERSION}/xianyu-saas-${VERSION}-source.zip"
 unzip -q "xianyu-saas-${VERSION}-source.zip"
 cd "xianyu-saas-${VERSION}"
@@ -20,7 +20,7 @@ cd "xianyu-saas-${VERSION}"
 
 请使用项目发布的 `xianyu-saas-<version>-source.zip`。GitHub 自动生成的 “Source code” 归档缺少发布构建信息，不是这里的安装包。
 
-当前 v0.4.6 安装包内置更新启动器，Docker 与 Ubuntu 原生部署均可在网页更新并自动重启。更早版本为已停用的历史测试版，不再提供安装附件。
+v0.4.6 起，安装包内置更新启动器，Docker 与 Ubuntu 原生部署均可在网页更新并自动重启。更早版本为已停用的历史测试版，不再提供安装附件。
 
 ### 3. 一键安装并验收（推荐）
 ```bash
@@ -90,10 +90,10 @@ docker compose up -d --build
 
 ### 2. 首次安装
 
-从官方 GitHub Releases 下载对应架构的安装器，执行 `install` 命令。以下命令安装 0.4.6，ARM64 机器请将 `ARCH` 改为 `aarch64`：
+从官方 GitHub Releases 下载对应架构的安装器，执行 `install` 命令。以下命令安装 0.4.7，ARM64 机器请将 `ARCH` 改为 `aarch64`：
 
 ```bash
-VERSION=0.4.6
+VERSION=0.4.7
 ARCH=x86_64  # ARM64 改为 aarch64
 curl -fLO "https://github.com/tswawa/xianyu-saas/releases/download/v${VERSION}/xianyu-saas-${VERSION}-linux-${ARCH}"
 chmod +x "xianyu-saas-${VERSION}-linux-${ARCH}"
@@ -102,7 +102,7 @@ sudo "./xianyu-saas-${VERSION}-linux-${ARCH}" install --version "$VERSION"
 
 也可以通过仓库内的在线安装脚本自动识别架构并安装：
 ```bash
-sudo bash deploy/install.sh --version 0.4.6
+sudo bash deploy/install.sh --version 0.4.7
 ```
 
 - **访问地址**：`http://127.0.0.1:8096/xianyu-saas/`
@@ -146,7 +146,7 @@ sudo xianyu-saas doctor
 
 ## 系统升级与版本维护
 
-0.4.6 是当前维护起点，之前版本不再提供功能修复。已接入内置更新功能的 v0.4.5 可以从网页升级到 0.4.6，现有账号、店铺配置与业务数据保留；旧版明确手动停止的店铺不会因本次升级而自动启动。
+0.4.6 是当前维护起点，之前版本不再提供功能修复。已接入内置更新功能的 v0.4.5、v0.4.6 可以从网页升级到当前正式版，现有账号、店铺配置与业务数据保留；旧版明确手动停止的店铺不会因升级而自动启动。
 
 0.4.6 新增了薄荷人设等配置，旧版不能完整识别。升级并使用新配置后，不要主动降级到旧版；启动失败时恢复上一版本代码的机制不等于任意版本之间的数据回滚。
 
@@ -193,10 +193,10 @@ sudo xianyu-saas doctor
 
 ### 旧安装迁移
 
-v0.4.6 以前的发布附件已撤下，不再通过旧版安装器或 v0.4.0 基线包进行安装与修复。已接入内置启动器的 v0.4.5 仍可在网页更新到 v0.4.6；未接入的历史环境按以下方式处理。
+v0.4.6 以前的发布附件已撤下，不再通过旧版安装器或 v0.4.0 基线包进行安装与修复。已接入内置启动器的 v0.4.5、v0.4.6 可在网页更新到当前正式版；未接入的历史环境按以下方式处理。
 
 - **旧版 Docker 实例升级**：既有旧版 Docker 安装未接入内置启动器时，**重新运行安装脚本不会自动迁移或替换已有容器镜像**（脚本重跑仅执行 `docker start` 启动既有容器）。在维护窗口停止旧容器，保留业务数据挂载与环境配置，使用 v0.4.6 或后续正式版源码安装包重新构建应用容器，并接回原有数据；
-- **Ubuntu 旧版实例修复**：下载 v0.4.6 或后续正式版安装器，显式指定目标版本（例如 `install --version 0.4.6`；在线脚本为 `sudo bash deploy/install.sh --version 0.4.6`）。安装器会核验旧安装的签名与服务模板；无法通过核验的历史布局需保留原数据、主密钥与环境配置后人工迁移，不能依靠已撤下的旧附件恢复安装。
+- **Ubuntu 旧版实例修复**：下载 v0.4.7 或后续正式版安装器，显式指定目标版本（例如 `install --version 0.4.7`；在线脚本为 `sudo bash deploy/install.sh --version 0.4.7`）。安装器会核验旧安装的签名与服务模板；无法通过核验的历史布局需保留原数据、主密钥与环境配置后人工迁移，不能依靠已撤下的旧附件恢复安装。
 - **旧版独立特权更新器兼容**：早期设计的独立更新器组件（`docker-compose.updates.yml` 与 systemd 独立更新服务）代码在系统中继续保留向后兼容，但已不再作为推荐路径。
 
 ---
