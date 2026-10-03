@@ -4961,13 +4961,16 @@ class XianyuLive:
                     self.delivery_store.requeue_inbound_event(event.key, "worker_cancelled")
                     raise
                 except Exception as exc:
-                    retry_status = self.delivery_store.requeue_inbound_event(
-                        event.key, type(exc).__name__
+                    error = (
+                        exc.code
+                        if isinstance(exc, (XianyuApiError, AuthenticationUnavailableError))
+                        else type(exc).__name__
                     )
+                    retry_status = self.delivery_store.requeue_inbound_event(event.key, error)
                     logger.error(
                         "入站事件处理失败 event={} error={} status={}",
                         stable_ref(event.key),
-                        type(exc).__name__,
+                        error,
                         retry_status,
                     )
                     return False

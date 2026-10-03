@@ -250,6 +250,22 @@ def internal_mapping_contracts():
     )
     assert invoked == [("resume", ())]
 
+    class FailingUpdater:
+        LAST_FAILURE_CODE = ""
+
+        @classmethod
+        def main(cls):
+            cls.LAST_FAILURE_CODE = "update_root_required"
+            return 1
+
+    try:
+        invoke_updater("resume", loader=lambda: FailingUpdater)
+    except ManagerError as exc:
+        assert (exc.code, exc.detail) == ("manager_updater_failed", "update_root_required")
+    else:
+        raise AssertionError("a failed updater run must raise")
+    assert ManagerError("manager_updater_failed", detail="Not A Code").detail == ""
+
 
 def static_bundle_contracts():
     spec = (ROOT / "deploy/manager/xianyu-saas-manager.spec").read_text(encoding="utf-8")

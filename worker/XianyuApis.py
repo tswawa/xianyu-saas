@@ -1,5 +1,6 @@
 import time
 import hashlib
+import http.cookiejar
 import json
 import os
 import re
@@ -224,13 +225,75 @@ class XianyuApis:
             "RGV587", "USER_VALIDATE", "_____TMD_____", "/PUNISH",
         ))
 
+    @staticmethod
+    def _is_token_rotation(payload):
+        """True when MTOP rejected only the short-lived ``_m_h5_tk`` signing token."""
+        ret_value = payload.get("ret") if isinstance(payload, dict) else None
+        if isinstance(ret_value, str):
+            ret_value = [ret_value]
+        if not isinstance(ret_value, (list, tuple)):
+            return False
+        return any(
+            isinstance(value, str)
+            and value.partition("::")[0].strip().upper().startswith(
+                ("FAIL_SYS_TOKEN_EX", "FAIL_SYS_TOKEN_EMPTY")
+            )
+            for value in ret_value[:16]
+        )
+
+    def _cookie_items(self):
+        jar = getattr(self.session, "cookies", None)
+        if not isinstance(jar, http.cookiejar.CookieJar):
+            return None
+        return {(cookie.domain, cookie.path, cookie.name): cookie.value for cookie in jar}
+
+    def _collapse_duplicate_cookies(self, before=None):
+        """Keep one cookie per name so lookups by name never raise CookieConflictError.
+
+        cookies.txt is loaded without a domain, while platform responses set the
+        same names (``_m_h5_tk`` and others) under their own domain. Without this
+        the jar holds both until the process restarts and every signed request
+        fails. A value written by the latest response wins, then a platform-set
+        cookie over the domainless baseline. The survivor is stored without a
+        domain, like the baseline, so every platform host still receives it.
+        """
+        jar = getattr(self.session, "cookies", None)
+        if not isinstance(jar, http.cookiejar.CookieJar):
+            return
+        groups = {}
+        for cookie in list(jar):
+            groups.setdefault(cookie.name, []).append(cookie)
+        for name, group in groups.items():
+            if len(group) < 2:
+                continue
+
+            def rank(cookie):
+                fresh = before is not None and before.get(
+                    (cookie.domain, cookie.path, cookie.name)
+                ) != cookie.value
+                return fresh, bool(cookie.domain), cookie.expires or 0
+
+            keep = max(reversed(group), key=rank)
+            for cookie in group:
+                jar.clear(cookie.domain, cookie.path, cookie.name)
+            jar.set_cookie(requests.cookies.create_cookie(name, keep.value))
+
+    def _cookie_value(self, name):
+        with self._session_lock:
+            self._collapse_duplicate_cookies()
+            return self.session.cookies.get(name, "") or ""
+
     def _post_json(self, url, **kwargs):
-        try:
-            response = self.session.post(url, timeout=self.request_timeout, **kwargs)
-        except requests.RequestException as exc:
-            raise XianyuApiError("network_error") from exc
-        except Exception as exc:
-            raise XianyuApiError("network_error") from exc
+        with self._session_lock:
+            before = self._cookie_items()
+            try:
+                response = self.session.post(url, timeout=self.request_timeout, **kwargs)
+            except requests.RequestException as exc:
+                raise XianyuApiError("network_error") from exc
+            except Exception as exc:
+                raise XianyuApiError("network_error") from exc
+            finally:
+                self._collapse_duplicate_cookies(before)
         try:
             payload = response.json()
         except (TypeError, ValueError) as exc:
@@ -242,6 +305,22 @@ class XianyuApis:
                 raise XianyuAuthenticationError("risk_control")
             raise XianyuApiError("response_invalid")
         return response, payload
+
+    def _post_signed(self, endpoint, params, data, headers=None):
+        """Sign with the current ``_m_h5_tk`` and post once.
+
+        Also reports whether the response replaced the token.
+        """
+        with self._session_lock:
+            previous = self._cookie_value("_m_h5_tk")
+            params["sign"] = generate_sign(params["t"], previous.split("_")[0], data["data"])
+            if headers:
+                response, result = self._post_json(
+                    endpoint, params=params, data=data, headers=dict(headers)
+                )
+            else:
+                response, result = self._post_json(endpoint, params=params, data=data)
+            return response, result, self._cookie_value("_m_h5_tk") != previous
 
     def _signed_mtop_request(
         self,
@@ -275,16 +354,14 @@ class XianyuApis:
             if value_type:
                 params["valueType"] = value_type
             try:
-                request_headers = dict(headers) if headers else None
-                with self._session_lock:
-                    token = self.session.cookies.get("_m_h5_tk", "").split("_")[0]
-                    params["sign"] = generate_sign(params["t"], token, data_val)
-                    if request_headers is None:
-                        response, result = self._post_json(endpoint, params=params, data=data)
-                    else:
-                        response, result = self._post_json(
-                            endpoint, params=params, data=data, headers=request_headers
-                        )
+                response, result, rotated = self._post_signed(endpoint, params, data, headers)
+                if rotated and self._is_token_rotation(result):
+                    # MTOP expired the signing token and sent a fresh one with
+                    # the rejection; resending once is the protocol, not a
+                    # session failure.
+                    logger.info("签名令牌已更新，重新发送一次")
+                    params = dict(params, t=str(int(time.time() * 1000)))
+                    response, result, _ = self._post_signed(endpoint, params, data, headers)
             except Exception as exc:
                 last_error_code = exc.code if isinstance(exc, XianyuApiError) else "network_error"
                 logger.warning("订单核验接口请求异常 code={}", last_error_code)
@@ -302,8 +379,6 @@ class XianyuApis:
                 raise XianyuAuthenticationError(last_error_code)
             if last_error_code == "account_restricted":
                 raise XianyuApiError(last_error_code)
-            if "Set-Cookie" in getattr(response, "headers", {}):
-                self.clear_duplicate_cookies()
             logger.warning("订单核验接口调用失败")
             self._wait_before_retry(attempt, attempts, self.request_backoff)
 
@@ -437,23 +512,29 @@ class XianyuApis:
             raise ValueError("media_path extension is invalid")
         params = {"floderId": "0", "appkey": "xy_chat", "_input_charset": "utf-8"}
         with self._session_lock:
-            with open(media_path, "rb") as handle:
-                response = self.session.post(
-                    "https://stream-upload.goofish.com/api/upload.api",
-                    headers=headers,
-                    params=params,
-                    files={"file": (os.path.basename(media_path), handle, media_type)},
-                    timeout=self.request_timeout,
-                )
-                response.raise_for_status()
-                result = response.json()
+            before = self._cookie_items()
+            try:
+                with open(media_path, "rb") as handle:
+                    response = self.session.post(
+                        "https://stream-upload.goofish.com/api/upload.api",
+                        headers=headers,
+                        params=params,
+                        files={"file": (os.path.basename(media_path), handle, media_type)},
+                        timeout=self.request_timeout,
+                    )
+                    response.raise_for_status()
+                    result = response.json()
+            finally:
+                self._collapse_duplicate_cookies(before)
         if not isinstance(result, dict):
             raise XianyuApiError("response_invalid")
         return result
 
     def update_cookies(self, cookies):
         with self._session_lock:
+            before = self._cookie_items()
             self.session.cookies.update(cookies)
+            self._collapse_duplicate_cookies(before)
 
     def cookie_header_snapshot(self):
         """Return a thread-safe snapshot of all current in-memory cookies."""
@@ -474,15 +555,7 @@ class XianyuApis:
     def clear_duplicate_cookies(self):
         """清理重复的cookies"""
         with self._session_lock:
-            new_jar = requests.cookies.RequestsCookieJar()
-            added_cookies = set()
-            cookie_list = list(self.session.cookies)
-            cookie_list.reverse()
-            for cookie in cookie_list:
-                if cookie.name not in added_cookies:
-                    new_jar.set_cookie(cookie)
-                    added_cookies.add(cookie.name)
-            self.session.cookies = new_jar
+            self._collapse_duplicate_cookies()
         # 注意：不写回 .env！运行中轮换的 cookie（_m_h5_tk 等）只用于当前会话，
         # 写回会覆盖人工维护的完整 cookie（含 HttpOnly unb/sgcookie），导致重启后失效。
 
@@ -498,13 +571,13 @@ class XianyuApis:
         params = {'appName': 'xianyu', 'fromSite': '77'}
         with self._session_lock:
             data = {
-                'hid': self.session.cookies.get('unb', ''),
+                'hid': self._cookie_value('unb'),
                 'ltl': 'true',
                 'appName': 'xianyu',
                 'appEntrance': 'web',
-                '_csrf_token': self.session.cookies.get('XSRF-TOKEN', ''),
+                '_csrf_token': self._cookie_value('XSRF-TOKEN'),
                 'umidToken': '',
-                'hsiz': self.session.cookies.get('cookie2', ''),
+                'hsiz': self._cookie_value('cookie2'),
                 'bizParams': 'taobaoBizLoginFrom=web',
                 'mainPage': 'false',
                 'isMobile': 'false',
@@ -557,7 +630,7 @@ class XianyuApis:
             'log_id': '14ad3da6ALVq3n',
         }
         with self._session_lock:
-            token = self.session.cookies.get('_m_h5_tk', '').split('_')[0]
+            token = self._cookie_value('_m_h5_tk').split('_')[0]
             params['sign'] = generate_sign(params['t'], token, data_val)
             response, payload = self._post_json(
                 self.url,
@@ -644,7 +717,7 @@ class XianyuApis:
             }
             try:
                 with self._session_lock:
-                    token = self.session.cookies.get('_m_h5_tk', '').split('_')[0]
+                    token = self._cookie_value('_m_h5_tk').split('_')[0]
                     params['sign'] = generate_sign(params['t'], token, data_val)
                     response, res_json = self._post_json(
                         'https://h5api.m.goofish.com/h5/mtop.taobao.idle.pc.detail/1.0/',

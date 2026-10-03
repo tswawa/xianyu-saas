@@ -75,6 +75,11 @@ MIN_FREE_BYTES = 512 * 1024 * 1024
 SYSTEMD_BIN = "/usr/bin/systemctl"
 SYSTEMD_ANALYZE_BIN = "/usr/bin/systemd-analyze"
 USERADD_BIN = "/usr/sbin/useradd"
+RUNUSER_BIN = "/usr/sbin/runuser"
+ENV_BIN = "/usr/bin/env"
+UPDATE_CAPABILITY_SCRIPT = (
+    "import json, platform_update; print(json.dumps(platform_update.update_capabilities()))"
+)
 HEALTH_URL = "http://127.0.0.1:8096/health"
 HEALTH_ATTEMPTS = 30
 HEALTH_INTERVAL_SECONDS = 1.0
@@ -575,6 +580,20 @@ class CommandAdapter:
             return True
         if len(command) >= 3 and command[:2] == (SYSTEMD_ANALYZE_BIN, "verify"):
             return all(Path(item).name in UNITS for item in command[2:])
+        # The installer's own update-capability probe (_verify_update_capability).
+        if len(command) == 14 and command[:5] == (RUNUSER_BIN, "-u", PRODUCT, "--", ENV_BIN):
+            paths = (command[5], command[8], command[9], command[11])
+            return (
+                command[5].startswith("PYTHONPATH=/")
+                and command[6:8] == ("SAAS_DEPLOYMENT_MODE=systemd", "SAAS_RELEASE_KIND=standalone")
+                and command[8].startswith("SAAS_CURRENT_ROOT=/")
+                and command[9].startswith("SAAS_APP_CODE_DIR=/")
+                and command[10] == "SAAS_UPDATE_PUBLIC_KEY_FILE=/etc/xianyu-saas/update-signing.pub"
+                and command[11].startswith("/")
+                and command[11].endswith("/runtime/python/bin/python3")
+                and command[12:] == ("-c", UPDATE_CAPABILITY_SCRIPT)
+                and not any(character in value for value in paths for character in "\0\r\n")
+            )
         return False
 
     def run(self, command: tuple[str, ...], *, check: bool = True) -> subprocess.CompletedProcess:
@@ -704,12 +723,14 @@ class Installer:
         # may inject a probe because they never run a real systemd/runtime.
         self.update_capability_probe = update_capability_probe or self._verify_update_capability
         self.clock = clock
+        self._install_stage = ""
         self._managed_data_roots: tuple[Path, ...] = ()
         self._managed_tenants_path = Path("/var/lib/xianyu-saas/tenants")
 
     def install(self, *, architecture: str, version: str | None = None) -> dict:
         release: VerifiedRelease | None = None
         manager: VerifiedManager | None = None
+        self._install_stage = ""
         try:
             if architecture not in ASSET_ARCHITECTURES:
                 raise ManagerError("manager_architecture_unsupported")
@@ -1769,6 +1790,7 @@ class Installer:
     def _update_install_journal(self, journal: dict, phase: str, **changes) -> None:
         journal.update(changes)
         journal["phase"] = phase
+        self._install_stage = phase
         self._save_install_journal(journal)
 
     def _read_install_journal(self) -> dict | None:
@@ -2177,13 +2199,12 @@ class Installer:
         if not name or not self.fs.is_file(python):
             return False
         command = (
-            "/usr/sbin/runuser", "-u", name, "--", "/usr/bin/env",
+            RUNUSER_BIN, "-u", name, "--", ENV_BIN,
             f"PYTHONPATH={code_root / 'backend'}:{site}",
             "SAAS_DEPLOYMENT_MODE=systemd", "SAAS_RELEASE_KIND=standalone",
             f"SAAS_CURRENT_ROOT={code_root}", f"SAAS_APP_CODE_DIR={store_root}",
             "SAAS_UPDATE_PUBLIC_KEY_FILE=/etc/xianyu-saas/update-signing.pub",
-            str(python), "-c",
-            "import json, platform_update; print(json.dumps(platform_update.update_capabilities()))",
+            str(python), "-c", UPDATE_CAPABILITY_SCRIPT,
         )
         for _ in range(60):
             result = self.commands.run(command, check=False)
@@ -2397,11 +2418,17 @@ class Installer:
         code = exc.code if isinstance(exc, ManagerError) else "manager_install_failed"
         if code == "manager_update_in_progress":
             return
+        payload = {
+            "schema": 1, "status": "failed", "error_code": code, "updated_at": self.clock(),
+        }
+        if getattr(exc, "detail", ""):
+            payload["detail"] = exc.detail
+        if self._install_stage:
+            # Last install journal phase reached before the failure and rollback.
+            payload["stage"] = self._install_stage
         try:
             self.fs.mkdir(self.paths.updater_state_dir, 0o700)
-            self.fs.atomic_write(self.paths.diagnostic_file, _json_bytes({
-                "schema": 1, "status": "failed", "error_code": code, "updated_at": self.clock(),
-            }), 0o600)
+            self.fs.atomic_write(self.paths.diagnostic_file, _json_bytes(payload), 0o600)
         except Exception:
             pass
 

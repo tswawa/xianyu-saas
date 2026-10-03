@@ -4,7 +4,7 @@
 
   const API_PREFIX = "/xianyu-saas";
   const QR_LOGIN_POLL_MS = 1500;
-  const ASSET_VERSION = "20260920-07";
+  const ASSET_VERSION = "20261003-01";
   const AI_TEXT_PLACEHOLDERS = new Set(["无", "暂无", "没有", "未填写", "待填写", "待补充", "占位", "n/a", "na", "none", "null", "todo", "tbd"]);
   const ICONS = API_PREFIX + "/assets/icons.svg?v=" + ASSET_VERSION + "#";
   // 旧版视图 key → 新版视图 key（历史会话/书签兜底）。
@@ -4396,6 +4396,7 @@
       title: String((requestStatus && COOKIE_STATUS_LABELS[code]) || item?.title || "需要处理"),
       message: String((requestStatus && COOKIE_ERROR_COPY[code]) || item?.message || "当前店铺有一项真实运行状态需要确认。"),
       action,
+      command: item?.action === "requeue_inbound" ? "requeue_inbound" : "",
       tone: item?.severity === "error" ? "error" : "warning",
       view,
     };
@@ -4430,7 +4431,9 @@
         '<svg class="icon"><use href="' + ICONS + '' + icon + '"></use></svg>' +
         '<div class="attention-copy"><strong>' + esc(copy.title) + '</strong><p>' + esc(copy.message) + '</p></div>' +
         '<div class="attention-actions">' +
-          '<button class="button button-secondary" type="button" data-view="' + esc(copy.view) + '">' + esc(copy.action) + '</button>' +
+          (copy.command === "requeue_inbound"
+            ? '<button class="button button-secondary" type="button" data-attention-requeue>' + esc(copy.action) + '</button>'
+            : '<button class="button button-secondary" type="button" data-view="' + esc(copy.view) + '">' + esc(copy.action) + '</button>') +
           '<button class="button attention-status-button' + (resolved ? " is-resolved" : "") + '" type="button" data-attention-toggle="' + esc(item.id) + '" aria-pressed="' + String(resolved) + '" aria-label="' + (resolved ? "恢复为待处理" : "标记为已处理") + '">' + statusIcon + '<span>' + (resolved ? "已处理" : "待处理") + '</span></button>' +
         '</div>' +
       '</div>';
@@ -4454,6 +4457,23 @@
       showToast(selected.resolved ? "已恢复为待处理" : "已标记为处理完成");
     } catch (error) {
       if (accountContextMatches(context)) showToast(error.message || "预警状态更新失败", "error");
+    } finally {
+      if (accountContextMatches(context)) setBusy(button, false);
+    }
+  }
+
+  async function requeueInboundEvents(button) {
+    const context = captureAccountContext();
+    setBusy(button, true);
+    try {
+      const data = await api("/api/bot/inbound/requeue", { method: "POST", body: "{}" });
+      if (!accountContextMatches(context)) return;
+      state.attention = Array.isArray(data?.items) ? data.items : [];
+      renderAttention();
+      renderHomeStats();
+      showToast("已重新提交 " + Number(data?.requeued || 0) + " 条消息");
+    } catch (error) {
+      if (accountContextMatches(context)) showToast(error.message || "重新处理失败", "error");
     } finally {
       if (accountContextMatches(context)) setBusy(button, false);
     }
@@ -10549,6 +10569,13 @@
         event.preventDefault();
         event.stopPropagation();
         void toggleAttentionResolution(attentionToggle.dataset.attentionToggle, attentionToggle);
+        return;
+      }
+      const attentionRequeue = event.target.closest("[data-attention-requeue]");
+      if (attentionRequeue) {
+        event.preventDefault();
+        event.stopPropagation();
+        void requeueInboundEvents(attentionRequeue);
         return;
       }
       const ruleEditorTrigger = event.target.closest("[data-edit-rule]");

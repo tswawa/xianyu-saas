@@ -134,7 +134,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         result = run(sys.argv[1:] if argv is None else argv)
     except ManagerError as exc:
-        print(_json({"ok": False, "error": exc.code}), file=sys.stderr)
+        payload = {"ok": False, "error": exc.code}
+        if exc.detail:
+            payload["detail"] = exc.detail
+        print(_json(payload), file=sys.stderr)
         return exc.exit_code
     except Exception:
         print(_json({"ok": False, "error": "manager_failed"}), file=sys.stderr)

@@ -2514,7 +2514,14 @@ def _parse_cli(argv: list[str]) -> tuple[str, tuple[Path, ...]]:
     raise UpdaterError("update_cli_invalid")
 
 
+# Safe error code of the last failed main() call; the in-process manager
+# bridge reports it instead of a bare exit status.
+LAST_FAILURE_CODE = ""
+
+
 def main() -> int:
+    global LAST_FAILURE_CODE
+    LAST_FAILURE_CODE = ""
     lock_descriptor = None
     intent = None
     config = None
@@ -2573,6 +2580,11 @@ def main() -> int:
                     return 0
             except (UpdaterError, OSError):
                 pass
+        LAST_FAILURE_CODE = _safe_error(exc)
+        print(
+            json.dumps({"ok": False, "error": LAST_FAILURE_CODE, "exception": type(exc).__name__}),
+            file=sys.stderr,
+        )
         return 1
     finally:
         # No app-file deletion before lock acquisition, and no deletion on an

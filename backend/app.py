@@ -3878,8 +3878,16 @@ def _attention_display(item: dict) -> dict:
     message = str(item.get("message") or "").strip()
     action_view = "shops"
     action_label = "查看店铺"
+    action = ""
 
-    if kind == "job":
+    if kind == "inbound":
+        title = title or "买家消息处理失败"
+        message = message or f"有 {count} 条买家消息多次处理失败，已停止自动重试。"
+        action = "requeue_inbound"
+        action_view = "chat"
+        action_label = "重新处理"
+        severity = "error"
+    elif kind == "job":
         job_label = "店铺同步任务" if job_kind == "shop_sync" else "后台任务"
         if code == "dead_letter":
             title = title or "任务需要人工处理"
@@ -3943,6 +3951,7 @@ def _attention_display(item: dict) -> dict:
         "title": title[:120],
         "message": message[:240],
         "severity": safe_severity,
+        "action": action,
         "action_view": action_view,
         "action_label": action_label,
         "desired_state": str(item.get("desired_state") or ""),
@@ -3963,6 +3972,7 @@ def _attention_payload(user, account) -> dict:
         db.attention_items(user_id, include_jobs=include_jobs, account_id=account_id)
     )
     raw_items.extend(records.manual_reply_attention(user_id, account_key))
+    raw_items.extend(records.inbound_dead_letter_attention(user_id, account_key))
 
     items = []
     active_fingerprints = {}
@@ -4069,6 +4079,23 @@ def update_attention_resolution(
     updated = _attention_payload(user, account)
     updated.pop("_items", None)
     return {"ok": True, **updated}
+
+
+@app.post("/api/bot/inbound/requeue")
+def requeue_inbound_dead_letters(
+    user=Depends(Auth.current_user),
+    account=Depends(current_shop_account),
+):
+    _require_permission(user, "records.read")
+    requeued = records.requeue_inbound_dead_letters(user["id"], str(account["account_key"]))
+    if requeued is None:
+        raise HTTPException(
+            503,
+            detail={"code": "inbound_requeue_failed", "message": "重新处理没有提交成功，请稍后再试"},
+        )
+    updated = _attention_payload(user, account)
+    updated.pop("_items", None)
+    return {"ok": True, "requeued": requeued, **updated}
 
 
 @app.get("/api/bot/jobs/{job_id}")

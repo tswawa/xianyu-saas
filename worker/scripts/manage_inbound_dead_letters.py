@@ -76,6 +76,14 @@ def safe_error(value):
         "LLMServiceError",
         "LLMEmptyResponseError",
         "ManualTakeoverError",
+        "network_error",
+        "platform_busy",
+        "response_invalid",
+        "token_unavailable",
+        "session_expired",
+        "risk_control",
+        "verification_required",
+        "account_restricted",
     }
     if isinstance(value, str) and value in safe_types:
         return value

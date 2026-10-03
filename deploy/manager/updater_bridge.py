@@ -130,5 +130,7 @@ def invoke_updater(
             else:
                 os.environ[name] = value
     if result != 0:
-        raise ManagerError("manager_updater_failed")
+        raise ManagerError(
+            "manager_updater_failed", detail=getattr(updater, "LAST_FAILURE_CODE", "")
+        )
     return {"ok": True, "action": action, "updater_exit_code": result}

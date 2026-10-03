@@ -697,6 +697,45 @@ def managed_runtime_upgrade_and_readiness(run: Path) -> None:
     print("installer: signed runtime upgrade preserves data, resets older web code and requires readiness on rerun")
 
 
+def update_capability_probe_uses_real_command_policy(run: Path) -> None:
+    """The fresh-install probe must pass the same policy CommandAdapter.run enforces (#24)."""
+    installer, _, _, _, _, _ = new_installer(run / "capability-probe")
+    executed = []
+
+    class ProbeCommands(DryCommands):
+        def run(self, command, *, check=True):
+            command = tuple(command)
+            if not CommandAdapter._allowed(command):
+                raise ManagerError("manager_command_rejected")
+            executed.append(command)
+            return subprocess.CompletedProcess(
+                command, 0, stdout='{"apply": true, "deployment": "systemd"}', stderr=""
+            )
+
+    installer.commands = ProbeCommands()
+    installer._account_name = lambda _account: "xianyu-saas"
+    python = installer.paths.current_link / "runtime/python/bin/python3"
+    python.parent.mkdir(parents=True, exist_ok=True)
+    python.write_bytes(b"")
+    for code_root in (installer.paths.current_link, installer._file_update_store_link()):
+        assert installer._verify_update_capability(managed_identity(), code_root) is True
+    assert len(executed) == 2 and all(command[0] == "/usr/sbin/runuser" for command in executed)
+    probe = executed[0]
+    for index, value in (
+        (2, "root"),
+        (4, "/bin/sh"),
+        (6, "SAAS_DEPLOYMENT_MODE=docker"),
+        (11, "/usr/bin/python3"),
+        (13, "import os; os.system('id')"),
+    ):
+        tampered = list(probe)
+        tampered[index] = value
+        assert not CommandAdapter._allowed(tuple(tampered)), index
+    assert not CommandAdapter._allowed(probe + ("extra",))
+    assert not CommandAdapter._allowed(("/usr/sbin/runuser", "-u", "xianyu-saas", "--", "/bin/sh"))
+    print("installer: fresh-install update probe passes the real command policy; variants stay rejected")
+
+
 def existing_environment_is_never_overwritten(run: Path) -> None:
     installer, _, _, _, _, _ = new_installer(run / "existing-env")
     original = write_environment(installer.paths.env_file)
@@ -905,7 +944,7 @@ def assert_legacy_restored(fixture) -> None:
 
 def failure_recovery(run: Path) -> None:
     def fail_initialize(_environment):
-        raise ManagerError("manager_updater_failed")
+        raise ManagerError("manager_updater_failed", detail="update_root_required")
 
     fixture = configure_legacy(run / "rollback-initialize", "/srv/xianyu-saas", initializer=fail_initialize)
     installer = fixture[0]
@@ -913,6 +952,9 @@ def failure_recovery(run: Path) -> None:
     assert_legacy_restored(fixture)
     diagnostic = json.loads(installer.paths.diagnostic_file.read_bytes())
     assert diagnostic["error_code"] == "manager_updater_failed"
+    # The rollback leaves no files behind, so the diagnostic must say where and why.
+    assert diagnostic["detail"] == "update_root_required"
+    assert diagnostic["stage"] == "units"
 
     fixture = configure_legacy(run / "rollback-health", "/srv/xianyu-saas", healthy=False)
     installer, _, commands, network = fixture[:4]
@@ -1233,6 +1275,7 @@ def main() -> None:
         run = Path(temporary)
         successful_transaction_and_repeat(run)
         managed_runtime_upgrade_and_readiness(run)
+        update_capability_probe_uses_real_command_policy(run)
         existing_environment_is_never_overwritten(run)
         architecture_selection(run)
         signed_unmanaged_adoption(run)

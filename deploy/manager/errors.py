@@ -87,12 +87,15 @@ EXIT_CODES = {
 class ManagerError(RuntimeError):
     """An expected failure with a machine-stable public code."""
 
-    def __init__(self, code: str, message: str = "manager operation failed"):
+    def __init__(self, code: str, message: str = "manager operation failed", *, detail: str = ""):
         safe = str(code)
         if not _ERROR_CODE.fullmatch(safe):
             safe = "manager_failed"
         super().__init__(message)
         self.code = safe
+        # Optional machine code from a lower layer, such as the updater.
+        detail = str(detail or "")
+        self.detail = detail if _ERROR_CODE.fullmatch(detail) else ""
 
     @property
     def exit_code(self) -> int:

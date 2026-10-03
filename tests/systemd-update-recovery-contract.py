@@ -573,10 +573,18 @@ def baseline_import_contracts(updater):
         inputs = build_offline_bundle(
             updater, f.key, f.root / "offline-cli", "0.3.8"
         )
+        diagnostics = io.StringIO()
         with patch.object(updater.Config, "from_env", return_value=f.config), patch.object(
             updater.sys, "argv", [str(UPDATER_FILE), updater.BASELINE_IMPORT_OPTION, *map(str, inputs[:3])]
-        ), patch.object(updater.os, "geteuid", return_value=12345):
+        ), patch.object(updater.os, "geteuid", return_value=12345), patch.object(
+            updater.sys, "stderr", diagnostics
+        ):
             assert updater.main() == 1
+        # A failed run names its error instead of a bare exit status.
+        assert updater.LAST_FAILURE_CODE == "update_root_required"
+        assert json.loads(diagnostics.getvalue()) == {
+            "ok": False, "error": "update_root_required", "exception": "UpdaterError",
+        }
         assert not (f.config.releases_dir / "0.3.8").exists()
         if os.geteuid() == 0:
             with patch.object(updater.Config, "from_env", return_value=f.config), patch.object(

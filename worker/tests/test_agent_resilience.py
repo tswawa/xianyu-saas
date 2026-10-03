@@ -1,4 +1,5 @@
 import os
+import http.client
 import json
 import tempfile
 import threading
@@ -21,6 +22,7 @@ from XianyuAgent import (
     XianyuReplyBot,
 )
 from XianyuApis import XianyuApiError, XianyuApis, XianyuAuthenticationError
+from utils.xianyu_utils import generate_sign
 from ai_runtime import AIRuntimeFormatError, AIRuntimeMissingError, load_published_context
 from platform_profile import CHROME_MAJOR, ORIGIN, PLATFORM, REFERER, USER_AGENT
 
@@ -40,6 +42,17 @@ def completion_response_with_reasoning(content, reasoning_content="internal"):
                 )
             )
         ]
+    )
+
+
+def set_platform_cookies(jar, url, *set_cookie_values):
+    """Apply Set-Cookie headers with the same cookielib rules requests uses."""
+    message = http.client.HTTPMessage()
+    for value in set_cookie_values:
+        message["Set-Cookie"] = value
+    request = requests.Request("POST", url).prepare()
+    jar.extract_cookies(
+        requests.cookies.MockResponse(message), requests.cookies.MockRequest(request)
     )
 
 
@@ -780,6 +793,102 @@ class XianyuApiResilienceTests(unittest.TestCase):
         self.assertIn("_m_h5_tk=new_2", snapshot)
         self.assertNotIn("old_1", snapshot)
         self.assertEqual(snapshot.count("_m_h5_tk="), 1)
+
+    def test_platform_cookie_beside_cookies_txt_does_not_break_signed_requests(self):
+        # #25: cookies.txt has no domain; MTOP re-sets the same names for
+        # .goofish.com. The second lookup used to raise CookieConflictError,
+        # which surfaced as network_error until the worker restarted.
+        api, session, _ = self.make_api(trade_max_attempts=1)
+        api.update_cookies({"unb": "seller", "_m_h5_tk": "old_1", "_m_h5_tk_enc": "old_enc"})
+
+        def platform(url, **kwargs):
+            set_platform_cookies(
+                session.cookies,
+                url,
+                "_m_h5_tk=new_2; Domain=.goofish.com; Path=/",
+                "_m_h5_tk_enc=new_enc; Domain=.goofish.com; Path=/",
+            )
+            return json_response({"ret": ["SUCCESS::调用成功"], "data": {}})
+
+        session.post.side_effect = platform
+        api.get_order_detail("5005")
+        api.get_order_detail("5006")
+
+        second = session.post.call_args_list[1].kwargs
+        self.assertEqual(
+            second["params"]["sign"],
+            generate_sign(second["params"]["t"], "new", second["data"]["data"]),
+        )
+        self.assertEqual(
+            sorted((cookie.name, cookie.value) for cookie in session.cookies),
+            [("_m_h5_tk", "new_2"), ("_m_h5_tk_enc", "new_enc"), ("unb", "seller")],
+        )
+
+    def test_cookie_reads_collapse_duplicates_instead_of_raising(self):
+        api, session, _ = self.make_api()
+        session.cookies.set("_m_h5_tk", "old_1")
+        session.cookies.set("_m_h5_tk", "new_2", domain=".goofish.com")
+        session.cookies.set("unb", "seller")
+        session.cookies.set("unb", "seller", domain=".goofish.com")
+        session.post.return_value = json_response(
+            {"ret": ["SUCCESS::调用成功"], "data": {"accessToken": "access"}}
+        )
+
+        api.get_token("device")
+
+        params = session.post.call_args.kwargs["params"]
+        data = session.post.call_args.kwargs["data"]["data"]
+        self.assertEqual(params["sign"], generate_sign(params["t"], "new", data))
+        self.assertEqual(
+            sorted((cookie.name, cookie.value, cookie.domain) for cookie in session.cookies),
+            [("_m_h5_tk", "new_2", ""), ("unb", "seller", "")],
+        )
+
+    def test_expired_signing_token_is_resent_once_with_the_rotated_cookie(self):
+        api, session, _ = self.make_api(trade_max_attempts=1)
+        api.update_cookies({"unb": "seller", "_m_h5_tk": "old_1"})
+        replies = [
+            ("_m_h5_tk=new_2; Domain=.goofish.com; Path=/", {"ret": ["FAIL_SYS_TOKEN_EXOIRED::令牌过期"]}),
+            (None, {"ret": ["SUCCESS::调用成功"], "data": {"status": 2}}),
+        ]
+
+        def platform(url, **kwargs):
+            cookie, payload = replies.pop(0)
+            if cookie:
+                set_platform_cookies(session.cookies, url, cookie)
+            return json_response(payload)
+
+        session.post.side_effect = platform
+        self.assertEqual(api.get_order_detail("5005")["data"], {"status": 2})
+        first, second = (call.kwargs for call in session.post.call_args_list)
+        self.assertEqual(first["params"]["sign"], generate_sign(first["params"]["t"], "old", first["data"]["data"]))
+        self.assertEqual(second["params"]["sign"], generate_sign(second["params"]["t"], "new", second["data"]["data"]))
+
+    def test_expired_signing_token_without_rotation_still_fails_closed(self):
+        expired = {"ret": ["FAIL_SYS_TOKEN_EXOIRED::令牌过期"]}
+        api, session, _ = self.make_api(trade_max_attempts=1)
+        api.update_cookies({"unb": "seller", "_m_h5_tk": "old_1"})
+        session.post.return_value = json_response(expired)
+        with self.assertRaises(XianyuAuthenticationError) as raised:
+            api.get_order_detail("5005")
+        self.assertEqual(raised.exception.code, "session_expired")
+        self.assertEqual(session.post.call_count, 1)
+
+        api, session, _ = self.make_api(trade_max_attempts=1)
+        api.update_cookies({"unb": "seller", "_m_h5_tk": "old_1"})
+        rotations = iter(("new_2", "new_3"))
+
+        def always_expired(url, **kwargs):
+            set_platform_cookies(
+                session.cookies, url, f"_m_h5_tk={next(rotations)}; Domain=.goofish.com; Path=/"
+            )
+            return json_response(expired)
+
+        session.post.side_effect = always_expired
+        with self.assertRaises(XianyuAuthenticationError) as raised:
+            api.get_order_detail("5005")
+        self.assertEqual(raised.exception.code, "session_expired")
+        self.assertEqual(session.post.call_count, 2)
 
     def test_token_network_error_is_one_classified_request(self):
         api, session, sleeps = self.make_api(token_max_attempts=3)

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import base64
+import importlib.util
 import json
 import os
 import sqlite3
@@ -678,7 +679,7 @@ def main():
     assert all(
         set(item) == {
             "id", "kind", "code", "account_id", "error_code", "count", "title", "message",
-            "severity", "action_view", "action_label", "resolved", "resolved_at",
+            "severity", "action", "action_view", "action_label", "resolved", "resolved_at",
         }
         for item in attention_payload["items"]
     )
@@ -707,6 +708,45 @@ def main():
         assert reopened_item["resolved"] is False
         assert reopened_item["resolved_at"] is None
     assert client.put("/api/bot/attention/att_000000000000000000000000", json={"resolved": True}).status_code == 404
+
+    # A buyer message (payment notices included) that used up its retries is
+    # listed under 需要处理 and can be handed back to the worker queue (#25).
+    store_spec = importlib.util.spec_from_file_location(
+        "contract_delivery_store", Path(__file__).resolve().parents[1] / "worker" / "delivery_store.py"
+    )
+    store_module = importlib.util.module_from_spec(store_spec)
+    store_spec.loader.exec_module(store_module)
+    store_clock = [time.time()]
+    free_account_root = app.records._account_root(
+        int(app.db.get_user("free-user")["id"]), "default", create=True
+    )
+    store = store_module.DeliveryStore(
+        os.path.join(free_account_root, "delivery_state.db"), now_fn=lambda: store_clock[0]
+    )
+    store.record_inbound_event("contract-paid", "contract-chat", {"n": 1})
+    for _ in range(store.MAX_INBOUND_ATTEMPTS):
+        assert store.claim_inbound_event("contract-paid") is not None
+        if store.requeue_inbound_event("contract-paid", "network_error") == "dead_letter":
+            break
+        store_clock[0] += 300
+    assert store.dead_letter_inbound_count() == 1
+    inbound_item = next(
+        item for item in client.get("/api/bot/attention").json()["items"] if item["kind"] == "inbound"
+    )
+    assert inbound_item["code"] == "inbound_dead_letter"
+    assert (inbound_item["action"], inbound_item["action_label"]) == ("requeue_inbound", "重新处理")
+    assert inbound_item["count"] == 1 and inbound_item["severity"] == "error"
+    assert "网络请求失败" in inbound_item["message"]
+    requeued = client.post("/api/bot/inbound/requeue")
+    assert requeued.status_code == 200, requeued.text
+    assert requeued.json()["requeued"] == 1
+    assert all(item["kind"] != "inbound" for item in requeued.json()["items"])
+    assert store.dead_letter_inbound_count() == 0
+    replay = store.claim_inbound_event("contract-paid")
+    assert replay is not None and json.loads(replay.payload) == {"n": 1}
+    store.complete_inbound_event("contract-paid")
+    assert client.post("/api/bot/inbound/requeue").json()["requeued"] == 0
+
     tenant_dir = Path(TENANTS_PATH) / str(app.db.get_user("free-user")["id"])
     state_file = tenant_dir / "shop_sync_state.json"
     assert json.loads(state_file.read_text())["code"] == "verified"

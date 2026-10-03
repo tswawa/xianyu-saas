@@ -1143,6 +1143,22 @@ function createServer() {
           resolved_total: fixtures.attention.length - pendingTotal,
         });
       }
+      if (apiPath === "/api/bot/inbound/requeue" && req.method === "POST") {
+        const requeued = fixtures.attention
+          .filter((item) => item.kind === "inbound")
+          .reduce((total, item) => total + Number(item.count || 0), 0);
+        fixtures.inboundRequeues = (fixtures.inboundRequeues || 0) + 1;
+        fixtures.attention = fixtures.attention.filter((item) => item.kind !== "inbound");
+        const pendingTotal = fixtures.attention.filter((candidate) => !candidate.resolved).length;
+        return json(res, {
+          ok: true,
+          requeued,
+          items: fixtures.attention,
+          total: fixtures.attention.length,
+          pending_total: pendingTotal,
+          resolved_total: fixtures.attention.length - pendingTotal,
+        });
+      }
       if (apiPath === "/api/bot/summary" && req.method === "GET") {
         return json(res, fixtures.summary);
       }
@@ -3358,7 +3374,23 @@ async function checkHomeAlerts(browser, baseUrl) {
     assert.equal(await page.locator("#checkCookieButton").isVisible(), true, "shop diagnostics remain actionable without starting a check");
     assert.equal(await page.locator('[data-panel="auto-reply"]').isVisible(), false, "worker CTA does not activate auto-reply settings");
 
+    // Buyer messages that stopped retrying are handed back from the card itself.
     fixtures.bot = { ...baseBot, product_count: 1 };
+    fixtures.attention = [{
+      id: `att_${"a".repeat(24)}`, kind: "inbound", code: "inbound_dead_letter", error_code: "", count: 2,
+      severity: "error", resolved: false, resolved_at: null, title: "买家消息处理失败",
+      message: "有 2 条买家消息多次处理失败，已停止自动重试。最近原因：网络请求失败。",
+      action: "requeue_inbound", action_view: "chat", action_label: "重新处理",
+    }];
+    await reloadHome();
+    const requeueButton = page.locator("#attentionList [data-attention-requeue]");
+    assert.equal(await requeueButton.innerText(), "重新处理");
+    assert.equal(await page.locator("#attentionList [data-view]").count(), 0, "the requeue row does not navigate away");
+    await requeueButton.click();
+    await page.waitForFunction(() => /当前没有需要处理的事项/.test(document.querySelector("#attentionList")?.textContent || ""));
+    assert.equal(fixtures.inboundRequeues, 1, "one click sends one requeue request");
+    assert.equal(await page.locator("#attentionCount").innerText(), "0");
+
     fixtures.attention = [];
     await reloadHome();
     assert.match(await page.locator("#attentionList").innerText(), /当前没有需要处理的事项/);
@@ -3401,7 +3433,7 @@ async function checkHomeAlerts(browser, baseUrl) {
     assert.equal(fixtures.shopActionRequests.length, 0, "view and acknowledgement actions cannot trigger shop probes");
     assert.equal(fixtures.cookieSaves + fixtures.botStartModes.length + fixtures.qrStarts + fixtures.qrConnects, 0, "display fixes must not reauthorize or restart workers");
     assertDesktopEvidence(evidence);
-    console.log(JSON.stringify({ ok: true, scope: "home-alerts", layoutCases: cases.length, homeLayoutWidths: [1440, 768, 390], attentionLayoutWidths: [1440, 1280, 1024, 980, 768, 390, 320], alertCases: ["legacy-worker-risk", "resolved-history", "explicit-verification", "local-cooldown", "platform-busy", "account-restricted", "session-expired", "long-reminders-equal-cards", "attention-scroll-to-last-action", "worker-shop-status-navigation", "recovered", "text-only-empty", "resolved-actions-kept"], noPlatformRequests: true }));
+    console.log(JSON.stringify({ ok: true, scope: "home-alerts", layoutCases: cases.length, homeLayoutWidths: [1440, 768, 390], attentionLayoutWidths: [1440, 1280, 1024, 980, 768, 390, 320], alertCases: ["legacy-worker-risk", "resolved-history", "explicit-verification", "local-cooldown", "platform-busy", "account-restricted", "session-expired", "long-reminders-equal-cards", "attention-scroll-to-last-action", "worker-shop-status-navigation", "inbound-requeue", "recovered", "text-only-empty", "resolved-actions-kept"], noPlatformRequests: true }));
   } catch (error) {
     await reportDesktopFailure(page, "home-alerts", error, evidence);
     throw error;

@@ -1860,6 +1860,91 @@ def manual_reply_attention(
         con.close()
 
 
+INBOUND_FAILURE_LABELS = {
+    "network_error": "网络请求失败",
+    "platform_busy": "平台繁忙",
+    "response_invalid": "平台返回异常",
+    "token_unavailable": "登录令牌不可用",
+    "session_expired": "登录已失效",
+    "risk_control": "触发平台风控",
+    "verification_required": "需要安全验证",
+    "account_restricted": "账号受限",
+}
+
+
+def inbound_dead_letter_attention(
+    user_id: int,
+    account_key: str = DEFAULT_ACCOUNT_ID,
+):
+    """Report buyer messages, payment notices included, that stopped retrying."""
+    con = _connect(user_id, "delivery_state.db", account_key)
+    if con is None or not _table_exists(con, "inbound_events"):
+        if con is not None:
+            con.close()
+        return []
+    try:
+        total = con.execute(
+            "SELECT COUNT(*) FROM inbound_events WHERE status = 'dead_letter'"
+        ).fetchone()[0]
+        if not total:
+            return []
+        latest = con.execute(
+            """SELECT last_error FROM inbound_events
+               WHERE status = 'dead_letter'
+               ORDER BY updated_at DESC, rowid DESC LIMIT 1"""
+        ).fetchone()
+        label = INBOUND_FAILURE_LABELS.get(str(latest["last_error"] or ""))
+        message = f"有 {int(total)} 条买家消息多次处理失败，已停止自动重试。"
+        if label:
+            message += f"最近原因：{label}。"
+        return [
+            {
+                "kind": "inbound",
+                "code": "inbound_dead_letter",
+                "severity": "error",
+                "count": int(total),
+                "message": message,
+            }
+        ]
+    except sqlite3.Error:
+        return []
+    finally:
+        con.close()
+
+
+def requeue_inbound_dead_letters(
+    user_id: int,
+    account_key: str = DEFAULT_ACCOUNT_ID,
+):
+    """Hand every stopped buyer message back to the worker queue.
+
+    The worker verifies each payment again and keeps its duplicate-delivery
+    guards, so a replay cannot ship one order twice.
+    """
+    con = _connect_writable(user_id, "delivery_state.db", account_key)
+    if con is None:
+        return 0
+    try:
+        if not _table_exists(con, "inbound_events"):
+            return 0
+        con.execute("BEGIN IMMEDIATE")
+        cursor = con.execute(
+            """UPDATE inbound_events
+               SET status = 'pending', attempt_count = 0, next_attempt_at = 0,
+                   last_error = NULL, updated_at = ?, completed_at = NULL
+               WHERE status = 'dead_letter'""",
+            (time.time(),),
+        )
+        con.commit()
+        return int(cursor.rowcount or 0)
+    except sqlite3.Error:
+        if con.in_transaction:
+            con.rollback()
+        return None
+    finally:
+        con.close()
+
+
 def _conversation_exists(con, chat_id: str, user_id, account_key=DEFAULT_ACCOUNT_ID) -> bool:
     try:
         visible, visibility_values = _customer_conversation_filter(con, user_id, account_key)
