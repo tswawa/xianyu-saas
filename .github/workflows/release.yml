@@ -211,12 +211,12 @@ jobs:
       - name: Install release verification dependencies
         run: python -m pip install -r backend/requirements.txt
       - name: Download x86_64 standalone handoff
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: standalone-linux-x86_64
           path: .local/downloads/linux-x86_64
       - name: Download aarch64 standalone handoff
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: standalone-linux-aarch64
           path: .local/downloads/linux-aarch64
