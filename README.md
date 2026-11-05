@@ -170,6 +170,10 @@ sudo "./xianyu-saas-${VERSION}-linux-${ARCH}" install --version "$VERSION"
 
 服务器本机访问：`http://127.0.0.1:8096/xianyu-saas/`。业务数据在 `/var/lib/xianyu-saas`，配置在 `/etc/xianyu-saas.env`。使用 `sudo xianyu-saas status` 查看状态，其他管理命令见[部署指南](docs/DEPLOYMENT.md)。
 
+## 一键部署
+
+[![Deploy on RepoCloud](https://d16t0pc4846x52.cloudfront.net/deploylobe.svg)](https://repocloud.io/details/Xianyu%20SaaS/)
+
 ## 首次使用
 
 ### 首次管理员注册
