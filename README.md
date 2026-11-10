@@ -4,6 +4,10 @@
 
 项目适合需要同时管理多个闲鱼账号、处理重复咨询，或销售卡密、兑换码、网盘资料等虚拟商品的卖家。可以只使用关键词回复，也可以接入大模型，让客服结合商品信息和店铺知识回答问题；发货按商品单独配置。
 
+[![Release 累计下载量](https://img.shields.io/github/downloads/tswawa/xianyu-saas/total?style=flat&logo=github&label=downloads)](https://github.com/tswawa/xianyu-saas/releases)
+[![GitHub Stars](https://img.shields.io/github/stars/tswawa/xianyu-saas?style=flat&logo=github)](https://github.com/tswawa/xianyu-saas/stargazers)
+[![GitHub Forks](https://img.shields.io/github/forks/tswawa/xianyu-saas?style=flat&logo=github)](https://github.com/tswawa/xianyu-saas/forks)
+[![GitHub Issues](https://img.shields.io/github/issues/tswawa/xianyu-saas?style=flat&logo=github)](https://github.com/tswawa/xianyu-saas/issues)
 [![License: GPL-3.0-only](https://img.shields.io/badge/license-GPL--3.0--only-blue.svg)](LICENSE)
 
 [功能介绍](#功能介绍) · [下载安装](#安装) · [首次使用](#首次使用) · [网页更新](#网页更新) · [更多截图](#更多截图) · [开发与文档](#开发与文档) · [交流与建议](#交流与建议)
