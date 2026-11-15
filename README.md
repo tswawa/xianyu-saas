@@ -293,9 +293,9 @@ docs/       部署、使用与架构文档
 
 ## 交流与建议
 
-对项目有改进建议，请提交issues
-交流群
-<img width="586" height="733" alt="image" src="https://github.com/user-attachments/assets/533358cd-f315-4ac1-86e4-ccad7398ea54" />
+对项目有改进建议，请提交issues，互相学习请进
+<img width="526" height="658" alt="image" src="https://github.com/user-attachments/assets/f7b5fb02-04f0-4e55-8af8-997f79c89c35" />
+
 
 
 ## 许可证
