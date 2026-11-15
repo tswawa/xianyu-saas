@@ -9,6 +9,8 @@
 [![GitHub Forks](https://img.shields.io/github/forks/tswawa/xianyu-saas?style=flat&logo=github)](https://github.com/tswawa/xianyu-saas/forks)
 [![GitHub Issues](https://img.shields.io/github/issues/tswawa/xianyu-saas?style=flat&logo=github)](https://github.com/tswawa/xianyu-saas/issues)
 [![License: GPL-3.0-only](https://img.shields.io/badge/license-GPL--3.0--only-blue.svg)](LICENSE)
+![Uploading image.png…]()
+
 
 [功能介绍](#功能介绍) · [下载安装](#安装) · [首次使用](#首次使用) · [网页更新](#网页更新) · [更多截图](#更多截图) · [开发与文档](#开发与文档) · [交流与建议](#交流与建议)
 
